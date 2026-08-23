@@ -8,6 +8,8 @@ https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive
 example output:
 https://youtu.be/hALjq11lK_s
 
+run_h3_prompt_studio.bat
+
 <img width="1280" height="769" alt="WhatsApp Image 2026-08-24 at 12 39 54 AM" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
 
 
