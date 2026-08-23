@@ -9,6 +9,7 @@ https://youtu.be/hALjq11lK_s
 
 <img width="1600" height="698" alt="WhatsApp Image 2026-08-23 at 5 08 24 PM" src="https://github.com/user-attachments/assets/365a0bb0-0a7b-4f64-b323-0b71e34a1847" />
 
+<img width="1474" height="2080" alt="Screenshot 2026-08-23 214016111" src="https://github.com/user-attachments/assets/345e1d79-455f-4836-bffb-8e138aa20ee4" />
 
 默认主工作流支持最多 **9 张图片、3 段参考视频和 3 段独立音频**：
 
