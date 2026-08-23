@@ -1,0 +1,21 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V1",
+  "subject_keywords": [
+    "young woman",
+    "long dark hair",
+    "casual summer dress",
+    "glass Coca-Cola bottle",
+    "condensation"
+  ],
+  "prompt": "A cinematic reference image of a young woman with long dark hair wearing a casual summer dress, holding a glass Coca-Cola bottle. She is in a sunlit urban street setting. The image should capture her face and upper body clearly to serve as the identity anchor for the zoom-out reveal. High detail on facial features and clothing texture.",
+  "z_image_generation": {
+    "source": "C:\\Users\\karuv\\OneDrive\\Documents\\ChatGPT\\minimax h3 reference r2v\\.director_cache\\design_materials\\1787491005455270300\\picture_01.png",
+    "seed": 2329659751875106335,
+    "prompt_id": "9e59673d-ebf9-4aab-aea4-cf7ead54430e",
+    "blip_caption": "a woman holding a beer bottle in her hand"
+  }
+}

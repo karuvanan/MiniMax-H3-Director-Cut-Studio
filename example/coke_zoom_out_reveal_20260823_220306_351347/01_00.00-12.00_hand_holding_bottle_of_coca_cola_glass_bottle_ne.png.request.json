@@ -1,0 +1,20 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V3",
+  "subject_keywords": [
+    "hand holding bottle of coca cola",
+    "glass bottle neck",
+    "red label",
+    "condensation droplets"
+  ],
+  "prompt": "Extreme close-up of a hand gripping the neck of a glass Coca-Cola bottle, red label clearly visible, condensation droplets on glass, shallow depth of field, cinematic lighting, 8k resolution",
+  "z_image_generation": {
+    "source": "C:\\Users\\karuv\\OneDrive\\Documents\\ChatGPT\\minimax h3 reference r2v\\.director_cache\\design_materials\\1787493689221970100\\picture_01.png",
+    "seed": 5297221303998650102,
+    "prompt_id": "ace4a6d2-eecc-4ec5-bb0a-feefd5a17373",
+    "blip_caption": "a hand holding a bottle of coca"
+  }
+}

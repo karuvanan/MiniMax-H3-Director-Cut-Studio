@@ -1,0 +1,87 @@
+{
+  "title": "Coca-Cola Zoom Out Reveal",
+  "creative_brief": "A seamless 12-second cinematic product shot that begins with an extreme close-up of a hand gripping a Coca-Cola bottle and slowly zooms out to reveal a young woman drinking the beverage in a sunlit urban setting.",
+  "global_visual_style": "High-end commercial photography, realistic skin texture, vibrant red branding, shallow depth of field transitioning to deep focus, natural lighting with soft shadows, crisp details on condensation droplets.",
+  "overall_soundscape": "Sharp plastic crinkle and glass clink at the start, followed by a refreshing carbonated fizz and a distinct gulp sound as the woman drinks. Background features subtle city ambience that fades in as the camera pulls back.",
+  "non_diegetic_music": "Upbeat, modern pop-rock track with a driving drum beat and bright guitar riffs, starting softly under the close-up and swelling to full volume by the end of the zoom-out.",
+  "constraints": "Maintain strict continuity of the Coca-Cola bottle design (red label, white script logo). Ensure realistic hand anatomy and grip. The transition from macro to wide shot must be smooth without jitter. No visible text overlays or subtitles.",
+  "theme_text": "",
+  "theme_text_explicit_user_requested": false,
+  "duration_seconds": 12.0,
+  "shots": [
+    {
+      "id": "S1",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "preset": "cinematic",
+      "framing": "Extreme Close-Up to Medium Shot",
+      "camera_angle": "Eye-level",
+      "camera_movement": "Slow continuous zoom out (dolly back)",
+      "movement_speed": "Steady and smooth",
+      "movement_amplitude": "Large scale change from 10cm subject distance to 2m subject distance",
+      "subject_action": "A hand firmly grips the neck of a chilled Coca-Cola bottle. As the camera pulls back, the woman's face comes into focus; she tilts her head back slightly and takes a refreshing sip.",
+      "environment_response": "Condensation droplets on the bottle catch the light. In the background, blurred urban elements (buildings, sky) become sharper as the focal length widens.",
+      "additional_direction": "Focus starts razor-sharp on the hand and bottle label, then racks focus to include the woman's face while keeping the bottle prominent in the foreground."
+    }
+  ],
+  "text_layers": [],
+  "transitions": [
+    {
+      "time_seconds": 0.0,
+      "preset": "none",
+      "direction": "continuous"
+    }
+  ],
+  "markers": [
+    {
+      "time_seconds": 11.5,
+      "preset": "final_hold",
+      "direction": "hold_frame"
+    }
+  ],
+  "media_requests": [
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "subject_keywords": [
+        "Coca-Cola bottle",
+        "red label",
+        "white logo",
+        "condensation",
+        "glass"
+      ],
+      "prompt": "A high-resolution reference of a standard glass Coca-Cola bottle with the iconic red label and white script logo, covered in realistic condensation droplets, held by a human hand. The lighting should highlight the curvature of the glass and the texture of the liquid inside."
+    },
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "subject_keywords": [
+        "young woman",
+        "casual summer outfit",
+        "natural makeup",
+        "drinking pose"
+      ],
+      "prompt": "A reference image of a young woman with natural beauty and casual summer attire (e.g., light linen shirt or tank top), holding a drink to her lips. Her expression should be relaxed and enjoying the moment, suitable for a commercial lifestyle shot."
+    },
+    {
+      "media_type": "video",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "subject_keywords": [
+        "zoom out motion",
+        "smooth dolly back",
+        "depth of field shift"
+      ],
+      "prompt": "A reference video clip demonstrating a smooth, continuous zoom-out camera movement from an extreme close-up object to a medium shot of a person. The motion should be steady, with no jitter, illustrating the transition from macro details to broader context."
+    }
+  ]
+}

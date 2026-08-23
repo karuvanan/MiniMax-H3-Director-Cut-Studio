@@ -1,0 +1,12 @@
+{
+  "media_type": "image",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V1",
+  "subject_keywords": [
+    "Coca-Cola bottle",
+    "hand grip",
+    "glass texture"
+  ],
+  "prompt": "Extreme close-up of a hand gripping a classic glass Coca-Cola bottle with condensation drops, high detail on the label and liquid clarity, bright natural lighting background blurred."
+}

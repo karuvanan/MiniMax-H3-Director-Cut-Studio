@@ -1,0 +1,25 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V3",
+  "subject_keywords": [
+    "Coca-Cola bottle",
+    "red label",
+    "white logo",
+    "condensation",
+    "glass"
+  ],
+  "prompt": "A high-resolution reference of a standard glass Coca-Cola bottle with the iconic red label and white script logo, covered in realistic condensation droplets, held by a human hand. The lighting should highlight the curvature of the glass and the texture of the liquid inside.",
+  "comfyui_generation": {
+    "generated": true,
+    "seed": 8789358013151459898,
+    "prompt_id": "c7eca137-1274-4e74-84db-8041bcfd4c6c",
+    "checkpoint": "epicrealismXL_vxviLastfameRealism.safetensors",
+    "width": 1024,
+    "height": 576,
+    "steps": 24,
+    "cfg": 5.5
+  }
+}

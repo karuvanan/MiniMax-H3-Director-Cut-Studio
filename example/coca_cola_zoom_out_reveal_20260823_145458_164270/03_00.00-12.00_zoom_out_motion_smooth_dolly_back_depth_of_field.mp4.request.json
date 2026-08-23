@@ -1,0 +1,13 @@
+{
+  "media_type": "video",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V3",
+  "subject_keywords": [
+    "zoom out motion",
+    "smooth dolly back",
+    "depth of field shift"
+  ],
+  "prompt": "A reference video clip demonstrating a smooth, continuous zoom-out camera movement from an extreme close-up object to a medium shot of a person. The motion should be steady, with no jitter, illustrating the transition from macro details to broader context."
+}

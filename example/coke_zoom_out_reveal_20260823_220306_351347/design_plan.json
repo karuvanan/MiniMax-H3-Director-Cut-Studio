@@ -1,0 +1,73 @@
+{
+  "title": "Coke Zoom-Out Reveal",
+  "creative_brief": "A 12-second cinematic commercial shot featuring a close-up of a hand gripping a glass bottle of Coca-Cola that slowly zooms out to reveal a woman drinking from it in a sunlit urban setting.",
+  "global_visual_style": "Cinematic realism, high-resolution photography, shallow depth of field transitioning to medium depth, warm natural lighting with soft highlights on the glass and condensation, vibrant red branding contrasted against neutral background tones.",
+  "overall_soundscape": "Sharp plastic/glass capping sound, distinct liquid glugging sounds as the bottle is tilted, ambient city hum fading in as the camera pulls back, subtle breeze rustling hair.",
+  "non_diegetic_music": "Upbeat, rhythmic indie-pop track with a steady bassline and bright synth accents that builds energy as the reveal happens.",
+  "constraints": "Maintain strict continuity of the bottle's label orientation and liquid level. Ensure realistic hand grip physics. The zoom-out must be smooth and linear without jitter. No visible text overlays other than the product branding on the bottle.",
+  "theme_text": "",
+  "theme_text_explicit_user_requested": false,
+  "duration_seconds": 12.0,
+  "shots": [
+    {
+      "id": "S1",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "preset": "cinematic_realism",
+      "framing": "Extreme close-up transitioning to medium shot",
+      "camera_angle": "Eye-level, slightly low angle initially",
+      "camera_movement": "Slow, steady zoom out (dolly back)",
+      "movement_speed": "Linear and smooth",
+      "movement_amplitude": "High (from macro detail to full upper body)",
+      "subject_action": "A hand firmly grips the neck of a glass Coca-Cola bottle. The bottle is tilted slightly upward. As the camera zooms out, the woman holding it brings the bottle to her lips and takes a sip.",
+      "environment_response": "Condensation droplets on the glass catch the light. Background elements (city street/cafe) become visible and sharp as depth of field widens.",
+      "additional_direction": "Focus starts razor-thin on the hand and bottle label, then racks focus slightly to include the woman's face in the final third of the shot."
+    }
+  ],
+  "text_layers": [],
+  "transitions": [
+    {
+      "time_seconds": 0.0,
+      "preset": "cut",
+      "direction": "forward"
+    }
+  ],
+  "markers": [
+    {
+      "time_seconds": 11.5,
+      "preset": "final_hold",
+      "direction": "forward"
+    }
+  ],
+  "media_requests": [
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "subject_keywords": [
+        "hand holding bottle of coca cola",
+        "glass bottle neck",
+        "red label",
+        "condensation droplets"
+      ],
+      "prompt": "Extreme close-up of a hand gripping the neck of a glass Coca-Cola bottle, red label clearly visible, condensation droplets on glass, shallow depth of field, cinematic lighting, 8k resolution"
+    },
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "subject_keywords": [
+        "woman drinking from bottle",
+        "casual summer attire",
+        "sunlit urban background",
+        "upper body reveal"
+      ],
+      "prompt": "Medium shot of a young woman drinking from a glass Coca-Cola bottle, smiling slightly, wearing casual summer attire, sunlit urban background, cinematic depth of field, 8k resolution"
+    }
+  ]
+}

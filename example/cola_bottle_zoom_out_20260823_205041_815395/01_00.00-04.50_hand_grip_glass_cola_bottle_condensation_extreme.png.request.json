@@ -1,0 +1,19 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 4.5,
+  "track": "V1",
+  "subject_keywords": [
+    "hand",
+    "grip",
+    "glass cola bottle",
+    "condensation",
+    "extreme close-up"
+  ],
+  "prompt": "Extreme close-up of a human hand gripping a glass bottle filled with dark cola liquid, condensation on the glass, shallow depth of field, warm lighting, high detail texture.",
+  "concept_reference": {
+    "source": "C:\\Users\\karuv\\OneDrive\\Documents\\ChatGPT\\minimax h3 reference r2v\\.director_cache\\design_concepts\\concept_1787487303111597100.png",
+    "blip_caption": "a person holding their hands in the middle of a table"
+  }
+}

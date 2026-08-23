@@ -1,0 +1,20 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V3",
+  "subject_keywords": [
+    "woman drinking from bottle",
+    "casual summer attire",
+    "sunlit urban background",
+    "upper body reveal"
+  ],
+  "prompt": "Medium shot of a young woman drinking from a glass Coca-Cola bottle, smiling slightly, wearing casual summer attire, sunlit urban background, cinematic depth of field, 8k resolution",
+  "z_image_generation": {
+    "source": "C:\\Users\\karuv\\OneDrive\\Documents\\ChatGPT\\minimax h3 reference r2v\\.director_cache\\design_materials\\1787493689221970100\\picture_02.png",
+    "seed": 5693871448695717440,
+    "prompt_id": "76dd5dec-a43c-4294-b266-bf87021ac48e",
+    "blip_caption": "a woman drinking from a bottle"
+  }
+}

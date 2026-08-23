@@ -1,0 +1,24 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 12.0,
+  "track": "V3",
+  "subject_keywords": [
+    "young woman",
+    "casual summer outfit",
+    "natural makeup",
+    "drinking pose"
+  ],
+  "prompt": "A reference image of a young woman with natural beauty and casual summer attire (e.g., light linen shirt or tank top), holding a drink to her lips. Her expression should be relaxed and enjoying the moment, suitable for a commercial lifestyle shot.",
+  "comfyui_generation": {
+    "generated": true,
+    "seed": 782240797511657950,
+    "prompt_id": "e0a3fa8a-384d-4cb2-a20e-3c8c1e8d8a02",
+    "checkpoint": "epicrealismXL_vxviLastfameRealism.safetensors",
+    "width": 1024,
+    "height": 576,
+    "steps": 24,
+    "cfg": 5.5
+  }
+}

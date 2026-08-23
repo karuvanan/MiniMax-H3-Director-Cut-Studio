@@ -1,0 +1,68 @@
+{
+  "title": "Coca-Cola Zoom Out Commercial",
+  "creative_brief": "A cinematic commercial shot starting with an extreme close-up of a hand gripping a glass Coca-Cola bottle, slowly zooming out to reveal a young woman enjoying the drink in a bright, sunlit modern interior.",
+  "global_visual_style": "Cinematic, high-definition, realistic lighting, shallow depth of field transitioning to medium depth, vibrant colors, commercial aesthetic, smooth camera movement.",
+  "overall_soundscape": "Soft diffuse environmental tone, distant reversed textures, airy movement and gentle spatial echoes. Subtle liquid sounds as the bottle is tilted.",
+  "non_diegetic_music": "A light, upbeat, and refreshing instrumental track that builds gently as the camera zooms out. Acoustic guitar or ukulele base with soft percussion entering at 00:04.000.",
+  "constraints": "Maintain consistent lighting and character appearance throughout the zoom. Ensure the Coca-Cola branding is clear and accurate on the bottle label. The zoom movement must be perfectly smooth and steady without jitter. Keep the subject's face in focus as it enters the frame.",
+  "theme_text": "",
+  "duration_seconds": 12.0,
+  "shots": [
+    {
+      "id": "S1",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "preset": "zoom_out",
+      "framing": "Extreme close-up transitioning to medium shot",
+      "camera_angle": "Eye-level",
+      "camera_movement": "Slow, smooth zoom out",
+      "movement_speed": "Slow",
+      "movement_amplitude": "Large",
+      "subject_action": "A hand holds a glass Coca-Cola bottle. As the camera zooms out, it reveals a young woman with long dark hair, wearing a casual white t-shirt, taking a sip from the bottle. She smiles slightly, enjoying the drink.",
+      "environment_response": "The background is a bright, modern café or living room with soft natural light streaming in. The environment remains static but becomes more visible as the camera zooms out.",
+      "additional_direction": "Focus on the condensation on the bottle and the clarity of the liquid. The transition from close-up to medium shot should be seamless, maintaining the subject's focus."
+    }
+  ],
+  "text_layers": [
+    {
+      "start_seconds": 9.5,
+      "end_seconds": 12.0,
+      "track": "V3",
+      "content": "A cinematic close-up of a hand holding a Coca-Cola bottle, slowly zooming out to reveal a young woman drinking it in a bright, modern setting.",
+      "role": "on_screen_text",
+      "speaker": "S1",
+      "language": "English",
+      "delivery": "Natural",
+      "lip_sync": true
+    }
+  ],
+  "transitions": [],
+  "markers": [],
+  "media_requests": [
+    {
+      "media_type": "image",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "subject_keywords": [
+        "Coca-Cola bottle",
+        "hand grip",
+        "glass texture"
+      ],
+      "prompt": "Extreme close-up of a hand gripping a classic glass Coca-Cola bottle with condensation drops, high detail on the label and liquid clarity, bright natural lighting background blurred."
+    },
+    {
+      "media_type": "image",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "subject_keywords": [
+        "young woman",
+        "white t-shirt",
+        "drinking action"
+      ],
+      "prompt": "Medium shot of a young woman with long dark hair wearing a white t-shirt drinking from a Coca-Cola bottle, smiling slightly, bright modern interior background."
+    }
+  ]
+}

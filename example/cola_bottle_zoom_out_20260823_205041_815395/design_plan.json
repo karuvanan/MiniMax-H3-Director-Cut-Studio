@@ -1,0 +1,125 @@
+{
+  "title": "Cola Bottle Zoom Out",
+  "creative_brief": "A 12-second cinematic shot starting with an extreme close-up of a hand gripping a glass cola bottle, slowly zooming out to reveal a woman drinking from it in a softly lit indoor setting.",
+  "global_visual_style": "Cinematic realism, shallow depth of field transitioning to medium depth, warm ambient lighting, high-fidelity texture on glass and skin, smooth camera movement.",
+  "overall_soundscape": "Subtle room tone, the crisp sound of liquid swirling in a glass bottle, and a distinct gulp as the woman drinks.",
+  "non_diegetic_music": "A minimal, low-tempo ambient track with soft piano notes that builds gently as the frame widens.",
+  "constraints": "Maintain consistent lighting direction from the left. Ensure the hand grip on the bottle remains physically realistic throughout the zoom-out. No visible text or logos other than generic cola branding if implied by context, but focus on the glass texture.",
+  "theme_text": "",
+  "theme_text_explicit_user_requested": false,
+  "duration_seconds": 12.0,
+  "shots": [
+    {
+      "id": "S1",
+      "start_seconds": 0.0,
+      "end_seconds": 4.5,
+      "track": "V1",
+      "preset": "cinematic_closeup",
+      "framing": "Extreme Close-Up (ECU)",
+      "camera_angle": "Eye-level with the bottle neck",
+      "camera_movement": "Slow, steady dolly out / zoom out",
+      "movement_speed": "slow",
+      "movement_amplitude": "small",
+      "subject_action": "A hand firmly grips a glass cola bottle filled with dark amber liquid. Fingers are wrapped around the mid-section of the bottle. Condensation droplets are visible on the glass surface.",
+      "environment_response": "Soft bokeh background, indistinct shapes suggesting an indoor table surface.",
+      "additional_direction": "Focus is locked sharply on the hand and the bottle's texture. The zoom out begins subtly, revealing more of the bottle's shoulder."
+    },
+    {
+      "id": "S2",
+      "start_seconds": 4.5,
+      "end_seconds": 9.0,
+      "track": "V1",
+      "preset": "cinematic_medium",
+      "framing": "Medium Close-Up (MCU)",
+      "camera_angle": "Slightly low angle looking up at the subject's face",
+      "camera_movement": "Continued slow dolly out / zoom out",
+      "movement_speed": "slow",
+      "movement_amplitude": "medium",
+      "subject_action": "The camera reveals a young woman with dark hair tied back. She tilts her head back slightly, bringing the bottle to her lips. Her eyes are closed in enjoyment as she takes a sip.",
+      "environment_response": "The background becomes clearer, showing a warm-toned interior wall and a hint of a window frame on the right side.",
+      "additional_direction": "Lighting highlights the contour of her jawline and the reflection on the glass bottle. The transition from hand to face is seamless."
+    },
+    {
+      "id": "S3",
+      "start_seconds": 9.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "preset": "cinematic_medium_wide",
+      "framing": "Medium Shot (MS)",
+      "camera_angle": "Eye-level",
+      "camera_movement": "Settle to static or very slow drift",
+      "movement_speed": "very_slow",
+      "movement_amplitude": "small",
+      "subject_action": "The woman lowers the bottle slightly from her lips, a small smile forming on her face. She holds the bottle in one hand, looking forward with a relaxed expression.",
+      "environment_response": "Full context of the scene is visible: she is seated at a wooden table. The lighting is soft and diffused, creating a cozy atmosphere.",
+      "additional_direction": "Final frame holds on her satisfied expression. The camera movement stops completely in the last 0.5 seconds to stabilize the shot."
+    }
+  ],
+  "text_layers": [],
+  "transitions": [
+    {
+      "time_seconds": 4.5,
+      "preset": "seamless_zoom",
+      "direction": "outward"
+    },
+    {
+      "time_seconds": 9.0,
+      "preset": "seamless_zoom",
+      "direction": "outward"
+    }
+  ],
+  "markers": [
+    {
+      "time_seconds": 11.5,
+      "preset": "final_hold",
+      "direction": "hold"
+    }
+  ],
+  "media_requests": [
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 4.5,
+      "track": "V1",
+      "subject_keywords": [
+        "hand",
+        "grip",
+        "glass cola bottle",
+        "condensation",
+        "extreme close-up"
+      ],
+      "prompt": "Extreme close-up of a human hand gripping a glass bottle filled with dark cola liquid, condensation on the glass, shallow depth of field, warm lighting, high detail texture."
+    },
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 4.5,
+      "end_seconds": 9.0,
+      "track": "V1",
+      "subject_keywords": [
+        "woman",
+        "drinking",
+        "cola bottle",
+        "medium close-up",
+        "indoor"
+      ],
+      "prompt": "Medium close-up of a young woman with dark hair drinking from a glass cola bottle, eyes closed, warm indoor lighting, soft background bokeh."
+    },
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 9.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "subject_keywords": [
+        "woman",
+        "seated",
+        "wooden table",
+        "medium shot",
+        "relaxed expression"
+      ],
+      "prompt": "Medium shot of a woman seated at a wooden table holding a glass cola bottle, relaxed smile, soft diffused lighting, cozy interior environment."
+    }
+  ]
+}

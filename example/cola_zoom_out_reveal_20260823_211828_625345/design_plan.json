@@ -1,0 +1,114 @@
+{
+  "title": "Cola Zoom Out Reveal",
+  "creative_brief": "A cinematic 12-second video starting with an extreme close-up of a hand gripping a glass cola bottle, slowly zooming out to reveal a young woman drinking the beverage in a sunlit urban setting. The sequence maintains strict continuity between the reference assets for the subject and product.",
+  "global_visual_style": "Cinematic realism, shallow depth of field transitioning to medium depth, warm natural lighting, high contrast, vibrant colors, 4k resolution, smooth camera movement.",
+  "overall_soundscape": "Ambient city background noise fading into focus, the distinct sound of liquid being swallowed and glass condensation, subtle breathing sounds.",
+  "non_diegetic_music": "A soft, rhythmic lo-fi beat that builds slightly as the camera zooms out, ending with a gentle resolution at the final hold.",
+  "constraints": "Maintain consistent character identity and product appearance throughout the zoom. Ensure realistic hand grip physics on the glass bottle. No text overlays unless specified.",
+  "theme_text": "",
+  "theme_text_explicit_user_requested": false,
+  "duration_seconds": 12.0,
+  "shots": [
+    {
+      "id": "S1",
+      "start_seconds": 0.0,
+      "end_seconds": 4.5,
+      "track": "V1",
+      "preset": "cinematic_closeup",
+      "framing": "Extreme Close-Up (ECU)",
+      "camera_angle": "Eye-level with the bottle neck",
+      "camera_movement": "Slow continuous zoom out",
+      "movement_speed": "slow",
+      "movement_amplitude": "small",
+      "subject_action": "A hand firmly grips a glass Coca-Cola bottle, fingers wrapped around the mid-section. Condensation droplets are visible on the glass surface.",
+      "environment_response": "Background is heavily blurred (bokeh), showing indistinct warm light sources and urban shapes.",
+      "additional_direction": "Focus is locked sharply on the hand and the upper part of the bottle label. The zoom begins from this tight framing, gradually widening the field of view to include more of the arm and shoulder area while maintaining focus on the bottle as the central anchor."
+    },
+    {
+      "id": "S2",
+      "start_seconds": 4.5,
+      "end_seconds": 9.0,
+      "track": "V1",
+      "preset": "cinematic_medium",
+      "framing": "Medium Close-Up (MCU)",
+      "camera_angle": "Slightly low angle looking up at the subject's face",
+      "camera_movement": "Continue slow zoom out",
+      "movement_speed": "slow",
+      "movement_amplitude": "medium",
+      "subject_action": "The camera reveals a young woman with long dark hair wearing a casual summer dress. She tilts her head back slightly, drinking from the bottle held in her hand.",
+      "environment_response": "The background resolves into a sunlit city street with green foliage and soft architectural details. Light flares subtly as the angle shifts.",
+      "additional_direction": "As the zoom continues, the woman's face becomes clearly visible. Her expression is relaxed and content. The transition from hand to face must be seamless, ensuring the bottle remains in the same relative position to her mouth."
+    },
+    {
+      "id": "S3",
+      "start_seconds": 9.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "preset": "cinematic_wide",
+      "framing": "Medium Shot (MS)",
+      "camera_angle": "Eye-level",
+      "camera_movement": "Settle and hold",
+      "movement_speed": "none",
+      "movement_amplitude": "none",
+      "subject_action": "The woman lowers the bottle slightly, pausing her drink to look directly into the camera with a subtle smile. She holds the pose for the final seconds.",
+      "environment_response": "Full context of the urban park/street setting is visible, including distant pedestrians and bright daylight.",
+      "additional_direction": "Final hold on this composition. The zoom movement stops completely at 10.5s to allow a stable 1.5-second hold for the final frame."
+    }
+  ],
+  "text_layers": [],
+  "transitions": [
+    {
+      "time_seconds": 4.5,
+      "preset": "seamless_zoom",
+      "direction": "forward"
+    },
+    {
+      "time_seconds": 9.0,
+      "preset": "seamless_zoom",
+      "direction": "forward"
+    }
+  ],
+  "markers": [
+    {
+      "time_seconds": 11.5,
+      "preset": "final_hold_start",
+      "direction": ""
+    },
+    {
+      "time_seconds": 11.5,
+      "preset": "final_frame",
+      "direction": ""
+    }
+  ],
+  "media_requests": [
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 12.0,
+      "track": "V1",
+      "subject_keywords": [
+        "young woman",
+        "long dark hair",
+        "casual summer dress",
+        "glass Coca-Cola bottle",
+        "condensation"
+      ],
+      "prompt": "A cinematic reference image of a young woman with long dark hair wearing a casual summer dress, holding a glass Coca-Cola bottle. She is in a sunlit urban street setting. The image should capture her face and upper body clearly to serve as the identity anchor for the zoom-out reveal. High detail on facial features and clothing texture."
+    },
+    {
+      "media_type": "image",
+      "usage": "h3_reference",
+      "start_seconds": 0.0,
+      "end_seconds": 4.5,
+      "track": "V1",
+      "subject_keywords": [
+        "hand grip",
+        "glass bottle",
+        "condensation droplets",
+        "extreme close-up"
+      ],
+      "prompt": "An extreme close-up reference image of a hand gripping the mid-section of a glass Coca-Cola bottle. Focus on realistic skin texture, finger placement, and condensation droplets on the glass. The background should be blurred to match the initial shot's depth of field."
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "media_type": "image",
+  "usage": "h3_reference",
+  "start_seconds": 0.0,
+  "end_seconds": 4.5,
+  "track": "V1",
+  "subject_keywords": [
+    "hand grip",
+    "glass bottle",
+    "condensation droplets",
+    "extreme close-up"
+  ],
+  "prompt": "An extreme close-up reference image of a hand gripping the mid-section of a glass Coca-Cola bottle. Focus on realistic skin texture, finger placement, and condensation droplets on the glass. The background should be blurred to match the initial shot's depth of field.",
+  "z_image_generation": {
+    "source": "C:\\Users\\karuv\\OneDrive\\Documents\\ChatGPT\\minimax h3 reference r2v\\.director_cache\\design_materials\\1787491005455270300\\picture_02.png",
+    "seed": 946363927577408900,
+    "prompt_id": "c15536f7-6641-4c98-b56c-9e39a05162d0",
+    "blip_caption": "a person holding a bottle of coca"
+  }
+}

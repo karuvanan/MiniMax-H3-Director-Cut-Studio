@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+ai_libraries_common/python_env/
+ai_libraries_common/engine_ffmpeg/
+ai_libraries_common/models/
+.director_cache/
+director_projects/

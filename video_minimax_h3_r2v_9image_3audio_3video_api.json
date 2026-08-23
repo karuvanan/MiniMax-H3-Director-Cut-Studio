@@ -1,0 +1,647 @@
+{
+  "92": {
+    "inputs": {
+      "filename_prefix": "video/MiniMax_H3",
+      "format": "auto",
+      "codec": "auto",
+      "video": [
+        "130",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "保存视频"
+    }
+  },
+  "115": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 1,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "Resolution Selector (Size)"
+    }
+  },
+  "119": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "120": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "121": {
+    "inputs": {
+      "samples": [
+        "631",
+        0
+      ],
+      "vae": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE解码（音频）"
+    }
+  },
+  "122": {
+    "inputs": {
+      "samples": [
+        "631",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "123": {
+    "inputs": {
+      "sampler_name": "res_multistep"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "K采样器选择"
+    }
+  },
+  "124": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "150",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "基本调度器"
+    }
+  },
+  "125": {
+    "inputs": {
+      "noise": [
+        "129",
+        0
+      ],
+      "guider": [
+        "126",
+        0
+      ],
+      "sampler": [
+        "123",
+        0
+      ],
+      "sigmas": [
+        "124",
+        0
+      ],
+      "latent_image": [
+        "136",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "自定义采样器（高级）"
+    }
+  },
+  "126": {
+    "inputs": {
+      "model": [
+        "150",
+        0
+      ],
+      "conditioning": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基本引导器"
+    }
+  },
+  "127": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "128": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "129": {
+    "inputs": {
+      "noise_seed": 872356096682123
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "随机噪波"
+    }
+  },
+  "130": {
+    "inputs": {
+      "fps": 24,
+      "bit_depth": 8,
+      "images": [
+        "147",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "创建视频"
+    }
+  },
+  "131": {
+    "inputs": {
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+      "values.a": [
+        "132",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "数学表达式"
+    }
+  },
+  "132": {
+    "inputs": {
+      "value": 12
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Float (Duration)"
+    }
+  },
+  "136": {
+    "inputs": {
+      "prompt": [
+        "138",
+        0
+      ],
+      "width": [
+        "115",
+        0
+      ],
+      "height": [
+        "115",
+        1
+      ],
+      "length": [
+        "131",
+        1
+      ],
+      "ref_image_size": "match",
+      "clip": [
+        "128",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ],
+      "audio_vae": [
+        "120",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "137",
+        0
+      ],
+      "ref_images.ref_image_1": [
+        "139",
+        0
+      ],
+      "ref_images.ref_image_2": [
+        "141",
+        0
+      ],
+      "ref_images.ref_image_3": [
+        "152",
+        0
+      ],
+      "ref_images.ref_image_4": [
+        "153",
+        0
+      ],
+      "ref_images.ref_image_5": [
+        "154",
+        0
+      ],
+      "ref_images.ref_image_6": [
+        "155",
+        0
+      ],
+      "ref_images.ref_image_7": [
+        "641",
+        0
+      ],
+      "ref_images.ref_image_8": [
+        "640",
+        0
+      ],
+      "ref_videos.ref_video_0": [
+        "148",
+        0
+      ],
+      "ref_videos.ref_video_1": [
+        "637",
+        0
+      ],
+      "ref_videos.ref_video_2": [
+        "639",
+        0
+      ],
+      "ref_video_audios.ref_video_audio_0": [
+        "148",
+        1
+      ],
+      "ref_video_audios.ref_video_audio_1": [
+        "637",
+        1
+      ],
+      "ref_video_audios.ref_video_audio_2": [
+        "639",
+        1
+      ],
+      "ref_audios.ref_audio_0": [
+        "144",
+        0
+      ],
+      "ref_audios.ref_audio_1": [
+        "635",
+        0
+      ],
+      "ref_audios.ref_audio_2": [
+        "634",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Reference to Video"
+    }
+  },
+  "137": {
+    "inputs": {
+      "image": "h3_product_7fb7cc9d_1_c32411a1.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像1"
+    }
+  },
+  "138": {
+    "inputs": {
+      "value": "Create one continuous 12-second photorealistic commercial product demonstration video using the supplied reference images.\n\nREFERENCE ROLES\n\n<Picture 1> is the identity reference for the main model. Preserve the model's facial identity, hairstyle, apparent age, body proportions, skin appearance, and recognizable personal features consistently throughout the entire video.\n\n<Picture 2> is Product A. Extract only the actual product from this reference. Preserve its original shape, proportions, construction, materials, surface texture, color relationships, hardware, decorations, functional details, and recognizable design.\n\n<Picture 3> is Product B. Extract only the actual product from this reference. Preserve its original shape, proportions, construction, materials, surface texture, color relationships, patterns, seams, accessories, and recognizable design.\n\n<Picture 4> is the environment reference. Reconstruct the location, spatial layout, environmental scale, surfaces, lighting conditions, background elements, depth, atmosphere, and overall visual character shown in this reference.\n\nAUTOMATIC PRODUCT AND ENVIRONMENT ADAPTATION\n\nFirst, visually analyze Product A and Product B and automatically determine their correct categories, scale, physical properties, intended uses, attachment methods, and natural relationships with the human body.\n\nIntegrate both products naturally with the model according to their actual functions. If a product is clothing, the model wears it correctly with realistic fit, folds, fabric tension, stitching, layering, and movement. If it is footwear, place it correctly on the appropriate feet. If it is a bag or carryable object, the model naturally carries, holds, wears, opens, adjusts, or presents it according to its real design. If it is jewelry, eyewear, a watch, a hat, or another accessory, place it correctly on the appropriate body area. If it is handheld or functional equipment, the model holds and uses it with believable hand placement and real-world operation. If it cannot reasonably be worn, attached, or carried, position it immediately beside the model and create a natural interaction while keeping the complete model visible. Never force a product into an anatomically or functionally incorrect position.\n\nAutomatically interpret <Picture 4> and create actions appropriate to that location. The model's walking style, poses, gestures, product handling, and environmental interaction must feel naturally motivated by the supplied scene rather than by a fixed activity. Products A and B must be visibly integrated with the model, never isolated as floating objects or separate catalogue inserts.\n\nPRIMARY FULL-BODY COMPOSITION REQUIREMENT\n\nThe complete main model is the highest visual priority. Maintain a continuous head-to-toe full-body composition during the entire video. The complete head, hair, face, torso, arms, hands, hips, legs, ankles, and both feet remain inside the frame, with comfortable empty space above the hair and below both feet. Keep the model approximately 65 to 80 percent of the frame height.\n\nProduct details are revealed through poses, body rotation, hand gestures, walking direction, and camera angle, not by cropping the person or using an isolated close-up. If the system must choose between a small product detail and preserving the complete person, always preserve the complete head-to-toe person.\n\nSELECTED MOVEMENT\n\nFIGURE-EIGHT ORBIT — DEFAULT\nThe camera performs one continuous, smooth horizontal figure-eight orbit centered on the complete model, not on either product. It curves around the model's left side, crosses gently through the front-center axis, curves around the right side, and returns to a stable hero angle. Use a moderate orbit radius, gentle parallax, consistent camera height, and stabilized professional gimbal movement. Keep the complete head-to-toe model visible throughout.\n\nADAPTIVE TIMELINE\n\nDuring the opening 20 percent, establish a stable head-to-toe view of the model inside <Picture 4>. Both products are already correctly worn, carried, attached, held, or positioned. The model establishes subtle eye contact and begins a natural environment-appropriate action.\n\nDuring the next 25 percent, begin the selected camera movement while maintaining full-body framing. The model demonstrates Product B using its real function through a natural step, turn, adjustment, hold, or use action.\n\nDuring the middle 15 percent, perform a smooth movement transition. The model makes one coordinated gesture involving both products while their identity, scale, placement, and physical contact remain stable.\n\nDuring the next 25 percent, continue and complete the selected camera movement from a complementary angle. The model demonstrates Product A through natural movement, orientation, or use while remaining completely visible.\n\nDuring the final 15 percent, settle into a stable full-body hero composition. The model faces or turns toward the camera and finishes in a confident natural pose clearly displaying both products together, with both feet fully visible.\n\nMODEL AND PRODUCT INTERACTION\n\nThe model behaves like a professional commercial presenter while remaining natural and physically believable. Use subtle eye contact, relaxed facial expressions, realistic breathing and blinking, gentle hair movement, accurate walking rhythm, balanced posture, anatomically correct hands, and realistic garment and object physics.\n\nAll hand-to-product contact must be accurate. Fingers wrap naturally around handles, straps, edges, controls, or surfaces. Products react correctly to gravity, body movement, fabric motion, momentum, and environmental airflow. If additional people exist in the environment, they may perform subtle natural background actions and briefly react to the model, but they remain secondary and never block or distract from the complete main model.\n\nLIGHT PARTICLE EFFECTS\n\nIntroduce refined, sparse, semi-transparent light particles around the model and both products. The particles gently follow the model's movement, hand gestures, and selected camera path. When the model touches, adjusts, carries, or uses a product, a small concentration may briefly gather near the contact point and disperse naturally. Particles inherit their appearance from the existing scene illumination and never cover the face, body, hands, feet, product structure, or environmental details.\n\nSCENE, ATMOSPHERE, AND VISUAL CONTINUITY\n\nPreserve the spatial scope, environmental atmosphere, lighting character, visual tone, color relationships, contrast, exposure, depth, material appearance, and overall mood established by <Picture 4> throughout the entire target video. Maintain the existing visual balance without assigning a new color style, introducing a separate color grade, or replacing the original lighting conditions.\n\nEnsure realistic reflections, contact shadows, depth, atmospheric perspective, environmental illumination, and consistent interaction between model, products, and location. The model and products must look physically present in the environment rather than composited over it.\n\nIDENTITY AND OBJECT CONSISTENCY\n\nMaintain one consistent model identity, one consistent instance of Product A, and one consistent instance of Product B. Preserve product designs and prevent changes in shape, color, size, material, orientation, or identity between frames. Keep wearables correctly fitted to the same body areas and carryable items connected to the correct hands, straps, shoulders, or attachment points. Preserve realistic anatomy, stable facial features, correct limb count, natural hands and fingers, consistent body proportions, and physically plausible motion.\n\nSTRICT GENERATION REQUIREMENTS\n\nThe complete main model remains visible from head to toe throughout the video. Always show both feet with visible space beneath them. Never crop the head, hair, arms, hands, hips, legs, knees, ankles, or feet. Never replace the full-body composition with an isolated product shot. Never allow either product to become the only subject. Never let products float, duplicate, disappear, merge with the body, deform, or change design. Never duplicate the main model. Never import product-image backgrounds into the final scene. Never replace <Picture 4> with a studio, runway, or unrelated location. Never add a separate artificial color treatment. Never let particles obscure the model or products. Do not generate new captions, subtitles, labels, interface elements, borders, watermarks, or unrelated text. Do not use product-only shots, macro shots, face-only shots, bust shots, waist-up shots, knee-up shots, extreme close-ups, abrupt zooms, rapid spins, sudden cuts, camera shaking, or disorienting motion.\n\nADDITIONAL USER DIRECTION\n\nExtra action: The model performs a bright upbeat retro-pop dance with springy footwork, playful shoulder movement and confident full-body rhythm. The model begins with a light bouncing step, alternates the feet quickly from side to side while the arms swing naturally, then transitions into a smooth sideways step with a coordinated shoulder accent. The model performs several playful rhythmic steps, turns the body through a quick controlled rotation and returns to face the camera with an energetic open-arm finishing groove.\n\nThe entire sequence is joyful, youthful and rhythmically connected, with light grounded footwork and natural momentum. Preserve the existing model appearance, clothing, referenced items, environment and framing; only add this action sequence.\n\nThe final result is a coherent, photorealistic, high-quality 12-second full-body commercial demonstration in which the model from <Picture 1> naturally presents and uses the automatically recognized products from <Picture 2> and <Picture 3> inside <Picture 4>. The selected camera movement and subtle interactive light particles enhance the presentation without sacrificing complete head-to-toe visibility."
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "Input Text (Prompt)"
+    }
+  },
+  "139": {
+    "inputs": {
+      "image": "h3_product_6c079338_2_4c9ada1d.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像2"
+    }
+  },
+  "141": {
+    "inputs": {
+      "image": "h3_product_7fb7cc9d_3_6236024f.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像3"
+    }
+  },
+  "144": {
+    "inputs": {
+      "audio": "xxt_mv2_S3.wav"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "加载音频"
+    }
+  },
+  "147": {
+    "inputs": {
+      "resize_type": "scale by multiplier",
+      "resize_type.scale": 2,
+      "quality": "ULTRA",
+      "images": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "RTXVideoSuperResolution",
+    "_meta": {
+      "title": "RTX Video Super Resolution"
+    }
+  },
+  "148": {
+    "inputs": {
+      "video": [
+        "149",
+        0
+      ]
+    },
+    "class_type": "GetVideoComponents",
+    "_meta": {
+      "title": "获取视频元素"
+    }
+  },
+  "149": {
+    "inputs": {
+      "file": "gp7yg5.mp4",
+      "video-preview": ""
+    },
+    "class_type": "LoadVideo",
+    "_meta": {
+      "title": "加载视频"
+    }
+  },
+  "150": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_v4_step600_ema.safetensors",
+      "strength": 1,
+      "low_vram": false,
+      "model": [
+        "157",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3TurboLoRA",
+    "_meta": {
+      "title": "MiniMax-H3 Turbo LoRA"
+    }
+  },
+  "151": {
+    "inputs": {
+      "enabled": true,
+      "tau": 1,
+      "min_tokens": 4096,
+      "strict": true,
+      "thresh_type": "diag",
+      "int8_qk": false,
+      "int8_pv": false,
+      "sink_conditioning": "exact_kv",
+      "dense_blocks": "",
+      "model": [
+        "632",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3MemoryEfficientSolAttentionPatch",
+    "_meta": {
+      "title": "MiniMax H3 Memory Efficient Sol Attention Patch"
+    }
+  },
+  "152": {
+    "inputs": {
+      "image": "h3_product_7fb7cc9d_4_735eda5e.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像4"
+    }
+  },
+  "153": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-08-14 at 3.41.08 AM.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "154": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-08-14 at 3.41.08 AM (1).jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "155": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-08-14 at 3.41.08 AM (2).jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "156": {
+    "inputs": {
+      "empty_cache": true,
+      "gc_collect": true,
+      "unload_all_models": true,
+      "any_input": [
+        "125",
+        0
+      ]
+    },
+    "class_type": "VRAM_Debug",
+    "_meta": {
+      "title": "VRAM Debug"
+    }
+  },
+  "157": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "151",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "ModelAttentionBackend"
+    }
+  },
+  "629": {
+    "inputs": {
+      "clean_file_cache": false,
+      "clean_processes": true,
+      "clean_dlls": true,
+      "retry_times": 3,
+      "anything": [
+        "156",
+        0
+      ]
+    },
+    "class_type": "RAMCleanup",
+    "_meta": {
+      "title": "🎈RAM-Cleanup"
+    }
+  },
+  "631": {
+    "inputs": {
+      "offload_model": true,
+      "offload_cache": false,
+      "anything": [
+        "629",
+        0
+      ]
+    },
+    "class_type": "VRAMCleanup",
+    "_meta": {
+      "title": "🎈VRAM-Cleanup"
+    }
+  },
+  "632": {
+    "inputs": {
+      "offload_model": true,
+      "offload_cache": false,
+      "anything": [
+        "633",
+        0
+      ]
+    },
+    "class_type": "VRAMCleanup",
+    "_meta": {
+      "title": "🎈VRAM-Cleanup"
+    }
+  },
+  "633": {
+    "inputs": {
+      "clean_file_cache": false,
+      "clean_processes": true,
+      "clean_dlls": true,
+      "retry_times": 3,
+      "anything": [
+        "127",
+        0
+      ]
+    },
+    "class_type": "RAMCleanup",
+    "_meta": {
+      "title": "🎈RAM-Cleanup"
+    }
+  },
+  "634": {
+    "inputs": {
+      "audio": "xxt_mv2_S3.wav"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "加载音频"
+    }
+  },
+  "635": {
+    "inputs": {
+      "audio": "xxt_mv2_S3.wav"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "加载音频"
+    }
+  },
+  "636": {
+    "inputs": {
+      "file": "gp7yg5.mp4",
+      "video-preview": ""
+    },
+    "class_type": "LoadVideo",
+    "_meta": {
+      "title": "加载视频"
+    }
+  },
+  "637": {
+    "inputs": {
+      "video": [
+        "636",
+        0
+      ]
+    },
+    "class_type": "GetVideoComponents",
+    "_meta": {
+      "title": "获取视频元素"
+    }
+  },
+  "638": {
+    "inputs": {
+      "file": "gp7yg5.mp4",
+      "video-preview": ""
+    },
+    "class_type": "LoadVideo",
+    "_meta": {
+      "title": "加载视频"
+    }
+  },
+  "639": {
+    "inputs": {
+      "video": [
+        "638",
+        0
+      ]
+    },
+    "class_type": "GetVideoComponents",
+    "_meta": {
+      "title": "获取视频元素"
+    }
+  },
+  "640": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-08-14 at 3.41.08 AM (2).jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "641": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-08-14 at 3.41.08 AM (2).jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  }
+}
