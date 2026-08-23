@@ -1,0 +1,9 @@
+{
+  "python": "python_env/python.exe",
+  "ffmpeg": "engine_ffmpeg/bin/ffmpeg.exe",
+  "ffprobe": "engine_ffmpeg/bin/ffprobe.exe",
+  "blip_model_id": "Salesforce/blip-image-captioning-base",
+  "blip_model_cache": "models/models--Salesforce--blip-image-captioning-base",
+  "blip_snapshot": "models/models--Salesforce--blip-image-captioning-base/snapshots/82a37760796d32b1411fe092ab5d4e227313294b",
+  "speech_model": "models/openai--whisper-small"
+}
