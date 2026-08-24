@@ -1,7 +1,7 @@
 {
   "3": {
     "inputs": {
-      "seed": 38448829049222,
+      "seed": 17375742899253,
       "steps": 8,
       "cfg": 1,
       "sampler_name": "euler",
@@ -62,7 +62,7 @@
     "inputs": {
       "filename_prefix": "Z-Image/Z-image",
       "images": [
-        "32",
+        "8",
         0
       ]
     },
@@ -137,24 +137,9 @@
       "title": "条件零化"
     }
   },
-  "32": {
-    "inputs": {
-      "resize_type": "scale by multiplier",
-      "resize_type.scale": 2,
-      "quality": "ULTRA",
-      "images": [
-        "8",
-        0
-      ]
-    },
-    "class_type": "RTXVideoSuperResolution",
-    "_meta": {
-      "title": "RTX Video Super Resolution"
-    }
-  },
   "33": {
     "inputs": {
-      "clean_file_cache": false,
+      "clean_file_cache": true,
       "clean_processes": true,
       "clean_dlls": true,
       "retry_times": 3,
@@ -171,7 +156,7 @@
   "34": {
     "inputs": {
       "offload_model": true,
-      "offload_cache": false,
+      "offload_cache": true,
       "anything": [
         "33",
         0
@@ -184,7 +169,7 @@
   },
   "35": {
     "inputs": {
-      "clean_file_cache": false,
+      "clean_file_cache": true,
       "clean_processes": true,
       "clean_dlls": true,
       "retry_times": 3,
@@ -201,7 +186,7 @@
   "36": {
     "inputs": {
       "offload_model": true,
-      "offload_cache": false,
+      "offload_cache": true,
       "anything": [
         "35",
         0
