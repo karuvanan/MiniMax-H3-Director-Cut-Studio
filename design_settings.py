@@ -18,6 +18,8 @@ class DesignAISettings:
         "qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf"
     )
     timeout: int = 900
+    auto_semantic_enrichment: bool = False
+    unload_lm_after_semantic_enrichment: bool = True
     generate_comfy_images: bool = True
     image_checkpoint: str = "z_image_turbo_bf16.safetensors"
     image_width: int = 1024
@@ -37,6 +39,8 @@ KEYS = {
     "H3_DESIGN_LM_STUDIO_BASE_URL": "lm_studio_base_url",
     "H3_DESIGN_LM_STUDIO_MODEL": "lm_studio_model",
     "H3_DESIGN_TIMEOUT": "timeout",
+    "H3_DESIGN_AUTO_SEMANTIC_ENRICHMENT": "auto_semantic_enrichment",
+    "H3_DESIGN_UNLOAD_LM_AFTER_SEMANTIC_ENRICHMENT": "unload_lm_after_semantic_enrichment",
     "H3_DESIGN_GENERATE_COMFY_IMAGES": "generate_comfy_images",
     "H3_DESIGN_IMAGE_CHECKPOINT": "image_checkpoint",
     "H3_DESIGN_IMAGE_WIDTH": "image_width",
@@ -73,7 +77,11 @@ def load_design_settings(path: str | Path) -> DesignAISettings:
                 value = float(value)
             except (TypeError, ValueError):
                 continue
-        elif field == "generate_comfy_images":
+        elif field in {
+            "auto_semantic_enrichment",
+            "unload_lm_after_semantic_enrichment",
+            "generate_comfy_images",
+        }:
             value = value if isinstance(value, bool) else str(value).lower() in {"1", "true", "yes", "on"}
         setattr(settings, field, value)
     if settings.provider not in {"openai", "lm_studio"}:

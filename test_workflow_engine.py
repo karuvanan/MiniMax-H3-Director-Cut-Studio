@@ -4,6 +4,7 @@ import unittest
 from workflow_engine import (
     assign_local_media,
     compile_active_workflow,
+    effective_reference_assets,
     load_workflow,
     scan_workflow_data,
     suggested_reference_rules,
@@ -91,6 +92,47 @@ class WorkflowEngineTests(unittest.TestCase):
             and "duration" in node.get("_meta", {}).get("title", "").lower()
         ]
         self.assertEqual(duration_values, [5.0])
+
+    def test_effective_tags_follow_connected_r2v_order_not_pool_slot(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        videos = [asset for asset in scan.assets if asset.media_type == "video"]
+        audios = [asset for asset in scan.assets if asset.media_type == "audio"]
+
+        # Physical Picture 1 and Picture 5 become the first two connected
+        # references.  A hidden continuity still appended by the worker is the
+        # third, regardless of which free loader slot stores it.
+        effective, continuity_tag = effective_reference_assets(
+            [pictures[0], pictures[4], videos[1], audios[2]],
+            extra_kind="image",
+        )
+        self.assertEqual(
+            [asset.tag for asset in effective if asset.media_type == "image"],
+            ["<Picture 1>", "<Picture 2>"],
+        )
+        self.assertEqual(continuity_tag, "<Picture 3>")
+        self.assertEqual(
+            next(asset.tag for asset in effective if asset.media_type == "video"),
+            "<Video 1>",
+        )
+        # The active video's paired soundtrack receives <Audio 1>; the
+        # standalone audio therefore becomes <Audio 2>.
+        self.assertEqual(
+            next(asset.tag for asset in effective if asset.media_type == "audio"),
+            "<Audio 2>",
+        )
+
+        effective, continuity_tag = effective_reference_assets(
+            [pictures[0], pictures[4]],
+            extra_kind="image",
+            extra_binding=pictures[1].binding,
+        )
+        self.assertEqual(continuity_tag, "<Picture 2>")
+        self.assertEqual(
+            [asset.tag for asset in effective if asset.media_type == "image"],
+            ["<Picture 1>", "<Picture 3>"],
+        )
 
     def test_activation_modes_override_auto_window(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"

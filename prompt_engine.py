@@ -47,6 +47,7 @@ class PromptSpec:
     ending: str = "Hold on the final image. Do not add another cut."
     must_keep: str = ""
     technical: str = ""
+    transition_ranges: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -146,6 +147,7 @@ def build_ai_brief(spec: PromptSpec) -> str:
         ],
         "exact_dialogue_or_on_screen_text": spec.dialogue,
         "preferred_transition_between_cuts": spec.transition,
+        "transitions_between_shots": spec.transition_ranges,
         "final_hold": spec.ending,
         "must_keep_or_avoid": spec.must_keep,
         "technical_delivery": spec.technical,

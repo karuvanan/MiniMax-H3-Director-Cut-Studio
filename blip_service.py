@@ -41,16 +41,26 @@ def main() -> int:
             job = json.loads(raw)
             with Image.open(job["image"]) as source_image:
                 image = source_image.convert("RGB")
+            prompt = str(job.get("prompt", "")).strip()
             inputs = {
                 key: value.to(device)
-                for key, value in processor(images=image, return_tensors="pt").items()
+                for key, value in processor(
+                    images=image,
+                    text=prompt or None,
+                    return_tensors="pt",
+                ).items()
             }
             with torch.inference_mode():
                 output = model.generate(**inputs, max_new_tokens=50)
             caption = processor.decode(output[0], skip_special_tokens=True).strip()
             print(
                 json.dumps(
-                    {"job": job["job"], "caption": caption, "device": device},
+                    {
+                        "job": job["job"],
+                        "caption": caption,
+                        "prompt": prompt,
+                        "device": device,
+                    },
                     ensure_ascii=False,
                 ),
                 flush=True,

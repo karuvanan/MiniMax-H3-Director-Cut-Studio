@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
+from media_semantic_enrichment import enrichment_fingerprint
 from prompt_engine import PromptSpec
 from workflow_engine import MediaAsset
 
@@ -175,6 +176,130 @@ def _dialogue_by_cut(text: str) -> dict[int, list[str]]:
     return result
 
 
+def _positive_shot_index(value: object) -> int | None:
+    """Return a one-based shot index, or None for missing/invalid values."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _transition_direction(row: dict) -> str:
+    """Compile one structured transition row into a ready-to-emit direction."""
+    for key in ("description", "direction", "text"):
+        value = str(row.get(key, "")).strip()
+        if value:
+            return value
+    preset = str(row.get("preset", "")).strip()
+    detail = str(row.get("detail", "")).strip()
+    if preset and detail:
+        return f"{preset}: {detail}"
+    return preset or detail
+
+
+def _transition_rows_by_boundary(
+    rows: list[dict],
+    timed_shots: list[dict],
+    shot_count: int,
+) -> dict[int, list[str]]:
+    """Map transition rows to the outgoing shot at each internal boundary.
+
+    Explicit shot IDs are preferred, followed by one-based shot indexes. A
+    timestamp-only row is matched to the nearest adjacent shot edge. Ordered
+    rows without any routing metadata fall back to boundary order.
+    """
+    if shot_count < 2:
+        return {}
+
+    shot_ids = {
+        str(row.get("cue_id", "")).strip(): index
+        for index, row in enumerate(timed_shots, 1)
+        if str(row.get("cue_id", "")).strip()
+    }
+    boundary_edges: dict[int, tuple[float, float]] = {}
+    if len(timed_shots) == shot_count:
+        for index in range(1, shot_count):
+            left = timed_shots[index - 1]
+            right = timed_shots[index]
+            try:
+                left_end = float(left.get("end_seconds", 0.0))
+                right_start = float(right.get("start_seconds", left_end))
+            except (TypeError, ValueError):
+                continue
+            boundary_edges[index] = (left_end, right_start)
+
+    mapped: dict[int, list[str]] = {}
+    sequential_boundary = 1
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        direction = _transition_direction(raw)
+        if not direction:
+            continue
+
+        after_index: int | None = None
+        from_id = str(raw.get("from_shot_id", "")).strip()
+        to_id = str(raw.get("to_shot_id", "")).strip()
+        if from_id in shot_ids:
+            after_index = shot_ids[from_id]
+        elif to_id in shot_ids:
+            after_index = shot_ids[to_id] - 1
+
+        if after_index is None:
+            for key in ("after_shot_index", "from_shot_index", "boundary_after_shot"):
+                after_index = _positive_shot_index(raw.get(key))
+                if after_index is not None:
+                    break
+        if after_index is None:
+            to_index = _positive_shot_index(raw.get("to_shot_index"))
+            if to_index is not None:
+                after_index = to_index - 1
+
+        timing_keys = ("boundary_seconds", "start_seconds", "end_seconds")
+        has_timing = any(raw.get(key) not in (None, "") for key in timing_keys)
+        if after_index is None and has_timing and boundary_edges:
+            try:
+                start = float(
+                    raw.get(
+                        "boundary_seconds",
+                        raw.get("start_seconds", raw.get("end_seconds")),
+                    )
+                )
+                end = float(raw.get("end_seconds", start))
+            except (TypeError, ValueError):
+                start = end = float("nan")
+            if start == start and end == end:  # NaN-safe without another dependency.
+                low, high = sorted((start, end))
+
+                def edge_distance(edges: tuple[float, float]) -> float:
+                    distances = []
+                    for edge in edges:
+                        if low <= edge <= high:
+                            distances.append(0.0)
+                        else:
+                            distances.append(min(abs(edge - low), abs(edge - high)))
+                    return min(distances)
+
+                candidate, distance = min(
+                    ((index, edge_distance(edges)) for index, edges in boundary_edges.items()),
+                    key=lambda item: item[1],
+                )
+                # Do not attach a transition at a segment entrance to an
+                # unrelated later boundary merely because it is nearest.
+                if distance <= 0.5:
+                    after_index = candidate
+
+        if after_index is None and not has_timing:
+            after_index = sequential_boundary
+            sequential_boundary += 1
+
+        if after_index is None or not 1 <= after_index < shot_count:
+            continue
+        mapped.setdefault(after_index, []).append(direction)
+    return mapped
+
+
 def _asset_definition(asset: MediaAsset) -> str:
     source = f' loaded from "{asset.filename}"' if asset.filename else ""
     analyzed_rows = []
@@ -194,6 +319,37 @@ def _asset_definition(asset: MediaAsset) -> str:
     if analyzed_rows:
         guidance = " | ".join(analyzed_rows)
         analysis = f" Analyzed planning guidance: {guidance[:1200]}."
+    number = "".join(character for character in asset.tag if character.isdigit())
+    media_prefix = {"image": "P", "video": "V", "audio": "A"}.get(asset.media_type, "M")
+    media_id = f"{media_prefix}{number}"
+    current_semantic_hash = enrichment_fingerprint(
+        media_id=media_id,
+        media_type=asset.media_type,
+        filename=asset.filename,
+        recognition=asset.recognition,
+        clip_prompt=asset.clip_prompt,
+        duration_seconds=asset.source_duration_seconds,
+        timeline_start_seconds=asset.start_seconds if asset.timeline_placed else 0.0,
+        timeline_end_seconds=asset.end_seconds if asset.timeline_placed else 0.0,
+    )
+    if (
+        asset.semantic_enrichment.strip()
+        and asset.semantic_enrichment_source_hash == current_semantic_hash
+    ):
+        semantic_lines = [
+            line.strip()
+            for line in asset.semantic_enrichment.splitlines()
+            if line.strip()
+            and not line.startswith(("AI PROVIDER:", "AI MODEL:", "EVIDENCE FINGERPRINT"))
+        ]
+        semantic = " | ".join(semantic_lines)
+        if len(semantic) > 2200:
+            semantic = semantic[:1450].rstrip() + " … " + semantic[-700:].lstrip()
+        analysis += (
+            " AI semantic enrichment (derived guidance; preserve its uncertainty labels): "
+            + semantic
+            + "."
+        )
     director_prompt = asset.clip_prompt.strip()
     if director_prompt:
         analysis += f" Director clip instruction: {director_prompt[:1200]}."
@@ -271,12 +427,17 @@ def build_ref2va_prompt(
             "and premium restrained motion remain consistent; every visible copy line stays on one line."
         )
     active_labels = ", ".join(asset.tag for asset in assets)
+    structured_transitions = _transition_rows_by_boundary(
+        spec.transition_ranges,
+        timed_shots,
+        len(shots),
+    )
     for index, shot in enumerate(shots, 1):
         if timed_shots:
             timed = timed_shots[index - 1]
             start = float(timed.get("start_seconds", 0.0))
             end = float(timed.get("end_seconds", start))
-            prefix = f"[Shot {index} · {_timecode(start)}–{_timecode(end)}]"
+            prefix = f"[Shot {index} | {_timecode(start)}-{_timecode(end)}]"
         else:
             prefix = f"[Shot {index}]"
         if index > 1 and not timed_shots:
@@ -288,10 +449,18 @@ def build_ref2va_prompt(
             for words in dialogue[index]:
                 sentence += f" The exact audible or visible wording is <d>[Original] {words}</d>."
         detailed_rows.append(f"{prefix} {sentence}")
-        if index < len(shots) and spec.transition.strip():
-            detailed_rows.append(
-                f"The transition into [Shot {index + 1}] is {spec.transition.strip().rstrip('.')} with continuous motion and sound."
-            )
+        if index < len(shots):
+            if spec.transition_ranges:
+                transition_directions = structured_transitions.get(index, [])
+            else:
+                # Backward compatibility for callers that only provide the
+                # original global transition string.
+                transition_directions = [spec.transition.strip()] if spec.transition.strip() else []
+            for direction in transition_directions:
+                detailed_rows.append(
+                    f"The transition into [Shot {index + 1}] is "
+                    f"{direction.rstrip('.')} with continuous motion and sound."
+                )
     if spec.ending.strip():
         detailed_rows.append(spec.ending.strip().rstrip(".。") + ".")
     if spec.must_keep.strip():

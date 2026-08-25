@@ -51,6 +51,20 @@ class PromptEngineTests(unittest.TestCase):
         self.assertIn("A hero confronts a mech", brief)
         self.assertIn('"cut": 2', brief)
 
+    def test_ai_brief_serializes_structured_transition_ranges(self):
+        self.spec.transition_ranges = [
+            {
+                "from_shot_id": "S1",
+                "to_shot_id": "S2",
+                "start_seconds": 3.5,
+                "description": "Whip pan through the falling leaves",
+            }
+        ]
+        brief = build_ai_brief(self.spec)
+        self.assertIn('"transitions_between_shots"', brief)
+        self.assertIn('"from_shot_id": "S1"', brief)
+        self.assertIn("Whip pan through the falling leaves", brief)
+
     def test_validation_accepts_h3_ref2va_six_sections(self):
         prompt = """subject_definitions:
 <Picture 1> is a reference.

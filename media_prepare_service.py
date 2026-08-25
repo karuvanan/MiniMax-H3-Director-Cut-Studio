@@ -12,6 +12,7 @@ import sys
 
 from media_engine import (
     create_audio_waveform,
+    create_image_analysis_regions,
     create_video_analysis_frames,
     human_probe_summary,
     probe_media,
@@ -97,7 +98,9 @@ def main() -> int:
             analysis_sources: list[list[str]] = []
             if media_type == "image":
                 preview_path = source
-                analysis_sources = [["still image", str(source)]]
+                region_dir = Path(str(cache_base) + "_regions")
+                regions = create_image_analysis_regions(source, region_dir)
+                analysis_sources = [[label, str(path)] for label, path in regions]
             elif media_type == "video":
                 source_duration = max(0.05, float(info.get("duration", 0.0)))
                 analysis_duration = min(source_duration, timeline_seconds)

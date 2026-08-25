@@ -11,18 +11,54 @@ import textwrap
 import wave
 
 
+MAX_DESIGN_DURATION_SECONDS = 600.0
+
+
+_PICTURE_REFERENCE_RE = re.compile(r"<\s*picture\s+\d+\s*>", flags=re.I)
+_MEDIA_ID_RE = re.compile(r"^@?([PVA])(\d+)$", flags=re.I)
+_H3_MEDIA_TAG_RE = re.compile(r"^<\s*(Picture|Video|Audio)\s+(\d+)\s*>$", flags=re.I)
+_DEPENDENT_IMAGE_WORDING_RE = re.compile(
+    r"(?:"
+    r"\b(?:as\s+(?:seen|shown|depicted)\s+in|based\s+on|copied\s+from|derived\s+from|"
+    r"continue(?:d)?\s+from|match(?:ing)?|same\s+as)\s+(?:the\s+)?"
+    r"(?:previous|next|future|above|below|generated|output|reference|source|input|this)\s+"
+    r"(?:image|picture|frame)\b"
+    r"|\b(?:previous|next|future|above|below)\s+(?:image|picture|frame)\b"
+    r"|\b(?:image|picture|frame)\s+(?:above|below|that\s+will\s+be\s+generated|to\s+be\s+generated)\b"
+    r")",
+    flags=re.I,
+)
+_ACTION_OR_BOUNDARY_RE = re.compile(
+    r"\b(?:action[- ]state|boundary[- ]continuity|continuity[- ]anchor|boundary[- ]frame|"
+    r"first[- ]frame|last[- ]frame|near[- ]impact|impact[- ]pose|mid[- ]air|airborne|"
+    r"wall[- ]run(?:ning)?|water[- ]run(?:ning)?|spear[- ]run(?:ning)?|weapon[- ]contact)\b",
+    flags=re.I,
+)
+_NON_STORY_BACKGROUND_RE = re.compile(
+    r"\b(?:neutral|blank|plain|empty|isolated|generic|seamless)(?:\s+studio)?\s+background\b"
+    r"|\b(?:on|against)\s+(?:a\s+)?(?:neutral|blank|plain|empty|isolated|generic|seamless)\s+"
+    r"(?:backdrop|studio)\b"
+    r"|\bstudio\s+(?:background|backdrop)\b",
+    flags=re.I,
+)
+
+
 DESIGN_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": [
         "title", "duration_seconds", "theme_text", "theme_text_explicit_user_requested", "creative_brief",
         "global_visual_style", "shots", "text_layers", "transitions",
-        "markers", "media_requests", "overall_soundscape", "non_diegetic_music",
+        "markers", "existing_media_uses", "media_requests", "overall_soundscape", "non_diegetic_music",
         "constraints",
     ],
     "properties": {
         "title": {"type": "string"},
-        "duration_seconds": {"type": "number", "minimum": 0.5, "maximum": 60},
+        "duration_seconds": {
+            "type": "number",
+            "minimum": 0.5,
+            "maximum": MAX_DESIGN_DURATION_SECONDS,
+        },
         "theme_text": {"type": "string"},
         "theme_text_explicit_user_requested": {"type": "boolean"},
         "creative_brief": {"type": "string"},
@@ -111,20 +147,55 @@ DESIGN_JSON_SCHEMA = {
                 },
             },
         },
+        "existing_media_uses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "requirement_id", "media_id", "media_type", "usage",
+                    "reuse_policy", "start_seconds", "end_seconds", "track",
+                    "subject_keywords", "instruction",
+                ],
+                "properties": {
+                    "requirement_id": {"type": "string"},
+                    "media_id": {"type": "string", "pattern": "^[PVA][1-9][0-9]*$"},
+                    "media_type": {"type": "string", "enum": ["image", "video", "audio"]},
+                    "usage": {
+                        "type": "string",
+                        "enum": ["h3_reference", "timeline_visual"],
+                    },
+                    "reuse_policy": {
+                        "type": "string",
+                        "enum": ["whole_design", "time_scoped"],
+                    },
+                    "start_seconds": {"type": "number"},
+                    "end_seconds": {"type": "number"},
+                    "track": {"type": "string"},
+                    "subject_keywords": {"type": "array", "items": {"type": "string"}},
+                    "instruction": {"type": "string"},
+                },
+            },
+        },
         "media_requests": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
-                    "media_type", "start_seconds", "end_seconds", "track",
-                    "subject_keywords", "prompt", "usage",
+                    "requirement_id", "media_type", "start_seconds", "end_seconds", "track",
+                    "subject_keywords", "prompt", "usage", "reuse_policy",
                 ],
                 "properties": {
+                    "requirement_id": {"type": "string"},
                     "media_type": {"type": "string", "enum": ["image", "video", "audio"]},
                     "usage": {
                         "type": "string",
                         "enum": ["h3_reference", "timeline_visual"],
+                    },
+                    "reuse_policy": {
+                        "type": "string",
+                        "enum": ["whole_design", "time_scoped"],
                     },
                     "start_seconds": {"type": "number"},
                     "end_seconds": {"type": "number"},
@@ -158,6 +229,49 @@ def _interval(item: dict, duration: float) -> tuple[float, float]:
     return start, end
 
 
+def _validate_t2i_media_prompt(
+    prompt: str,
+    *,
+    request_number: int,
+    start_seconds: float,
+    end_seconds: float,
+    duration_seconds: float,
+) -> None:
+    """Reject image-generation instructions that cannot stand on their own.
+
+    ``<Picture N>`` is an H3 reference token.  A Z-Image/T2I request runs
+    before those H3 slots exist, so allowing that token (especially a token
+    naming the image currently being generated) makes the prompt circular.
+    Time-scoped images are composition/action/boundary references in the
+    Director planner; those frames must be staged in the story location rather
+    than on a catalog-style neutral backdrop.
+    """
+
+    label = f"Image media_request {request_number}"
+    if not prompt:
+        raise ValueError(
+            f"{label} has no T2I prompt. Replan it as a complete standalone visual description."
+        )
+    if _PICTURE_REFERENCE_RE.search(prompt):
+        raise ValueError(
+            f"{label} contains an H3 <Picture N> token. Z-Image/T2I prompts must be standalone; "
+            "replan the request without current, self or future Picture references."
+        )
+    if _DEPENDENT_IMAGE_WORDING_RE.search(prompt):
+        raise ValueError(
+            f"{label} depends on another image or frame. Z-Image/T2I prompts must restate every "
+            "required subject, prop, owner, action and environment explicitly."
+        )
+
+    is_time_scoped = start_seconds > 0.0 or end_seconds < duration_seconds
+    is_action_or_boundary = is_time_scoped or bool(_ACTION_OR_BOUNDARY_RE.search(prompt))
+    if is_action_or_boundary and _NON_STORY_BACKGROUND_RE.search(prompt):
+        raise ValueError(
+            f"{label} is an action/boundary reference with a neutral, blank or studio background. "
+            "Replan it inside the story's real in-world environment and preserve character/prop ownership."
+        )
+
+
 def extract_design_json(value: object) -> dict:
     if isinstance(value, dict):
         return value
@@ -174,9 +288,70 @@ def extract_design_json(value: object) -> dict:
     return payload
 
 
-def normalize_design_plan(payload: object, capacities: dict[str, int]) -> dict:
+def _normalized_requirement_id(value: object, fallback: str) -> str:
+    text = "" if value is None else str(value).strip().lower()
+    normalized = re.sub(r"[^a-z0-9_-]+", "_", text).strip("_")
+    return normalized[:80] or fallback
+
+
+def _normalized_media_id(value: object) -> str:
+    text = str(value).strip()
+    direct = _MEDIA_ID_RE.fullmatch(text)
+    if direct:
+        ordinal = int(direct.group(2))
+        return f"{direct.group(1).upper()}{ordinal}" if ordinal >= 1 else ""
+    tag = _H3_MEDIA_TAG_RE.fullmatch(text)
+    if tag:
+        prefix = {"picture": "P", "video": "V", "audio": "A"}[tag.group(1).lower()]
+        ordinal = int(tag.group(2))
+        return f"{prefix}{ordinal}" if ordinal >= 1 else ""
+    return ""
+
+
+def _media_type_for_id(media_id: str) -> str:
+    return {"P": "image", "V": "video", "A": "audio"}.get(media_id[:1], "")
+
+
+def _media_inventory(items: list[dict] | None) -> dict[str, dict]:
+    inventory: dict[str, dict] = {}
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            continue
+        media_id = _normalized_media_id(
+            raw.get("media_id") or raw.get("asset_id") or raw.get("tag") or ""
+        )
+        if not media_id:
+            continue
+        row = dict(raw)
+        row["media_id"] = media_id
+        row["media_type"] = str(
+            row.get("media_type") or row.get("type") or _media_type_for_id(media_id)
+        ).strip().lower()
+        row["loaded"] = bool(row.get("loaded", row.get("available", True)))
+        inventory[media_id] = row
+    return inventory
+
+
+def _string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(",")]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def normalize_design_plan(
+    payload: object,
+    capacities: dict[str, int],
+    *,
+    existing_media: list[dict] | None = None,
+    strict_t2i_prompts: bool = False,
+) -> dict:
     source = extract_design_json(payload)
-    duration = snap_half_second(source.get("duration_seconds", 5.0), 60.0)
+    duration = snap_half_second(
+        source.get("duration_seconds", 5.0),
+        MAX_DESIGN_DURATION_SECONDS,
+    )
     duration = max(0.5, duration)
     required_text = (
         "title", "creative_brief", "global_visual_style", "overall_soundscape",
@@ -271,37 +446,171 @@ def normalize_design_plan(payload: object, capacities: dict[str, int]) -> dict:
             ),
         })
 
-    media_requests: list[dict] = []
-    counts = {"image": 0, "video": 0, "audio": 0}
-    for raw in source.get("media_requests") or []:
+    inventory = _media_inventory(existing_media)
+    inventory_was_supplied = existing_media is not None
+    existing_media_uses: list[dict] = []
+    reused_requirement_ids: set[str] = set()
+    reused_media_ids: set[str] = set()
+    for use_number, raw in enumerate(source.get("existing_media_uses") or [], 1):
         if not isinstance(raw, dict):
             continue
-        media_type = str(raw.get("media_type", "image")).lower()
-        if media_type not in counts:
-            continue
-        counts[media_type] += 1
-        if counts[media_type] > int(capacities.get(media_type, 0)):
+        media_id = _normalized_media_id(raw.get("media_id", ""))
+        if not media_id:
             raise ValueError(
-                f"Design requests {counts[media_type]} {media_type} assets, but the API has only "
-                f"{capacities.get(media_type, 0)} slots"
+                f"Existing media use {use_number} has an invalid media_id; use P1, V1 or A1."
             )
+        inferred_type = _media_type_for_id(media_id)
+        media_type = str(raw.get("media_type") or inferred_type).strip().lower()
+        if media_type != inferred_type:
+            raise ValueError(
+                f"Existing media {media_id} is {inferred_type}, not {media_type}."
+            )
+        ordinal = int(media_id[1:])
+        if ordinal > int(capacities.get(media_type, 0)):
+            raise ValueError(
+                f"Existing media {media_id} is outside the API's {capacities.get(media_type, 0)} "
+                f"{media_type} slots."
+            )
+        inventory_row = inventory.get(media_id)
+        if inventory_was_supplied:
+            if inventory_row is None:
+                raise ValueError(f"Existing media {media_id} is not present in the Media Pool inventory.")
+            if not inventory_row.get("loaded", False):
+                raise ValueError(f"Existing media {media_id} is empty and cannot be reused.")
+            inventory_type = str(inventory_row.get("media_type", "")).strip().lower()
+            if inventory_type and inventory_type != media_type:
+                raise ValueError(
+                    f"Media Pool {media_id} is {inventory_type}, not {media_type}."
+                )
+        requirement_id = _normalized_requirement_id(
+            raw.get("requirement_id"), f"reuse_{media_id.lower()}"
+        )
+        if requirement_id in reused_requirement_ids:
+            raise ValueError(
+                f"Existing media requirement_id {requirement_id!r} is used more than once."
+            )
+        if media_id in reused_media_ids:
+            raise ValueError(f"Existing media {media_id} is assigned more than once.")
         start, end = _interval(raw, duration)
-        keywords = raw.get("subject_keywords") or []
-        if isinstance(keywords, str):
-            keywords = [item.strip() for item in keywords.split(",") if item.strip()]
-        media_requests.append({
+        reuse_policy = str(raw.get("reuse_policy", "")).strip().lower()
+        if reuse_policy not in {"whole_design", "time_scoped"}:
+            reuse_policy = (
+                "whole_design"
+                if start <= 0.0 and end >= duration
+                else "time_scoped"
+            )
+        if reuse_policy == "whole_design":
+            start, end = 0.0, duration
+        keywords = _string_list(raw.get("subject_keywords") or [])
+        fallback_instruction = ""
+        if inventory_row:
+            fallback_instruction = str(
+                inventory_row.get("clip_prompt")
+                or inventory_row.get("caption")
+                or inventory_row.get("analysis_summary")
+                or ""
+            ).strip()
+        existing_media_uses.append({
+            "requirement_id": requirement_id,
+            "media_id": media_id,
             "media_type": media_type,
             "usage": (
                 str(raw.get("usage", "h3_reference"))
                 if str(raw.get("usage", "h3_reference")) in {"h3_reference", "timeline_visual"}
                 else "h3_reference"
             ),
+            "reuse_policy": reuse_policy,
+            "start_seconds": start,
+            "end_seconds": end,
+            "track": str(
+                raw.get("track", "A1" if media_type == "audio" else "V1")
+            ).strip() or ("A1" if media_type == "audio" else "V1"),
+            "subject_keywords": keywords,
+            "instruction": str(raw.get("instruction") or fallback_instruction).strip(),
+        })
+        reused_requirement_ids.add(requirement_id)
+        reused_media_ids.add(media_id)
+    plan["existing_media_uses"] = existing_media_uses
+
+    media_requests: list[dict] = []
+    counts = {"image": 0, "video": 0, "audio": 0}
+    occupied_counts = {"image": 0, "video": 0, "audio": 0}
+    if inventory_was_supplied:
+        for row in inventory.values():
+            media_type = str(row.get("media_type", "")).strip().lower()
+            if row.get("loaded", False) and media_type in occupied_counts:
+                occupied_counts[media_type] += 1
+    available_counts = {
+        media_type: max(0, int(capacities.get(media_type, 0)) - occupied_counts[media_type])
+        for media_type in counts
+    }
+    requested_requirement_ids: set[str] = set()
+    for request_number, raw in enumerate(source.get("media_requests") or [], 1):
+        if not isinstance(raw, dict):
+            continue
+        media_type = str(raw.get("media_type", "image")).lower()
+        if media_type not in counts:
+            continue
+        requirement_id = _normalized_requirement_id(
+            raw.get("requirement_id"), f"request_{request_number}"
+        )
+        # A reusable Media Pool asset is authoritative for a requirement.  A
+        # model may still emit the same requirement in media_requests; silently
+        # discard that duplicate instead of wasting a slot or a generation.
+        if requirement_id in reused_requirement_ids:
+            continue
+        if requirement_id in requested_requirement_ids:
+            raise ValueError(
+                f"Media requirement_id {requirement_id!r} is requested more than once."
+            )
+        counts[media_type] += 1
+        slot_limit = available_counts[media_type]
+        if counts[media_type] > slot_limit:
+            if inventory_was_supplied:
+                raise ValueError(
+                    f"Design requests {counts[media_type]} new {media_type} assets, but the API has "
+                    f"only {slot_limit} free slots ({occupied_counts[media_type]} already loaded)."
+                )
+            raise ValueError(
+                f"Design requests {counts[media_type]} {media_type} assets, but the API has only "
+                f"{capacities.get(media_type, 0)} slots"
+            )
+        start, end = _interval(raw, duration)
+        reuse_policy = str(raw.get("reuse_policy", "")).strip().lower()
+        if reuse_policy not in {"whole_design", "time_scoped"}:
+            reuse_policy = (
+                "whole_design"
+                if start <= 0.0 and end >= duration
+                else "time_scoped"
+            )
+        if reuse_policy == "whole_design":
+            start, end = 0.0, duration
+        prompt = str(raw.get("prompt", "")).strip()
+        if media_type == "image" and strict_t2i_prompts:
+            _validate_t2i_media_prompt(
+                prompt,
+                request_number=request_number,
+                start_seconds=start,
+                end_seconds=end,
+                duration_seconds=duration,
+            )
+        keywords = _string_list(raw.get("subject_keywords") or [])
+        media_requests.append({
+            "requirement_id": requirement_id,
+            "media_type": media_type,
+            "usage": (
+                str(raw.get("usage", "h3_reference"))
+                if str(raw.get("usage", "h3_reference")) in {"h3_reference", "timeline_visual"}
+                else "h3_reference"
+            ),
+            "reuse_policy": reuse_policy,
             "start_seconds": start,
             "end_seconds": end,
             "track": str(raw.get("track", "A1" if media_type == "audio" else "V1")).strip(),
-            "subject_keywords": [str(item).strip() for item in keywords if str(item).strip()],
-            "prompt": str(raw.get("prompt", "")).strip(),
+            "subject_keywords": keywords,
+            "prompt": prompt,
         })
+        requested_requirement_ids.add(requirement_id)
     plan["media_requests"] = media_requests
     return plan
 
@@ -314,12 +623,45 @@ def build_design_system_prompt(context: dict) -> str:
         "Apply their planning, continuity, reference-retention, shot, audio and technical rules while producing the JSON; "
         "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
+        "subject action, environmental response and additional direction. "
+        "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. The user may "
+        "refer to its stable Media Pool IDs as @P1, @P2, @V1 or @A1; write the ID without @ in existing_media_uses.media_id. "
+        "Reuse only loaded assets that genuinely satisfy the story requirement, and never invent an ID, select an empty slot, "
+        "or force every existing asset into the design. Give every logical media need a concise stable requirement_id. When a "
+        "Treat each asset's caption, clip_prompt and analysis_summary as the evidence for its content, including video-frame "
+        "captions, beat/VAD and transcript observations. If analysis_status is pending or the evidence is ambiguous, do not "
+        "invent unseen people, objects, speech or actions; use a neutral preserve-the-supplied-asset instruction instead. "
+        "loaded asset satisfies that need, put it in existing_media_uses and do not emit a media_request with the same "
+        "requirement_id. existing_media_uses instructions describe how H3 should preserve or use the supplied asset; they do not "
+        "ask Z-Image to regenerate it. Use reuse_policy=whole_design for identity, product, wardrobe, environment or audio references "
+        "needed throughout the story, and reuse_policy=time_scoped for one contiguous action or editorial interval. An existing "
+        "Media Pool asset may appear at most once in existing_media_uses; widen its single range when it must cover several Shots. "
+        "media_requests must contain only genuinely missing assets after this reuse audit. Choose that missing count dynamically from "
+        "the concept and available empty slots; never duplicate a requirement already fulfilled by @P1/@V1/@A1. "
         "For media_requests, use h3_reference when an asset supplies subject, product, wardrobe, environment or composition guidance; "
         "use timeline_visual only when the user explicitly asks to composite the literal file into the editorial preview. "
+        "Plan reference media dynamically from the story: reusable identity and environment references are valid, and time-scoped "
+        "composition, action-state or boundary-continuity references are also valid when they reduce ambiguity between story phases. "
+        "Choose the useful count and exact timeline ranges yourself. Never force one image per Shot, never fill all available slots merely "
+        "because they exist, and never make redundant copies; distinct temporal states of the same subject are allowed when they prevent "
+        "a later segment from replaying an earlier action. "
+        "Every image media_request sent to Z-Image/T2I must contain a complete standalone visual prompt. Never put an H3 <Picture N> "
+        "token in a T2I prompt and never ask it to copy, match, continue from or depend on a previous, current/self, next/future, generated "
+        "or output image; those H3 slots do not exist when reference images are generated. Restate all required identity, appearance, wardrobe, "
+        "prop, action, composition, lighting and environment facts directly inside each image prompt. "
+        "For every time-scoped action-state or segment-boundary reference, stage the requested moment inside the story's exact real in-world "
+        "location with its recognizable geography and lighting; never use a neutral, blank, plain, isolated or studio background for those "
+        "action/boundary images. First infer and preserve an exact character/prop ownership ledger from the story: name which character wears "
+        "or holds each item in every affected prompt, keep counts exact, and never swap, duplicate or transfer ownership unless the story "
+        "explicitly performs that transfer. "
+        "During a BLIP-backed refinement pass, use BLIP only as visual QA. Compare each caption against the intended identity, character/prop "
+        "ownership, counts, action state and in-world environment. If BLIP conflicts on any of those facts, reject that generated reference "
+        "and replan the affected media_request with a corrected standalone prompt for regeneration; never alter the story or ownership ledger "
+        "to agree with an incorrect BLIP observation, and never approve the conflicting image as an H3 reference. "
         "Only create a text_layer or theme_text when the user explicitly requests visible text, dialogue, voice-over or lyrics, and set "
         "explicit_user_requested=true only in that case. Never turn the creative brief or scene description into on-screen text. "
         "Always include a Final Hold marker before the final frame; cue timestamps must be earlier than duration_seconds. "
-        "subject action, environmental response and additional direction. Media requests are reference requirements, not final generated media. "
+        "Media requests are reference requirements, not final generated media. "
         "Keep exact product/subject continuity, realistic object interaction and H3-friendly concise directions. "
         "Do not include markdown or commentary. Available workspace context: "
         + json.dumps(context, ensure_ascii=False)

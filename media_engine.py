@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from runtime_paths import RuntimePaths, load_runtime_paths
 
@@ -132,6 +132,48 @@ def create_video_analysis_frames(
             create_video_thumbnail(path, destination, seconds, runtime)
         frames.append((f"{label} @ {seconds:.2f}s", destination))
     return frames
+
+
+def create_image_analysis_regions(
+    path: str | Path,
+    destination_dir: str | Path,
+) -> list[tuple[str, Path]]:
+    """Create complementary crops so title cards do not dominate BLIP.
+
+    The full frame remains evidence, while three broad scene crops suppress
+    common lower-third captions, corner logos and poster-like typography.  The
+    crops deliberately overlap so no single crop is treated as authoritative.
+    """
+
+    source = Path(path)
+    destination_dir = Path(destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    regions: list[tuple[str, Path]] = [("full frame", source)]
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        width, height = image.size
+        definitions = (
+            ("upper scene excluding lower titles", (0.02, 0.02, 0.98, 0.74)),
+            ("central scene excluding edge overlays", (0.08, 0.08, 0.92, 0.78)),
+            ("central subject detail", (0.18, 0.12, 0.82, 0.76)),
+        )
+        for index, (label, bounds) in enumerate(definitions, 1):
+            left = max(0, min(width - 1, round(width * bounds[0])))
+            top = max(0, min(height - 1, round(height * bounds[1])))
+            right = max(left + 1, min(width, round(width * bounds[2])))
+            bottom = max(top + 1, min(height, round(height * bounds[3])))
+            if right - left < 48 or bottom - top < 48:
+                continue
+            destination = destination_dir / f"region_{index}.jpg"
+            if not destination.is_file():
+                image.crop((left, top, right, bottom)).save(
+                    destination,
+                    format="JPEG",
+                    quality=92,
+                    optimize=True,
+                )
+            regions.append((label, destination))
+    return regions
 
 
 def create_audio_waveform(

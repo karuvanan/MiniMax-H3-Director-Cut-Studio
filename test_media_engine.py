@@ -2,9 +2,15 @@ from pathlib import Path
 import unittest
 
 import numpy as np
+from PIL import Image
 
 from audio_engine import SAMPLE_RATE, estimate_tempo, stream_audio_chunks, voice_activity
-from media_engine import create_video_analysis_frames, media_type_for_path, probe_media
+from media_engine import (
+    create_image_analysis_regions,
+    create_video_analysis_frames,
+    media_type_for_path,
+    probe_media,
+)
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
@@ -42,6 +48,26 @@ class MediaEngineTests(unittest.TestCase):
         self.assertTrue(all(path.is_file() for _, path in frames))
         self.assertIn("10%", frames[0][0])
         self.assertIn("90%", frames[-1][0])
+
+    def test_image_analysis_regions_include_overlay_resistant_scene_crops(self):
+        root = PROJECT_ROOT / ".director_cache" / "image_region_test"
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "portrait_with_lower_title.png"
+        Image.new("RGB", (400, 600), (12, 42, 68)).save(source)
+        target = root / "regions"
+
+        regions = create_image_analysis_regions(source, target)
+
+        self.assertEqual(len(regions), 4)
+        self.assertEqual(regions[0], ("full frame", source))
+        self.assertTrue(all(path.is_file() for _label, path in regions))
+        self.assertTrue(any("lower titles" in label for label, _path in regions))
+        self.assertTrue(any("edge overlays" in label for label, _path in regions))
+        for _label, path in regions[1:]:
+            path.unlink(missing_ok=True)
+        target.rmdir()
+        source.unlink(missing_ok=True)
+        root.rmdir()
 
     def test_tempo_estimator_finds_synthetic_120_bpm_clicks(self):
         samples = np.zeros(SAMPLE_RATE * 10, dtype=np.float32)

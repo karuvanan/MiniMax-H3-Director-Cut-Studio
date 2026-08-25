@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -87,6 +88,14 @@ def generate(job: dict) -> dict:
     system_prompt = str(job.get("system_prompt", ""))
     user_prompt = str(job.get("user_prompt", ""))
     schema = job.get("schema") or {}
+    raw_schema_name = str(job.get("schema_name", "h3_director_design")).strip()
+    schema_name = re.sub(r"[^A-Za-z0-9_-]", "_", raw_schema_name)[:64]
+    schema_name = schema_name or "structured_response"
+    try:
+        max_output_tokens = int(job.get("max_output_tokens", 12000))
+    except (TypeError, ValueError):
+        max_output_tokens = 12000
+    max_output_tokens = max(512, min(12000, max_output_tokens))
     if not model:
         raise ValueError("Model is required")
     if provider == "openai":
@@ -103,12 +112,12 @@ def generate(job: dict) -> dict:
                 "text": {
                     "format": {
                         "type": "json_schema",
-                        "name": "h3_director_design",
+                        "name": schema_name,
                         "strict": True,
                         "schema": schema,
                     }
                 },
-                "max_output_tokens": 12000,
+                "max_output_tokens": max_output_tokens,
             },
         )
     else:
@@ -119,6 +128,7 @@ def generate(job: dict) -> dict:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.3,
+            "max_tokens": max_output_tokens,
             # LM Studio reasoning models can spend the entire completion budget on
             # hidden thinking and return an empty content field. Director Design
             # needs the schema object itself, so request direct output mode.
@@ -126,7 +136,7 @@ def generate(job: dict) -> dict:
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "h3_director_design",
+                    "name": schema_name,
                     "strict": True,
                     "schema": schema,
                 },

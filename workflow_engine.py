@@ -33,6 +33,13 @@ class MediaAsset:
     activation_mode: str = "auto"
     local_path: str = ""
     recognition: str = ""
+    # Keep evidence produced by FFprobe/BLIP/VAD/Whisper separate from the
+    # optional language-model interpretation.  This prevents inferred details
+    # from being fed back into a later recognition pass as if they were facts.
+    semantic_enrichment: str = ""
+    semantic_enrichment_source_hash: str = ""
+    semantic_enrichment_model: str = ""
+    semantic_enrichment_updated_at: str = ""
     timeline_placed: bool = False
     timeline_lane: int = 0
     timeline_track_id: str = ""
@@ -451,6 +458,82 @@ def compile_active_workflow(
     return compiled, active_assets
 
 
+def effective_reference_assets(
+    assets: list[MediaAsset],
+    *,
+    extra_kind: str = "",
+    extra_binding: str = "",
+    extra_has_paired_audio: bool = False,
+) -> tuple[list[MediaAsset], str]:
+    """Return prompt-only clones carrying H3's effective reference ordinals.
+
+    MiniMaxH3ReferenceToVideo numbers only the references that are actually
+    connected for a request.  A physical ``ref_image_8`` therefore becomes
+    ``<Picture 6>`` when only five earlier image inputs are present.  Timeline
+    windows routinely disconnect inactive inputs, so the editor's permanent
+    pool labels cannot safely be used in a compiled prompt.
+
+    ``extra_kind``/``extra_binding`` represent the hidden previous-segment
+    continuity reference.  The returned string is its effective H3 tag. Source
+    assets are never mutated.
+    """
+    clones = [deepcopy(asset) for asset in assets]
+
+    def binding_index(asset: MediaAsset) -> int:
+        match = re.search(r"_(\d+)$", asset.binding)
+        return int(match.group(1)) if match else 10_000
+
+    extra_tag = ""
+    extra_match = re.search(r"_(\d+)$", extra_binding)
+    # An unknown binding is appended after the known active bindings, matching
+    # the worker's fallback insertion order.
+    extra_index = int(extra_match.group(1)) if extra_match else 20_000
+
+    images: list[tuple[int, MediaAsset | None]] = [
+        (binding_index(asset), asset)
+        for asset in clones if asset.media_type == "image"
+    ]
+    if extra_kind == "image":
+        images.append((extra_index, None))
+    for ordinal, (_index, asset) in enumerate(sorted(images, key=lambda row: row[0]), 1):
+        if asset is None:
+            extra_tag = f"<Picture {ordinal}>"
+        else:
+            asset.tag = f"<Picture {ordinal}>"
+
+    videos: list[tuple[int, MediaAsset | None]] = [
+        (binding_index(asset), asset)
+        for asset in clones if asset.media_type == "video"
+    ]
+    if extra_kind == "video":
+        videos.append((extra_index, None))
+    for ordinal, (_index, asset) in enumerate(sorted(videos, key=lambda row: row[0]), 1):
+        if asset is None:
+            extra_tag = f"<Video {ordinal}>"
+        else:
+            asset.tag = f"<Video {ordinal}>"
+
+    paired_audio_count = sum(
+        bool(asset and asset.paired_audio_binding) for _index, asset in videos
+    )
+    if extra_kind == "video" and extra_has_paired_audio:
+        paired_audio_count += 1
+    audios: list[tuple[int, MediaAsset | None]] = [
+        (binding_index(asset), asset)
+        for asset in clones if asset.media_type == "audio"
+    ]
+    if extra_kind == "audio":
+        audios.append((extra_index, None))
+    for ordinal, (_index, asset) in enumerate(
+        sorted(audios, key=lambda row: row[0]), paired_audio_count + 1
+    ):
+        if asset is None:
+            extra_tag = f"<Audio {ordinal}>"
+        else:
+            asset.tag = f"<Audio {ordinal}>"
+    return clones, extra_tag
+
+
 def timed_reference_rules(assets: list[MediaAsset]) -> tuple[str, str]:
     """Build reference rules including the timeline range where each asset applies."""
     visual: list[str] = []
@@ -478,6 +561,11 @@ def assign_local_media(scan: WorkflowScan, asset: MediaAsset, path: str | Path) 
     local_path = Path(path).expanduser().resolve()
     if not local_path.is_file():
         raise FileNotFoundError(local_path)
+    if asset.local_path != str(local_path):
+        asset.semantic_enrichment = ""
+        asset.semantic_enrichment_source_hash = ""
+        asset.semantic_enrichment_model = ""
+        asset.semantic_enrichment_updated_at = ""
     node = scan.nodes.get(asset.node_id)
     if node is None:
         raise KeyError(f"Unknown media node: {asset.node_id}")

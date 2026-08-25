@@ -6,7 +6,12 @@ from unittest.mock import patch
 
 from design_cleanup_service import cleanup, lm_origin, unload_lm_studio
 from design_ai_service import handle as handle_design_ai_job
-from design_engine import materialize_design_media, normalize_design_plan
+from design_engine import (
+    DESIGN_JSON_SCHEMA,
+    build_design_system_prompt,
+    materialize_design_media,
+    normalize_design_plan,
+)
 from design_media_service import image_workflow
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
@@ -223,7 +228,16 @@ class DesignEngineTests(unittest.TestCase):
         self.assertEqual(workflow["11"]["inputs"]["model"], ["34", 0])
         self.assertEqual(workflow["37"]["inputs"]["any_input"], ["3", 0])
         self.assertEqual(workflow["8"]["inputs"]["samples"], ["36", 0])
-        self.assertEqual(workflow["9"]["inputs"]["images"], ["32", 0])
+        # The user's latest Z-Image template deliberately removed RTX upscaling.
+        # Patching settings must preserve whichever decoded-image connection the
+        # current template defines instead of restoring an obsolete node id.
+        self.assertEqual(
+            workflow["9"]["inputs"]["images"],
+            template["9"]["inputs"]["images"],
+        )
+        self.assertFalse(
+            any("RTXVideoSuperResolution" in row.get("class_type", "") for row in workflow.values())
+        )
 
     def test_z_image_patching_finds_nodes_by_class_type_not_fixed_ids(self):
         template = {
@@ -278,6 +292,214 @@ class DesignEngineTests(unittest.TestCase):
         self.assertEqual((plan["shots"][0]["start_seconds"], plan["shots"][0]["end_seconds"]), (0.0, 4.0))
         self.assertEqual(plan["transitions"][0]["time_seconds"], 4.0)
         self.assertEqual(plan["markers"][0]["time_seconds"], 11.0)
+
+    def test_schema_v2_requires_explicit_existing_media_uses(self):
+        self.assertIn("existing_media_uses", DESIGN_JSON_SCHEMA["required"])
+        media_use = DESIGN_JSON_SCHEMA["properties"]["existing_media_uses"]["items"]
+        self.assertIn("media_id", media_use["required"])
+        self.assertIn("requirement_id", media_use["required"])
+        media_request = DESIGN_JSON_SCHEMA["properties"]["media_requests"]["items"]
+        self.assertIn("requirement_id", media_request["required"])
+        self.assertIn("reuse_policy", media_request["required"])
+
+    def test_legacy_design_defaults_new_media_planning_fields(self):
+        plan = normalize_design_plan(sample_design(), {"image": 9, "video": 3, "audio": 3})
+        self.assertEqual(plan["existing_media_uses"], [])
+        self.assertEqual(plan["media_requests"][0]["requirement_id"], "request_1")
+        self.assertEqual(plan["media_requests"][0]["reuse_policy"], "time_scoped")
+        self.assertEqual(plan["media_requests"][1]["reuse_policy"], "whole_design")
+
+    def test_existing_media_reuse_wins_over_duplicate_generation_requirement(self):
+        payload = sample_design()
+        payload["existing_media_uses"] = [{
+            "requirement_id": "hero_product",
+            "media_id": "@P1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 3.0,
+            "end_seconds": 6.0,
+            "track": "V1",
+            "subject_keywords": ["cola can", "hand"],
+            "instruction": "",
+        }]
+        payload["media_requests"][0]["requirement_id"] = "hero_product"
+        payload["media_requests"][0]["prompt"] = "Invalid duplicate from <Picture 1>."
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "tag": "<Picture 1>",
+                "type": "image",
+                "loaded": True,
+                "clip_prompt": "Preserve the exact supplied can and hand.",
+            }],
+            strict_t2i_prompts=True,
+        )
+        self.assertEqual(len(plan["existing_media_uses"]), 1)
+        self.assertEqual(plan["existing_media_uses"][0]["media_id"], "P1")
+        self.assertEqual(
+            plan["existing_media_uses"][0]["instruction"],
+            "Preserve the exact supplied can and hand.",
+        )
+        self.assertEqual(
+            (plan["existing_media_uses"][0]["start_seconds"], plan["existing_media_uses"][0]["end_seconds"]),
+            (0.0, 12.0),
+        )
+        self.assertFalse(any(
+            item["requirement_id"] == "hero_product" for item in plan["media_requests"]
+        ))
+        self.assertEqual([item["media_type"] for item in plan["media_requests"]], ["audio"])
+
+    def test_existing_media_inventory_rejects_unknown_empty_or_wrong_type(self):
+        base_use = {
+            "requirement_id": "hero",
+            "media_id": "P1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0,
+            "end_seconds": 12,
+            "track": "V1",
+            "subject_keywords": ["hero"],
+            "instruction": "Preserve the hero.",
+        }
+        for inventory, error in (
+            ([], "not present"),
+            ([{"media_id": "P1", "media_type": "image", "loaded": False}], "empty"),
+            ([{"media_id": "P1", "media_type": "video", "loaded": True}], "not image"),
+        ):
+            payload = sample_design()
+            payload["existing_media_uses"] = [dict(base_use)]
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                normalize_design_plan(
+                    payload,
+                    {"image": 9, "video": 3, "audio": 3},
+                    existing_media=inventory,
+                )
+
+    def test_loaded_media_reserves_slots_for_missing_media_requests(self):
+        payload = sample_design()
+        with self.assertRaisesRegex(ValueError, "only 0 free slots"):
+            normalize_design_plan(
+                payload,
+                {"image": 1, "video": 3, "audio": 3},
+                existing_media=[{
+                    "media_id": "P1",
+                    "media_type": "image",
+                    "loaded": True,
+                }],
+            )
+
+    def test_system_prompt_guards_standalone_t2i_and_blip_replanning(self):
+        prompt = build_design_system_prompt({"image_capacity": 9}).lower()
+        self.assertIn("complete standalone visual prompt", prompt)
+        self.assertIn("h3 <picture n>", prompt)
+        self.assertIn("exact real in-world location", prompt)
+        self.assertIn("character/prop ownership ledger", prompt)
+        self.assertIn("if blip conflicts", prompt)
+        self.assertIn("reject that generated reference", prompt)
+        self.assertIn("never force one image per shot", prompt)
+        self.assertIn("@p1", prompt)
+        self.assertIn("existing_media_uses", prompt)
+        self.assertIn("only genuinely missing assets", prompt)
+
+    def test_t2i_prompt_rejects_h3_picture_token(self):
+        payload = sample_design()
+        payload["media_requests"][0]["prompt"] = (
+            "Action reference of the assassin from <Picture 3> landing in the courtyard."
+        )
+        with self.assertRaisesRegex(ValueError, "Picture N"):
+            normalize_design_plan(
+                payload,
+                {"image": 9, "video": 3, "audio": 3},
+                strict_t2i_prompts=True,
+            )
+
+    def test_legacy_design_json_with_picture_tokens_still_loads_non_strict(self):
+        payload = sample_design()
+        payload["media_requests"][0]["prompt"] = (
+            "Legacy identity reference based on <Picture 1>."
+        )
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+        )
+        self.assertEqual(
+            plan["media_requests"][0]["prompt"],
+            "Legacy identity reference based on <Picture 1>.",
+        )
+
+    def test_t2i_prompt_rejects_self_or_future_image_dependency(self):
+        payload = sample_design()
+        payload["media_requests"][0]["prompt"] = (
+            "Match the next image and preserve whatever character it will generate."
+        )
+        with self.assertRaisesRegex(ValueError, "depends on another image"):
+            normalize_design_plan(
+                payload,
+                {"image": 9, "video": 3, "audio": 3},
+                strict_t2i_prompts=True,
+            )
+
+    def test_time_scoped_action_reference_rejects_neutral_background(self):
+        payload = sample_design()
+        payload["media_requests"][0].update({
+            "start_seconds": 4.0,
+            "end_seconds": 8.0,
+            "prompt": (
+                "Action-state reference of the assassin rotating around the general's spear, "
+                "dual swords extended, neutral background, no text."
+            ),
+        })
+        with self.assertRaisesRegex(ValueError, "story's real in-world environment"):
+            normalize_design_plan(
+                payload,
+                {"image": 9, "video": 3, "audio": 3},
+                strict_t2i_prompts=True,
+            )
+
+    def test_global_identity_reference_may_keep_catalog_background(self):
+        payload = sample_design()
+        payload["media_requests"][0].update({
+            "start_seconds": 0.0,
+            "end_seconds": payload["duration_seconds"],
+            "prompt": (
+                "Full-body identity reference of one Tang general wearing dark-gold armor and "
+                "holding his one rigid long spear, plain studio background, no text."
+            ),
+        })
+        plan = normalize_design_plan(payload, {"image": 9, "video": 3, "audio": 3})
+        self.assertEqual(len(plan["shots"]), 2)
+        self.assertEqual(
+            len([row for row in plan["media_requests"] if row["media_type"] == "image"]),
+            1,
+        )
+
+    def test_design_plan_supports_two_minute_long_form_timeline(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 120.0
+        payload["shots"][-1]["end_seconds"] = 120.0
+        plan = normalize_design_plan(payload, {"image": 9, "video": 3, "audio": 3})
+        self.assertEqual(plan["duration_seconds"], 120.0)
+
+    def test_tang_ting_ci_ying_demo_preserves_all_twenty_one_action_beats(self):
+        demo = json.loads(
+            (
+                PROJECT_ROOT
+                / "example"
+                / "tang_ting_ci_ying_45s_demo"
+                / "design_plan.json"
+            ).read_text(encoding="utf-8")
+        )
+        plan = normalize_design_plan(demo, {"image": 9, "video": 3, "audio": 3})
+        self.assertEqual(plan["duration_seconds"], 45.0)
+        self.assertEqual(len(plan["shots"]), 21)
+        self.assertEqual(len(plan["media_requests"]), 5)
+        self.assertEqual(plan["shots"][0]["start_seconds"], 0.0)
+        self.assertEqual(plan["shots"][-1]["end_seconds"], 45.0)
+        for previous, current in zip(plan["shots"], plan["shots"][1:]):
+            self.assertEqual(previous["end_seconds"], current["start_seconds"])
 
     def test_end_marker_is_clamped_and_final_hold_is_guaranteed(self):
         payload = sample_design()
@@ -339,6 +561,44 @@ class DesignEngineTests(unittest.TestCase):
             self.assertTrue(image.with_suffix(image.suffix + ".request.json").is_file())
             saved = json.loads((design_dir / "design_plan.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["theme_text"], "OPEN HAPPINESS")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_materialize_only_creates_missing_requests_not_existing_media(self):
+        payload = sample_design()
+        payload["existing_media_uses"] = [{
+            "requirement_id": "hero_product",
+            "media_id": "P1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0,
+            "end_seconds": 12,
+            "track": "V1",
+            "subject_keywords": ["cola can"],
+            "instruction": "Preserve the exact supplied product.",
+        }]
+        payload["media_requests"][0]["requirement_id"] = "hero_product"
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1",
+                "media_type": "image",
+                "loaded": True,
+            }],
+        )
+        root = PROJECT_ROOT / ".director_cache" / "design_existing_media_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        try:
+            design_dir, outputs = materialize_design_media(
+                plan, root, load_runtime_paths().ffmpeg
+            )
+            self.assertEqual([item["media_type"] for item in outputs], ["audio"])
+            saved = json.loads((design_dir / "design_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["existing_media_uses"][0]["media_id"], "P1")
+            self.assertEqual(len(saved["media_requests"]), 1)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
