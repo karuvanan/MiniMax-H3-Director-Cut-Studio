@@ -1,0 +1,41 @@
+# Normalize text files so GitHub and Windows checkouts produce stable diffs.
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.env text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Windows launcher scripts should keep CRLF line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Media, archives, model weights and generated artifacts are binary.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.wav binary
+*.mp3 binary
+*.aac binary
+*.flac binary
+*.mp4 binary
+*.mov binary
+*.mkv binary
+*.avi binary
+*.zip binary
+*.7z binary
+*.tar binary
+*.gz binary
+*.safetensors binary
+*.gguf binary
+*.bin binary

@@ -2,21 +2,19 @@
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
-complete library file can found at google drive:
-https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link
+## 下载与快速开始
 
-example output:
-https://youtu.be/hALjq11lK_s
+- [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
+- [示范输出影片（YouTube）](https://youtu.be/hALjq11lK_s)
+- 下载源码及 runtime 后，从项目根目录执行 `run_h3_prompt_studio.bat`。
 
-run_h3_prompt_studio.bat
+源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
 
-<img width="1280" height="769" alt="WhatsApp Image 2026-08-24 at 12 39 54 AM" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
+<img width="1280" height="769" alt="MiniMax H3 Director Cut Studio" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
 
+<img width="1600" height="698" alt="Director Cut Timeline" src="https://github.com/user-attachments/assets/365a0bb0-0a7b-4f64-b323-0b71e34a1847" />
 
-<img width="1600" height="698" alt="WhatsApp Image 2026-08-23 at 5 08 24 PM" src="https://github.com/user-attachments/assets/365a0bb0-0a7b-4f64-b323-0b71e34a1847" />
-
-<img width="1474" height="2080" alt="Screenshot 2026-08-23 214016111" src="https://github.com/user-attachments/assets/345e1d79-455f-4836-bffb-8e138aa20ee4" />
-
+<img width="1474" height="2080" alt="Design workspace" src="https://github.com/user-attachments/assets/345e1d79-455f-4836-bffb-8e138aa20ee4" />
 
 默认主工作流支持最多 **9 张图片、3 段参考视频和 3 段独立音频**：
 
@@ -99,11 +97,11 @@ ai_libraries_common/models/models--Salesforce--blip-image-captioning-base/snapsh
 
 ### 4. LM Studio 模型
 
-Design 页面通过 OpenAI-compatible API 连接 LM Studio。当前 `design_ai.env` 使用：
+Design 页面通过 OpenAI-compatible API 连接 LM Studio。公开配置建议先使用本机地址：
 
 ```text
 Base URL:
-http://192.168.0.185:1234/v1
+http://127.0.0.1:1234/v1
 
 Model ID:
 hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf
@@ -120,7 +118,7 @@ mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
 
 当前 Design 流程会先用本地 BLIP 把生成图转成 caption，再把文字 caption 交给 LM Studio，因此 **mmproj 对现有纯文字请求不是硬性必需**；只有直接把图片提交给 LM Studio 的视觉模型模式才需要它。GGUF 由 LM Studio 管理，不要放入 ComfyUI 的模型目录。
 
-`192.168.0.185` 是开发机的局域网地址。其他使用者必须在 Design 设置或 `design_ai.env` 中改成自己的 LM Studio 地址和模型 ID。
+如果 LM Studio 位于其他电脑，请在 Design 设置或 `design_ai.env` 中改成对应的局域网地址和模型 ID。
 
 ## 推荐的模型目录结构
 
@@ -145,7 +143,7 @@ ComfyUI/
 
 ## 节点与自定义节点依赖
 
-下表来自当前连接的 ComfyUI `http://192.168.0.185:8189/object_info`。`comfy_extras.*` 属于较新版本 ComfyUI 的内置扩展；`custom_nodes.*` 需要相应自定义节点包。
+下表来自当前工作流使用的 ComfyUI 节点类型。可以通过 `http://YOUR_COMFYUI_HOST:8189/object_info` 检查自己的节点安装；`comfy_extras.*` 属于较新版本 ComfyUI 的内置扩展，`custom_nodes.*` 需要相应自定义节点包。
 
 | 节点 | Python module | 来源/处理方式 | 额外模型文件 |
 |---|---|---|---|
@@ -313,7 +311,7 @@ FFmpeg: 2026-05-25-git-34dfa8bf2b-full_build-www.gyan.dev
 主页可以选择 Aspect Ratio，并测试 ComfyUI 连接。设置保存在项目根目录 `.env`：
 
 ```dotenv
-H3_COMFYUI_URL=http://192.168.0.185:8189
+H3_COMFYUI_URL=http://127.0.0.1:8189
 H3_ASPECT_RATIO=16:9
 H3_MEGAPIXELS=1.0
 H3_SAMPLING_STEPS=8
@@ -332,7 +330,7 @@ H3_HTTP_REQUEST_TIMEOUT=30
 
 ```dotenv
 H3_DESIGN_PROVIDER="lm_studio"
-H3_DESIGN_LM_STUDIO_BASE_URL="http://192.168.0.185:1234/v1"
+H3_DESIGN_LM_STUDIO_BASE_URL="http://127.0.0.1:1234/v1"
 H3_DESIGN_LM_STUDIO_MODEL="hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf"
 H3_DESIGN_TIMEOUT=900
 H3_DESIGN_AUTO_SEMANTIC_ENRICHMENT=false
@@ -364,15 +362,18 @@ H3_DESIGN_IMAGE_CFG=1.0
 
 - Media Pool 会随面板宽度自动重排，素材使用 `P1 / V1 / A1` 简称。
 - Recognition 检查器分为 `RAW ANALYSIS` 与 `AI SEMANTIC` 两页。后者可手动执行，也可开启 `AUTO AI SEMANTIC ENRICHMENT`，并复用 Design 当前选择的 LM Studio／Online GPT 服务与模型。
+- Media Pool 或 Timeline 素材执行 AI Enrich 时，对应 Media Pool 卡片会显示半透明 processing overlay；分析在后台执行，不会冻结主界面。
 - 只有拖入 Timeline 的素材才会连接并激活到 H3 workflow。
 - Clip、Shot、Marker 与编辑范围仍以 `0.5s` 为一格执行 snap；播放头和 Program Monitor 播放滑杆不 snap，可按毫秒连续拖动。滑杆使用按下位置作为相对拖动锚点，不会在开始向左或向右时突然跳到端点；拖动期间画面 seek 会轻量 debounce，释放后精确落在所选时间。
 - 支持动态增加/删除 V 与 A 轨、多层视频合成、Opacity、Blend Mode、Mute、Solo、Volume、Pan、锁定和轨道高度。
 - Clip 支持速度、源入点/出点、淡入淡出与转场。
 - Selection Tool 可移动 clip 及 Program Monitor 文字；Hand Tool 用于平移 Timeline。
-- Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics；Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
+- Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics；文字层可以放入任意空 V Track，不需要与原素材重叠。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
+- Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、Subject action、Environment response、Additional direction 与 Shot Prompt Preset。
 - Prompt Tool 点击图片 clip 时会带入 BLIP visual caption，也可为其他元素加入专属提示词。
 - Marker Tool、Creative Brief、Visual Style、Transition、Ending Hold、Constraints、Soundscape 与 Music 会共同自动生成 Director H3 Prompt。
+- `AUTO SYNC FROM TIMELINE` 启用时会执行 Timeline Prompt Reconcile：以当前素材引用、Shot、Dialogue、Voice-over、Lyrics、Ending Hold 与音频 transcript 为 source of truth，自动重写 Creative Brief 与 Director H3 Prompt，并忽略已被替换的 Design placeholder，不需要重新进入 Design 页面。
 - 项目保存格式为 `.h3director.json`，支持 Undo/Redo。
 - Program Monitor 使用可拖动的左右分割线：左侧 `TIMELINE SOURCE` 显示当前时间轴素材与文字合成，右侧 `GENERATED OUTPUT` 显示最终 MP4。两侧采用 1px 合法最小宽度，分割线可以连续推到视觉上的最左/最右，但不会触发 Qt 自动 collapse、跳边或把手卡死；当前比例会随项目保存，并为后续 Depth / Pose 分析视图保留扩展空间。
 - 播放生成视频时，右侧 MP4 作为主时钟同步 Timeline playhead、时间标签、滑杆及左侧素材画面；拖动 Timeline 或滑杆也会反向定位生成视频。
@@ -399,7 +400,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - FFmpeg 会裁掉重复的重叠区，将所有段重编码为一个带音频的 `master.mp4`。Program Monitor 与 Export 始终只显示完整 Master。
 - Pre-run Preview 会为所有内部段建立稳定 seed；Accept 以 1.0MP 复用同一组 seed。
 
-Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 version 13，并记录 Master、各段 manifest、归档工作文件夹、生成视频时间起点与 Program Monitor 分割比例。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
+Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 **version 14**，并记录 Master、各段 manifest、归档工作文件夹、生成视频时间起点、Program Monitor 分割比例与 Prompt Auto Sync 状态。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
 
 Design 页的 `LOAD JSON` 可以载入人工校准或先前保存的 Director Design。若载入的 JSON 尚无预生成图片，点击 Apply 后仍会自动执行所需的 Z-Image reference generation。项目附带的 45 秒长片示范位于：
 
@@ -445,6 +446,9 @@ preset_env/non_diegetic_music.env
 - 音频按 8 秒分块流式解码，总解码长度不超过 Timeline 秒数。
 - 音频先执行 VAD，再只对语音区间执行 Whisper，并以 FFT 估算节拍。
 - 可选 AI Semantic Enrichment 会在所有基础分析完成后，把有界的原始证据交给 Design 当前的 Qwen/GPT，输出 Summary、Observed Facts、Subjects、Objects、Environment、Camera、Lighting、Temporal Motion、Audio/Speech、H3 Usage 与 Uncertainties。AI 推断独立保存，不会覆盖 BLIP／Whisper 原文。
+- AI Enrich 会先根据素材类型和基础证据决定是否需要多区域 BLIP；需要时会补充主体、环境与细节区域 caption，再交给 Qwen/GPT，避免无条件重复分析整张图片。
+- 如果被分析素材已经位于 Timeline 且存在重叠 Shot，AI 会返回对应 `shot_adaptations`，自动更新 Subject Action、Environment Response 与 Additional Direction；没有现有 Shot 时不会擅自创建新 Shot。
+- Design 后替换 Timeline 素材时，旧素材的 caption、placeholder prompt 与旧 Shot 描述会失效；新素材完成分析后会融合到原有 Shot 和最终 H3 Prompt，而不是被当作额外静态照片叠加。
 - 每次结果都校验素材编号、类型与 SHA-256 evidence fingerprint；换素材、修改 Recognition 或 Clip Prompt 后旧结果会标为 Stale，且不会进入 Design 的有效分析上下文。只发送文件 basename，本机绝对路径会先遮蔽。
 - Online GPT 模式会把有界的 caption／transcript 证据发送至所配置的远端服务；API key 可沿用本次运行中 Design 页输入的值，或读取当前进程的 `OPENAI_API_KEY`，但不会写入 `design_ai.env` 或项目文件。
 - 识别工作在后台 worker 中运行，支持取消、超时与失败回退，不阻塞主界面。
@@ -498,13 +502,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 
 ## 测试
 
+当前主分支验证结果：**156 tests passed**。
+
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
-
-## 测试
-
-```powershell
-.\ai_libraries_common\python_env\python.exe -m unittest discover -v
+```text
+Ran 156 tests
+OK
 ```
