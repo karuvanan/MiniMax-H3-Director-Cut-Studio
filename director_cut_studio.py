@@ -129,6 +129,9 @@ from workflow_engine import (
     compile_active_workflow,
     effective_reference_assets,
     load_workflow,
+    media_upload_manifest,
+    patch_media_upload_names,
+    stable_reference_id,
 )
 
 
@@ -184,9 +187,29 @@ def snap_timeline_range(
 
 def media_shortcut(asset: MediaAsset) -> str:
     """Return a compact UI label without changing the API reference tag."""
-    prefixes = {"image": "P", "video": "V", "audio": "A"}
-    number = "".join(character for character in asset.tag if character.isdigit())
-    return f"{prefixes.get(asset.media_type, 'M')}{number or '?'}"
+    return stable_reference_id(asset)
+
+
+def canonicalize_cue_reference_ids(text: str, media_ids: object) -> str:
+    """Add ``@`` to explicit stable IDs owned by one Director Cue.
+
+    Older AI Enrichment results wrote ``P3`` inside Shot prose while keeping
+    ``P3`` as the cue's structured reference key. Bare IDs are not globally
+    rewritten because values such as product model ``A1`` may be literal text;
+    the cue-owned key makes this targeted migration unambiguous.
+    """
+    result = str(text or "")
+    for raw_media_id in media_ids or []:
+        media_id = str(raw_media_id).strip().upper().lstrip("@")
+        if not re.fullmatch(r"[PVA]\d+", media_id):
+            continue
+        result = re.sub(
+            rf"(?<![@\w]){re.escape(media_id)}(?!\w)",
+            f"@{media_id}",
+            result,
+            flags=re.I,
+        )
+    return result
 
 
 APP_STYLE = """
@@ -3961,7 +3984,7 @@ class DesignPageDialog(QDialog):
                 Qt.Checked if previous_checks.get(media_id, True) else Qt.Unchecked
             )
             detail = [
-                f"@{media_id} / {row.get('h3_tag') or row.get('tag') or media_id}",
+                f"Stable reference: @{media_id}",
                 f"File: {filename}",
             ]
             if caption:
@@ -5928,8 +5951,6 @@ class DirectorCutStudio(QMainWindow):
                 ]
                 media.append({
                     "media_id": media_shortcut(asset),
-                    "h3_tag": asset.tag,
-                    "tag": asset.tag,
                     "node_id": asset.node_id,
                     "media_type": asset.media_type,
                     "type": asset.media_type,
@@ -8094,7 +8115,7 @@ class DirectorCutStudio(QMainWindow):
 
         media_id = media_shortcut(asset)
         parts = [
-            f"Use the overlapping {media_id} AI-enriched media as a concrete reference",
+            f"Use the overlapping @{media_id} AI-enriched media as a concrete reference",
         ]
         field_specs = (
             ("Summary", "summary", 320),
@@ -10378,14 +10399,42 @@ class DirectorCutStudio(QMainWindow):
                 f"{cue.camera_movement} · {cue.movement_speed} · {cue.movement_amplitude} amplitude",
             ]
             if cue.subject_action:
-                parts.append("Subject: " + cue.subject_action)
+                parts.append(
+                    "Subject: "
+                    + canonicalize_cue_reference_ids(
+                        cue.subject_action, cue.semantic_reference_directions
+                    )
+                )
             if cue.environment_response:
-                parts.append("Environment: " + cue.environment_response)
+                parts.append(
+                    "Environment: "
+                    + canonicalize_cue_reference_ids(
+                        cue.environment_response,
+                        cue.semantic_reference_directions,
+                    )
+                )
             if cue.detail:
-                parts.append("Direction: " + cue.detail)
+                parts.append(
+                    "Direction: "
+                    + canonicalize_cue_reference_ids(
+                        cue.detail, cue.semantic_reference_directions
+                    )
+                )
             for media_id, direction in cue.semantic_reference_directions.items():
                 if direction:
-                    parts.append(f"AI reference {media_id}: {direction}")
+                    stable_token = (
+                        media_id
+                        if str(media_id).startswith("@")
+                        else f"@{media_id}"
+                        if re.fullmatch(r"[PVA]\d+", str(media_id), flags=re.I)
+                        else str(media_id)
+                    )
+                    parts.append(
+                        f"AI reference {stable_token}: "
+                        + canonicalize_cue_reference_ids(
+                            direction, cue.semantic_reference_directions
+                        )
+                    )
             shot_lines.append(" | ".join(parts))
         self.prompt_panel.shots.setPlainText("\n".join(shot_lines))
 
@@ -10446,16 +10495,17 @@ class DirectorCutStudio(QMainWindow):
                 if not asset.timeline_placed or asset.activation_mode == "bypass":
                     continue
                 media_id = media_shortcut(asset)
+                stable_token = f"@{media_id}"
                 if asset.media_type in {"image", "video"}:
-                    if media_id not in active_visual_ids:
-                        active_visual_ids.append(media_id)
+                    if stable_token not in active_visual_ids:
+                        active_visual_ids.append(stable_token)
                 elif asset.media_type == "audio":
-                    if media_id not in active_audio_ids:
-                        active_audio_ids.append(media_id)
+                    if stable_token not in active_audio_ids:
+                        active_audio_ids.append(stable_token)
                 if asset.clip_prompt.strip():
                     instruction = " ".join(asset.clip_prompt.split())
                     reference_roles.append(
-                        f"{media_id} at {asset.start_seconds:.2f}-{asset.end_seconds:.2f}s: "
+                        f"{stable_token} at {asset.start_seconds:.2f}-{asset.end_seconds:.2f}s: "
                         f"{instruction[:260]}"
                     )
                 if asset.media_type == "audio" and "WHISPER TRANSCRIPT" in asset.recognition:
@@ -10551,6 +10601,22 @@ class DirectorCutStudio(QMainWindow):
             return
         self.prompt_generation_timer.start()
 
+    def _track_allows_reference(
+        self,
+        asset: MediaAsset,
+        *,
+        audio_solo: bool,
+    ) -> bool:
+        """Return whether an editorial track may feed this H3 request."""
+        track = self._track_for_asset(asset)
+        if not track or not track.enabled:
+            return False
+        if track.kind == "visual":
+            return bool(track.visible)
+        if track.kind == "audio":
+            return not track.muted and (not audio_solo or track.solo)
+        return False
+
     def generate_prompt(self, interactive: bool = True) -> None:
         if not self.scan:
             return
@@ -10563,18 +10629,37 @@ class DirectorCutStudio(QMainWindow):
             if interactive:
                 QMessageBox.information(self, "Brief required", "Add a creative brief before generating the H3 prompt.")
             return
+        timeline_assets = self.scan.timeline_assets()
+        original_enabled = [(asset, asset.enabled) for asset in timeline_assets]
+        audio_solo = any(
+            track.enabled and track.solo for track in self.tracks if track.kind == "audio"
+        )
         try:
-            _, assets = compile_active_workflow(self.scan, self.clip_start.value(), self.clip_end.value())
-            prompt_assets, _ = effective_reference_assets(assets)
-            special_key = self.special_combo.currentData()
-            special = None if special_key == NONE_SPECIAL else self.profiles[special_key]
-            output = build_ref2va_prompt(
-                spec,
-                prompt_assets,
-                self.clip_end.value() - self.clip_start.value(),
-                self.profiles[DEFAULT_SKILL],
-                special,
-            )
+            for asset, was_enabled in original_enabled:
+                asset.enabled = was_enabled and self._track_allows_reference(
+                    asset, audio_solo=audio_solo
+                )
+            start, end = self.clip_start.value(), self.clip_end.value()
+            _, assets = compile_active_workflow(self.scan, start, end)
+            if start > 1e-6 or end < self.scan.duration_seconds - 1e-6:
+                output = self._prompt_for_window(
+                    start,
+                    end,
+                    assets,
+                    is_final_window=end >= self.scan.duration_seconds - 1e-6,
+                )
+            else:
+                prompt_assets, _ = effective_reference_assets(assets)
+                special_key = self.special_combo.currentData()
+                special = None if special_key == NONE_SPECIAL else self.profiles[special_key]
+                output = build_ref2va_prompt(
+                    spec,
+                    prompt_assets,
+                    end - start,
+                    self.profiles[DEFAULT_SKILL],
+                    special,
+                    source_assets=self.scan.assets,
+                )
             self.prompt_panel.output.setPlainText(output)
             self.statusBar().showMessage(
                 f"H3 prompt auto-generated with {len(assets)} active references"
@@ -10584,6 +10669,9 @@ class DirectorCutStudio(QMainWindow):
                 QMessageBox.critical(self, "Prompt error", str(exc))
             else:
                 self.statusBar().showMessage(f"Automatic prompt generation paused: {exc}")
+        finally:
+            for asset, was_enabled in original_enabled:
+                asset.enabled = was_enabled
 
     def _prompt_spec_with_director_cues(
         self,
@@ -10644,14 +10732,41 @@ class DirectorCutStudio(QMainWindow):
                     movement,
                 ]
                 if cue.subject_action:
-                    parts.append(f"Subject action: {cue.subject_action}")
+                    parts.append(
+                        "Subject action: "
+                        + canonicalize_cue_reference_ids(
+                            cue.subject_action, cue.semantic_reference_directions
+                        )
+                    )
                 if cue.environment_response:
-                    parts.append(f"Environment response: {cue.environment_response}")
+                    parts.append(
+                        "Environment response: "
+                        + canonicalize_cue_reference_ids(
+                            cue.environment_response,
+                            cue.semantic_reference_directions,
+                        )
+                    )
                 if cue.detail:
-                    parts.append(cue.detail)
+                    parts.append(
+                        canonicalize_cue_reference_ids(
+                            cue.detail, cue.semantic_reference_directions
+                        )
+                    )
                 for media_id, direction in cue.semantic_reference_directions.items():
                     if direction:
-                        parts.append(f"AI-enriched media reference {media_id}: {direction}")
+                        stable_token = (
+                            media_id
+                            if str(media_id).startswith("@")
+                            else f"@{media_id}"
+                            if re.fullmatch(r"[PVA]\d+", str(media_id), flags=re.I)
+                            else str(media_id)
+                        )
+                        parts.append(
+                            f"AI-enriched media reference {stable_token}: "
+                            + canonicalize_cue_reference_ids(
+                                direction, cue.semantic_reference_directions
+                            )
+                        )
                 layers = [
                     layer
                     for layer in self.text_layers
@@ -10927,6 +11042,7 @@ class DirectorCutStudio(QMainWindow):
             end - start,
             self.profiles[DEFAULT_SKILL],
             special,
+            source_assets=self.scan.assets if self.scan else None,
         )
 
     def export_active_api(self) -> None:
@@ -10936,20 +11052,16 @@ class DirectorCutStudio(QMainWindow):
         if end <= start:
             QMessageBox.warning(self, "Invalid work area", "Work-area end must be later than its start.")
             return
-        prompt = self.prompt_panel.output.toPlainText().strip() or None
+        # Rebuild from stable Timeline IDs so a previous work area's dynamic
+        # Picture/Video/Audio ordinals can never leak into this export.
+        self.generate_prompt(interactive=False)
         self._read_settings_ui()
         seed = self._new_seed()
         try:
-            compiled, assets = compile_active_workflow(
-                self.scan,
-                start,
-                end,
-                prompt,
-                generation=self._generation_parameters(
-                    megapixels=self.render_settings.megapixels,
-                    seed=seed,
-                    enable_rtx_vsr=self.render_settings.rtx_video_super_resolution,
-                ),
+            compiled, assets = self._compiled_job(
+                megapixels=self.render_settings.megapixels,
+                seed=seed,
+                enable_rtx_vsr=self.render_settings.rtx_video_super_resolution,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Compile error", str(exc))
@@ -11226,17 +11338,9 @@ class DirectorCutStudio(QMainWindow):
         )
         try:
             for asset, was_enabled in original_enabled:
-                track = self._track_for_asset(asset)
-                track_active = bool(track and track.enabled)
-                if track and track.kind == "visual":
-                    track_active = track_active and track.visible
-                if track and track.kind == "audio":
-                    track_active = (
-                        track_active
-                        and not track.muted
-                        and (not audio_solo or track.solo)
-                    )
-                asset.enabled = was_enabled and track_active
+                asset.enabled = was_enabled and self._track_allows_reference(
+                    asset, audio_solo=audio_solo
+                )
                 if asset.enabled and not self._reference_belongs_to_window(
                     asset, start, end
                 ):
@@ -11344,7 +11448,7 @@ class DirectorCutStudio(QMainWindow):
         """Create a resumable sequential job for a work area beyond 15 seconds."""
         start, end = self.clip_start.value(), self.clip_end.value()
         planned = self._planned_render_segments()
-        all_media: list[str] = []
+        all_media: list[dict[str, str]] = []
         segment_rows: list[dict] = []
         render_root = CACHE_ROOT / "generated_outputs" / request_kind / str(seed)
         for index, segment in enumerate(planned):
@@ -11369,8 +11473,10 @@ class DirectorCutStudio(QMainWindow):
                 continuity_mode=segment.continuity_mode,
                 fingerprint_start=core_start,
             )
+            uploads = media_upload_manifest(assets)
+            patch_media_upload_names(compiled, uploads)
             segment.fingerprint = fingerprint
-            all_media.extend(asset.local_path for asset in assets if asset.local_path)
+            all_media.extend(uploads)
             row = segment.to_dict()
             row.update(
                 {
@@ -11410,7 +11516,10 @@ class DirectorCutStudio(QMainWindow):
             "action": "smart_render",
             "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "server": self.server_url.text().strip(),
-            "media": list(dict.fromkeys(all_media)),
+            "media": list({
+                (row["loader_node_id"], row["upload_name"]): row
+                for row in all_media
+            }.values()),
             "segments": segment_rows,
             "segment_count": len(segment_rows),
             "progress_shots": self._progress_shot_rows(start, end),
@@ -11454,19 +11563,38 @@ class DirectorCutStudio(QMainWindow):
         start, end = self.clip_start.value(), self.clip_end.value()
         if end <= start:
             raise ValueError("Work-area end must be later than its start.")
-        prompt = self.prompt_panel.output.toPlainText().strip() or None
         timeline_assets = self.scan.timeline_assets()
         original_enabled = [(asset, asset.enabled) for asset in timeline_assets]
         audio_solo = any(track.enabled and track.solo for track in self.tracks if track.kind == "audio")
         try:
             for asset, was_enabled in original_enabled:
-                track = self._track_for_asset(asset)
-                track_active = bool(track and track.enabled)
-                if track and track.kind == "visual":
-                    track_active = track_active and track.visible
-                if track and track.kind == "audio":
-                    track_active = track_active and not track.muted and (not audio_solo or track.solo)
-                asset.enabled = was_enabled and track_active
+                asset.enabled = was_enabled and self._track_allows_reference(
+                    asset, audio_solo=audio_solo
+                )
+            _, prompt_sources = compile_active_workflow(self.scan, start, end)
+            is_partial_window = (
+                start > 1e-6 or end < self.scan.duration_seconds - 1e-6
+            )
+            if is_partial_window:
+                prompt = self._prompt_for_window(
+                    start,
+                    end,
+                    prompt_sources,
+                    is_final_window=end >= self.scan.duration_seconds - 1e-6,
+                )
+            else:
+                prompt_assets, _ = effective_reference_assets(prompt_sources)
+                special_key = self.special_combo.currentData()
+                special = None if special_key == NONE_SPECIAL else self.profiles[special_key]
+                prompt = build_ref2va_prompt(
+                    self._prompt_spec_with_director_cues(self.prompt_panel.spec()),
+                    prompt_assets,
+                    end - start,
+                    self.profiles[DEFAULT_SKILL],
+                    special,
+                    source_assets=self.scan.assets,
+                )
+            self.prompt_panel.output.setPlainText(prompt)
             return compile_active_workflow(
                 self.scan,
                 start,
@@ -11545,7 +11673,8 @@ class DirectorCutStudio(QMainWindow):
                     seed=seed,
                     enable_rtx_vsr=enable_rtx_vsr,
                 )
-                media = [asset.local_path for asset in assets if asset.local_path]
+                media = media_upload_manifest(assets)
+                patch_media_upload_names(compiled, media)
                 job_path = CACHE_ROOT / "comfy_submit_job.json"
                 job = {
                     "action": "queue",
@@ -12134,7 +12263,8 @@ class DirectorCutStudio(QMainWindow):
             return
         try:
             compiled, assets = self._compiled_job()
-            media = [asset.local_path for asset in assets if asset.local_path]
+            media = media_upload_manifest(assets)
+            patch_media_upload_names(compiled, media)
             job_path = CACHE_ROOT / "comfy_submit_job.json"
             job_path.write_text(
                 json.dumps(

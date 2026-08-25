@@ -28,12 +28,18 @@ def _request_json(request: urllib.request.Request, timeout: int = 600) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def upload_file(server: str, path: Path, timeout: int) -> dict:
+def upload_file(
+    server: str,
+    path: Path,
+    timeout: int,
+    upload_name: str | None = None,
+) -> dict:
     boundary = "----H3Director" + uuid.uuid4().hex
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    remote_name = str(upload_name or path.name)
     head = (
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="image"; filename="{path.name}"\r\n'
+        f'Content-Disposition: form-data; name="image"; filename="{remote_name}"\r\n'
         f"Content-Type: {mime}\r\n\r\n"
     ).encode("utf-8")
     tail = (
@@ -165,12 +171,22 @@ def main() -> int:
         print(json.dumps(test_connection(server, http_timeout), ensure_ascii=False), flush=True)
         return 0
     uploaded: list[dict] = []
-    for filename in job.get("media", []):
-        path = Path(filename)
+    seen_uploads: set[tuple[str, str]] = set()
+    for item in job.get("media", []):
+        if isinstance(item, dict):
+            path = Path(str(item.get("path", "")))
+            upload_name = str(item.get("upload_name") or path.name)
+        else:
+            path = Path(str(item))
+            upload_name = path.name
+        upload_key = (str(path.resolve()) if path.exists() else str(path), upload_name)
+        if upload_key in seen_uploads:
+            continue
+        seen_uploads.add(upload_key)
         if path.is_file():
-            result = upload_file(server, path, http_timeout)
-            uploaded.append({"file": path.name, "result": result})
-            print(json.dumps({"progress": f"Uploaded {path.name}"}, ensure_ascii=False), flush=True)
+            result = upload_file(server, path, http_timeout, upload_name)
+            uploaded.append({"file": path.name, "upload_name": upload_name, "result": result})
+            print(json.dumps({"progress": f"Uploaded {path.name} as {upload_name}"}, ensure_ascii=False), flush=True)
     payload = json.dumps(
         {"prompt": job["workflow"], "client_id": "h3-director-" + uuid.uuid4().hex},
         ensure_ascii=False,

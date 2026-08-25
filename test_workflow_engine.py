@@ -7,7 +7,12 @@ from workflow_engine import (
     compile_active_workflow,
     effective_reference_assets,
     load_workflow,
+    media_upload_manifest,
+    paired_audio_reference_tags,
+    patch_media_upload_names,
+    remap_reference_tokens,
     scan_workflow_data,
+    stable_reference_id,
     suggested_reference_rules,
 )
 
@@ -135,6 +140,46 @@ class WorkflowEngineTests(unittest.TestCase):
             ["<Picture 1>", "<Picture 3>"],
         )
 
+    def test_stable_reference_ids_come_from_physical_bindings(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        picture_4 = [asset for asset in scan.assets if asset.media_type == "image"][3]
+        video_2 = [asset for asset in scan.assets if asset.media_type == "video"][1]
+        audio_3 = [asset for asset in scan.assets if asset.media_type == "audio"][2]
+        picture_4.tag = "<Picture 1>"
+        video_2.tag = "<Video 1>"
+        audio_3.tag = "<Audio 1>"
+        self.assertEqual(stable_reference_id(picture_4), "P4")
+        self.assertEqual(stable_reference_id(video_2), "V2")
+        self.assertEqual(stable_reference_id(audio_3), "A3")
+
+    def test_reference_remapping_uses_active_p4_and_p7_effective_ordinals(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        effective, _ = effective_reference_assets([pictures[3], pictures[6]])
+        authored = (
+            "Preserve @P4 for the escaping woman and use legacy <Picture 7> "
+            "for the beauty salon entrance."
+        )
+        compiled = remap_reference_tokens(authored, scan.assets, effective)
+        self.assertIn("<Picture 1> for the escaping woman", compiled)
+        self.assertIn("<Picture 2> for the beauty salon entrance", compiled)
+
+    def test_inactive_legacy_reference_cannot_alias_an_active_effective_tag(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        effective, _ = effective_reference_assets([pictures[3], pictures[6]])
+        compiled = remap_reference_tokens(
+            "Use <Picture 1> for the salon signage and @P99 for a prop.",
+            scan.assets,
+            effective,
+        )
+        self.assertIn("[P1 reference is inactive in this segment]", compiled)
+        self.assertIn("[P99 reference is unavailable]", compiled)
+        self.assertNotIn("<Picture 1>", compiled)
+
     def test_activation_modes_override_auto_window(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
         scan = load_workflow(path)
@@ -170,6 +215,96 @@ class WorkflowEngineTests(unittest.TestCase):
 
         effective, _ = effective_reference_assets([source, repeated])
         self.assertEqual([asset.tag for asset in effective], ["<Picture 1>", "<Picture 1>"])
+
+    def test_repeated_clip_with_editor_node_id_still_shares_one_effective_tag(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        source = next(asset for asset in scan.assets if asset.media_type == "image")
+        repeated = deepcopy(source)
+        repeated.node_id = "timeline-instance-only"
+        repeated.source_node_id = source.node_id
+        repeated.clip_id = "clip-distinct-editor-id"
+        effective, _ = effective_reference_assets([source, repeated])
+        self.assertEqual([asset.tag for asset in effective], ["<Picture 1>", "<Picture 1>"])
+
+    def test_paired_video_soundtracks_receive_effective_audio_tags(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        videos = [asset for asset in scan.assets if asset.media_type == "video"]
+        audios = [asset for asset in scan.assets if asset.media_type == "audio"]
+        effective, _ = effective_reference_assets([videos[1], videos[2], audios[2]])
+        paired = paired_audio_reference_tags(effective)
+        self.assertEqual(list(paired.values()), ["<Audio 1>", "<Audio 2>"])
+        standalone = next(asset for asset in effective if asset.media_type == "audio")
+        self.assertEqual(standalone.tag, "<Audio 3>")
+
+    def test_mixed_picture_video_audio_window_compiles_stable_ids_together(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        videos = [asset for asset in scan.assets if asset.media_type == "video"]
+        audios = [asset for asset in scan.assets if asset.media_type == "audio"]
+        active = [pictures[3], pictures[6], videos[1], audios[2]]
+        for asset in active:
+            asset.timeline_placed = True
+            asset.start_seconds = 20.0
+            asset.end_seconds = 25.0
+
+        compiled_workflow, compiled_assets = compile_active_workflow(scan, 20.0, 25.0)
+        inputs = compiled_workflow[scan.h3_node_ids[0]]["inputs"]
+        self.assertIn(pictures[3].binding, inputs)
+        self.assertIn(pictures[6].binding, inputs)
+        self.assertIn(videos[1].binding, inputs)
+        self.assertIn(videos[1].paired_audio_binding, inputs)
+        self.assertIn(audios[2].binding, inputs)
+        self.assertNotIn(pictures[0].binding, inputs)
+        self.assertNotIn(videos[0].binding, inputs)
+        self.assertNotIn(audios[0].binding, inputs)
+
+        effective, _ = effective_reference_assets(compiled_assets)
+        compiled_prompt = remap_reference_tokens(
+            "Use @P4 and @P7 with @V2 motion and @A3 sound. "
+            "Do not alias inactive @P1, @V1 or @A1.",
+            scan.assets,
+            effective,
+        )
+        self.assertIn("<Picture 1> and <Picture 2>", compiled_prompt)
+        self.assertIn("<Video 1> motion", compiled_prompt)
+        # V2's enabled synchronized soundtrack is Audio 1, so standalone A3
+        # correctly becomes the second Audio signal in this request.
+        self.assertIn("<Audio 2> sound", compiled_prompt)
+        self.assertIn("[P1 reference is inactive in this segment]", compiled_prompt)
+        self.assertIn("[V1 reference is inactive in this segment]", compiled_prompt)
+        self.assertIn("[A1 reference is inactive in this segment]", compiled_prompt)
+
+    def test_same_basename_uploads_receive_distinct_loader_names(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"][:2]
+        root = Path(__file__).parent / ".director_cache" / "upload_collision_test"
+        first = root / "one" / "image.png"
+        second = root / "two" / "image.png"
+        first.parent.mkdir(parents=True, exist_ok=True)
+        second.parent.mkdir(parents=True, exist_ok=True)
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        for asset, local in zip(pictures, (first, second)):
+            asset.local_path = str(local.resolve())
+            asset.timeline_placed = True
+            asset.start_seconds = 0.0
+            asset.end_seconds = 5.0
+
+        compiled, active = compile_active_workflow(scan, 0.0, 5.0)
+        uploads = media_upload_manifest(active)
+        patch_media_upload_names(compiled, uploads)
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(len({row["upload_name"] for row in uploads}), 2)
+        self.assertNotEqual(uploads[0]["upload_name"], "image.png")
+        for row in uploads:
+            node = compiled[row["loader_node_id"]]
+            self.assertEqual(
+                node["inputs"][row["loader_input"]], row["upload_name"]
+            )
 
     def test_asset_outside_timeline_can_never_activate(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"

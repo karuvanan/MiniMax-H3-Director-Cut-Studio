@@ -1,5 +1,6 @@
 import os
 import json
+from copy import deepcopy
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -31,6 +32,7 @@ from director_cut_studio import (
     media_shortcut,
     snap_timeline_range,
     snap_timeline_seconds,
+    timeline_state,
 )
 from runtime_paths import PROJECT_ROOT
 from design_engine import normalize_design_plan
@@ -71,6 +73,27 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.app.processEvents()
         self.app.processEvents()
         return enter, move, drop
+
+    @staticmethod
+    def _workflow_prompt(workflow):
+        return next(
+            node["inputs"]["value"]
+            for node in workflow.values()
+            if node.get("class_type") == "PrimitiveStringMultiline"
+        )
+
+    @staticmethod
+    def _h3_inputs(window, workflow):
+        return workflow[window.scan.h3_node_ids[0]]["inputs"]
+
+    @staticmethod
+    def _place(asset, start, end, track_id="V1", prompt=""):
+        asset.timeline_placed = True
+        asset.timeline_track_id = track_id
+        asset.start_seconds = float(start)
+        asset.end_seconds = float(end)
+        asset.clip_prompt = prompt
+        return asset
 
     @staticmethod
     def _semantic_result(asset, fingerprint, summary="Grounded semantic summary."):
@@ -301,6 +324,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
 
         context = window._design_context()
         row = next(item for item in context["existing_media"] if item["media_id"] == "P1")
+        self.assertNotIn("h3_tag", row)
+        self.assertNotIn("tag", row)
         self.assertEqual(row["filename"], picture_path.name)
         self.assertEqual(
             row["caption"],
@@ -315,6 +340,10 @@ class DirectorTimelineDragTests(unittest.TestCase):
             context["media_capacity"]["image"] - 1,
         )
         serialized = json.dumps(context, ensure_ascii=False)
+        self.assertNotIn(
+            "<Picture 1>",
+            json.dumps(context["existing_media"], ensure_ascii=False),
+        )
         self.assertNotIn(str(picture_path.resolve()), serialized)
         self.assertNotIn(str(media_root.resolve()), serialized)
         window.project_dirty = False
@@ -607,10 +636,10 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("living cave scene", final_shot.subject_action)
         self.assertEqual(final_shot.camera_movement, "Slow push in")
         window._sync_prompt_panel_from_timeline(force=True)
-        self.assertIn("AI reference P3", window.prompt_panel.shots.toPlainText())
+        self.assertIn("AI reference @P3", window.prompt_panel.shots.toPlainText())
         compiled_spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
         self.assertTrue(
-            any("AI-enriched media reference P3" in shot for shot in compiled_spec.shots)
+            any("AI-enriched media reference @P3" in shot for shot in compiled_spec.shots)
         )
         saved_cue = next(
             row for row in window._project_payload()["director_cues"] if row["cue_id"] == "S3"
@@ -1923,10 +1952,19 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("Southern Cross", brief)
         self.assertIn("螢光蟲同南十字座上下呼應", brief)
         self.assertIn("ignore superseded AI Design placeholder descriptions", brief)
-        self.assertIn("P3", brief)
-        self.assertIn("A1", brief)
+        self.assertIn("@P3", brief)
+        self.assertIn("@A1", brief)
         spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
         self.assertIn("Voice-over says exactly", spec.shot_ranges[0]["description"])
+        segment_prompt = window._prompt_for_window(
+            8.0,
+            12.0,
+            [picture, audio],
+            is_final_window=True,
+        )
+        self.assertIn("AI-enriched media reference <Picture 1>", segment_prompt)
+        self.assertNotIn("@P3", segment_prompt)
+        self.assertNotIn("@A1", segment_prompt)
         self.assertIn("螢光蟲同南十字座上下呼應", spec.shot_ranges[0]["description"])
         window.project_dirty = False
         window.close()
@@ -1998,6 +2036,525 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(calls[0][2], 987654321)
         payload = window._project_payload()
         self.assertIn("render_settings", payload)
+        window.project_dirty = False
+        window.close()
+
+    def test_active_api_export_rebuilds_dynamic_mapping_before_compile(self):
+        window = DirectorCutStudio()
+        window.prompt_panel.brief.setPlainText("Use the current Timeline references.")
+        with (
+            patch.object(window, "generate_prompt", wraps=window.generate_prompt) as regenerate,
+            patch(
+                "director_cut_studio.QFileDialog.getSaveFileName",
+                return_value=("", ""),
+            ),
+        ):
+            window.export_active_api()
+        regenerate.assert_called_once_with(interactive=False)
+        window.project_dirty = False
+        window.close()
+
+    def test_native_render_track_filters_and_prompt_ordinals_stay_aligned(self):
+        window = DirectorCutStudio()
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        videos = [asset for asset in window.scan.assets if asset.media_type == "video"]
+        audios = [asset for asset in window.scan.assets if asset.media_type == "audio"]
+        selected = (pictures[0], pictures[3], videos[1], audios[0], audios[2])
+        track_ids = ("V1", "V2", "V3", "A1", "A2")
+        for asset, track_id in zip(selected, track_ids):
+            asset.timeline_placed = True
+            asset.timeline_track_id = track_id
+            asset.start_seconds = 0.0
+            asset.end_seconds = 12.0
+        next(track for track in window.tracks if track.track_id == "V1").visible = False
+        next(track for track in window.tracks if track.track_id == "A1").muted = True
+        window.prompt_panel.brief.setPlainText(
+            "Use @P1 and @P4 with @V2 motion, @A1 dialogue and @A3 music."
+        )
+
+        compiled, active = window._compiled_job(
+            megapixels=0.2,
+            seed=123,
+            enable_rtx_vsr=False,
+        )
+        self.assertNotIn(pictures[0], active)
+        self.assertIn(pictures[3], active)
+        self.assertIn(videos[1], active)
+        self.assertNotIn(audios[0], active)
+        self.assertIn(audios[2], active)
+        prompt = next(
+            node["inputs"]["value"]
+            for node in compiled.values()
+            if node.get("class_type") == "PrimitiveStringMultiline"
+        )
+        self.assertIn("[P1 reference is inactive in this segment]", prompt)
+        self.assertIn("<Picture 1>", prompt)
+        self.assertNotIn("<Picture 2>", prompt)
+        self.assertIn("<Video 1>", prompt)
+        self.assertIn("[A1 reference is inactive in this segment]", prompt)
+        # V2's synchronized soundtrack is Audio 1, so standalone A3 is Audio 2.
+        self.assertIn("<Audio 2>", prompt)
+        h3_inputs = compiled[window.scan.h3_node_ids[0]]["inputs"]
+        self.assertNotIn(pictures[0].binding, h3_inputs)
+        self.assertIn(pictures[3].binding, h3_inputs)
+        self.assertIn(videos[1].paired_audio_binding, h3_inputs)
+        self.assertNotIn(audios[0].binding, h3_inputs)
+        self.assertIn(audios[2].binding, h3_inputs)
+        window.project_dirty = False
+        window.close()
+
+    def test_partial_native_rerender_uses_local_shot_time_and_only_its_references(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        pictures[0].timeline_placed = True
+        pictures[0].timeline_track_id = "V1"
+        pictures[0].start_seconds, pictures[0].end_seconds = 0.0, 10.0
+        pictures[3].timeline_placed = True
+        pictures[3].timeline_track_id = "V2"
+        pictures[3].start_seconds, pictures[3].end_seconds = 16.0, 22.0
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 8.0, "Opening action", track_id="V1"),
+            DirectorCue(
+                "S2",
+                "shot",
+                16.0,
+                22.0,
+                "Escape action",
+                subject_action="Use @P4 while the subject escapes.",
+                track_id="V2",
+            ),
+        ]
+        window.prompt_panel.brief.setPlainText("Create the complete 30-second story.")
+        window.clip_start.setValue(15.0)
+        window.clip_end.setValue(23.0)
+
+        compiled, active = window._compiled_job(
+            megapixels=0.2,
+            seed=456,
+            enable_rtx_vsr=False,
+        )
+        self.assertNotIn(pictures[0], active)
+        self.assertIn(pictures[3], active)
+        prompt = next(
+            node["inputs"]["value"]
+            for node in compiled.values()
+            if node.get("class_type") == "PrimitiveStringMultiline"
+        )
+        self.assertIn("Generate only the timeline interval from 15.00s to 23.00s", prompt)
+        self.assertIn("[Shot 1 | 00:01.000-00:07.000]", prompt)
+        self.assertIn("<Picture 1>", prompt)
+        self.assertNotIn("Opening action", prompt)
+        self.assertNotIn("00:16.000", prompt)
+        window.project_dirty = False
+        window.close()
+
+    def test_end_to_end_smart_job_keeps_segment_mapping_and_upload_loaders_aligned(self):
+        image = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.png"
+        video = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
+        audio = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.wav"
+        if not all(path.is_file() for path in (image, video, audio)):
+            self.skipTest("runtime smoke media is not present")
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        videos = [asset for asset in window.scan.assets if asset.media_type == "video"]
+        audios = [asset for asset in window.scan.assets if asset.media_type == "audio"]
+        rows = (
+            (pictures[3], image, "V1", 0.0, 15.0, "Opening identity @P4."),
+            (pictures[6], image, "V1", 15.0, 30.0, "Later environment @P7."),
+            (videos[1], video, "V2", 15.0, 30.0, "Follow @V2 motion."),
+            (audios[2], audio, "A2", 15.0, 30.0, "Use @A3 exactly."),
+        )
+        for asset, local, track_id, start, end, clip_prompt in rows:
+            assign_local_media(window.scan, asset, local)
+            asset.timeline_placed = True
+            asset.timeline_track_id = track_id
+            asset.start_seconds, asset.end_seconds = start, end
+            asset.clip_prompt = clip_prompt
+        window.prompt_panel.brief.setPlainText(
+            "Use @P4 in the opening, then @P7, @V2 and @A3 in the second half."
+        )
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(30.0)
+
+        job_path, count = window._build_smart_render_job(
+            request_kind="preview",
+            megapixels=0.2,
+            seed=789,
+            enable_rtx_vsr=False,
+        )
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        self.assertEqual(count, 2)
+        self.assertTrue(job["media"])
+        self.assertTrue(all(isinstance(row, dict) for row in job["media"]))
+        self.assertEqual(
+            len({row["upload_name"] for row in job["media"]}), len(job["media"])
+        )
+
+        first, second = job["segments"]
+        first_prompt = next(
+            node["inputs"]["value"]
+            for node in first["workflow"].values()
+            if node.get("class_type") == "PrimitiveStringMultiline"
+        )
+        second_prompt = next(
+            node["inputs"]["value"]
+            for node in second["workflow"].values()
+            if node.get("class_type") == "PrimitiveStringMultiline"
+        )
+        self.assertIn("<Picture 1>", first_prompt)
+        self.assertNotIn("<Picture 2>", first_prompt)
+        self.assertIn("<Picture 1>", second_prompt)
+        self.assertIn("<Video 1> contains exactly the preceding segment", second_prompt)
+        self.assertIn("<Video 2>", second_prompt)
+        self.assertIn("<Audio 1> is the enabled synchronized soundtrack", second_prompt)
+        self.assertIn("<Audio 2>", second_prompt)
+        self.assertNotIn("@P", first_prompt + second_prompt)
+        self.assertNotIn("@V", first_prompt + second_prompt)
+        self.assertNotIn("@A", first_prompt + second_prompt)
+        uploads_by_node = {
+            row["loader_node_id"]: row for row in job["media"]
+        }
+        active_nodes_by_segment = (
+            {pictures[3].node_id},
+            {pictures[6].node_id, videos[1].node_id, audios[2].node_id},
+        )
+        for segment, active_nodes in zip(job["segments"], active_nodes_by_segment):
+            for node_id in active_nodes:
+                upload = uploads_by_node[node_id]
+                node = segment["workflow"][node_id]
+                self.assertEqual(
+                    node["inputs"][upload["loader_input"]],
+                    upload["upload_name"],
+                )
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_single_native_window_1_to_15(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        picture = [a for a in window.scan.assets if a.media_type == "image"][3]
+        self._place(picture, 1.0, 15.0, "V1", "Use @P4 as the only subject reference.")
+        window.clip_start.setValue(1.0)
+        window.clip_end.setValue(15.0)
+
+        workflow, active = window._compiled_job(
+            megapixels=0.2, seed=101, enable_rtx_vsr=False
+        )
+        prompt = self._workflow_prompt(workflow)
+        h3 = self._h3_inputs(window, workflow)
+        self.assertEqual(active, [picture])
+        self.assertIn("<Picture 1>", prompt)
+        self.assertNotIn("<Picture 2>", prompt)
+        self.assertIn(picture.binding, h3)
+        self.assertEqual(h3[picture.binding], [picture.node_id, 0])
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_partial_14_to_20_crosses_reference_boundary(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        pictures = [a for a in window.scan.assets if a.media_type == "image"]
+        first = self._place(pictures[3], 10.0, 16.0, "V1", "Opening uses @P4.")
+        second = self._place(pictures[6], 16.0, 24.0, "V2", "Continuation uses @P7.")
+        window.director_cues = [
+            DirectorCue("S1", "shot", 14.0, 16.0, "First half", track_id="V1"),
+            DirectorCue("S2", "shot", 16.0, 20.0, "Second half", track_id="V2"),
+        ]
+        window.clip_start.setValue(14.0)
+        window.clip_end.setValue(20.0)
+
+        workflow, active = window._compiled_job(
+            megapixels=0.2, seed=102, enable_rtx_vsr=False
+        )
+        prompt = self._workflow_prompt(workflow)
+        h3 = self._h3_inputs(window, workflow)
+        self.assertEqual(active, [first, second])
+        self.assertIn("[Shot 1 | 00:00.000-00:02.000]", prompt)
+        self.assertIn("[Shot 2 | 00:02.000-00:06.000]", prompt)
+        self.assertIn("<Picture 1>", prompt)
+        self.assertIn("<Picture 2>", prompt)
+        self.assertEqual(h3[first.binding], [first.node_id, 0])
+        self.assertEqual(h3[second.binding], [second.node_id, 0])
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_long_1_to_30_builds_two_local_jobs(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(31.0)
+        pictures = [a for a in window.scan.assets if a.media_type == "image"]
+        first = self._place(pictures[3], 1.0, 16.0, "V1", "First half uses @P4.")
+        second = self._place(pictures[6], 16.0, 30.0, "V2", "Second half uses @P7.")
+        window.clip_start.setValue(1.0)
+        window.clip_end.setValue(30.0)
+
+        job_path, count = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=103,
+            enable_rtx_vsr=False,
+        )
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        self.assertEqual(count, 2)
+        self.assertEqual(job["target_duration_seconds"], 29.0)
+        self.assertEqual(
+            [(s["start_seconds"], s["end_seconds"]) for s in job["segments"]],
+            [(1.0, 16.0), (16.0, 30.0)],
+        )
+        first_job, second_job = job["segments"]
+        self.assertIn("<Picture 1>", self._workflow_prompt(first_job["workflow"]))
+        self.assertIn("First half", self._workflow_prompt(first_job["workflow"]))
+        self.assertNotIn("Second half", self._workflow_prompt(first_job["workflow"]))
+        self.assertIn("<Picture 1>", self._workflow_prompt(second_job["workflow"]))
+        self.assertIn("Second half", self._workflow_prompt(second_job["workflow"]))
+        self.assertNotIn("First half", self._workflow_prompt(second_job["workflow"]))
+        self.assertEqual(
+            self._h3_inputs(window, first_job["workflow"])[first.binding],
+            [first.node_id, 0],
+        )
+        self.assertEqual(
+            self._h3_inputs(window, second_job["workflow"])[second.binding],
+            [second.node_id, 0],
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_long_context_reserves_video_1_without_renumbering_media(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        videos = [a for a in window.scan.assets if a.media_type == "video"]
+        video = self._place(videos[1], 15.0, 30.0, "V2", "Follow @V2 motion.")
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(30.0)
+
+        job_path, _ = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=104,
+            enable_rtx_vsr=False,
+        )
+        second = json.loads(job_path.read_text(encoding="utf-8"))["segments"][1]
+        prompt = self._workflow_prompt(second["workflow"])
+        h3 = self._h3_inputs(window, second["workflow"])
+        self.assertEqual(second["continuity"]["kind"], "video")
+        self.assertEqual(second["continuity"]["frame_count"], 24)
+        self.assertEqual(second["continuity"]["tag"], "<Video 1>")
+        self.assertIn("<Video 1> contains exactly the preceding segment", prompt)
+        self.assertIn("<Video 2>", prompt)
+        self.assertIn(video.binding, h3)
+        self.assertEqual(
+            h3[video.binding],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][video.binding],
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_edit_each_segment_changes_only_its_fingerprint(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(45.0)
+        pictures = [a for a in window.scan.assets if a.media_type == "image"]
+        placed = [
+            self._place(pictures[0], 0.0, 15.0, "V1", "Segment one @P1."),
+            self._place(pictures[3], 15.0, 30.0, "V1", "Segment two @P4."),
+            self._place(pictures[6], 30.0, 45.0, "V1", "Segment three @P7."),
+        ]
+        windows = [(0.0, 15.0), (15.0, 30.0), (30.0, 45.0)]
+
+        def fingerprints():
+            return [
+                window._compiled_window_job(
+                    start, end, megapixels=0.2, seed=105,
+                    enable_rtx_vsr=False, is_final_window=index == 2,
+                    continuity_mode="none",
+                )[3]
+                for index, (start, end) in enumerate(windows)
+            ]
+
+        baseline = fingerprints()
+        for changed_index, asset in enumerate(placed):
+            original = asset.clip_prompt
+            asset.clip_prompt = original + " Edited locally."
+            changed = fingerprints()
+            self.assertEqual(
+                [index for index, pair in enumerate(zip(baseline, changed)) if pair[0] != pair[1]],
+                [changed_index],
+            )
+            asset.clip_prompt = original
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_edit_packed_small_segment_stays_local(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 10.0, "Part one", track_id="V1"),
+            DirectorCue("S2", "shot", 10.0, 20.0, "Part two", track_id="V1"),
+            DirectorCue("S3", "shot", 20.0, 30.0, "Part three", track_id="V1"),
+        ]
+        pictures = [a for a in window.scan.assets if a.media_type == "image"]
+        self._place(pictures[0], 0.0, 10.0, "V1", "Small segment @P1.")
+        middle = self._place(pictures[3], 10.0, 20.0, "V1", "Small segment @P4.")
+        self._place(pictures[6], 20.0, 30.0, "V1", "Small segment @P7.")
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(30.0)
+        first_path, _ = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=106,
+            enable_rtx_vsr=False,
+        )
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(s["start_seconds"], s["end_seconds"]) for s in first["segments"]],
+            [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)],
+        )
+        middle.clip_prompt += " Changed only here."
+        second_path, _ = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=106,
+            enable_rtx_vsr=False,
+        )
+        second = json.loads(second_path.read_text(encoding="utf-8"))
+        changed = [
+            index for index, (before, after) in enumerate(zip(first["segments"], second["segments"]))
+            if before["fingerprint"] != after["fingerprint"]
+        ]
+        self.assertEqual(changed, [1])
+        for index, segment in enumerate(second["segments"]):
+            h3 = self._h3_inputs(window, segment["workflow"])
+            self.assertEqual(
+                len([key for key in h3 if key.startswith("ref_images.ref_image_")]),
+                1,
+            )
+            self.assertIn("<Picture 1>", self._workflow_prompt(segment["workflow"]))
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_delete_then_readd_preserves_stable_source_identity(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(15.0)
+        picture = [a for a in window.scan.assets if a.media_type == "image"][3]
+        self._place(picture, 2.0, 8.0, "V1", "Use @P4.")
+
+        before, active_before = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=107, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )[:2]
+        picture.timeline_placed = False
+        deleted, active_deleted = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=107, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )[:2]
+        self._place(picture, 9.0, 14.0, "V2", "Reuse @P4 later.")
+        readded, active_readded = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=107, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )[:2]
+
+        self.assertEqual(active_before, [picture])
+        self.assertEqual(active_deleted, [])
+        self.assertEqual(active_readded, [picture])
+        self.assertIn(picture.binding, self._h3_inputs(window, before))
+        self.assertNotIn(picture.binding, self._h3_inputs(window, deleted))
+        self.assertIn(picture.binding, self._h3_inputs(window, readded))
+        self.assertIn("<Picture 1>", self._workflow_prompt(readded))
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_move_between_segments_dirties_old_and_new_windows(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        picture = [a for a in window.scan.assets if a.media_type == "image"][3]
+        self._place(picture, 2.0, 8.0, "V1", "Move @P4.")
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(30.0)
+        before_state = timeline_state(picture)
+        early_before = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=108, enable_rtx_vsr=False,
+            is_final_window=False, continuity_mode="none",
+        )[1]
+        picture.start_seconds, picture.end_seconds = 22.0, 28.0
+        after_state = timeline_state(picture)
+        window._mark_render_states_dirty(before_state, after_state)
+        early_after = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=108, enable_rtx_vsr=False,
+            is_final_window=False, continuity_mode="none",
+        )[1]
+        late_after = window._compiled_window_job(
+            15.0, 30.0, megapixels=0.2, seed=108, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )[1]
+
+        self.assertEqual(early_before, [picture])
+        self.assertEqual(early_after, [])
+        self.assertEqual(late_after, [picture])
+        self.assertEqual(
+            window.render_dirty_segment_ids,
+            {segment.segment_id for segment in window._planned_render_segments()},
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_move_between_visible_tracks_keeps_binding(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(15.0)
+        picture = [a for a in window.scan.assets if a.media_type == "image"][3]
+        self._place(picture, 0.0, 15.0, "V1", "Track move @P4.")
+        first, first_assets, _, first_fingerprint = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=109, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )
+        picture.timeline_track_id = "V2"
+        second, second_assets, _, second_fingerprint = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=109, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )
+        next(track for track in window.tracks if track.track_id == "V2").visible = False
+        hidden, hidden_assets = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=109, enable_rtx_vsr=False,
+            is_final_window=True, continuity_mode="none",
+        )[:2]
+
+        self.assertEqual(first_assets, [picture])
+        self.assertEqual(second_assets, [picture])
+        self.assertEqual(first_fingerprint, second_fingerprint)
+        self.assertEqual(
+            self._h3_inputs(window, first)[picture.binding],
+            self._h3_inputs(window, second)[picture.binding],
+        )
+        self.assertEqual(hidden_assets, [])
+        self.assertNotIn(picture.binding, self._h3_inputs(window, hidden))
+        window.project_dirty = False
+        window.close()
+
+    def test_mapping_matrix_repeated_source_on_same_track_maps_once_per_window(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        picture = [a for a in window.scan.assets if a.media_type == "image"][3]
+        self._place(picture, 1.0, 4.0, "V1", "Opening occurrence @P4.")
+        repeat = deepcopy(picture)
+        repeat.clip_id = "repeat-p4-25s"
+        repeat.source_node_id = picture.node_id
+        repeat.start_seconds, repeat.end_seconds = 25.0, 30.0
+        repeat.clip_prompt = "Closing occurrence @P4."
+        window.scan.timeline_clips.append(repeat)
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(30.0)
+
+        job_path, count = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=110,
+            enable_rtx_vsr=False,
+        )
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        self.assertEqual(count, 2)
+        first, second = job["segments"]
+        for segment in (first, second):
+            prompt = self._workflow_prompt(segment["workflow"])
+            h3 = self._h3_inputs(window, segment["workflow"])
+            self.assertIn("<Picture 1>", prompt)
+            self.assertEqual(
+                [key for key in h3 if key.startswith("ref_images.ref_image_")],
+                [picture.binding],
+            )
+            self.assertEqual(h3[picture.binding], [picture.node_id, 0])
+        self.assertIn("Opening occurrence", self._workflow_prompt(first["workflow"]))
+        self.assertNotIn("Closing occurrence", self._workflow_prompt(first["workflow"]))
+        self.assertIn("Closing occurrence", self._workflow_prompt(second["workflow"]))
+        self.assertNotIn("Opening occurrence", self._workflow_prompt(second["workflow"]))
         window.project_dirty = False
         window.close()
 

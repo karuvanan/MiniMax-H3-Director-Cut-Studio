@@ -505,7 +505,7 @@ def effective_reference_assets(
         for asset in clones:
             if asset.media_type != kind:
                 continue
-            key = (asset.node_id, asset.binding)
+            key = (asset.source_node_id or asset.node_id, asset.binding)
             groups.setdefault(key, []).append(asset)
         return [
             (binding_index(group[0]), group)
@@ -549,6 +549,195 @@ def effective_reference_assets(
             for asset in group:
                 asset.tag = f"<Audio {ordinal}>"
     return clones, extra_tag
+
+
+_REFERENCE_TOKEN_RE = re.compile(
+    r"@(?P<short_kind>[PVA])\s*(?P<short_number>\d+)"
+    r"|<\s*(?P<long_kind>Picture|Video|Audio)\s+"
+    r"(?P<long_number>\d+)\s*>",
+    flags=re.IGNORECASE,
+)
+
+
+def stable_reference_id(asset: MediaAsset) -> str:
+    """Return the permanent Media Pool ID for an asset (P4/V2/A1).
+
+    ``asset.tag`` is request-local after :func:`effective_reference_assets`, so
+    it cannot be used as an editor identity.  The physical H3 binding remains
+    stable and is also shared by repeated Timeline Clip Instances.
+    """
+    prefixes = {"image": "P", "video": "V", "audio": "A"}
+    prefix = prefixes.get(asset.media_type, "M")
+    binding_patterns = {
+        "image": r"ref_images\.ref_image_(\d+)$",
+        "video": r"ref_videos\.ref_video_(\d+)$",
+        "audio": r"ref_audios\.ref_audio_(\d+)$",
+    }
+    match = re.search(binding_patterns.get(asset.media_type, r"$^"), asset.binding)
+    if match:
+        return f"{prefix}{int(match.group(1)) + 1}"
+    tag_number = re.search(r"(\d+)", asset.tag)
+    return f"{prefix}{tag_number.group(1) if tag_number else '?'}"
+
+
+def _reference_source_key(asset: MediaAsset) -> tuple[str, str, str]:
+    return (
+        asset.media_type,
+        asset.source_node_id or asset.node_id,
+        asset.binding,
+    )
+
+
+def paired_audio_reference_tags(
+    effective_assets: list[MediaAsset],
+) -> dict[tuple[str, str, str], str]:
+    """Return effective ``<Audio N>`` labels for enabled video soundtracks.
+
+    H3 numbers visual video references independently from audio signals.  An
+    active video's explicitly connected ``ref_video_audio`` output enters the
+    Audio sequence before standalone ``ref_audio`` inputs in this workflow.
+    The result is keyed by the same permanent source identity used by dynamic
+    reference remapping, so repeated Clip Instances share one audio label.
+    """
+    groups: dict[tuple[str, str, str], MediaAsset] = {}
+    for asset in effective_assets:
+        if asset.media_type != "video" or not asset.paired_audio_binding:
+            continue
+        groups.setdefault(_reference_source_key(asset), asset)
+
+    def binding_index(asset: MediaAsset) -> int:
+        match = re.search(r"_(\d+)$", asset.paired_audio_binding)
+        return int(match.group(1)) if match else 10_000
+
+    return {
+        key: f"<Audio {ordinal}>"
+        for ordinal, (key, _asset) in enumerate(
+            sorted(groups.items(), key=lambda item: binding_index(item[1])),
+            1,
+        )
+    }
+
+
+def remap_reference_tokens(
+    text: str,
+    source_assets: list[MediaAsset],
+    effective_assets: list[MediaAsset],
+) -> str:
+    """Compile stable/legacy editor references into request-local H3 tags.
+
+    Authored ``@P4`` and legacy ``<Picture 4>`` both mean the permanent
+    physical Media Pool source P4.  If P4 is connected in the current request,
+    it is replaced with its actual H3 ordinal (which may be ``<Picture 1>``).
+    An inactive or unknown source is rendered as non-token text so it can never
+    silently bind to a different active reference with the same request-local
+    ordinal.
+    """
+    if not text:
+        return text
+
+    source_by_id = {
+        stable_reference_id(asset).upper(): asset
+        for asset in source_assets
+        if stable_reference_id(asset) not in {"P?", "V?", "A?", "M?"}
+    }
+    effective_by_source = {
+        _reference_source_key(asset): asset.tag
+        for asset in effective_assets
+        if asset.tag and asset.tag != "—"
+    }
+    long_prefix = {"PICTURE": "P", "VIDEO": "V", "AUDIO": "A"}
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group("short_kind"):
+            stable_id = (
+                match.group("short_kind").upper()
+                + str(int(match.group("short_number")))
+            )
+        else:
+            stable_id = (
+                long_prefix[match.group("long_kind").upper()]
+                + str(int(match.group("long_number")))
+            )
+        source = source_by_id.get(stable_id)
+        if source is None:
+            return f"[{stable_id} reference is unavailable]"
+        effective_tag = effective_by_source.get(_reference_source_key(source))
+        if effective_tag:
+            return effective_tag
+        return f"[{stable_id} reference is inactive in this segment]"
+
+    return _REFERENCE_TOKEN_RE.sub(replace, str(text))
+
+
+def remap_reference_value(
+    value: Any,
+    source_assets: list[MediaAsset],
+    effective_assets: list[MediaAsset],
+) -> Any:
+    """Recursively remap reference tokens inside PromptSpec-compatible data."""
+    if isinstance(value, str):
+        return remap_reference_tokens(value, source_assets, effective_assets)
+    if isinstance(value, list):
+        return [
+            remap_reference_value(item, source_assets, effective_assets)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            remap_reference_value(item, source_assets, effective_assets)
+            for item in value
+        )
+    if isinstance(value, dict):
+        return {
+            key: remap_reference_value(item, source_assets, effective_assets)
+            for key, item in value.items()
+        }
+    return value
+
+
+def media_upload_manifest(assets: list[MediaAsset]) -> list[dict[str, str]]:
+    """Describe unique local uploads for the physical loader sources.
+
+    ComfyUI uploads use ``overwrite=true``. Two unrelated local files can share
+    a basename, so sending only ``image.png`` would let the later upload replace
+    the first one. Each physical loader receives a deterministic request-local
+    name and repeated Timeline instances collapse back to that same source.
+    """
+    loader_inputs = {"image": "image", "video": "file", "audio": "audio"}
+    rows: dict[tuple[str, str], dict[str, str]] = {}
+    for asset in assets:
+        local_path = str(asset.local_path or "").strip()
+        if not local_path:
+            continue
+        source_node_id = str(asset.source_node_id or asset.node_id)
+        key = (asset.media_type, source_node_id)
+        if key in rows:
+            continue
+        basename = Path(local_path).name
+        safe_node = re.sub(r"[^A-Za-z0-9_-]+", "_", source_node_id).strip("_") or "node"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", basename).strip("_") or "media"
+        upload_name = f"h3ref_{asset.media_type}_{safe_node}_{safe_name}"
+        rows[key] = {
+            "path": local_path,
+            "loader_node_id": source_node_id,
+            "loader_input": loader_inputs.get(asset.media_type, "file"),
+            "upload_name": upload_name,
+        }
+    return list(rows.values())
+
+
+def patch_media_upload_names(
+    workflow: dict[str, dict[str, Any]],
+    uploads: list[dict[str, str]],
+) -> None:
+    """Point compiled loader nodes at their collision-safe uploaded names."""
+    for row in uploads:
+        node = workflow.get(str(row.get("loader_node_id", "")))
+        upload_name = str(row.get("upload_name", "")).strip()
+        loader_input = str(row.get("loader_input", "")).strip()
+        if not isinstance(node, dict) or not upload_name or not loader_input:
+            continue
+        node.setdefault("inputs", {})[loader_input] = upload_name
 
 
 def timed_reference_rules(assets: list[MediaAsset]) -> tuple[str, str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+from dataclasses import asdict
 from pathlib import Path
 import threading
 import tkinter as tk
@@ -28,7 +29,10 @@ from version_info import APP_VERSION
 from workflow_engine import (
     WorkflowScan,
     compile_active_workflow,
+    effective_reference_assets,
     load_workflow,
+    remap_reference_value,
+    stable_reference_id,
     timed_reference_rules,
 )
 
@@ -59,6 +63,7 @@ class PromptStudio(tk.Tk):
         self.minsize(1050, 680)
         self.configure(background="#11151c")
         self.workflow_scan: WorkflowScan | None = None
+        self.output_mapping_signature = ""
         self.skill_profiles = load_skill_profiles(Path.cwd())
         self.current_special_key: str | None = None
         self._configure_style()
@@ -473,8 +478,16 @@ class PromptStudio(tk.Tk):
         default_profile = self._default_profile()
         special_profile = self._special_profile()
         active = self.workflow_scan.active_assets(start, end)
-        prompt = self._get(self.output) or build_ref2va_prompt(
-            self._spec(), active, end - start, default_profile, special_profile
+        prompt_assets, _ = effective_reference_assets(active)
+        existing_prompt = self._get(self.output)
+        prompt = (
+            existing_prompt
+            if existing_prompt
+            and self.output_mapping_signature == self._reference_mapping_signature()
+            else build_ref2va_prompt(
+                self._spec(), prompt_assets, end - start, default_profile,
+                special_profile, source_assets=self.workflow_scan.assets,
+            )
         )
         compiled, active = compile_active_workflow(self.workflow_scan, start, end, prompt=prompt)
         filename = filedialog.asksaveasfilename(
@@ -569,9 +582,39 @@ class PromptStudio(tk.Tk):
             return False
         return True
 
-    def _set_output(self, text: str, spec: PromptSpec) -> None:
+    def _reference_mapping_signature(self) -> str:
+        if not self.workflow_scan:
+            return ""
+        try:
+            start, end = self._clip_window()
+        except ValueError:
+            return ""
+        active = self.workflow_scan.active_assets(start, end)
+        effective, _ = effective_reference_assets(active)
+        rows = sorted(
+            (
+                stable_reference_id(asset),
+                asset.tag,
+                asset.source_node_id or asset.node_id,
+                asset.binding,
+            )
+            for asset in effective
+        )
+        return json.dumps([start, end, rows], ensure_ascii=False)
+
+    def _set_output(
+        self,
+        text: str,
+        spec: PromptSpec,
+        mapping_signature: str | None = None,
+    ) -> None:
         self.output.delete("1.0", "end")
         self.output.insert("1.0", text.strip())
+        self.output_mapping_signature = (
+            self._reference_mapping_signature()
+            if mapping_signature is None
+            else mapping_signature
+        )
         report = validate_prompt(text, reference_tags_from_spec(spec))
         self.check.delete("1.0", "end")
         self.check.insert("1.0", report.as_text())
@@ -589,12 +632,21 @@ class PromptStudio(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror(APP_TITLE, str(exc))
                 return
-            assets = self.workflow_scan.active_assets(start, end)
+            active_assets = self.workflow_scan.active_assets(start, end)
+            assets, _ = effective_reference_assets(active_assets)
+            source_assets = self.workflow_scan.assets
+            validation_spec = PromptSpec(
+                **remap_reference_value(asdict(spec), source_assets, assets)
+            )
             duration = end - start
         else:
-            assets, duration = [], 5.0
+            assets, source_assets, validation_spec, duration = [], None, spec, 5.0
         self._set_output(
-            build_ref2va_prompt(spec, assets, duration, default_profile, special_profile), spec
+            build_ref2va_prompt(
+                spec, assets, duration, default_profile, special_profile,
+                source_assets=source_assets,
+            ),
+            validation_spec,
         )
 
     def _generate_ai(self) -> None:
@@ -606,6 +658,23 @@ class PromptStudio(tk.Tk):
         api_key = self.key_var.get()
         default_profile = self._default_profile()
         special_profile = self._special_profile()
+        api_spec = spec
+        mapping_signature = self._reference_mapping_signature()
+        if self.workflow_scan:
+            try:
+                start, end = self._clip_window()
+            except ValueError as exc:
+                messagebox.showerror(APP_TITLE, str(exc))
+                return
+            active = self.workflow_scan.active_assets(start, end)
+            effective, _ = effective_reference_assets(active)
+            api_spec = PromptSpec(
+                **remap_reference_value(
+                    asdict(spec),
+                    self.workflow_scan.assets,
+                    effective,
+                )
+            )
         if not endpoint or not model:
             messagebox.showwarning(APP_TITLE, "AI 英文润色需要填写完整 Endpoint 和模型名称。")
             return
@@ -617,13 +686,16 @@ class PromptStudio(tk.Tk):
                     endpoint,
                     api_key,
                     model,
-                    spec,
+                    api_spec,
                     system_prompt=profile_system_prompt(default_profile, special_profile),
                 )
             except Exception as exc:  # Surface network/provider errors in the UI.
                 self.after(0, lambda: self._show_ai_error(str(exc)))
                 return
-            self.after(0, lambda: self._set_output(text, spec))
+            self.after(
+                0,
+                lambda: self._set_output(text, api_spec, mapping_signature),
+            )
 
         threading.Thread(target=work, daemon=True).start()
 

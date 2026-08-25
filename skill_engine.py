@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 
 from media_semantic_enrichment import enrichment_fingerprint
 from prompt_engine import PromptSpec
-from workflow_engine import MediaAsset
+from workflow_engine import (
+    MediaAsset,
+    paired_audio_reference_tags,
+    remap_reference_tokens,
+    remap_reference_value,
+    stable_reference_id,
+)
 
 
 DEFAULT_SKILL = "h3-prompt-writing"
@@ -300,7 +306,29 @@ def _transition_rows_by_boundary(
     return mapped
 
 
-def _asset_definition(asset: MediaAsset) -> str:
+def _asset_definition(
+    asset: MediaAsset,
+    source_assets: list[MediaAsset] | None = None,
+    effective_assets: list[MediaAsset] | None = None,
+    paired_audio_tag: str = "",
+) -> str:
+    def display(value: str) -> str:
+        if source_assets is None or effective_assets is None:
+            return value
+        return remap_reference_tokens(value, source_assets, effective_assets)
+
+    source_asset = asset
+    if source_assets is not None:
+        source_node_id = asset.source_node_id or asset.node_id
+        source_asset = next(
+            (
+                item for item in source_assets
+                if item.media_type == asset.media_type
+                and (item.source_node_id or item.node_id) == source_node_id
+                and item.binding == asset.binding
+            ),
+            asset,
+        )
     source = f' loaded from "{asset.filename}"' if asset.filename else ""
     analyzed_rows = []
     include_transcript = False
@@ -310,39 +338,43 @@ def _asset_definition(asset: MediaAsset) -> str:
             include_transcript = True
             continue
         if line.startswith("[") and include_transcript:
-            analyzed_rows.append("machine transcript: " + line)
+            analyzed_rows.append("machine transcript: " + display(line))
             continue
         include_transcript = False
         if line.startswith(("BLIP visual caption", "BLIP video frame", "Beat estimate", "VAD voice ratio")):
-            analyzed_rows.append(line)
+            analyzed_rows.append(display(line))
     analysis = ""
     if analyzed_rows:
         guidance = " | ".join(analyzed_rows)
         analysis = f" Analyzed planning guidance: {guidance[:1200]}."
-    number = "".join(character for character in asset.tag if character.isdigit())
-    media_prefix = {"image": "P", "video": "V", "audio": "A"}.get(asset.media_type, "M")
-    media_id = f"{media_prefix}{number}"
+    # Semantic enrichment belongs to the permanent Media Pool source.  Its
+    # fingerprint must not change when P4 is request-locally numbered as
+    # <Picture 1> in a later segment.
     current_semantic_hash = enrichment_fingerprint(
-        media_id=media_id,
-        media_type=asset.media_type,
-        filename=asset.filename,
-        recognition=asset.recognition,
-        clip_prompt=asset.clip_prompt,
-        duration_seconds=asset.source_duration_seconds,
-        timeline_start_seconds=asset.start_seconds if asset.timeline_placed else 0.0,
-        timeline_end_seconds=asset.end_seconds if asset.timeline_placed else 0.0,
+        media_id=stable_reference_id(source_asset),
+        media_type=source_asset.media_type,
+        filename=source_asset.filename,
+        recognition=source_asset.recognition,
+        clip_prompt=source_asset.clip_prompt,
+        duration_seconds=source_asset.source_duration_seconds,
+        timeline_start_seconds=(
+            source_asset.start_seconds if source_asset.timeline_placed else 0.0
+        ),
+        timeline_end_seconds=(
+            source_asset.end_seconds if source_asset.timeline_placed else 0.0
+        ),
     )
     if (
-        asset.semantic_enrichment.strip()
-        and asset.semantic_enrichment_source_hash == current_semantic_hash
+        source_asset.semantic_enrichment.strip()
+        and source_asset.semantic_enrichment_source_hash == current_semantic_hash
     ):
         semantic_lines = [
             line.strip()
-            for line in asset.semantic_enrichment.splitlines()
+            for line in source_asset.semantic_enrichment.splitlines()
             if line.strip()
             and not line.startswith(("AI PROVIDER:", "AI MODEL:", "EVIDENCE FINGERPRINT"))
         ]
-        semantic = " | ".join(semantic_lines)
+        semantic = display(" | ".join(semantic_lines))
         if len(semantic) > 2200:
             semantic = semantic[:1450].rstrip() + " … " + semantic[-700:].lstrip()
         analysis += (
@@ -350,13 +382,17 @@ def _asset_definition(asset: MediaAsset) -> str:
             + semantic
             + "."
         )
-    director_prompt = asset.clip_prompt.strip()
+    director_prompt = display(asset.clip_prompt.strip())
     if director_prompt:
         analysis += f" Director clip instruction: {director_prompt[:1200]}."
     if asset.media_type == "image":
         return f"{asset.tag} is a reference image{source} used as a concrete visual and shot-planning anchor.{analysis}"
     if asset.media_type == "video":
-        audio_note = " Its synchronized soundtrack is enabled." if asset.paired_audio_binding else ""
+        audio_note = (
+            f" Its synchronized soundtrack is enabled as {paired_audio_tag}."
+            if paired_audio_tag
+            else ""
+        )
         return f"{asset.tag} is a reference video{source} providing motion, camera, and temporal guidance.{audio_note}{analysis}"
     return f"{asset.tag} is a standalone reference audio asset{source} reused according to the target timeline.{analysis}"
 
@@ -367,8 +403,14 @@ def build_ref2va_prompt(
     duration: float,
     default_profile: SkillProfile,
     special_profile: SkillProfile | None = None,
+    source_assets: list[MediaAsset] | None = None,
 ) -> str:
     """Deterministically build the six sections required by h3-prompt-writing."""
+    if source_assets is not None:
+        spec = PromptSpec(
+            **remap_reference_value(asdict(spec), source_assets, assets)
+        )
+
     def source_key(asset: MediaAsset) -> tuple[str, str, str]:
         return (asset.media_type, asset.source_node_id or asset.node_id, asset.binding)
 
@@ -376,6 +418,7 @@ def build_ref2va_prompt(
     for asset in assets:
         grouped.setdefault(source_key(asset), []).append(asset)
     unique_assets = [instances[0] for instances in grouped.values()]
+    paired_audio_tags = paired_audio_reference_tags(unique_assets)
     visual_assets = [asset for asset in unique_assets if asset.media_type in ("image", "video")]
     audio_assets = [asset for asset in unique_assets if asset.media_type == "audio"]
     has_reused_audio = bool(audio_assets or any(a.paired_audio_binding for a in assets))
@@ -384,15 +427,31 @@ def build_ref2va_prompt(
     definition_rows: list[str] = []
     for representative in unique_assets:
         instances = grouped[source_key(representative)]
-        row = _asset_definition(representative)
+        paired_audio_tag = paired_audio_tags.get(source_key(representative), "")
+        row = _asset_definition(
+            representative,
+            source_assets,
+            assets,
+            paired_audio_tag,
+        )
         if len(instances) > 1:
             uses = "; ".join(
                 f"{asset.start_seconds:.2f}s-{asset.end_seconds:.2f}s"
-                + (f" ({asset.clip_prompt.strip()[:300]})" if asset.clip_prompt.strip() else "")
+                + (
+                    f" ({remap_reference_tokens(asset.clip_prompt.strip(), source_assets, assets)[:300]})"
+                    if asset.clip_prompt.strip() and source_assets is not None
+                    else f" ({asset.clip_prompt.strip()[:300]})" if asset.clip_prompt.strip()
+                    else ""
+                )
                 for asset in instances
             )
             row += f" Reused Timeline instances: {uses}."
         definition_rows.append(row)
+        if paired_audio_tag:
+            definition_rows.append(
+                f"{paired_audio_tag} is the enabled synchronized soundtrack from "
+                f"{representative.tag}; it follows the same active Timeline ranges."
+            )
     definitions = "\n".join(definition_rows)
     if not definitions:
         definitions = "No active reference asset is assigned to this time window."
@@ -429,6 +488,19 @@ def build_ref2va_prompt(
             f"{asset.tag}: fully_copy - the assigned signal is reused during its "
             f"{ranges} timeline range."
         )
+    for asset in visual_assets:
+        paired_audio_tag = paired_audio_tags.get(source_key(asset), "")
+        if not paired_audio_tag:
+            continue
+        instances = grouped[source_key(asset)]
+        ranges = ", ".join(
+            f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s"
+            for item in instances
+        )
+        retention_rows.append(
+            f"{paired_audio_tag}: fully_copy - the synchronized soundtrack from "
+            f"{asset.tag} is reused during its {ranges} timeline range."
+        )
     if not retention_rows:
         retention_rows.append("No active reference relationship is retained in this time window.")
 
@@ -453,7 +525,10 @@ def build_ref2va_prompt(
             "The product body color, material, silhouette, functional details, negative space, "
             "and premium restrained motion remain consistent; every visible copy line stays on one line."
         )
-    active_labels = ", ".join(asset.tag for asset in unique_assets)
+    active_labels = ", ".join(
+        [asset.tag for asset in unique_assets]
+        + list(paired_audio_tags.values())
+    )
     structured_transitions = _transition_rows_by_boundary(
         spec.transition_ranges,
         timed_shots,

@@ -635,12 +635,26 @@ def main() -> int:
     })
 
     uploaded: list[dict] = []
-    for filename in dict.fromkeys(job.get("media", [])):
-        path = Path(filename)
+    seen_uploads: set[tuple[str, str]] = set()
+    for item in job.get("media", []):
+        if isinstance(item, dict):
+            path = Path(str(item.get("path", "")))
+            upload_name = str(item.get("upload_name") or path.name)
+        else:
+            path = Path(str(item))
+            upload_name = path.name
+        upload_key = (str(path.resolve()) if path.exists() else str(path), upload_name)
+        if upload_key in seen_uploads:
+            continue
+        seen_uploads.add(upload_key)
         if path.is_file():
-            result = upload_file(server, path, http_timeout)
-            uploaded.append({"file": path.name, "result": result})
-            emit({"progress": f"Uploaded {path.name}"})
+            result = upload_file(server, path, http_timeout, upload_name)
+            uploaded.append({
+                "file": path.name,
+                "upload_name": upload_name,
+                "result": result,
+            })
+            emit({"progress": f"Uploaded {path.name} as {upload_name}"})
 
     completed: list[dict] = []
     previous_video: Path | None = None

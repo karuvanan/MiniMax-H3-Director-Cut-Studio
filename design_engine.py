@@ -340,6 +340,19 @@ def _string_list(value: object) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _canonicalize_design_media_mentions(text: object, media_ids: list[str]) -> str:
+    """Canonicalize bare IDs only for media explicitly reused by the plan."""
+    result = str(text or "")
+    for media_id in media_ids:
+        result = re.sub(
+            rf"(?<![@\w]){re.escape(media_id)}(?!\w)",
+            f"@{media_id}",
+            result,
+            flags=re.I,
+        )
+    return result
+
+
 def normalize_design_plan(
     payload: object,
     capacities: dict[str, int],
@@ -534,6 +547,35 @@ def normalize_design_plan(
         })
         reused_requirement_ids.add(requirement_id)
     plan["existing_media_uses"] = existing_media_uses
+    reused_media_ids = sorted({row["media_id"] for row in existing_media_uses})
+    if reused_media_ids:
+        for field_name in (
+            "creative_brief", "global_visual_style", "overall_soundscape",
+            "non_diegetic_music", "constraints",
+        ):
+            plan[field_name] = _canonicalize_design_media_mentions(
+                plan.get(field_name, ""), reused_media_ids
+            )
+        for row in plan.get("shots") or []:
+            for field_name in (
+                "framing", "camera_angle", "camera_movement", "subject_action",
+                "environment_response", "additional_direction",
+            ):
+                row[field_name] = _canonicalize_design_media_mentions(
+                    row.get(field_name, ""), reused_media_ids
+                )
+        for row in plan.get("transitions") or []:
+            row["direction"] = _canonicalize_design_media_mentions(
+                row.get("direction", ""), reused_media_ids
+            )
+        for row in plan.get("markers") or []:
+            row["direction"] = _canonicalize_design_media_mentions(
+                row.get("direction", ""), reused_media_ids
+            )
+        for row in existing_media_uses:
+            row["instruction"] = _canonicalize_design_media_mentions(
+                row.get("instruction", ""), reused_media_ids
+            )
 
     media_requests: list[dict] = []
     counts = {"image": 0, "video": 0, "audio": 0}
@@ -635,6 +677,10 @@ def build_design_system_prompt(context: dict) -> str:
         "additional editorial tracks exist. "
         "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. The user may "
         "refer to its stable Media Pool IDs as @P1, @P2, @V1 or @A1; write the ID without @ in existing_media_uses.media_id. "
+        "Inside creative_brief, Shot subject_action, environment_response, additional_direction, marker direction and every other "
+        "authored instruction, always cite an existing Media Pool source with its stable @P/@V/@A ID, for example @P4. Never write "
+        "a raw <Picture N>, <Video N> or <Audio N> token in authored Design JSON: those angle-bracket tags are request-local H3 "
+        "ordinals assigned only when the Studio compiles one render segment, and their numbers can change between segments. "
         "Reuse only loaded assets that genuinely satisfy the story requirement, and never invent an ID, select an empty slot, "
         "or force every existing asset into the design. Give every logical media need a concise stable requirement_id. "
         "Treat each asset's caption, clip_prompt and analysis_summary as the evidence for its content, including video-frame "

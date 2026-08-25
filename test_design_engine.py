@@ -351,6 +351,33 @@ class DesignEngineTests(unittest.TestCase):
         ))
         self.assertEqual([item["media_type"] for item in plan["media_requests"]], ["audio"])
 
+    def test_design_normalization_canonicalizes_bare_reused_media_ids(self):
+        payload = sample_design()
+        payload["shots"][0]["additional_direction"] = "Use P1 as the exact product reference."
+        payload["existing_media_uses"] = [{
+            "requirement_id": "product_reference",
+            "media_id": "P1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": 12.0,
+            "track": "V1",
+            "subject_keywords": ["product"],
+            "instruction": "Preserve P1 without replacement.",
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1",
+                "media_type": "image",
+                "loaded": True,
+            }],
+        )
+        self.assertIn("Use @P1", plan["shots"][0]["additional_direction"])
+        self.assertIn("Preserve @P1", plan["existing_media_uses"][0]["instruction"])
+
     def test_existing_media_can_return_in_separate_timeline_intervals(self):
         payload = sample_design()
         payload["existing_media_uses"] = [
@@ -450,6 +477,9 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("treat each asset's caption", prompt)
         self.assertIn("when a loaded asset satisfies that need", prompt)
         self.assertIn("multiple existing_media_uses rows", prompt)
+        self.assertIn("stable @p/@v/@a id", prompt)
+        self.assertIn("never write a raw <picture n>", prompt)
+        self.assertIn("request-local h3 ordinals", prompt)
         self.assertNotIn("when a treat each asset", prompt)
 
     def test_t2i_prompt_rejects_h3_picture_token(self):
