@@ -2,6 +2,43 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.1.0-alpha.4] - 2026-08-25
+
+### Fixed
+
+- Resynchronized the Track Header vertical offset after project loading, dynamic V-track creation and header rebuilding. Picture clips with valid V-track IDs can no longer appear visually aligned with A1/A2/A3 labels because the two panes retained different scroll positions.
+
+### Verification
+
+- `162` automated tests passed with the bundled Python environment.
+
+## [0.1.0-alpha.3] - 2026-08-25
+
+### Fixed
+
+- Gave the Timeline Tools palette a DPI-aware minimum width based on its longest button and scrollbar, so every icon keeps its visible Selection/Hand/Razor/Shot/Type/Prompt/Transition/Marker label even when the splitter is dragged left.
+
+### Verification
+
+- `161` automated tests passed with the bundled Python environment.
+
+## [0.1.0-alpha.2] - 2026-08-25
+
+### Added
+
+- Allowed AI Design plans to create and populate editorial tracks beyond V3/A3 (up to V16/A16), including separate visual title and dialogue/voice-over/lyrics lanes.
+- Added automatic cross-segment motion context using exactly the preceding 24 frames at 24 fps, without carrying prior audio.
+- Added strict single-colour, edge-connected background detection and non-destructive transparent PNG derivatives for Media Pool and Design-generated images.
+
+### Changed
+
+- Reserved one of the three physical H3 video reference inputs for hidden continuity when possible; if all are occupied, the least-specific Auto reference is released for that segment while force-active references remain untouched.
+- Raised the Smart Render policy version to `6`, invalidating older segment manifests whose continuity assumptions are no longer safe to reuse.
+
+### Verification
+
+- `161` automated tests passed with the bundled Python environment.
+
 ## [0.1.0-alpha.1] - 2026-08-25
 
 ### Added

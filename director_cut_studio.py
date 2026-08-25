@@ -148,7 +148,7 @@ DIRECTOR_LANE_TYPES = ("shot", "transition", "marker")
 DIRECTOR_LANES_TOP = TIMELINE_RULER_HEIGHT + RENDER_STATUS_BAR_HEIGHT
 TIMELINE_TRACKS_TOP = DIRECTOR_LANES_TOP + DIRECTOR_LANE_HEIGHT * len(DIRECTOR_LANE_TYPES)
 TIMELINE_SNAP_SECONDS = 0.5
-SMART_RENDER_POLICY_VERSION = 5
+SMART_RENDER_POLICY_VERSION = 6
 CONTINUITY_MODE_LABELS = (
     "Auto", "Hard Cut", "Match Action", "Motion Reference", "Transition",
 )
@@ -5663,7 +5663,10 @@ class DirectorCutStudio(QMainWindow):
         self.timeline_tool_scroll.setWidgetResizable(True)
         self.timeline_tool_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.timeline_tool_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.timeline_tool_scroll.setMinimumWidth(43)
+        # Keep the palette wide enough to show every tool label.  The splitter
+        # remains resizable, but it can no longer collapse back to icon-only
+        # mode and hide names such as Selection or Transition.
+        self.timeline_tool_scroll.setMinimumWidth(118)
         self.timeline_tool_scroll.setMaximumWidth(220)
         self.timeline_tool_scroll.setToolTip("Timeline tools · use the mouse wheel to scroll up or down")
         self.timeline_tool_scroll.setStyleSheet(
@@ -5703,11 +5706,24 @@ class DirectorCutStudio(QMainWindow):
             button.setMinimumSize(35, 34)
             button.setMaximumHeight(34)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             button.setCheckable(True)
             button.setToolTip(tooltip)
             button.clicked.connect(lambda _checked=False, value=mode: self.set_timeline_tool(value))
             self.timeline_tool_buttons[mode] = button
             tool_layout.addWidget(button)
+        scroll_width = self.timeline_tool_scroll.verticalScrollBar().sizeHint().width()
+        layout_width = tool_layout.contentsMargins().left() + tool_layout.contentsMargins().right()
+        widest_button = max(
+            button.sizeHint().width() for button in self.timeline_tool_buttons.values()
+        )
+        self.timeline_tools_minimum_width = max(
+            118, widest_button + layout_width + scroll_width + 8
+        )
+        self.timeline_tool_scroll.setMinimumWidth(self.timeline_tools_minimum_width)
+        self.timeline_tool_palette.setMinimumWidth(
+            self.timeline_tools_minimum_width - scroll_width - 4
+        )
         self.timeline_tool_buttons["selection"].setChecked(True)
         tool_layout.addStretch()
         self.timeline_tool_palette.setMinimumHeight(len(self.timeline_tool_buttons) * 38 + 10)
@@ -5767,12 +5783,24 @@ class DirectorCutStudio(QMainWindow):
         self.track_header_scroll.verticalScrollBar().valueChanged.connect(
             self.timeline.verticalScrollBar().setValue
         )
+        self.timeline.verticalScrollBar().rangeChanged.connect(
+            lambda _minimum, _maximum: QTimer.singleShot(
+                0, self._sync_timeline_track_scrolls
+            )
+        )
+        self.track_header_scroll.verticalScrollBar().rangeChanged.connect(
+            lambda _minimum, _maximum: QTimer.singleShot(
+                0, self._sync_timeline_track_scrolls
+            )
+        )
         self._rebuild_track_headers()
         self.timeline_body_splitter.addWidget(self.timeline)
         self.timeline_body_splitter.setStretchFactor(0, 0)
         self.timeline_body_splitter.setStretchFactor(1, 0)
         self.timeline_body_splitter.setStretchFactor(2, 1)
-        self.timeline_body_splitter.setSizes([43, 222, 1100])
+        self.timeline_body_splitter.setSizes(
+            [self.timeline_tools_minimum_width, 222, 1100]
+        )
         self.timeline_body_splitter.splitterMoved.connect(
             lambda _position, _index: self._refresh_timeline_tool_labels()
         )
@@ -6033,8 +6061,28 @@ class DirectorCutStudio(QMainWindow):
         self._refresh_render_status_bar()
 
     def _design_track(self, track_id: str, kind: str) -> TimelineTrack:
+        normalized = str(track_id or "").strip().upper()
+        prefix = "A" if kind == "audio" else "V"
+        match = re.fullmatch(rf"{prefix}(\d+)", normalized)
+        if match:
+            requested_number = min(16, max(1, int(match.group(1))))
+            while self._next_track_number(prefix) <= requested_number:
+                number = self._next_track_number(prefix)
+                color = "#258a70" if kind == "audio" else "#3978ba"
+                created = TimelineTrack(
+                    f"{prefix}{number}", f"{prefix}{number}", kind, color
+                )
+                if kind == "audio":
+                    self.tracks.append(created)
+                else:
+                    first_visual = next(
+                        (index for index, item in enumerate(self.tracks) if item.kind == "visual"),
+                        0,
+                    )
+                    self.tracks.insert(first_visual, created)
+            normalized = f"{prefix}{requested_number}"
         track = next(
-            (item for item in self.tracks if item.track_id == track_id and item.kind == kind),
+            (item for item in self.tracks if item.track_id == normalized and item.kind == kind),
             None,
         )
         if track:
@@ -6073,7 +6121,7 @@ class DirectorCutStudio(QMainWindow):
                     (item for item in self.tracks if item.kind == "visual"),
                     key=lambda item: int(re.sub(r"\D", "", item.track_id) or 999),
                 )
-                track = next(
+                available_track = next(
                     (
                         item for item in available
                         if not any(
@@ -6081,7 +6129,10 @@ class DirectorCutStudio(QMainWindow):
                             for start, end in visual_occupancy.get(item.track_id, [])
                         )
                     ),
-                    track,
+                    None,
+                )
+                track = available_track or self._design_track(
+                    f"V{self._next_track_number('V')}", "visual"
                 )
             if kind == "visual":
                 visual_occupancy.setdefault(track.track_id, []).append(
@@ -6179,6 +6230,12 @@ class DirectorCutStudio(QMainWindow):
                 asset.recognition += (
                     "\nBLIP concept analysis: " + str(request["concept_blip_caption"])
                 )
+            background_removal = request.get("background_removal") or {}
+            if background_removal:
+                asset.recognition += (
+                    "\nAUTO BACKGROUND REMOVAL: uniform edge-connected background removed "
+                    f"({round(float(background_removal.get('removed_ratio', 0.0)) * 100)}% transparent)."
+                )
             preview_path = Path(request.get("preview_path", ""))
             if preview_path.is_file():
                 self.preview_paths[asset.node_id] = preview_path
@@ -6205,7 +6262,16 @@ class DirectorCutStudio(QMainWindow):
                 marker["preset"], marker["direction"],
             ))
         for index, item in enumerate(plan["text_layers"], 1):
-            track = self._design_track(item.get("track", ""), "visual")
+            role = str(item.get("role", "on_screen_text"))
+            track_kind = "visual" if role == "on_screen_text" else "audio"
+            requested_track = str(item.get("track", ""))
+            if track_kind == "audio" and not requested_track.upper().startswith("A"):
+                requested_track = {
+                    "dialogue": "A4", "voice_over": "A5", "lyrics": "A6",
+                }.get(role, "A4")
+            elif track_kind == "visual" and not requested_track.upper().startswith("V"):
+                requested_track = "V4"
+            track = self._design_track(requested_track, track_kind)
             midpoint = (item["start_seconds"] + item["end_seconds"]) / 2
             shot_id = next(
                 (
@@ -6417,6 +6483,7 @@ class DirectorCutStudio(QMainWindow):
                 material["generated_by_comfyui"] = True
                 material["preview_path"] = str(destination)
                 material["concept_blip_caption"] = str(reference.get("caption", ""))
+                material["background_removal"] = dict(reference.get("background_removal") or {})
                 reused_count += 1
                 sidecar = destination.with_suffix(destination.suffix + ".request.json")
                 if sidecar.is_file():
@@ -6780,7 +6847,11 @@ class DirectorCutStudio(QMainWindow):
             if "match" in preset:
                 return "match_action"
             return "transition"
-        return "match_action"
+        # Auto continuity now carries one second of motion history (exactly
+        # 24 frames at 24 fps) into the next native H3 window.  An authored
+        # Hard Cut remains a deliberate context reset, while an explicit
+        # Match Action can still request the lighter text-only state contract.
+        return "motion_reference"
 
     def _planned_render_segments(self):
         """Return the hidden render windows represented by the current work area."""
@@ -7438,8 +7509,19 @@ class DirectorCutStudio(QMainWindow):
             return
         result = payload.get("result") or {}
         info = result.get("info") or {}
+        background_removal = result.get("background_removal") or {}
+        transparent_path = Path(str(background_removal.get("path", "")))
+        if transparent_path.is_file() and self.scan:
+            assign_local_media(self.scan, asset, transparent_path)
         if not job["preserve_recognition"] or not asset.recognition.strip():
             asset.recognition = result.get("metadata", "")
+        if transparent_path.is_file():
+            summary = (
+                "AUTO BACKGROUND REMOVAL: uniform edge-connected background removed "
+                f"({round(float(background_removal.get('removed_ratio', 0.0)) * 100)}% transparent)."
+            )
+            if summary not in asset.recognition:
+                asset.recognition = (asset.recognition.rstrip() + "\n" + summary).strip()
         preview_path = Path(result.get("preview_path", ""))
         if preview_path.is_file():
             self.preview_paths[asset.node_id] = preview_path
@@ -8238,15 +8320,10 @@ class DirectorCutStudio(QMainWindow):
     def _refresh_timeline_tool_labels(self) -> None:
         if not hasattr(self, "timeline_tool_palette"):
             return
-        available_width = (
-            self.timeline_tool_scroll.viewport().width()
-            if hasattr(self, "timeline_tool_scroll")
-            else self.timeline_tool_palette.width()
-        )
-        expanded = available_width >= 92
-        style = Qt.ToolButtonTextBesideIcon if expanded else Qt.ToolButtonIconOnly
+        minimum_width = getattr(self, "timeline_tools_minimum_width", 118)
+        self.timeline_tool_scroll.setMinimumWidth(minimum_width)
         for button in self.timeline_tool_buttons.values():
-            button.setToolButtonStyle(style)
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
     def _visual_track_is_empty_for_range(
         self,
@@ -8802,6 +8879,26 @@ class DirectorCutStudio(QMainWindow):
         self.track_header_container.setMinimumHeight(
             TIMELINE_TRACKS_TOP + sum(track.height for track in self.tracks) + 18
         )
+        # Rebuilding the header container can preserve its old scrollbar value
+        # while QGraphicsView has already returned to the top.  Defer until Qt
+        # recalculates both ranges, then make the Timeline the source of truth.
+        QTimer.singleShot(0, self._sync_timeline_track_scrolls)
+
+    def _sync_timeline_track_scrolls(self) -> None:
+        """Keep Track Header rows aligned with their Timeline scene rows."""
+        if not hasattr(self, "timeline") or not hasattr(self, "track_header_scroll"):
+            return
+        timeline_bar = self.timeline.verticalScrollBar()
+        header_bar = self.track_header_scroll.verticalScrollBar()
+        target = max(
+            header_bar.minimum(),
+            min(header_bar.maximum(), timeline_bar.value()),
+        )
+        blocked = header_bar.blockSignals(True)
+        try:
+            header_bar.setValue(target)
+        finally:
+            header_bar.blockSignals(blocked)
 
     def _refresh_track_after_command(self, track: TimelineTrack) -> None:
         header = self.track_header_widgets.get(track.track_id)
@@ -10692,19 +10789,17 @@ class DirectorCutStudio(QMainWindow):
     ) -> dict:
         """Describe one unused reference slot for the selected boundary policy.
 
-        A still extracted from the previous result is only an ordinary image
-        reference to MiniMax H3 R2V; it is not a temporally pinned first frame.
-        In practice H3 may replay that still at any point in the next segment.
-        Match-action boundaries therefore use a text-only state contract.  An
-        explicitly authored motion-reference transition can still use a free
-        video slot.
+        Match-action boundaries retain the text-only state contract.  Motion
+        and authored transition boundaries use a motion-only clip containing
+        exactly the preceding 24 frames.  One physical H3 video input is
+        reserved for that hidden context when possible.
         """
         if not self.scan or not self.scan.h3_node_ids:
             return {}
         if mode == "match_action":
             return {}
-        media_type = "video" if mode == "motion_reference" else "image"
-        if mode not in {"match_action", "motion_reference"}:
+        media_type = "video"
+        if mode not in {"motion_reference", "transition"}:
             return {}
         active_ids = {asset.node_id for asset in active_assets}
         h3_id = self.scan.h3_node_ids[0]
@@ -10739,15 +10834,52 @@ class DirectorCutStudio(QMainWindow):
             "h3_node_id": h3_id,
             "binding": asset.binding,
             "connection": list(h3_inputs[asset.binding]),
+            "frame_count": 24,
+            "fps": 24,
+            "tail_seconds": 1.0,
         }
-        if media_type == "video" and asset.paired_audio_binding and isinstance(
-            h3_inputs.get(asset.paired_audio_binding), list
-        ):
-            result["paired_audio_binding"] = asset.paired_audio_binding
-            result["paired_audio_connection"] = list(
-                h3_inputs[asset.paired_audio_binding]
-            )
+        # Deliberately do not attach the loader's paired audio output.  The
+        # preceding 24 frames are visual motion context, not prior sound to
+        # repeat at the next segment boundary.
         return result
+
+    def _reserve_continuity_video_slot(
+        self,
+        active_assets: list[MediaAsset],
+        mode: str,
+    ) -> MediaAsset | None:
+        """Free one auto video reference slot for hidden 24-frame context.
+
+        The workflow has three physical H3 video inputs even when the editor
+        owns V4+ tracks.  If all three are occupied, prefer preserving
+        force-active references and release the least temporally specific
+        automatic video reference for this render window only.
+        """
+        if mode not in {"motion_reference", "transition"}:
+            return None
+        if self._continuity_slot(active_assets, mode):
+            return None
+        candidates = [
+            asset
+            for asset in active_assets
+            if asset.media_type == "video" and asset.activation_mode != "active"
+        ]
+        if not candidates:
+            return None
+
+        def release_score(asset: MediaAsset) -> tuple[int, float, int]:
+            duration = max(0.0, asset.end_seconds - asset.start_seconds)
+            # Global/long automatic references are less specific to this
+            # boundary than a tightly timed action clip.
+            timed_specificity = 1 if duration < MAX_NATIVE_SECONDS - 1e-6 else 0
+            prompted = 1 if asset.clip_prompt.strip() else 0
+            match = re.search(r"_(\d+)$", asset.binding)
+            binding_index = int(match.group(1)) if match else 10_000
+            return timed_specificity + prompted, -duration, -binding_index
+
+        released = min(candidates, key=release_score)
+        released.enabled = False
+        return released
 
     def _reference_belongs_to_window(
         self,
@@ -10871,7 +11003,16 @@ class DirectorCutStudio(QMainWindow):
                     asset.enabled = False
 
             _, assets = compile_active_workflow(self.scan, start, end)
+            released_for_continuity = self._reserve_continuity_video_slot(
+                assets, continuity_mode
+            )
+            if released_for_continuity is not None:
+                _, assets = compile_active_workflow(self.scan, start, end)
             continuity = self._continuity_slot(assets, continuity_mode)
+            if continuity and released_for_continuity is not None:
+                continuity["reserved_from_media"] = media_shortcut(
+                    released_for_continuity
+                )
             prompt = self._prompt_for_window(
                 start,
                 end,
@@ -10883,10 +11024,11 @@ class DirectorCutStudio(QMainWindow):
                 tag = continuity.get("tag", "<reference>")
                 if continuity.get("kind") == "video":
                     continuity_rule = (
-                        f"{tag} is a short motion-only reference from immediately before this segment. "
-                        "It is context, not footage to reproduce. Do not replay, recap, restart, loop, "
-                        "or imitate its events. Begin with the next physical moment after its final "
-                        "state and execute only the current timeline action."
+                        f"{tag} contains exactly the preceding segment's final 24 motion-only frames "
+                        "at 24 fps. It is one second of temporal context, not footage to reproduce. "
+                        "Do not replay, recap, restart, loop, or imitate its events. Begin with the "
+                        "next physical moment after its final frame and execute only the current "
+                        "timeline action."
                     )
                 else:
                     continuity_rule = (

@@ -8,10 +8,11 @@ from smart_render_worker import (
     _patch_continuity,
     build_render_progress,
     build_assembly_command,
+    extract_tail_frames,
     main,
     preflight_smart_render,
 )
-from runtime_paths import PROJECT_ROOT
+from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
@@ -154,6 +155,45 @@ class SmartRenderWorkerTests(unittest.TestCase):
                 "ref_images.ref_image_4",
             ],
         )
+
+    def test_motion_continuity_extracts_exact_silent_24_frame_tail(self):
+        runtime = load_runtime_paths()
+        source = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
+        if not source.is_file():
+            self.skipTest("runtime smoke video is not present")
+        destination = PROJECT_ROOT / ".director_cache" / "continuity_24_frames.mp4"
+        destination.unlink(missing_ok=True)
+
+        extract_tail_frames(
+            runtime.ffmpeg,
+            runtime.ffprobe,
+            source,
+            destination,
+            frame_count=24,
+            fps=24,
+        )
+
+        import subprocess
+        probe = subprocess.run(
+            [
+                str(runtime.ffprobe), "-v", "error", "-count_frames",
+                "-select_streams", "v:0", "-show_entries",
+                "stream=nb_read_frames", "-of",
+                "default=noprint_wrappers=1:nokey=1", str(destination),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(int(probe.stdout.strip()), 24)
+        audio = subprocess.run(
+            [
+                str(runtime.ffprobe), "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=index", "-of", "csv=p=0",
+                str(destination),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(audio.stdout.strip(), "")
+        destination.unlink(missing_ok=True)
 
     def test_preflight_rejects_internal_segment_over_native_limit(self):
         job = {

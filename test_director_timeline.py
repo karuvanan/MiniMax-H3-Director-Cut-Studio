@@ -33,6 +33,7 @@ from director_cut_studio import (
     snap_timeline_seconds,
 )
 from runtime_paths import PROJECT_ROOT
+from design_engine import normalize_design_plan
 from design_settings import DesignAISettings
 from prompt_presets import (
     CONSTRAINT_PRESETS,
@@ -968,6 +969,32 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_ai_design_auto_creates_higher_visual_and_audio_tracks(self):
+        window = DirectorCutStudio()
+        plan = sample_design()
+        plan["shots"][0]["track"] = "V5"
+        plan["text_layers"] = [{
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "track": "V1",
+            "content": "Keep moving through the reveal.",
+            "role": "voice_over",
+            "speaker": "S1",
+            "language": "English",
+            "delivery": "Urgent",
+            "lip_sync": False,
+            "explicit_user_requested": True,
+        }]
+        plan = normalize_design_plan(plan, window.scan.counts)
+        warnings = window._apply_ai_design_direct(plan, [], replace=True)
+        self.assertTrue(any(track.track_id == "V5" for track in window.tracks))
+        self.assertTrue(any(track.track_id == "A5" for track in window.tracks))
+        self.assertEqual(window.director_cues[0].track_id, "V5")
+        self.assertEqual(window.text_layers[0].track_id, "A5")
+        self.assertEqual(warnings, [])
+        window.project_dirty = False
+        window.close()
+
     def test_media_card_drag_is_accepted_through_timeline_viewport(self):
         window = DirectorCutStudio()
         window.resize(1400, 900)
@@ -1520,7 +1547,12 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.timeline_body_splitter.setSizes([43, 222, 1000])
         self.app.processEvents()
         window._refresh_timeline_tool_labels()
-        self.assertEqual(window.timeline_tool_buttons["shot"].toolButtonStyle(), Qt.ToolButtonIconOnly)
+        self.assertGreaterEqual(
+            window.timeline_tool_scroll.width(), window.timeline_tools_minimum_width
+        )
+        self.assertEqual(
+            window.timeline_tool_buttons["shot"].toolButtonStyle(), Qt.ToolButtonTextBesideIcon
+        )
 
         window.timeline_tool_scroll.setFixedHeight(150)
         self.app.processEvents()
@@ -1532,6 +1564,41 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.app.sendEvent(window.timeline_tool_scroll.viewport(), wheel)
         self.assertGreater(scroll_bar.value(), 0)
+        window.project_dirty = False
+        window.close()
+
+    def test_track_headers_resync_after_dynamic_visual_tracks_rebuild(self):
+        window = DirectorCutStudio()
+        window.resize(1400, 650)
+        window._design_track("V12", "visual")
+        picture = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        picture.timeline_placed = True
+        picture.timeline_track_id = "V5"
+        picture.timeline_lane = 0
+        window.timeline.set_tracks(window.tracks)
+        window._rebuild_track_headers()
+        window.show()
+        self.app.processEvents()
+
+        timeline_bar = window.timeline.verticalScrollBar()
+        header_bar = window.track_header_scroll.verticalScrollBar()
+        self.assertGreater(header_bar.maximum(), 0)
+        header_bar.blockSignals(True)
+        header_bar.setValue(min(header_bar.maximum(), 40))
+        header_bar.blockSignals(False)
+        timeline_bar.setValue(0)
+        self.assertNotEqual(header_bar.value(), timeline_bar.value())
+
+        window._rebuild_track_headers()
+        self.app.processEvents()
+        self.app.processEvents()
+
+        self.assertEqual(header_bar.value(), timeline_bar.value())
+        self.assertEqual(picture.timeline_track_id, "V5")
+        self.assertEqual(
+            window.tracks[picture.timeline_lane].kind,
+            "visual",
+        )
         window.project_dirty = False
         window.close()
 
@@ -1884,15 +1951,17 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn("GLOBAL WHOLE-TIMELINE", second_prompt)
         self.assertIn("Generate only the timeline interval", second_prompt)
         self.assertIn("clean continuity handoff", second_prompt)
-        self.assertIn("Text-only boundary state", second_prompt)
-        self.assertIn("No previous rendered frame is supplied", second_prompt)
+        self.assertIn("final 24 motion-only frames", second_prompt)
+        self.assertIn("Do not replay", second_prompt)
         self.assertIn("Timeline checkpoint", second_prompt)
         self.assertIn("already completed off-screen", second_prompt)
         self.assertNotIn("final-state continuity still", second_prompt)
         self.assertNotIn("<Picture 9>", second_prompt)
-        self.assertEqual(job["segments"][1]["continuity"], {})
+        self.assertEqual(job["segments"][1]["continuity"]["kind"], "video")
+        self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
+        self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 5)
+        self.assertEqual(job["render_policy_version"], 6)
         window.project_dirty = False
         window.close()
 
@@ -1947,8 +2016,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertTrue(all(global_reference.filename in names for names in (
             first_names, second_names, third_names,
         )))
-        self.assertEqual(job["segments"][1]["continuity"], {})
-        self.assertEqual(job["segments"][2]["continuity"], {})
+        self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
+        self.assertEqual(job["segments"][2]["continuity"]["frame_count"], 24)
         window.project_dirty = False
         window.close()
 
@@ -1969,6 +2038,53 @@ class DirectorTimelineDragTests(unittest.TestCase):
         job = json.loads(job_path.read_text(encoding="utf-8"))
         self.assertEqual(job["segments"][1]["continuity_mode"], "hard_cut")
         self.assertEqual(job["segments"][1]["continuity"], {})
+        window.project_dirty = False
+        window.close()
+
+    def test_motion_context_reserves_one_auto_video_slot_but_not_force_active(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        videos = [asset for asset in window.scan.assets if asset.media_type == "video"]
+        self.assertEqual(len(videos), 3)
+        for asset in window.scan.assets:
+            asset.timeline_placed = False
+        for index, asset in enumerate(videos, 1):
+            asset.timeline_placed = True
+            asset.timeline_track_id = f"V{index}"
+            asset.start_seconds = 0.0
+            asset.end_seconds = 30.0
+            asset.activation_mode = "auto"
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 15.0, "Opening", track_id="V1"),
+            DirectorCue("S2", "shot", 15.0, 30.0, "Continue", track_id="V1"),
+        ]
+
+        job_path, _ = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=97531,
+            enable_rtx_vsr=False,
+        )
+        second = json.loads(job_path.read_text(encoding="utf-8"))["segments"][1]
+        self.assertEqual(second["continuity"]["frame_count"], 24)
+        self.assertTrue(second["continuity"].get("reserved_from_media", "").startswith("V"))
+        h3 = next(
+            node for node in second["workflow"].values()
+            if node.get("class_type") == "MiniMaxH3ReferenceToVideo"
+        )
+        active_video_inputs = [
+            key for key in h3["inputs"] if key.startswith("ref_videos.ref_video_")
+        ]
+        self.assertEqual(len(active_video_inputs), 2)
+
+        for asset in videos:
+            asset.activation_mode = "active"
+        forced_path, _ = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=97531,
+            enable_rtx_vsr=False,
+        )
+        forced_second = json.loads(
+            forced_path.read_text(encoding="utf-8")
+        )["segments"][1]
+        self.assertEqual(forced_second["continuity"], {})
         window.project_dirty = False
         window.close()
 
@@ -2072,7 +2188,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 5,
+            "render_policy_version": 6,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -2435,7 +2551,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 5,
+            "render_policy_version": 6,
             "segments": completed,
         }
         window._refresh_render_status_bar()

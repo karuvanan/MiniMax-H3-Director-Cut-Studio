@@ -405,12 +405,19 @@ def normalize_design_plan(
             continue
         start, end = _interval(raw, duration)
         role = str(raw.get("role", "on_screen_text"))
+        role = role if role in roles else "on_screen_text"
+        requested_track = str(raw.get("track", "")).strip().upper()
+        if role == "on_screen_text":
+            track = requested_track if requested_track.startswith("V") else "V4"
+        else:
+            role_tracks = {"dialogue": "A4", "voice_over": "A5", "lyrics": "A6"}
+            track = requested_track if requested_track.startswith("A") else role_tracks.get(role, "A4")
         text_layers.append({
             "start_seconds": start,
             "end_seconds": end,
-            "track": str(raw.get("track", "V1")).strip() or "V1",
+            "track": track,
             "content": str(raw.get("content", "")).strip(),
-            "role": role if role in roles else "on_screen_text",
+            "role": role,
             "speaker": str(raw.get("speaker", "S1")) if str(raw.get("speaker", "S1")) in {"S1", "S2"} else "S1",
             "language": str(raw.get("language", "English")).strip() or "English",
             "delivery": str(raw.get("delivery", "Natural")).strip() or "Natural",
@@ -624,6 +631,12 @@ def build_design_system_prompt(context: dict) -> str:
         "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
         "subject action, environmental response and additional direction. "
+        "Timeline tracks are editorial lanes, not the physical H3 reference-slot count. You may plan V4, V5 and higher "
+        "visual lanes for overlapping action states, titles or compositing, and A4, A5 and higher audio lanes for dialogue, "
+        "voice-over, lyrics, ambience or music stems; the Studio creates those tracks automatically. Keep on-screen text on "
+        "a V track and place dialogue, voice-over and lyrics on A tracks. The renderer will select only the temporally relevant "
+        "references for each native 15-second H3 window, so never exceed the supplied physical media_capacity merely because "
+        "additional editorial tracks exist. "
         "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. The user may "
         "refer to its stable Media Pool IDs as @P1, @P2, @V1 or @A1; write the ID without @ in existing_media_uses.media_id. "
         "Reuse only loaded assets that genuinely satisfy the story requirement, and never invent an ID, select an empty slot, "

@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 from runtime_paths import RuntimePaths, load_runtime_paths
 
@@ -15,6 +15,93 @@ from runtime_paths import RuntimePaths, load_runtime_paths
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus"}
+
+
+def remove_solid_background(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    border_tolerance: int = 22,
+    flood_tolerance: int = 36,
+    min_border_ratio: float = 0.92,
+    feather_radius: float = 0.8,
+) -> dict[str, Any] | None:
+    """Create a transparent derivative when an image has a uniform backdrop.
+
+    The original file is never modified.  Detection is intentionally strict:
+    most sampled edge pixels must agree with one robust background colour,
+    then only edge-connected pixels are removed.  Complex photographs are
+    returned unchanged instead of risking destructive subject masking.
+    """
+    source_path = Path(source)
+    destination_path = Path(destination)
+    with Image.open(source_path) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGBA")
+    if image.width < 8 or image.height < 8:
+        return None
+    alpha_extrema = image.getchannel("A").getextrema()
+    if alpha_extrema[0] < 250:
+        return None
+
+    rgb = image.convert("RGB")
+    pixels = rgb.load()
+    step_x = max(1, image.width // 64)
+    step_y = max(1, image.height // 64)
+    samples: list[tuple[int, int, int]] = []
+    for x in range(0, image.width, step_x):
+        samples.extend((pixels[x, 0], pixels[x, image.height - 1]))
+    for y in range(step_y, image.height - 1, step_y):
+        samples.extend((pixels[0, y], pixels[image.width - 1, y]))
+    if not samples:
+        return None
+    background = tuple(
+        sorted(sample[channel] for sample in samples)[len(samples) // 2]
+        for channel in range(3)
+    )
+
+    def close_to_background(value: tuple[int, int, int]) -> bool:
+        return max(abs(value[index] - background[index]) for index in range(3)) <= border_tolerance
+
+    border_ratio = sum(close_to_background(value) for value in samples) / len(samples)
+    if border_ratio < min_border_ratio:
+        return None
+
+    sentinel = (1, 2, 3)
+    if background == sentinel:
+        sentinel = (252, 1, 253)
+    flood = rgb.copy()
+    seeds: list[tuple[int, int]] = []
+    seed_count = 16
+    for index in range(seed_count + 1):
+        x = round(index * (image.width - 1) / seed_count)
+        y = round(index * (image.height - 1) / seed_count)
+        seeds.extend(((x, 0), (x, image.height - 1), (0, y), (image.width - 1, y)))
+    flood_pixels = flood.load()
+    for seed in seeds:
+        value = flood_pixels[seed[0], seed[1]]
+        if value != sentinel and close_to_background(value):
+            ImageDraw.floodfill(flood, seed, sentinel, thresh=max(0, flood_tolerance))
+
+    difference = ImageChops.difference(flood, Image.new("RGB", flood.size, sentinel))
+    bands = difference.split()
+    nonzero = ImageChops.lighter(ImageChops.lighter(bands[0], bands[1]), bands[2])
+    alpha = nonzero.point(lambda value: 0 if value == 0 else 255)
+    histogram = alpha.histogram()
+    removed_ratio = histogram[0] / max(1, image.width * image.height)
+    if removed_ratio < 0.08 or removed_ratio > 0.96:
+        return None
+    if feather_radius > 0:
+        alpha = alpha.filter(ImageFilter.GaussianBlur(float(feather_radius)))
+    image.putalpha(alpha)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(destination_path, format="PNG", optimize=True)
+    return {
+        "path": str(destination_path.resolve()),
+        "background_color": list(background),
+        "border_consistency": round(border_ratio, 4),
+        "removed_ratio": round(removed_ratio, 4),
+        "method": "strict_edge_connected_solid_background",
+    }
 
 
 def media_type_for_path(path: str | Path) -> str | None:

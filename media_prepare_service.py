@@ -16,6 +16,7 @@ from media_engine import (
     create_video_analysis_frames,
     human_probe_summary,
     probe_media,
+    remove_solid_background,
 )
 from runtime_paths import RuntimePaths
 
@@ -96,10 +97,19 @@ def main() -> int:
             _emit({"job": job["job"], "progress": 0.10, "stage": "probing"})
             info = probe_media(source, runtime)
             analysis_sources: list[list[str]] = []
+            background_removal: dict | None = None
             if media_type == "image":
-                preview_path = source
+                analysis_source = source
+                transparent_path = Path(str(cache_base) + "_nobg.png")
+                _emit({"job": job["job"], "progress": 0.18, "stage": "checking background"})
+                background_removal = remove_solid_background(
+                    source, transparent_path
+                )
+                if background_removal:
+                    analysis_source = transparent_path
+                preview_path = analysis_source
                 region_dir = Path(str(cache_base) + "_regions")
-                regions = create_image_analysis_regions(source, region_dir)
+                regions = create_image_analysis_regions(analysis_source, region_dir)
                 analysis_sources = [[label, str(path)] for label, path in regions]
             elif media_type == "video":
                 source_duration = max(0.05, float(info.get("duration", 0.0)))
@@ -137,6 +147,7 @@ def main() -> int:
                         "metadata": human_probe_summary(info),
                         "preview_path": str(preview_path),
                         "analysis_sources": analysis_sources,
+                        "background_removal": background_removal,
                     },
                 }
             )

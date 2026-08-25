@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 
 from comfy_submit_worker import _direct_urlopen, _request_json, wait_for_history
+from media_engine import remove_solid_background
 
 
 def emit(payload: dict) -> None:
@@ -188,6 +189,15 @@ def generate(job: dict) -> dict:
             if image_output is None:
                 raise RuntimeError("ComfyUI completed without an image output")
             download_image(server, image_output, destination, int(job["http_timeout"]))
+            transparent_destination = destination.with_name(
+                destination.stem + "_nobg.png"
+            )
+            background_removal = remove_solid_background(
+                destination, transparent_destination
+            )
+            effective_destination = (
+                transparent_destination if background_removal else destination
+            )
             sidecar = destination.with_suffix(destination.suffix + ".request.json")
             if sidecar.is_file():
                 metadata = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -205,11 +215,13 @@ def generate(job: dict) -> dict:
                     json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
             generated = {
-                "local_path": str(destination.resolve()),
+                "local_path": str(effective_destination.resolve()),
+                "original_local_path": str(destination.resolve()),
                 "seed": seed,
                 "prompt_id": prompt_id,
                 "generated": True,
                 "request_index": item.get("request_index", number - 1),
+                "background_removal": background_removal,
             }
             results.append(generated)
             emit({"generated_output": generated, "index": number - 1})

@@ -10,6 +10,7 @@ from media_engine import (
     create_video_analysis_frames,
     media_type_for_path,
     probe_media,
+    remove_solid_background,
 )
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
@@ -66,6 +67,46 @@ class MediaEngineTests(unittest.TestCase):
         for _label, path in regions[1:]:
             path.unlink(missing_ok=True)
         target.rmdir()
+        source.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_uniform_background_creates_transparent_derivative(self):
+        root = PROJECT_ROOT / ".director_cache" / "background_removal_test"
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "product.png"
+        destination = root / "product_nobg.png"
+        image = Image.new("RGB", (96, 96), "white")
+        for x in range(28, 68):
+            for y in range(20, 78):
+                image.putpixel((x, y), (210, 20, 30))
+        image.save(source)
+
+        result = remove_solid_background(source, destination)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(destination.is_file())
+        with Image.open(destination) as derived:
+            self.assertLess(derived.getpixel((0, 0))[3], 20)
+            self.assertGreater(derived.getpixel((48, 48))[3], 240)
+        destination.unlink(missing_ok=True)
+        source.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_complex_edge_does_not_trigger_background_removal(self):
+        root = PROJECT_ROOT / ".director_cache" / "background_rejection_test"
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "scene.png"
+        destination = root / "scene_nobg.png"
+        image = Image.new("RGB", (96, 96))
+        for x in range(96):
+            for y in range(96):
+                image.putpixel((x, y), ((x * 7) % 256, (y * 11) % 256, ((x + y) * 5) % 256))
+        image.save(source)
+
+        result = remove_solid_background(source, destination)
+
+        self.assertIsNone(result)
+        self.assertFalse(destination.exists())
         source.unlink(missing_ok=True)
         root.rmdir()
 

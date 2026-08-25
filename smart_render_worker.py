@@ -30,7 +30,7 @@ from comfy_submit_worker import (
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 5
+SMART_RENDER_POLICY_VERSION = 6
 
 
 def emit(payload: dict) -> None:
@@ -372,26 +372,32 @@ def _canonicalize_reference_input_order(h3_node: dict) -> None:
     h3_node["inputs"] = dict(ordinary + sorted(references, key=sort_key))
 
 
-def extract_tail(
+def extract_tail_frames(
     ffmpeg: Path,
+    ffprobe: Path,
     source: Path,
     destination: Path,
     *,
-    source_duration: float,
-    overlap: float,
+    frame_count: int = 24,
+    fps: int = 24,
 ) -> Path:
+    """Extract exact motion-only tail frames for the next H3 segment."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    start = max(0.0, source_duration - max(0.5, overlap))
+    frame_count = max(1, int(frame_count))
+    fps = max(1, int(fps))
+    source_duration = _probe_duration(ffprobe, source)
+    tail_seconds = frame_count / fps
+    start = max(0.0, source_duration - tail_seconds)
     command = [
         str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.6f}", "-i", str(source),
-        "-t", f"{max(0.5, overlap):.6f}",
+        "-an", "-vf", f"fps={fps}", "-frames:v", str(frame_count),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         str(destination),
     ]
     completed = subprocess.run(command, capture_output=True, text=True, timeout=180)
-    if completed.returncode:
+    if completed.returncode or not destination.is_file():
         raise RuntimeError("Could not extract continuity tail: " + completed.stderr[-800:])
     return destination.resolve()
 
@@ -663,12 +669,13 @@ def main() -> int:
             kind = str(continuity.get("kind", "image")).lower()
             if kind == "video":
                 anchor_path = Path(segment["download_dir"]) / "continuity_tail.mp4"
-                extract_tail(
+                extract_tail_frames(
                     Path(job["ffmpeg"]),
+                    Path(job["ffprobe"]),
                     previous_video,
                     anchor_path,
-                    source_duration=_probe_duration(Path(job["ffprobe"]), previous_video),
-                    overlap=float(continuity.get("tail_seconds", 0.5)),
+                    frame_count=int(continuity.get("frame_count", 24)),
+                    fps=int(continuity.get("fps", 24)),
                 )
             else:
                 anchor_path = Path(segment["download_dir"]) / "continuity_frame.jpg"
@@ -681,7 +688,7 @@ def main() -> int:
             upload = upload_file(server, anchor_path, http_timeout)
             uploaded_name = str((upload or {}).get("name") or anchor_path.name)
             _patch_continuity(workflow, continuity, uploaded_name)
-            label = "motion tail" if kind == "video" else "last-frame still"
+            label = "24-frame motion tail" if kind == "video" else "last-frame still"
             emit({"progress": f"Segment {index + 1}: previous {label} continuity attached"})
 
         emit({
