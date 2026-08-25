@@ -106,6 +106,7 @@ from prompt_preset_store import (
 )
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 from settings_engine import RenderSettings, load_settings, save_settings
+from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 from skill_engine import (
     DEFAULT_SKILL,
     NONE_SPECIAL,
@@ -5075,7 +5076,7 @@ class DirectorCutStudio(QMainWindow):
         self.timeline_slider_seek_timer.setInterval(45)
         self.timeline_slider_seek_timer.timeout.connect(self._apply_timeline_slider_seek)
         CACHE_ROOT.mkdir(exist_ok=True)
-        self.setWindowTitle("MiniMax H3 Director Cut Studio")
+        self.setWindowTitle(f"MiniMax H3 Director Cut Studio v{APP_VERSION}")
         self.resize(1680, 980)
         self.setMinimumSize(1180, 720)
         self._build_toolbar()
@@ -6932,7 +6933,9 @@ class DirectorCutStudio(QMainWindow):
     def _update_window_title(self) -> None:
         name = self.project_path.name if self.project_path else "Untitled Director Project"
         marker = " *" if self.project_dirty else ""
-        self.setWindowTitle(f"MiniMax H3 Director Cut Studio — {name}{marker}")
+        self.setWindowTitle(
+            f"MiniMax H3 Director Cut Studio v{APP_VERSION} — {name}{marker}"
+        )
 
     def _project_payload(self) -> dict:
         if not self.scan:
@@ -6974,7 +6977,8 @@ class DirectorCutStudio(QMainWindow):
             }
         return {
             "format": "h3-director-project",
-            "version": 14,
+            "version": PROJECT_FORMAT_VERSION,
+            "application_version": APP_VERSION,
             "workflow_path": str(self.scan.path),
             "timeline_duration_seconds": self.scan.duration_seconds,
             "work_area": [self.clip_start.value(), self.clip_end.value()],
@@ -11804,7 +11808,10 @@ def _install_crash_logging() -> None:
         _CRASH_LOG_STREAM = (CACHE_ROOT / "director_crash.log").open(
             "a", encoding="utf-8", buffering=1
         )
-        _CRASH_LOG_STREAM.write(f"\n=== session {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        _CRASH_LOG_STREAM.write(
+            f"\n=== session {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"· Studio v{APP_VERSION} · project format {PROJECT_FORMAT_VERSION} ===\n"
+        )
         faulthandler.enable(_CRASH_LOG_STREAM, all_threads=True)
 
         def report_exception(exc_type, exc_value, exc_traceback) -> None:
@@ -11825,6 +11832,7 @@ def main() -> int:
     _install_crash_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("MiniMax H3 Director Cut Studio")
+    app.setApplicationVersion(APP_VERSION)
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
     window = DirectorCutStudio()

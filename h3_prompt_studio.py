@@ -24,6 +24,7 @@ from skill_engine import (
     load_skill_profiles,
     profile_system_prompt,
 )
+from version_info import APP_VERSION
 from workflow_engine import (
     WorkflowScan,
     compile_active_workflow,
@@ -32,7 +33,7 @@ from workflow_engine import (
 )
 
 
-APP_TITLE = "H3 Prompt Studio"
+APP_TITLE = f"H3 Prompt Studio v{APP_VERSION}"
 
 
 class ScrolledFrame(ttk.Frame):

@@ -4,11 +4,15 @@
 
 ## 下载与快速开始
 
+- 当前应用版本：[`v0.1.0-alpha.1`](VERSION)
+- 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
 - [示范输出影片（YouTube）](https://youtu.be/hALjq11lK_s)
 - 下载源码及 runtime 后，从项目根目录执行 `run_h3_prompt_studio.bat`。
 
 源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
+
+版本规则：每一次用户可见的修正都会提升 `VERSION` 并在 `CHANGELOG.md` 留下日期、修改内容与验证结果。应用版本遵循 Semantic Versioning；Project JSON 的 format version 独立管理，只有 `.h3director.json` 保存结构改变时才提升。
 
 <img width="1280" height="769" alt="MiniMax H3 Director Cut Studio" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
 

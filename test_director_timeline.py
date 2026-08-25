@@ -44,6 +44,7 @@ from prompt_presets import (
 )
 from workflow_engine import assign_local_media
 from test_design_engine import sample_design
+from version_info import APP_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
@@ -1225,6 +1226,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(asset.transition_out, "Cross Dissolve")
         payload = window._project_payload()
         self.assertEqual(payload["version"], 14)
+        self.assertEqual(payload["application_version"], APP_VERSION)
         self.assertEqual(len(payload["tracks"]), 8)
         self.assertIn("playback_speed", payload["assets"][asset.node_id])
         window.project_dirty = False
