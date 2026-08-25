@@ -17,6 +17,7 @@ run_h3_prompt_studio.bat
 
 <img width="1474" height="2080" alt="Screenshot 2026-08-23 214016111" src="https://github.com/user-attachments/assets/345e1d79-455f-4836-bffb-8e138aa20ee4" />
 
+
 默认主工作流支持最多 **9 张图片、3 段参考视频和 3 段独立音频**：
 
 ```text
@@ -75,7 +76,7 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 - CFG：`1.0`
 - Denoise：`1.0`
 - `ModelSamplingAuraFlow` shift：`3`
-- RTX Video Super Resolution：`2x`，所以默认最终图约为 `2048 × 1152`
+- RTX Video Super Resolution：当前 Z-Image API 已移除；默认输出保持 Base resolution
 
 Design 页面可以在 `Image Generation Checkpoint` 下拉菜单选择 ComfyUI 的 `UNETLoader` 模型。当前工作流仍固定搭配 `qwen_3_4b.safetensors` 与 `ae.safetensors`；换用其他 diffusion checkpoint 时，必须确认它与这组 Z-Image text encoder/VAE 兼容，否则会在采样或解码阶段失败。
 
@@ -186,7 +187,7 @@ VRAM_Debug, VRAMCleanup
 
 Z-Image workflow:
 CLIPTextEncode, ConditioningZeroOut, EmptySD3LatentImage, KSampler,
-ModelSamplingAuraFlow, RAMCleanup, RTXVideoSuperResolution, SaveImage,
+ModelSamplingAuraFlow, RAMCleanup, SaveImage,
 VAEDecode, VRAM_Debug, VRAMCleanup
 ```
 
@@ -334,6 +335,8 @@ H3_DESIGN_PROVIDER="lm_studio"
 H3_DESIGN_LM_STUDIO_BASE_URL="http://192.168.0.185:1234/v1"
 H3_DESIGN_LM_STUDIO_MODEL="hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf"
 H3_DESIGN_TIMEOUT=900
+H3_DESIGN_AUTO_SEMANTIC_ENRICHMENT=false
+H3_DESIGN_UNLOAD_LM_AFTER_SEMANTIC_ENRICHMENT=true
 H3_DESIGN_GENERATE_COMFY_IMAGES=true
 H3_DESIGN_IMAGE_CHECKPOINT="z_image_turbo_bf16.safetensors"
 H3_DESIGN_IMAGE_WIDTH=1024
@@ -360,8 +363,9 @@ H3_DESIGN_IMAGE_CFG=1.0
 ## Director Cut 工作区
 
 - Media Pool 会随面板宽度自动重排，素材使用 `P1 / V1 / A1` 简称。
+- Recognition 检查器分为 `RAW ANALYSIS` 与 `AI SEMANTIC` 两页。后者可手动执行，也可开启 `AUTO AI SEMANTIC ENRICHMENT`，并复用 Design 当前选择的 LM Studio／Online GPT 服务与模型。
 - 只有拖入 Timeline 的素材才会连接并激活到 H3 workflow。
-- Timeline 以 `0.5s` 为一格执行 snap。
+- Clip、Shot、Marker 与编辑范围仍以 `0.5s` 为一格执行 snap；播放头和 Program Monitor 播放滑杆不 snap，可按毫秒连续拖动。滑杆使用按下位置作为相对拖动锚点，不会在开始向左或向右时突然跳到端点；拖动期间画面 seek 会轻量 debounce，释放后精确落在所选时间。
 - 支持动态增加/删除 V 与 A 轨、多层视频合成、Opacity、Blend Mode、Mute、Solo、Volume、Pan、锁定和轨道高度。
 - Clip 支持速度、源入点/出点、淡入淡出与转场。
 - Selection Tool 可移动 clip 及 Program Monitor 文字；Hand Tool 用于平移 Timeline。
@@ -370,7 +374,38 @@ H3_DESIGN_IMAGE_CFG=1.0
 - Prompt Tool 点击图片 clip 时会带入 BLIP visual caption，也可为其他元素加入专属提示词。
 - Marker Tool、Creative Brief、Visual Style、Transition、Ending Hold、Constraints、Soundscape 与 Music 会共同自动生成 Director H3 Prompt。
 - 项目保存格式为 `.h3director.json`，支持 Undo/Redo。
-- Program Monitor 在生成过程中显示进度遮罩，完成后保持最终视频，直到点击 New Project，并提供 Export link。
+- Program Monitor 使用可拖动的左右分割线：左侧 `TIMELINE SOURCE` 显示当前时间轴素材与文字合成，右侧 `GENERATED OUTPUT` 显示最终 MP4。两侧采用 1px 合法最小宽度，分割线可以连续推到视觉上的最左/最右，但不会触发 Qt 自动 collapse、跳边或把手卡死；当前比例会随项目保存，并为后续 Depth / Pose 分析视图保留扩展空间。
+- 播放生成视频时，右侧 MP4 作为主时钟同步 Timeline playhead、时间标签、滑杆及左侧素材画面；拖动 Timeline 或滑杆也会反向定位生成视频。
+- 对大于 1080p、高码率或超过 100MB 的成片，Studio 会在后台建立缓存用的 720p Monitor Proxy，避免 Windows 播放器停在第一帧；Export 与项目归档仍使用未经修改的原始 Master。
+- 生成过程中仍显示进度遮罩；完成后成片保持在右侧，直到点击 New Project，并提供 Export link。
+- 每次 Preview / Run 完成后，Studio 会把成片复制为当前 `example` 工作文件夹中的 `generated_preview.mp4` 或 `generated_output.mp4`，并自动保存 `director_project.h3director.json`。使用 Open Project 打开这份项目时，会同时恢复成片、左右分割比例及对应 Timeline 起点。
+
+## Smart Long Render（突破 15 秒）
+
+工作区仍然显示一条完整 Timeline，不需要手动切割。生成行为由 Work Area 长度自动决定：
+
+- `≤ 15s`：继续使用原来的单次 H3/ComfyUI 提交流程，不分段、不拼接。
+- `> 15s`：自动启用 Shot-aware Smart Long Render；每段最长 15 秒，相邻段最多保留 1 秒 continuity handle。
+- 当 Shot Blocks 覆盖至少 80% Work Area 时，Shot 起点／终点成为优先切点；少于 3 秒的微小动作（例如 1 秒 bullet-time）会向后合并，通常形成约 3–6 秒 Render Units。若项目没有完整 Shot 结构，则继续使用稳定的 `0–15 / 14–29 / 28–43…` 规划。
+- Shot Render Unit 与稳定 seed 绑定。修改一秒动作时，只重新生成包含该时间的 Render Unit；continuity handle 内发生的修改不会令下一个已缓存 Shot 连锁失效。
+- 每段的 Shot、Dialogue、Marker 与 Ending 指令会过滤到该段，并从全局时间自动换算成段内 `0–15s` 时间。
+- 非最后一段使用 continuity handoff 结尾；若工作流有空闲的 Video reference slot，会把上一段最后 1 秒自动送入下一段，维持人物、动作方向、镜头、光线、环境和声音节奏。
+- ComfyUI 一次只执行一段，每段后请求 unload/free VRAM；单段失败会自动重试，已成功的段会写入 manifest，避免全部重来。
+- 未改变且 fingerprint 相同的段会直接复用缓存；编辑局部 Shot 或素材后，只重新生成受影响的内部段，再重新组装 Master。
+- Timeline ruler 下方有一条 6px `Render Status` 状态条，并按隐藏 Segment 显示：绿色为已生成且可复用、黄色为编辑后需要重算、蓝色为正在生成、红色为生成失败、灰色为尚未生成。Hover 可查看该 Segment 的真实时间范围和状态。
+- 修改 Shot、Marker、Transition、文字层、Clip Prompt、素材时间／属性时，只把与修改前后时间范围相交的 Segment 标成黄色；修改全局视觉风格、Creative Brief、声音设计或影响合成的轨道属性时，才会把所有 Segment 标成黄色。
+- 生成时当前 Segment 自动变蓝；成功写入 manifest 后立即变绿，失败则保留红色。状态及黄色 dirty Segment 会跟随 Director Project 保存和恢复。
+- Program Monitor 在生成期间不会再被全屏遮罩取代：旧 Master／Timeline Source 会继续显示，上方使用横跨左右两个画面的半透明 spinner 和实时阶段文字；右侧生成视频通过 `QVideoSink` 绘制，避免 Windows 原生视频表面穿透遮罩。每个 Shot Unit 下载完成后会立即在右侧循环预览，同时后台继续生成下一段与组装 Master。
+- FFmpeg 会裁掉重复的重叠区，将所有段重编码为一个带音频的 `master.mp4`。Program Monitor 与 Export 始终只显示完整 Master。
+- Pre-run Preview 会为所有内部段建立稳定 seed；Accept 以 1.0MP 复用同一组 seed。
+
+Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 version 13，并记录 Master、各段 manifest、归档工作文件夹、生成视频时间起点与 Program Monitor 分割比例。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
+
+Design 页的 `LOAD JSON` 可以载入人工校准或先前保存的 Director Design。若载入的 JSON 尚无预生成图片，点击 Apply 后仍会自动执行所需的 Z-Image reference generation。项目附带的 45 秒长片示范位于：
+
+```text
+example/tang_ting_ci_ying_45s_demo/design_plan.json
+```
 
 ## H3 Prompt Skills
 
@@ -409,6 +444,9 @@ preset_env/non_diegetic_music.env
 - 视频使用 FFprobe 获取元数据，并抽取开头 10%、中段 50%、结尾 90% 多帧进行 BLIP 分析。
 - 音频按 8 秒分块流式解码，总解码长度不超过 Timeline 秒数。
 - 音频先执行 VAD，再只对语音区间执行 Whisper，并以 FFT 估算节拍。
+- 可选 AI Semantic Enrichment 会在所有基础分析完成后，把有界的原始证据交给 Design 当前的 Qwen/GPT，输出 Summary、Observed Facts、Subjects、Objects、Environment、Camera、Lighting、Temporal Motion、Audio/Speech、H3 Usage 与 Uncertainties。AI 推断独立保存，不会覆盖 BLIP／Whisper 原文。
+- 每次结果都校验素材编号、类型与 SHA-256 evidence fingerprint；换素材、修改 Recognition 或 Clip Prompt 后旧结果会标为 Stale，且不会进入 Design 的有效分析上下文。只发送文件 basename，本机绝对路径会先遮蔽。
+- Online GPT 模式会把有界的 caption／transcript 证据发送至所配置的远端服务；API key 可沿用本次运行中 Design 页输入的值，或读取当前进程的 `OPENAI_API_KEY`，但不会写入 `design_ai.env` 或项目文件。
 - 识别工作在后台 worker 中运行，支持取消、超时与失败回退，不阻塞主界面。
 - thumbnail、抽帧、波形与分析结果缓存于 `.director_cache/`。
 
@@ -457,6 +495,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 - `H3_DESIGN_TIMEOUT` 是单次 Design 流程的总等待上限，当前默认 900 秒。
 - 先检查 LM Studio 是否仍在加载 GGUF、ComfyUI queue 是否有旧任务，以及 Z-Image 是否已经输出图片。
 - 可减少参考图数量、宽高或 steps 后重试。
+
+## 测试
+
+```powershell
+.\ai_libraries_common\python_env\python.exe -m unittest discover -v
+```
+
 
 ## 测试
 
