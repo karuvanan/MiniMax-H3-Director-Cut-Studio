@@ -53,6 +53,28 @@ class SkillEngineTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertIn("[Shot 2] At 00:05.000", prompt)
 
+    def test_repeated_timeline_uses_share_one_h3_tag_and_keep_both_ranges(self):
+        spec = PromptSpec(brief="A subject returns later in the story.")
+        first = MediaAsset(
+            "1", "LoadImage", "image", "subject.png", "<Picture 1>",
+            "ref_images.ref_image_0", timeline_placed=True,
+            start_seconds=1.0, end_seconds=10.0,
+        )
+        second = MediaAsset(
+            "1", "LoadImage", "image", "subject.png", "<Picture 1>",
+            "ref_images.ref_image_0", timeline_placed=True,
+            start_seconds=25.0, end_seconds=30.0,
+            clip_prompt="Return from a new camera angle.",
+            clip_id="clip-repeat", source_node_id="1",
+        )
+        prompt = build_ref2va_prompt(
+            spec, [first, second], 30.0, self.profiles[DEFAULT_SKILL]
+        )
+        self.assertEqual(prompt.count("is a reference image"), 1)
+        self.assertIn("1.00s to 10.00s, 25.00s to 30.00s", prompt)
+        self.assertIn("Return from a new camera angle", prompt)
+        self.assertNotIn("<Picture 2>", prompt)
+
     def test_structured_shot_ranges_drive_exact_detailed_description_timing(self):
         spec = PromptSpec(
             brief="A hero turns toward camera.",

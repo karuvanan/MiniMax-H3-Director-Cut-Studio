@@ -457,7 +457,6 @@ def normalize_design_plan(
     inventory_was_supplied = existing_media is not None
     existing_media_uses: list[dict] = []
     reused_requirement_ids: set[str] = set()
-    reused_media_ids: set[str] = set()
     for use_number, raw in enumerate(source.get("existing_media_uses") or [], 1):
         if not isinstance(raw, dict):
             continue
@@ -490,14 +489,12 @@ def normalize_design_plan(
                     f"Media Pool {media_id} is {inventory_type}, not {media_type}."
                 )
         requirement_id = _normalized_requirement_id(
-            raw.get("requirement_id"), f"reuse_{media_id.lower()}"
+            raw.get("requirement_id"), f"reuse_{media_id.lower()}_{use_number}"
         )
         if requirement_id in reused_requirement_ids:
             raise ValueError(
                 f"Existing media requirement_id {requirement_id!r} is used more than once."
             )
-        if media_id in reused_media_ids:
-            raise ValueError(f"Existing media {media_id} is assigned more than once.")
         start, end = _interval(raw, duration)
         reuse_policy = str(raw.get("reuse_policy", "")).strip().lower()
         if reuse_policy not in {"whole_design", "time_scoped"}:
@@ -536,7 +533,6 @@ def normalize_design_plan(
             "instruction": str(raw.get("instruction") or fallback_instruction).strip(),
         })
         reused_requirement_ids.add(requirement_id)
-        reused_media_ids.add(media_id)
     plan["existing_media_uses"] = existing_media_uses
 
     media_requests: list[dict] = []
@@ -647,8 +643,10 @@ def build_design_system_prompt(context: dict) -> str:
         "When a loaded asset satisfies that need, put it in existing_media_uses and do not emit a media_request with the same "
         "requirement_id. existing_media_uses instructions describe how H3 should preserve or use the supplied asset; they do not "
         "ask Z-Image to regenerate it. Use reuse_policy=whole_design for identity, product, wardrobe, environment or audio references "
-        "needed throughout the story, and reuse_policy=time_scoped for one contiguous action or editorial interval. An existing "
-        "Media Pool asset may appear at most once in existing_media_uses; widen its single range when it must cover several Shots. "
+        "needed throughout the story, and reuse_policy=time_scoped for one contiguous action or editorial interval. The same "
+        "Media Pool asset may appear in multiple existing_media_uses rows when it returns in separate non-contiguous intervals; "
+        "give every occurrence a unique requirement_id, exact range, track and instruction. Do not widen across an interval where "
+        "the reference should be inactive. Repeated uses share one physical H3 reference slot. "
         "media_requests must contain only genuinely missing assets after this reuse audit. Choose that missing count dynamically from "
         "the concept and available empty slots; never duplicate a requirement already fulfilled by @P1/@V1/@A1. "
         "For media_requests, use h3_reference when an asset supplies subject, product, wardrobe, environment or composition guidance; "

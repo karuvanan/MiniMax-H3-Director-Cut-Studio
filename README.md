@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.1.0-alpha.4`](VERSION)
+- 当前应用版本：[`v0.1.0-alpha.5`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
 - [示范输出影片（YouTube）](https://youtu.be/hALjq11lK_s)
@@ -368,6 +368,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - Recognition 检查器分为 `RAW ANALYSIS` 与 `AI SEMANTIC` 两页。后者可手动执行，也可开启 `AUTO AI SEMANTIC ENRICHMENT`，并复用 Design 当前选择的 LM Studio／Online GPT 服务与模型。
 - Media Pool 或 Timeline 素材执行 AI Enrich 时，对应 Media Pool 卡片会显示半透明 processing overlay；分析在后台执行，不会冻结主界面。
 - 只有拖入 Timeline 的素材才会连接并激活到 H3 workflow。
+- 同一个 Media Pool Source 可以重复拖入 Timeline。每次重复使用都是独立 Clip Instance，可分别调整时间、轨道、速度、Source In/Out、淡入淡出、转场及 Clip Prompt；它们仍共享同一份识别/AI Enrich 结果，而且只占用一个实体 H3 Picture／Video／Audio reference slot。
 - Clip、Shot、Marker 与编辑范围仍以 `0.5s` 为一格执行 snap；播放头和 Program Monitor 播放滑杆不 snap，可按毫秒连续拖动。滑杆使用按下位置作为相对拖动锚点，不会在开始向左或向右时突然跳到端点；拖动期间画面 seek 会轻量 debounce，释放后精确落在所选时间。
 - 支持动态增加/删除 V 与 A 轨、多层视频合成、Opacity、Blend Mode、Mute、Solo、Volume、Pan、锁定和轨道高度。
 - AI Design 可按内容自动建立 V4/V5… 与 A4/A5… 编辑轨：画面／标题使用 V 轨，Dialogue、Voice-over、Lyrics 使用独立 A 轨。编辑轨最多 V16/A16；MiniMax H3 每个原生 15 秒任务仍遵守工作流的 9 Picture、3 Video、3 Audio 实体参考槽，并只选择该时间窗有关的素材。
@@ -405,7 +406,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - FFmpeg 会裁掉重复的重叠区，将所有段重编码为一个带音频的 `master.mp4`。Program Monitor 与 Export 始终只显示完整 Master。
 - Pre-run Preview 会为所有内部段建立稳定 seed；Accept 以 1.0MP 复用同一组 seed。
 
-Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 **version 14**，并记录 Master、各段 manifest、归档工作文件夹、生成视频时间起点、Program Monitor 分割比例与 Prompt Auto Sync 状态。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
+Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 **version 15**，并记录独立 Timeline Clip Instance、Master、各段 manifest、归档工作文件夹、生成视频时间起点、Program Monitor 分割比例与 Prompt Auto Sync 状态。旧版项目会把原有素材位置自动视为第一次 Timeline 使用；version 15 另外保存重复出现的实例。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
 
 Design 页的 `LOAD JSON` 可以载入人工校准或先前保存的 Director Design。若载入的 JSON 尚无预生成图片，点击 Apply 后仍会自动执行所需的 Z-Image reference generation。项目附带的 45 秒长片示范位于：
 
@@ -507,13 +508,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 
 ## 测试
 
-当前主分支验证结果：**162 tests passed**。
+当前主分支验证结果：**168 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 162 tests
+Ran 168 tests
 OK
 ```

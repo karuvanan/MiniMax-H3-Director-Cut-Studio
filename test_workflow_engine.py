@@ -1,4 +1,5 @@
 from pathlib import Path
+from copy import deepcopy
 import unittest
 
 from workflow_engine import (
@@ -148,6 +149,27 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertIn(first, active)
         self.assertIn(second, active)
         self.assertNotIn(third, active)
+
+    def test_same_pool_source_can_have_multiple_independent_timeline_uses(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        source = next(asset for asset in scan.assets if asset.media_type == "image")
+        source.timeline_placed = True
+        source.start_seconds, source.end_seconds = 1.0, 5.0
+        repeated = deepcopy(source)
+        repeated.clip_id = "clip-repeat-p1"
+        repeated.source_node_id = source.node_id
+        repeated.start_seconds, repeated.end_seconds = 8.0, 11.0
+        repeated.clip_prompt = "Return to the same subject from a new angle."
+        scan.timeline_clips.append(repeated)
+
+        _, early = compile_active_workflow(scan, 1.0, 4.0)
+        _, late = compile_active_workflow(scan, 8.0, 11.0)
+        self.assertEqual(early, [source])
+        self.assertEqual(late, [repeated])
+
+        effective, _ = effective_reference_assets([source, repeated])
+        self.assertEqual([asset.tag for asset in effective], ["<Picture 1>", "<Picture 1>"])
 
     def test_asset_outside_timeline_can_never_activate(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"

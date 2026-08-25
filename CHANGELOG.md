@@ -2,6 +2,25 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.1.0-alpha.5] - 2026-08-26
+
+### Added
+
+- Added independent Timeline Clip Instances so one Media Pool source can be reused in any number of non-contiguous ranges, tracks or overlapping layers.
+- Added per-instance timing, activation, source trim, playback speed, fades, transitions, monitor visibility and Clip Prompt persistence with Undo/Redo.
+- Allowed AI Design JSON to route the same `P`/`V`/`A` Media Pool ID into multiple time-scoped `existing_media_uses` rows.
+
+### Changed
+
+- Kept recognition and AI Semantic Enrichment source-owned and automatically shared across all repeated instances.
+- Deduplicated repeated instances when assigning effective MiniMax H3 reference ordinals, uploading media and compiling subject definitions, while retaining every time range and per-instance direction in the generated prompt.
+- Updated Program Monitor video/audio player keys and Smart Render fingerprints so repeated clips remain independently seekable and locally editable.
+- Raised the Director Project format to version `15`; version 14 and older projects continue loading with their original media placements as first-use clips.
+
+### Verification
+
+- `168` automated tests passed with the bundled Python environment.
+
 ## [0.1.0-alpha.4] - 2026-08-25
 
 ### Fixed

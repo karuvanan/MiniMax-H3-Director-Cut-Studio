@@ -55,6 +55,12 @@ class MediaAsset:
     # H3 references may remain active for generation without being composited as
     # literal picture layers in the Program Monitor.
     monitor_visible: bool = True
+    # A Media Pool source may be used more than once on the Timeline.  The
+    # original loader asset keeps an empty clip_id; additional editorial uses
+    # carry a stable clip_id while source_node_id points back to the one
+    # physical ComfyUI loader/reference slot.
+    clip_id: str = ""
+    source_node_id: str = ""
 
     def overlaps(self, clip_start: float, clip_end: float) -> bool:
         """Return whether this reference participates in the current generation clip."""
@@ -77,6 +83,7 @@ class WorkflowScan:
     nodes: dict[str, dict[str, Any]]
     h3_node_ids: list[str]
     assets: list[MediaAsset] = field(default_factory=list)
+    timeline_clips: list[MediaAsset] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     duration_seconds: float = 5.0
 
@@ -88,7 +95,11 @@ class WorkflowScan:
         }
 
     def active_assets(self, clip_start: float, clip_end: float) -> list[MediaAsset]:
-        return [asset for asset in self.assets if asset.overlaps(clip_start, clip_end)]
+        return [asset for asset in self.timeline_assets() if asset.overlaps(clip_start, clip_end)]
+
+    def timeline_assets(self) -> list[MediaAsset]:
+        """Return legacy first uses plus independent repeated clip instances."""
+        return [*self.assets, *self.timeline_clips]
 
 
 def load_workflow(path: str | Path) -> WorkflowScan:
@@ -489,48 +500,54 @@ def effective_reference_assets(
     # the worker's fallback insertion order.
     extra_index = int(extra_match.group(1)) if extra_match else 20_000
 
-    images: list[tuple[int, MediaAsset | None]] = [
-        (binding_index(asset), asset)
-        for asset in clones if asset.media_type == "image"
-    ]
+    def unique_binding_rows(kind: str) -> list[tuple[int, list[MediaAsset] | None]]:
+        groups: dict[tuple[str, str], list[MediaAsset]] = {}
+        for asset in clones:
+            if asset.media_type != kind:
+                continue
+            key = (asset.node_id, asset.binding)
+            groups.setdefault(key, []).append(asset)
+        return [
+            (binding_index(group[0]), group)
+            for group in groups.values()
+        ]
+
+    images = unique_binding_rows("image")
     if extra_kind == "image":
         images.append((extra_index, None))
-    for ordinal, (_index, asset) in enumerate(sorted(images, key=lambda row: row[0]), 1):
-        if asset is None:
+    for ordinal, (_index, group) in enumerate(sorted(images, key=lambda row: row[0]), 1):
+        if group is None:
             extra_tag = f"<Picture {ordinal}>"
         else:
-            asset.tag = f"<Picture {ordinal}>"
+            for asset in group:
+                asset.tag = f"<Picture {ordinal}>"
 
-    videos: list[tuple[int, MediaAsset | None]] = [
-        (binding_index(asset), asset)
-        for asset in clones if asset.media_type == "video"
-    ]
+    videos = unique_binding_rows("video")
     if extra_kind == "video":
         videos.append((extra_index, None))
-    for ordinal, (_index, asset) in enumerate(sorted(videos, key=lambda row: row[0]), 1):
-        if asset is None:
+    for ordinal, (_index, group) in enumerate(sorted(videos, key=lambda row: row[0]), 1):
+        if group is None:
             extra_tag = f"<Video {ordinal}>"
         else:
-            asset.tag = f"<Video {ordinal}>"
+            for asset in group:
+                asset.tag = f"<Video {ordinal}>"
 
     paired_audio_count = sum(
-        bool(asset and asset.paired_audio_binding) for _index, asset in videos
+        bool(group and group[0].paired_audio_binding) for _index, group in videos
     )
     if extra_kind == "video" and extra_has_paired_audio:
         paired_audio_count += 1
-    audios: list[tuple[int, MediaAsset | None]] = [
-        (binding_index(asset), asset)
-        for asset in clones if asset.media_type == "audio"
-    ]
+    audios = unique_binding_rows("audio")
     if extra_kind == "audio":
         audios.append((extra_index, None))
-    for ordinal, (_index, asset) in enumerate(
+    for ordinal, (_index, group) in enumerate(
         sorted(audios, key=lambda row: row[0]), paired_audio_count + 1
     ):
-        if asset is None:
+        if group is None:
             extra_tag = f"<Audio {ordinal}>"
         else:
-            asset.tag = f"<Audio {ordinal}>"
+            for asset in group:
+                asset.tag = f"<Audio {ordinal}>"
     return clones, extra_tag
 
 

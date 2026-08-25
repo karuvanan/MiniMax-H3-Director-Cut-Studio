@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import faulthandler
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
@@ -789,6 +790,38 @@ class AssetEditCommand(QUndoCommand):
 
     def redo(self) -> None:
         self._apply(self.after)
+
+
+class AddTimelineClipCommand(QUndoCommand):
+    """Add/remove one independent Timeline use of a Media Pool source."""
+
+    def __init__(self, clips: list[MediaAsset], clip: MediaAsset, refresh) -> None:
+        super().__init__("Add repeated media clip")
+        self.clips = clips
+        self.clip = clip
+        self.refresh = refresh
+
+    def undo(self) -> None:
+        if self.clip in self.clips:
+            self.clips.remove(self.clip)
+        self.refresh(self.clip)
+
+    def redo(self) -> None:
+        if self.clip not in self.clips:
+            self.clips.append(self.clip)
+        self.refresh(self.clip)
+
+
+class RemoveTimelineClipCommand(AddTimelineClipCommand):
+    def __init__(self, clips: list[MediaAsset], clip: MediaAsset, refresh) -> None:
+        super().__init__(clips, clip, refresh)
+        self.setText("Remove repeated media clip")
+
+    def undo(self) -> None:
+        AddTimelineClipCommand.redo(self)
+
+    def redo(self) -> None:
+        AddTimelineClipCommand.undo(self)
 
 
 class TrackEditCommand(QUndoCommand):
@@ -2006,6 +2039,7 @@ class TimelineView(QGraphicsView):
     asset_changed = Signal(object)
     playhead_changed = Signal(float)
     asset_edit_committed = Signal(object, object, object)
+    clip_instance_created = Signal(object)
     remove_requested = Signal(object)
     empty_slot_dropped = Signal(object)
     track_selected = Signal(object)
@@ -2299,7 +2333,7 @@ class TimelineView(QGraphicsView):
             self.scene_obj.addLine(0, y, width, y, QPen(QColor("#34383d")))
             self.scene_obj.addLine(0, y + track.height - 1, width, y + track.height - 1, QPen(QColor("#292d31")))
         if self.scan:
-            for asset in self.scan.assets:
+            for asset in self.scan.timeline_assets():
                 if not asset.timeline_placed:
                     continue
                 lane, track = self._track_for_asset(asset)
@@ -2438,7 +2472,18 @@ class TimelineView(QGraphicsView):
             requested_lane, requested_track_id, _clip_y, _clip_height = self._resolve_track(
                 asset, scene_point.y()
             )
-            if asset.timeline_placed:
+            create_instance = asset.timeline_placed
+            if create_instance:
+                source = asset
+                asset = deepcopy(source)
+                asset.clip_id = f"clip-{secrets.token_hex(8)}"
+                asset.source_node_id = source.node_id
+                # Recognition and file identity remain source-owned. Timeline
+                # properties below are independently editable on this clone.
+                asset.timeline_placed = False
+            if create_instance:
+                length = max(0.25, source.end_seconds - source.start_seconds)
+            elif asset.timeline_placed:
                 length = max(0.25, asset.end_seconds - asset.start_seconds)
             elif asset.media_type == "image":
                 length = 3.0
@@ -2469,15 +2514,26 @@ class TimelineView(QGraphicsView):
             # widget alive during QDrag.exec().
             QTimer.singleShot(
                 0,
-                lambda item=asset, old=before, new=after: self._finish_media_drop(item, old, new),
+                lambda item=asset, old=before, new=after, created=create_instance: self._finish_media_drop(
+                    item, old, new, created
+                ),
             )
             return
         event.ignore()
 
-    def _finish_media_drop(self, asset: MediaAsset, before: dict, after: dict) -> None:
-        if self.scan is None or asset not in self.scan.assets:
+    def _finish_media_drop(
+        self, asset: MediaAsset, before: dict, after: dict, created: bool = False
+    ) -> None:
+        if self.scan is None:
             return
-        self.asset_edit_committed.emit(asset, before, after)
+        if created:
+            for name, value in after.items():
+                setattr(asset, name, value)
+            self.clip_instance_created.emit(asset)
+        elif asset in self.scan.assets:
+            self.asset_edit_committed.emit(asset, before, after)
+        else:
+            return
         self.asset_selected.emit(asset)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -4970,6 +5026,7 @@ class DirectorCutStudio(QMainWindow):
         self.profiles = load_skill_profiles(PROJECT_ROOT)
         self.scan: WorkflowScan | None = None
         self.selected_asset: MediaAsset | None = None
+        self.selected_timeline_asset: MediaAsset | None = None
         self.selected_track: TimelineTrack | None = None
         self.tracks = default_timeline_tracks()
         self.text_layers: list[TextLayer] = []
@@ -5493,7 +5550,7 @@ class DirectorCutStudio(QMainWindow):
         apply_clip.clicked.connect(self.apply_clip_properties)
         self.remove_clip_button = QPushButton("REMOVE FROM TIMELINE")
         self.remove_clip_button.clicked.connect(
-            lambda: self.remove_timeline_asset(self.selected_asset) if self.selected_asset else None
+            lambda: self.remove_timeline_asset(self._selected_clip()) if self._selected_clip() else None
         )
         inspector_form.addRow("Reference", self.inspect_tag)
         inspector_form.addRow("Comfy node", self.inspect_node)
@@ -5751,9 +5808,10 @@ class DirectorCutStudio(QMainWindow):
         self.timeline.set_tracks(self.tracks)
         self.timeline.set_text_layers(self.text_layers)
         self.timeline.set_director_cues(self.director_cues)
-        self.timeline.asset_selected.connect(self.select_asset)
+        self.timeline.asset_selected.connect(self.select_timeline_asset)
         self.timeline.asset_changed.connect(self.asset_timing_changed)
         self.timeline.asset_edit_committed.connect(self.commit_asset_edit)
+        self.timeline.clip_instance_created.connect(self.add_timeline_clip_instance)
         self.timeline.remove_requested.connect(self.remove_timeline_asset)
         self.timeline.empty_slot_dropped.connect(self.reject_empty_timeline_slot)
         self.timeline.playhead_changed.connect(self.playhead_changed)
@@ -5856,6 +5914,18 @@ class DirectorCutStudio(QMainWindow):
                         flags=re.I,
                     )
                 )
+                timeline_uses = [
+                    {
+                        "clip_id": item.clip_id or f"source-{asset.node_id}",
+                        "track": item.timeline_track_id,
+                        "start_seconds": float(item.start_seconds),
+                        "end_seconds": float(item.end_seconds),
+                        "instruction": item.clip_prompt,
+                    }
+                    for item in scan.timeline_assets()
+                    if item.timeline_placed
+                    and (item.source_node_id or item.node_id) == asset.node_id
+                ]
                 media.append({
                     "media_id": media_shortcut(asset),
                     "h3_tag": asset.tag,
@@ -5866,7 +5936,7 @@ class DirectorCutStudio(QMainWindow):
                     "filename": Path(local_path).name,
                     "loaded": True,
                     "locally_available": True,
-                    "timeline_placed": bool(asset.timeline_placed),
+                    "timeline_placed": bool(timeline_uses),
                     "timeline_track_id": asset.timeline_track_id,
                     "start_seconds": float(asset.start_seconds),
                     "end_seconds": float(asset.end_seconds),
@@ -5878,6 +5948,7 @@ class DirectorCutStudio(QMainWindow):
                     "semantic_enrichment_status": semantic_status,
                     "analysis_summary": analysis,
                     "analysis_status": "ready" if analysis_ready else "pending",
+                    "timeline_uses": timeline_uses,
                 })
         total_capacity = (
             dict(scan.counts) if scan else {"image": 9, "video": 3, "audio": 3}
@@ -5976,6 +6047,7 @@ class DirectorCutStudio(QMainWindow):
             "duration_seconds": self.scan.duration_seconds,
             "duration_nodes": duration_nodes,
             "assets": {asset.node_id: asdict(asset) for asset in self.scan.assets},
+            "timeline_clips": [asdict(clip) for clip in self.scan.timeline_clips],
             "text_layers": [asdict(layer) for layer in self.text_layers],
             "director_cues": [asdict(cue) for cue in self.director_cues],
             "prompt": {
@@ -6002,6 +6074,10 @@ class DirectorCutStudio(QMainWindow):
                 setattr(asset, name, value)
             input_name = {"image": "image", "video": "file", "audio": "audio"}[asset.media_type]
             self.scan.nodes[asset.node_id].setdefault("inputs", {})[input_name] = asset.filename
+        self.scan.timeline_clips = [
+            MediaAsset(**values) for values in state.get("timeline_clips", [])
+        ]
+        self._sync_timeline_clip_sources()
         self.text_layers = [TextLayer(**values) for values in state.get("text_layers", [])]
         self.director_cues = [DirectorCue(**values) for values in state.get("director_cues", [])]
         self.preview_paths = {
@@ -6099,8 +6175,9 @@ class DirectorCutStudio(QMainWindow):
         duration = float(plan["duration_seconds"])
         self._set_design_duration(duration)
         if replace:
-            for asset in self.scan.assets:
+            for asset in self.scan.timeline_assets():
                 asset.timeline_placed = False
+            self.scan.timeline_clips.clear()
             self.text_layers = []
             self.director_cues = []
 
@@ -6108,8 +6185,15 @@ class DirectorCutStudio(QMainWindow):
         used_nodes: set[str] = set()
         visual_occupancy: dict[str, list[tuple[float, float]]] = {}
 
-        def place_asset(asset: MediaAsset, request: dict, prompt_key: str) -> None:
-            kind = "audio" if asset.media_type == "audio" else "visual"
+        def place_asset(source: MediaAsset, request: dict, prompt_key: str) -> MediaAsset:
+            asset = source
+            if source.timeline_placed:
+                asset = deepcopy(source)
+                asset.clip_id = f"clip-{secrets.token_hex(8)}"
+                asset.source_node_id = source.node_id
+                asset.clip_prompt = ""
+                self.scan.timeline_clips.append(asset)
+            kind = "audio" if source.media_type == "audio" else "visual"
             track = self._design_track(request.get("track", ""), kind)
             request_start = float(request["start_seconds"])
             request_end = float(request["end_seconds"])
@@ -6146,17 +6230,14 @@ class DirectorCutStudio(QMainWindow):
             asset.activation_mode = "auto"
             direction = str(request.get(prompt_key, "")).strip()
             if prompt_key == "instruction" and direction:
-                current = asset.clip_prompt.strip()
-                if not current:
-                    asset.clip_prompt = direction
-                elif direction not in current:
-                    asset.clip_prompt = current + "\nDesign use: " + direction
+                asset.clip_prompt = direction
             elif prompt_key == "prompt":
                 asset.clip_prompt = direction
             asset.monitor_visible = (
                 asset.media_type == "audio"
                 or request.get("usage", "h3_reference") == "timeline_visual"
             )
+            return asset
 
         assets_by_media_id = {
             media_shortcut(asset).upper(): asset for asset in self.scan.assets
@@ -6167,6 +6248,14 @@ class DirectorCutStudio(QMainWindow):
             for item in reuse_rows
             if (media_id := str(item.get("media_id", "")).upper()) in assets_by_media_id
         }
+        if reused_node_ids:
+            self.scan.timeline_clips[:] = [
+                clip for clip in self.scan.timeline_clips
+                if (clip.source_node_id or clip.node_id) not in reused_node_ids
+            ]
+            for source in self.scan.assets:
+                if source.node_id in reused_node_ids:
+                    source.timeline_placed = False
         if not replace:
             for asset in self.scan.assets:
                 if not asset.timeline_placed or asset.node_id in reused_node_ids:
@@ -7060,6 +7149,7 @@ class DirectorCutStudio(QMainWindow):
             "render_settings": asdict(self.render_settings),
             "prompt": prompt,
             "assets": assets,
+            "timeline_clips": [asdict(clip) for clip in self.scan.timeline_clips],
             "tracks": [asdict(track) for track in self.tracks],
             "text_layers": [asdict(layer) for layer in self.text_layers],
             "director_cues": [asdict(cue) for cue in self.director_cues],
@@ -7185,6 +7275,23 @@ class DirectorCutStudio(QMainWindow):
                         auto_analyze=False,
                         preserve_recognition=True,
                     )
+            self.scan.timeline_clips = []  # type: ignore[union-attr]
+            for saved_clip in payload.get("timeline_clips", []):
+                if not isinstance(saved_clip, dict):
+                    continue
+                source_node_id = str(
+                    saved_clip.get("source_node_id") or saved_clip.get("node_id") or ""
+                )
+                source = asset_map.get(source_node_id)
+                if source is None:
+                    continue
+                values = asdict(source)
+                values.update(saved_clip)
+                values["node_id"] = source.node_id
+                values["source_node_id"] = source.node_id
+                values["clip_id"] = str(values.get("clip_id") or f"clip-{secrets.token_hex(8)}")
+                self.scan.timeline_clips.append(MediaAsset(**values))  # type: ignore[union-attr]
+            self._sync_timeline_clip_sources()
             prompt = payload.get("prompt", {})
             for name, value in prompt.items():
                 field = getattr(self.prompt_panel, name, None)
@@ -7311,6 +7418,7 @@ class DirectorCutStudio(QMainWindow):
         self.text_layers = []
         self.director_cues = []
         self.selected_asset = None
+        self.selected_timeline_asset = None
         self.selected_track = None
         self.timeline.set_tracks(self.tracks)
         self.timeline.set_text_layers(self.text_layers)
@@ -7385,7 +7493,11 @@ class DirectorCutStudio(QMainWindow):
         try:
             incoming_path = str(Path(filename).expanduser().resolve())
             replacing_timeline_media = bool(
-                asset.timeline_placed
+                any(
+                    item.timeline_placed
+                    for item in self._timeline_assets()
+                    if self._source_asset_for(item) is asset
+                )
                 and asset.local_path
                 and asset.local_path != incoming_path
             )
@@ -7397,11 +7509,16 @@ class DirectorCutStudio(QMainWindow):
                 # to its replacement. Force the complete visual-analysis → LM
                 # Shot-adaptation chain even when AUTO AI ENRICH is disabled.
                 asset.clip_prompt = ""
+                for clip in self.scan.timeline_clips:  # type: ignore[union-attr]
+                    if clip.source_node_id == asset.node_id:
+                        clip.clip_prompt = ""
                 self.semantic_waiting_assets.add(asset.node_id)
+            self._sync_timeline_clip_sources(asset)
             self.select_asset(asset)
             self.queue_media_preparation(asset, auto_analyze=True, preserve_recognition=False)
-            if asset.timeline_placed:
-                self._mark_render_range_dirty(asset.start_seconds, asset.end_seconds)
+            for clip in self._timeline_assets():
+                if self._source_asset_for(clip) is asset and clip.timeline_placed:
+                    self._mark_render_range_dirty(clip.start_seconds, clip.end_seconds)
             self._mark_dirty()
             self.schedule_prompt_generation()
             if replacing_timeline_media:
@@ -7538,10 +7655,13 @@ class DirectorCutStudio(QMainWindow):
                     self.scan.duration_seconds,
                     asset.start_seconds + float(info["duration"]),
                 )
+        self._sync_timeline_clip_sources(asset)
         self.timeline.schedule_rebuild()
         self._refresh_semantic_card(asset)
         if asset is self.selected_asset:
-            self.select_asset(asset)
+            self._show_asset_inspector(
+                asset, self.selected_timeline_asset or asset
+            )
         self.statusBar().showMessage(f"Prepared {asset.tag}; recognition queued")
         if job["auto_analyze"]:
             if asset.media_type in ("image", "video"):
@@ -8017,17 +8137,24 @@ class DirectorCutStudio(QMainWindow):
         automatic update remains undoable.
         """
 
-        if not asset.timeline_placed:
+        occurrences = [
+            item for item in self._timeline_assets()
+            if item.timeline_placed and self._source_asset_for(item) is asset
+        ]
+        if not occurrences:
             return []
         matching = [
             cue
             for cue in self.director_cues
             if cue.cue_type == "shot"
-            and ranges_intersect(
-                cue.start_seconds,
-                cue.end_seconds,
-                asset.start_seconds,
-                asset.end_seconds,
+            and any(
+                ranges_intersect(
+                    cue.start_seconds,
+                    cue.end_seconds,
+                    occurrence.start_seconds,
+                    occurrence.end_seconds,
+                )
+                for occurrence in occurrences
             )
         ]
         if not matching:
@@ -8178,6 +8305,7 @@ class DirectorCutStudio(QMainWindow):
             asset.semantic_enrichment_updated_at = time.strftime(
                 "%Y-%m-%d %H:%M:%S UTC", time.gmtime()
             )
+            self._sync_timeline_clip_sources(asset)
             self.semantic_errors.pop(asset.node_id, None)
             synced_shots = self._sync_semantic_enrichment_to_existing_shots(
                 asset,
@@ -8190,7 +8318,10 @@ class DirectorCutStudio(QMainWindow):
                     f"AI semantic enrichment ready for {asset.tag} · updated "
                     + ", ".join(synced_shots)
                 )
-            elif asset.timeline_placed:
+            elif any(
+                item.timeline_placed and self._source_asset_for(item) is asset
+                for item in self._timeline_assets()
+            ):
                 self.statusBar().showMessage(
                     f"AI semantic enrichment ready for {asset.tag} · no existing overlapping Shot"
                 )
@@ -8274,25 +8405,70 @@ class DirectorCutStudio(QMainWindow):
 
         QTimer.singleShot(0, lambda current=asset: self._maybe_auto_enrich(current))
 
-    def select_asset(self, asset: MediaAsset) -> None:
-        self.selected_asset = asset
-        self.inspect_tag.setText(f"{asset.tag} · {asset.media_type.upper()}")
-        self.inspect_node.setText(f"{asset.node_id} · {asset.class_type}")
-        self.inspect_file.setText(asset.local_path or asset.filename or "Not loaded")
-        self.asset_start.setValue(asset.start_seconds)
-        self.asset_end.setValue(asset.end_seconds)
-        self.asset_speed.setValue(asset.playback_speed)
-        self.asset_source_in.setValue(asset.source_in_seconds)
-        self.asset_source_out.setValue(asset.source_out_seconds)
-        self.asset_fade_in.setValue(asset.fade_in_seconds)
-        self.asset_fade_out.setValue(asset.fade_out_seconds)
-        self.asset_transition_in.setCurrentText(asset.transition_in)
-        self.asset_transition_out.setCurrentText(asset.transition_out)
-        self._refresh_recognition_inspector(asset)
-        self.remove_clip_button.setEnabled(asset.timeline_placed)
+    def _timeline_assets(self) -> list[MediaAsset]:
+        return self.scan.timeline_assets() if self.scan else []
+
+    def _source_asset_for(self, asset: MediaAsset) -> MediaAsset:
+        if not self.scan or not asset.source_node_id:
+            return asset
+        return next(
+            (item for item in self.scan.assets if item.node_id == asset.source_node_id),
+            asset,
+        )
+
+    def _selected_clip(self) -> MediaAsset | None:
+        return self.selected_timeline_asset or self.selected_asset
+
+    def _sync_timeline_clip_sources(self, source: MediaAsset | None = None) -> None:
+        """Refresh source-owned media and analysis on every repeated use."""
+        if not self.scan:
+            return
+        shared = (
+            "filename", "local_path", "recognition", "semantic_enrichment",
+            "semantic_enrichment_source_hash", "semantic_enrichment_model",
+            "semantic_enrichment_updated_at", "source_duration_seconds", "state",
+            "binding", "paired_audio_binding", "tag", "class_type", "media_type",
+        )
+        sources = {item.node_id: item for item in self.scan.assets}
+        for clip in self.scan.timeline_clips:
+            source_asset = sources.get(clip.source_node_id or clip.node_id)
+            if source_asset is None or (source is not None and source_asset is not source):
+                continue
+            for name in shared:
+                setattr(clip, name, getattr(source_asset, name))
+
+    def _show_asset_inspector(self, source: MediaAsset, clip: MediaAsset) -> None:
+        self.inspect_tag.setText(f"{source.tag} · {source.media_type.upper()}")
+        instance = f" · {clip.clip_id}" if clip.clip_id else ""
+        self.inspect_node.setText(f"{source.node_id} · {source.class_type}{instance}")
+        self.inspect_file.setText(source.local_path or source.filename or "Not loaded")
+        self.asset_start.setValue(clip.start_seconds)
+        self.asset_end.setValue(clip.end_seconds)
+        self.asset_speed.setValue(clip.playback_speed)
+        self.asset_source_in.setValue(clip.source_in_seconds)
+        self.asset_source_out.setValue(clip.source_out_seconds)
+        self.asset_fade_in.setValue(clip.fade_in_seconds)
+        self.asset_fade_out.setValue(clip.fade_out_seconds)
+        self.asset_transition_in.setCurrentText(clip.transition_in)
+        self.asset_transition_out.setCurrentText(clip.transition_out)
+        self._refresh_recognition_inspector(source)
+        self.remove_clip_button.setEnabled(clip.timeline_placed)
         for mode, button in self.mode_buttons.items():
-            button.setChecked(mode == asset.activation_mode)
+            button.setChecked(mode == clip.activation_mode)
         self.render_timeline_at(self.playhead_seconds, force_seek=False)
+
+    def select_asset(self, asset: MediaAsset) -> None:
+        """Select a Media Pool source rather than a particular occurrence."""
+        self.selected_asset = self._source_asset_for(asset)
+        self.selected_timeline_asset = None
+        self._show_asset_inspector(self.selected_asset, self.selected_asset)
+
+    def select_timeline_asset(self, clip: MediaAsset) -> None:
+        """Select one independently editable Timeline occurrence."""
+        source = self._source_asset_for(clip)
+        self.selected_asset = source
+        self.selected_timeline_asset = clip
+        self._show_asset_inspector(source, clip)
 
     def set_timeline_tool(self, mode: str) -> None:
         if mode not in self.timeline_tool_buttons:
@@ -8334,7 +8510,7 @@ class DirectorCutStudio(QMainWindow):
         """Return whether a visual track has no media or text in a time range."""
         if track.kind != "visual" or track.locked or not self.scan:
             return False
-        for item in self.scan.assets:
+        for item in self.scan.timeline_assets():
             if (
                 item.timeline_placed
                 and item.media_type in {"image", "video"}
@@ -8665,7 +8841,7 @@ class DirectorCutStudio(QMainWindow):
         self.statusBar().showMessage(f"Split {cue.cue_id} at {seconds:.2f}s")
 
     def edit_clip_prompt(self, asset: MediaAsset) -> None:
-        self.select_asset(asset)
+        self.select_timeline_asset(asset)
         initial_prompt = asset.clip_prompt
         if not initial_prompt.strip() and asset.media_type == "image":
             initial_prompt = self._blip_caption_for_asset(asset)
@@ -8714,8 +8890,9 @@ class DirectorCutStudio(QMainWindow):
         self._sync_prompt_panel_from_timeline()
         state = "saved" if normalized else "cleared"
         self.statusBar().showMessage(f"{asset.tag} clip prompt {state}")
-        self._refresh_recognition_inspector(asset if asset is self.selected_asset else None)
-        self._maybe_auto_enrich(asset)
+        source = self._source_asset_for(asset)
+        self._refresh_recognition_inspector(source if source is self.selected_asset else None)
+        self._maybe_auto_enrich(source)
 
     def select_track(self, track: TimelineTrack) -> None:
         self.selected_track = track
@@ -8807,7 +8984,7 @@ class DirectorCutStudio(QMainWindow):
             return
         source_index = self.tracks.index(track)
         fallback = min(compatible, key=lambda item: abs(self.tracks.index(item) - source_index))
-        assets = self.scan.assets if self.scan else []
+        assets = self.scan.timeline_assets() if self.scan else []
         self.undo_stack.push(
             RemoveTrackCommand(
                 self.tracks,
@@ -8946,19 +9123,21 @@ class DirectorCutStudio(QMainWindow):
         self._scale_generated_video_frame()
 
     def set_activation_mode(self, mode: str) -> None:
-        if not self.selected_asset:
+        asset = self._selected_clip()
+        if not asset:
             return
-        before = timeline_state(self.selected_asset)
+        before = timeline_state(asset)
         after = dict(before)
         after["activation_mode"] = mode
         self.undo_stack.push(
-            AssetEditCommand(self.selected_asset, before, after, self._refresh_after_asset_command, "Change activation")
+            AssetEditCommand(asset, before, after, self._refresh_after_asset_command, "Change activation")
         )
         self._mark_render_states_dirty(before, after)
         self._mark_dirty()
 
     def apply_asset_range(self) -> None:
-        if not self.selected_asset:
+        asset = self._selected_clip()
+        if not asset:
             return
         duration = self.scan.duration_seconds if self.scan else self.asset_end.maximum()
         start, end = snap_timeline_range(
@@ -8967,17 +9146,17 @@ class DirectorCutStudio(QMainWindow):
         if end <= start:
             QMessageBox.warning(self, "Invalid range", "Asset end must be later than its start.")
             return
-        before = timeline_state(self.selected_asset)
+        before = timeline_state(asset)
         after = dict(before)
         after.update(start_seconds=start, end_seconds=end)
         self.undo_stack.push(
-            AssetEditCommand(self.selected_asset, before, after, self._refresh_after_asset_command, "Trim clip")
+            AssetEditCommand(asset, before, after, self._refresh_after_asset_command, "Trim clip")
         )
         self._mark_render_states_dirty(before, after)
         self._mark_dirty()
 
     def apply_clip_properties(self) -> None:
-        asset = self.selected_asset
+        asset = self._selected_clip()
         if not asset:
             return
         source_in = self.asset_source_in.value()
@@ -9004,7 +9183,7 @@ class DirectorCutStudio(QMainWindow):
         self._mark_dirty()
 
     def asset_timing_changed(self, asset: MediaAsset) -> None:
-        if asset is self.selected_asset:
+        if asset is self._selected_clip():
             self.asset_start.setValue(asset.start_seconds)
             self.asset_end.setValue(asset.end_seconds)
         self.refresh_activation()
@@ -9020,6 +9199,17 @@ class DirectorCutStudio(QMainWindow):
         self._mark_dirty()
 
     def remove_timeline_asset(self, asset: MediaAsset) -> None:
+        if not self.scan:
+            return
+        if asset in self.scan.timeline_clips:
+            self.undo_stack.push(
+                RemoveTimelineClipCommand(
+                    self.scan.timeline_clips, asset, self._refresh_after_timeline_clip_list
+                )
+            )
+            self._mark_render_states_dirty(timeline_state(asset))
+            self._mark_dirty()
+            return
         before = timeline_state(asset)
         after = dict(before)
         after["timeline_placed"] = False
@@ -9042,11 +9232,34 @@ class DirectorCutStudio(QMainWindow):
         card = self.cards.get(asset.node_id)
         if card:
             card.refresh_mode(asset.overlaps(self.clip_start.value(), self.clip_end.value()))
-        if asset is self.selected_asset:
-            self.select_asset(asset)
+        if asset is self._selected_clip():
+            self.select_timeline_asset(asset)
         else:
             self._refresh_recognition_inspector()
-        self._maybe_auto_enrich(asset)
+        self._maybe_auto_enrich(self._source_asset_for(asset))
+        self.render_timeline_at(self.playhead_seconds, force_seek=True)
+
+    def add_timeline_clip_instance(self, clip: MediaAsset) -> None:
+        if not self.scan:
+            return
+        self.undo_stack.push(
+            AddTimelineClipCommand(
+                self.scan.timeline_clips, clip, self._refresh_after_timeline_clip_list
+            )
+        )
+        self._mark_render_states_dirty(timeline_state(clip))
+        self._mark_dirty()
+
+    def _refresh_after_timeline_clip_list(self, clip: MediaAsset) -> None:
+        if not self.scan:
+            return
+        if clip not in self.scan.timeline_clips and self.selected_timeline_asset is clip:
+            self.selected_timeline_asset = None
+            if self.selected_asset:
+                self._show_asset_inspector(self.selected_asset, self.selected_asset)
+        self.timeline.schedule_rebuild()
+        self.refresh_activation()
+        self._sync_prompt_panel_from_timeline(reconcile_brief=True)
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
 
     def refresh_activation(self) -> None:
@@ -9056,7 +9269,8 @@ class DirectorCutStudio(QMainWindow):
         if end <= start:
             return
         audio_solo = any(track.enabled and track.solo for track in self.tracks if track.kind == "audio")
-        for asset in self.scan.assets:
+        active_source_ids: set[str] = set()
+        for asset in self.scan.timeline_assets():
             track = self._track_for_asset(asset)
             track_active = bool(track and track.enabled)
             if track and track.kind == "visual":
@@ -9064,9 +9278,12 @@ class DirectorCutStudio(QMainWindow):
             if track and track.kind == "audio":
                 track_active = track_active and not track.muted and (not audio_solo or track.solo)
             active = asset.overlaps(start, end) and track_active
-            card = self.cards.get(asset.node_id)
+            if active:
+                active_source_ids.add(asset.source_node_id or asset.node_id)
+        for source in self.scan.assets:
+            card = self.cards.get(source.node_id)
             if card:
-                card.refresh_mode(active)
+                card.refresh_mode(source.node_id in active_source_ids)
 
     def playhead_changed(self, seconds: float) -> None:
         self.seek_timeline(seconds)
@@ -9291,6 +9508,10 @@ class DirectorCutStudio(QMainWindow):
         return max(0, round(source_seconds * 1000))
 
     @staticmethod
+    def _clip_runtime_key(asset: MediaAsset) -> str:
+        return asset.clip_id or asset.node_id
+
+    @staticmethod
     def _clip_envelope(asset: MediaAsset, seconds: float) -> float:
         elapsed = max(0.0, seconds - asset.start_seconds)
         remaining = max(0.0, asset.end_seconds - seconds)
@@ -9315,7 +9536,7 @@ class DirectorCutStudio(QMainWindow):
         )
         present = [
             asset
-            for asset in self.scan.assets
+            for asset in self.scan.timeline_assets()
             if asset.timeline_placed
             and asset.activation_mode != "bypass"
             and asset.start_seconds <= lookup_seconds < asset.end_seconds
@@ -9376,9 +9597,11 @@ class DirectorCutStudio(QMainWindow):
                 and track.visible
             )
 
+        if eligible(self.selected_timeline_asset):
+            return self.selected_timeline_asset
         if eligible(self.selected_asset):
             return self.selected_asset
-        return next((asset for asset in self.scan.assets if eligible(asset)), None)
+        return next((asset for asset in self.scan.timeline_assets() if eligible(asset)), None)
 
     def _compositor_required(self, visuals: list[MediaAsset]) -> bool:
         if len(visuals) > 1:
@@ -9406,11 +9629,11 @@ class DirectorCutStudio(QMainWindow):
             "Difference": QPainter.CompositionMode_Difference,
         }.get(name, QPainter.CompositionMode_SourceOver)
 
-    def _composite_frame_changed(self, node_id: str, frame) -> None:
+    def _composite_frame_changed(self, clip_key: str, frame) -> None:
         image = frame.toImage()
         if not image.isNull():
-            self.composite_video_frames[node_id] = image.copy()
-            if any(asset.node_id == node_id for asset in self.composite_visuals):
+            self.composite_video_frames[clip_key] = image.copy()
+            if any(self._clip_runtime_key(asset) == clip_key for asset in self.composite_visuals):
                 self._render_visual_composite(self.composite_visuals, self.playhead_seconds)
 
     def _sync_composite_video_players(
@@ -9420,7 +9643,7 @@ class DirectorCutStudio(QMainWindow):
         force_seek: bool,
     ) -> None:
         active_ids = {
-            asset.node_id
+            self._clip_runtime_key(asset)
             for asset in visuals
             if asset.media_type == "video" and asset.local_path
         }
@@ -9430,16 +9653,17 @@ class DirectorCutStudio(QMainWindow):
         for asset in visuals:
             if asset.media_type != "video" or not asset.local_path:
                 continue
-            player = self.composite_video_players.get(asset.node_id)
+            clip_key = self._clip_runtime_key(asset)
+            player = self.composite_video_players.get(clip_key)
             if player is None:
                 sink = QVideoSink(self)
                 sink.videoFrameChanged.connect(
-                    lambda frame, node_id=asset.node_id: self._composite_frame_changed(node_id, frame)
+                    lambda frame, key=clip_key: self._composite_frame_changed(key, frame)
                 )
                 player = QMediaPlayer(self)
                 player.setVideoOutput(sink)
-                self.composite_video_sinks[asset.node_id] = sink
-                self.composite_video_players[asset.node_id] = player
+                self.composite_video_sinks[clip_key] = sink
+                self.composite_video_players[clip_key] = player
             desired_ms = self._source_position_ms(asset, seconds)
             player.setPlaybackRate(asset.playback_speed)
             if player.source().toLocalFile() != asset.local_path:
@@ -9455,7 +9679,7 @@ class DirectorCutStudio(QMainWindow):
 
     def _layer_image(self, asset: MediaAsset) -> QImage:
         if asset.media_type == "video":
-            frame = self.composite_video_frames.get(asset.node_id)
+            frame = self.composite_video_frames.get(self._clip_runtime_key(asset))
             if frame is not None and not frame.isNull():
                 return frame
         preview = self.preview_paths.get(asset.node_id)
@@ -9518,13 +9742,13 @@ class DirectorCutStudio(QMainWindow):
                 player.stop()
             desired_ms = self._source_position_ms(visual, seconds)
             source_changed = (
-                self.current_visual_node != visual.node_id
+                self.current_visual_node != self._clip_runtime_key(visual)
                 or self.player.source().toLocalFile() != visual.local_path
             )
             self.pending_video_position_ms = desired_ms
             self.player.setPlaybackRate(visual.playback_speed)
             if source_changed:
-                self.current_visual_node = visual.node_id
+                self.current_visual_node = self._clip_runtime_key(visual)
                 self.player.stop()
                 self.player.setSource(QUrl.fromLocalFile(visual.local_path))
                 self.player.setPosition(desired_ms)
@@ -9542,8 +9766,9 @@ class DirectorCutStudio(QMainWindow):
                 player.stop()
             if self.current_visual_node and self.player.playbackState() != QMediaPlayer.StoppedState:
                 self.player.stop()
-            source_changed = self.current_visual_node != (visual.node_id if visual else "")
-            self.current_visual_node = visual.node_id if visual else ""
+            visual_key = self._clip_runtime_key(visual) if visual else ""
+            source_changed = self.current_visual_node != visual_key
+            self.current_visual_node = visual_key
             self.monitor_stack.setCurrentWidget(self.monitor_image)
             if visual:
                 if source_changed or force_seek or self.monitor_image.pixmap().isNull():
@@ -9662,29 +9887,30 @@ class DirectorCutStudio(QMainWindow):
         return asset.local_path
 
     def _sync_timeline_audio(self, audios: list[MediaAsset], seconds: float, force_seek: bool) -> None:
-        active_ids = {asset.node_id for asset in audios if asset.local_path}
-        for node_id, player in self.timeline_audio_players.items():
-            if node_id not in active_ids:
+        active_ids = {self._clip_runtime_key(asset) for asset in audios if asset.local_path}
+        for clip_key, player in self.timeline_audio_players.items():
+            if clip_key not in active_ids:
                 player.stop()
         for asset in audios:
             if not asset.local_path:
                 continue
-            player = self.timeline_audio_players.get(asset.node_id)
+            clip_key = self._clip_runtime_key(asset)
+            player = self.timeline_audio_players.get(clip_key)
             if player is None:
                 output = QAudioOutput(self)
                 player = QMediaPlayer(self)
                 player.setAudioOutput(output)
                 player.mediaStatusChanged.connect(
-                    lambda status, node_id=asset.node_id: self._audio_media_status_changed(node_id, status)
+                    lambda status, key=clip_key: self._audio_media_status_changed(key, status)
                 )
-                self.timeline_audio_outputs[asset.node_id] = output
-                self.timeline_audio_players[asset.node_id] = player
-            output = self.timeline_audio_outputs[asset.node_id]
+                self.timeline_audio_outputs[clip_key] = output
+                self.timeline_audio_players[clip_key] = player
+            output = self.timeline_audio_outputs[clip_key]
             track = self._track_for_asset(asset)
             track_volume = track.volume if track and track.kind == "audio" else 1.0
             output.setVolume(max(0.0, min(1.0, track_volume * self._clip_envelope(asset, seconds))))
             desired_ms = self._source_position_ms(asset, seconds)
-            self.pending_audio_positions[asset.node_id] = desired_ms
+            self.pending_audio_positions[clip_key] = desired_ms
             player.setPlaybackRate(asset.playback_speed)
             playback_source = self._audio_playback_source(asset, track)
             if player.source().toLocalFile() != playback_source:
@@ -9734,14 +9960,14 @@ class DirectorCutStudio(QMainWindow):
             if self.timeline_playing:
                 self.generated_player.play()
 
-    def _audio_media_status_changed(self, node_id: str, status) -> None:
+    def _audio_media_status_changed(self, clip_key: str, status) -> None:
         if status not in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
             return
-        player = self.timeline_audio_players.get(node_id)
+        player = self.timeline_audio_players.get(clip_key)
         if not player:
             return
-        player.setPosition(self.pending_audio_positions.get(node_id, 0))
-        if self.timeline_playing and self.pending_audio_positions.get(node_id, 0) < player.duration() - 20:
+        player.setPosition(self.pending_audio_positions.get(clip_key, 0))
+        if self.timeline_playing and self.pending_audio_positions.get(clip_key, 0) < player.duration() - 20:
             player.play()
 
     def _stop_all_timeline_media(self) -> None:
@@ -9938,6 +10164,7 @@ class DirectorCutStudio(QMainWindow):
         else:
             error = payload.get("error") or "BLIP returned no caption"
             asset.recognition += f"\n\nBLIP error: {error}"
+        self._sync_timeline_clip_sources(asset)
         self._mark_dirty()
         self.schedule_prompt_generation()
         card = self.cards.get(asset.node_id)
@@ -10064,6 +10291,7 @@ class DirectorCutStudio(QMainWindow):
                 asset.recognition += f"\n\nWHISPER TRANSCRIPT · {payload.get('speech_device', '-')}\n{transcript}"
             else:
                 asset.recognition += "\n\nWHISPER TRANSCRIPT\nNo confident speech was transcribed."
+        self._sync_timeline_clip_sources(asset)
         self._mark_dirty()
         self._sync_prompt_panel_from_timeline(reconcile_brief=True)
         card = self.cards.get(asset.node_id)
@@ -10214,17 +10442,22 @@ class DirectorCutStudio(QMainWindow):
         active_audio_ids: list[str] = []
         transcript_rows: list[str] = []
         if self.scan:
-            for asset in self.scan.assets:
+            for asset in self.scan.timeline_assets():
                 if not asset.timeline_placed or asset.activation_mode == "bypass":
                     continue
                 media_id = media_shortcut(asset)
                 if asset.media_type in {"image", "video"}:
-                    active_visual_ids.append(media_id)
+                    if media_id not in active_visual_ids:
+                        active_visual_ids.append(media_id)
                 elif asset.media_type == "audio":
-                    active_audio_ids.append(media_id)
+                    if media_id not in active_audio_ids:
+                        active_audio_ids.append(media_id)
                 if asset.clip_prompt.strip():
                     instruction = " ".join(asset.clip_prompt.split())
-                    reference_roles.append(f"{media_id}: {instruction[:260]}")
+                    reference_roles.append(
+                        f"{media_id} at {asset.start_seconds:.2f}-{asset.end_seconds:.2f}s: "
+                        f"{instruction[:260]}"
+                    )
                 if asset.media_type == "audio" and "WHISPER TRANSCRIPT" in asset.recognition:
                     capture = False
                     for raw in asset.recognition.splitlines():
@@ -10321,6 +10554,7 @@ class DirectorCutStudio(QMainWindow):
     def generate_prompt(self, interactive: bool = True) -> None:
         if not self.scan:
             return
+        self._sync_timeline_clip_sources()
         if interactive:
             self._sync_prompt_panel_from_timeline()
         spec = self._prompt_spec_with_director_cues(self.prompt_panel.spec())
@@ -10878,7 +11112,10 @@ class DirectorCutStudio(QMainWindow):
             return timed_specificity + prompted, -duration, -binding_index
 
         released = min(candidates, key=release_score)
-        released.enabled = False
+        released_source = released.source_node_id or released.node_id
+        for asset in active_assets:
+            if (asset.source_node_id or asset.node_id) == released_source:
+                asset.enabled = False
         return released
 
     def _reference_belongs_to_window(
@@ -10955,6 +11192,7 @@ class DirectorCutStudio(QMainWindow):
             rows.append(
                 {
                     "node_id": asset.node_id,
+                    "clip_id": asset.clip_id or f"source-{asset.node_id}",
                     "path": str(path.resolve()) if path and path.is_file() else asset.filename,
                     "size": stat.st_size if stat else None,
                     "mtime_ns": stat.st_mtime_ns if stat else None,
@@ -10980,12 +11218,14 @@ class DirectorCutStudio(QMainWindow):
         """Compile one hidden segment without changing the visible work area."""
         if not self.scan:
             raise RuntimeError("No API workflow is loaded.")
-        original_enabled = {asset.node_id: asset.enabled for asset in self.scan.assets}
+        self._sync_timeline_clip_sources()
+        timeline_assets = self.scan.timeline_assets()
+        original_enabled = [(asset, asset.enabled) for asset in timeline_assets]
         audio_solo = any(
             track.enabled and track.solo for track in self.tracks if track.kind == "audio"
         )
         try:
-            for asset in self.scan.assets:
+            for asset, was_enabled in original_enabled:
                 track = self._track_for_asset(asset)
                 track_active = bool(track and track.enabled)
                 if track and track.kind == "visual":
@@ -10996,7 +11236,7 @@ class DirectorCutStudio(QMainWindow):
                         and not track.muted
                         and (not audio_solo or track.solo)
                     )
-                asset.enabled = original_enabled[asset.node_id] and track_active
+                asset.enabled = was_enabled and track_active
                 if asset.enabled and not self._reference_belongs_to_window(
                     asset, start, end
                 ):
@@ -11090,8 +11330,8 @@ class DirectorCutStudio(QMainWindow):
             )
             return compiled, assets, continuity, fingerprint
         finally:
-            for asset in self.scan.assets:
-                asset.enabled = original_enabled[asset.node_id]
+            for asset, was_enabled in original_enabled:
+                asset.enabled = was_enabled
 
     def _build_smart_render_job(
         self,
@@ -11202,6 +11442,7 @@ class DirectorCutStudio(QMainWindow):
     ) -> tuple[dict, list[MediaAsset]]:
         if not self.scan:
             raise RuntimeError("No API workflow is loaded.")
+        self._sync_timeline_clip_sources()
         self._read_settings_ui()
         megapixels = self.render_settings.megapixels if megapixels is None else megapixels
         seed = self._new_seed() if seed is None else seed
@@ -11214,17 +11455,18 @@ class DirectorCutStudio(QMainWindow):
         if end <= start:
             raise ValueError("Work-area end must be later than its start.")
         prompt = self.prompt_panel.output.toPlainText().strip() or None
-        original_enabled = {asset.node_id: asset.enabled for asset in self.scan.assets}
+        timeline_assets = self.scan.timeline_assets()
+        original_enabled = [(asset, asset.enabled) for asset in timeline_assets]
         audio_solo = any(track.enabled and track.solo for track in self.tracks if track.kind == "audio")
         try:
-            for asset in self.scan.assets:
+            for asset, was_enabled in original_enabled:
                 track = self._track_for_asset(asset)
                 track_active = bool(track and track.enabled)
                 if track and track.kind == "visual":
                     track_active = track_active and track.visible
                 if track and track.kind == "audio":
                     track_active = track_active and not track.muted and (not audio_solo or track.solo)
-                asset.enabled = original_enabled[asset.node_id] and track_active
+                asset.enabled = was_enabled and track_active
             return compile_active_workflow(
                 self.scan,
                 start,
@@ -11237,8 +11479,8 @@ class DirectorCutStudio(QMainWindow):
                 ),
             )
         finally:
-            for asset in self.scan.assets:
-                asset.enabled = original_enabled[asset.node_id]
+            for asset, was_enabled in original_enabled:
+                asset.enabled = was_enabled
 
     def generate_pre_run_preview(self) -> None:
         self.preview_seed = self._new_seed(self.preview_seed)

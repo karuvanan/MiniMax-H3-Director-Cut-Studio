@@ -369,12 +369,31 @@ def build_ref2va_prompt(
     special_profile: SkillProfile | None = None,
 ) -> str:
     """Deterministically build the six sections required by h3-prompt-writing."""
-    visual_assets = [asset for asset in assets if asset.media_type in ("image", "video")]
-    audio_assets = [asset for asset in assets if asset.media_type == "audio"]
+    def source_key(asset: MediaAsset) -> tuple[str, str, str]:
+        return (asset.media_type, asset.source_node_id or asset.node_id, asset.binding)
+
+    grouped: dict[tuple[str, str, str], list[MediaAsset]] = {}
+    for asset in assets:
+        grouped.setdefault(source_key(asset), []).append(asset)
+    unique_assets = [instances[0] for instances in grouped.values()]
+    visual_assets = [asset for asset in unique_assets if asset.media_type in ("image", "video")]
+    audio_assets = [asset for asset in unique_assets if asset.media_type == "audio"]
     has_reused_audio = bool(audio_assets or any(a.paired_audio_binding for a in assets))
     task_types = "reference generation + audio reuse" if has_reused_audio else "reference generation"
 
-    definitions = "\n".join(_asset_definition(asset) for asset in assets)
+    definition_rows: list[str] = []
+    for representative in unique_assets:
+        instances = grouped[source_key(representative)]
+        row = _asset_definition(representative)
+        if len(instances) > 1:
+            uses = "; ".join(
+                f"{asset.start_seconds:.2f}s-{asset.end_seconds:.2f}s"
+                + (f" ({asset.clip_prompt.strip()[:300]})" if asset.clip_prompt.strip() else "")
+                for asset in instances
+            )
+            row += f" Reused Timeline instances: {uses}."
+        definition_rows.append(row)
+    definitions = "\n".join(definition_rows)
     if not definitions:
         definitions = "No active reference asset is assigned to this time window."
 
@@ -390,17 +409,25 @@ def build_ref2va_prompt(
 
     retention_rows: list[str] = []
     for asset in visual_assets:
+        instances = grouped[source_key(asset)]
+        ranges = ", ".join(
+            f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s" for item in instances
+        )
         role = "visual identity, composition, and referenced attributes are retained"
         if asset.media_type == "video":
             role = "motion, camera, and temporal characteristics guide the target sequence"
         retention_rows.append(
-            f"{asset.tag} (active from {asset.start_seconds:.2f}s to {asset.end_seconds:.2f}s): "
+            f"{asset.tag} (active from {ranges}): "
             f"fully_preserved - {role}."
         )
     for asset in audio_assets:
+        instances = grouped[source_key(asset)]
+        ranges = ", ".join(
+            f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s" for item in instances
+        )
         retention_rows.append(
             f"{asset.tag}: fully_copy - the assigned signal is reused during its "
-            f"{asset.start_seconds:.2f}s to {asset.end_seconds:.2f}s timeline range."
+            f"{ranges} timeline range."
         )
     if not retention_rows:
         retention_rows.append("No active reference relationship is retained in this time window.")
@@ -426,7 +453,7 @@ def build_ref2va_prompt(
             "The product body color, material, silhouette, functional details, negative space, "
             "and premium restrained motion remain consistent; every visible copy line stays on one line."
         )
-    active_labels = ", ".join(asset.tag for asset in assets)
+    active_labels = ", ".join(asset.tag for asset in unique_assets)
     structured_transitions = _transition_rows_by_boundary(
         spec.transition_ranges,
         timed_shots,

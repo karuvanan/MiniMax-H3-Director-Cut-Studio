@@ -7,7 +7,7 @@ from pathlib import Path
 
 VERSION_FILE = Path(__file__).resolve().with_name("VERSION")
 FALLBACK_APP_VERSION = "0.0.0-unknown"
-PROJECT_FORMAT_VERSION = 14
+PROJECT_FORMAT_VERSION = 15
 
 
 def read_app_version(version_file: Path = VERSION_FILE) -> str:

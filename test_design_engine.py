@@ -351,6 +351,47 @@ class DesignEngineTests(unittest.TestCase):
         ))
         self.assertEqual([item["media_type"] for item in plan["media_requests"]], ["audio"])
 
+    def test_existing_media_can_return_in_separate_timeline_intervals(self):
+        payload = sample_design()
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "p1_opening",
+                "media_id": "P1",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": 1.0,
+                "end_seconds": 5.0,
+                "track": "V1",
+                "subject_keywords": ["hero"],
+                "instruction": "Establish the hero.",
+            },
+            {
+                "requirement_id": "p1_return",
+                "media_id": "P1",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": 8.0,
+                "end_seconds": 12.0,
+                "track": "V2",
+                "subject_keywords": ["hero"],
+                "instruction": "Return to the hero from a new angle.",
+            },
+        ]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+            }],
+        )
+        self.assertEqual(
+            [(row["media_id"], row["start_seconds"], row["end_seconds"])
+             for row in plan["existing_media_uses"]],
+            [("P1", 1.0, 5.0), ("P1", 8.0, 12.0)],
+        )
+
     def test_existing_media_inventory_rejects_unknown_empty_or_wrong_type(self):
         base_use = {
             "requirement_id": "hero",
@@ -408,6 +449,7 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("a4, a5 and higher", prompt)
         self.assertIn("treat each asset's caption", prompt)
         self.assertIn("when a loaded asset satisfies that need", prompt)
+        self.assertIn("multiple existing_media_uses rows", prompt)
         self.assertNotIn("when a treat each asset", prompt)
 
     def test_t2i_prompt_rejects_h3_picture_token(self):

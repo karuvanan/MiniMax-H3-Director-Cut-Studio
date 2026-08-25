@@ -995,6 +995,46 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_ai_design_places_repeated_media_uses_as_independent_clips(self):
+        window = DirectorCutStudio()
+        media_root = PROJECT_ROOT / ".director_cache" / "repeated_design_media"
+        media_root.mkdir(parents=True, exist_ok=True)
+        picture_path = media_root / "p1.png"
+        Image.new("RGB", (48, 48), (30, 50, 70)).save(picture_path)
+        self.addCleanup(lambda: picture_path.unlink(missing_ok=True))
+        source = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        assign_local_media(window.scan, source, picture_path)
+        payload = sample_design()
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "p1_opening", "media_id": "P1", "media_type": "image",
+                "usage": "h3_reference", "reuse_policy": "time_scoped",
+                "start_seconds": 1.0, "end_seconds": 5.0, "track": "V1",
+                "subject_keywords": ["hero"], "instruction": "Opening identity view.",
+            },
+            {
+                "requirement_id": "p1_return", "media_id": "P1", "media_type": "image",
+                "usage": "h3_reference", "reuse_policy": "time_scoped",
+                "start_seconds": 8.0, "end_seconds": 12.0, "track": "V2",
+                "subject_keywords": ["hero"], "instruction": "Return from a low angle.",
+            },
+        ]
+        plan = normalize_design_plan(
+            payload,
+            window.scan.counts,
+            existing_media=window._design_context()["existing_media"],
+        )
+        window._apply_ai_design_direct(plan, [], replace=True)
+        self.assertEqual((source.start_seconds, source.end_seconds), (1.0, 5.0))
+        self.assertEqual(source.clip_prompt, "Opening identity view.")
+        self.assertEqual(len(window.scan.timeline_clips), 1)
+        repeated = window.scan.timeline_clips[0]
+        self.assertEqual((repeated.start_seconds, repeated.end_seconds), (8.0, 12.0))
+        self.assertEqual(repeated.timeline_track_id, "V2")
+        self.assertEqual(repeated.clip_prompt, "Return from a low angle.")
+        window.project_dirty = False
+        window.close()
+
     def test_media_card_drag_is_accepted_through_timeline_viewport(self):
         window = DirectorCutStudio()
         window.resize(1400, 900)
@@ -1013,6 +1053,65 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertAlmostEqual(asset.start_seconds, 2.0, places=1)
         window.project_dirty = False
         window.close()
+
+    def test_media_pool_source_can_be_dropped_twice_as_independent_clips(self):
+        window = DirectorCutStudio()
+        window.resize(1400, 900)
+        window.show()
+        self.app.processEvents()
+        asset = next(item for item in window.scan.assets if item.media_type == "image")
+
+        self._send_drop(window, asset, 1.0)
+        first_range = (asset.start_seconds, asset.end_seconds)
+        self._send_drop(window, asset, 8.0)
+
+        self.assertEqual(first_range, (1.0, 4.0))
+        self.assertEqual((asset.start_seconds, asset.end_seconds), first_range)
+        self.assertEqual(len(window.scan.timeline_clips), 1)
+        repeated = window.scan.timeline_clips[0]
+        self.assertEqual(repeated.source_node_id, asset.node_id)
+        self.assertTrue(repeated.clip_id.startswith("clip-"))
+        self.assertEqual((repeated.start_seconds, repeated.end_seconds), (8.0, 11.0))
+        self.assertEqual(len(window._project_payload()["timeline_clips"]), 1)
+
+        window.undo_stack.undo()
+        self.assertEqual(window.scan.timeline_clips, [])
+        window.undo_stack.redo()
+        self.assertEqual(window.scan.timeline_clips, [repeated])
+        window.project_dirty = False
+        window.close()
+
+    def test_repeated_media_clips_round_trip_in_project_format_15(self):
+        project = PROJECT_ROOT / ".director_cache" / "repeated_clip_project_test.h3director.json"
+        self.addCleanup(lambda: project.unlink(missing_ok=True))
+        window = DirectorCutStudio()
+        window.resize(1400, 900)
+        window.show()
+        self.app.processEvents()
+        source = next(item for item in window.scan.assets if item.media_type == "image")
+        self._send_drop(window, source, 1.0)
+        self._send_drop(window, source, 8.0)
+        repeated_id = window.scan.timeline_clips[0].clip_id
+        project.write_text(
+            json.dumps(window._project_payload(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        window.project_dirty = False
+        window.close()
+
+        restored = DirectorCutStudio()
+        restored.load_project_path(project)
+        restored_source = next(
+            item for item in restored.scan.assets if item.node_id == source.node_id
+        )
+        self.assertEqual((restored_source.start_seconds, restored_source.end_seconds), (1.0, 4.0))
+        self.assertEqual(len(restored.scan.timeline_clips), 1)
+        repeated = restored.scan.timeline_clips[0]
+        self.assertEqual(repeated.clip_id, repeated_id)
+        self.assertEqual(repeated.source_node_id, restored_source.node_id)
+        self.assertEqual((repeated.start_seconds, repeated.end_seconds), (8.0, 11.0))
+        restored.project_dirty = False
+        restored.close()
 
     def test_timeline_uses_half_second_snap_grid(self):
         self.assertEqual(snap_timeline_seconds(0.24), 0.0)
@@ -1252,7 +1351,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertAlmostEqual(asset.source_in_seconds, 0.25)
         self.assertEqual(asset.transition_out, "Cross Dissolve")
         payload = window._project_payload()
-        self.assertEqual(payload["version"], 14)
+        self.assertEqual(payload["version"], 15)
         self.assertEqual(payload["application_version"], APP_VERSION)
         self.assertEqual(len(payload["tracks"]), 8)
         self.assertIn("playback_speed", payload["assets"][asset.node_id])
@@ -1374,7 +1473,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.undo_stack.redo()
         self.assertEqual((layer.position_x, layer.position_y), moved_position)
         payload = window._project_payload()
-        self.assertEqual(payload["version"], 14)
+        self.assertEqual(payload["version"], 15)
         self.assertEqual(payload["text_layers"][0]["font_size"], 52)
 
         before = layer.__dict__ if hasattr(layer, "__dict__") else {
@@ -1669,7 +1768,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("Whip Pan", spec.transition)
         self.assertIn("GET READY", " ".join(spec.shots))
         payload = window._project_payload()
-        self.assertEqual(payload["version"], 14)
+        self.assertEqual(payload["version"], 15)
         self.assertEqual(len(payload["director_cues"]), 3)
         window.project_dirty = False
         window.close()
@@ -2348,7 +2447,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertTrue((archive / "render_manifest.json").is_file())
         self.assertTrue(project.is_file())
         payload = json.loads(project.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 14)
+        self.assertEqual(payload["version"], 15)
         self.assertEqual(payload["generated_output_timeline_start"], 0.0)
         self.assertEqual(len(payload["monitor_compare_sizes"]), 2)
         # Simulate the user's portable version 12 example folder: its saved
