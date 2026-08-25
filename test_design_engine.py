@@ -403,6 +403,9 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("@p1", prompt)
         self.assertIn("existing_media_uses", prompt)
         self.assertIn("only genuinely missing assets", prompt)
+        self.assertIn("treat each asset's caption", prompt)
+        self.assertIn("when a loaded asset satisfies that need", prompt)
+        self.assertNotIn("when a treat each asset", prompt)
 
     def test_t2i_prompt_rejects_h3_picture_token(self):
         payload = sample_design()
