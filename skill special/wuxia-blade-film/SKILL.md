@@ -22,6 +22,24 @@ Create dangerous, improvised and physically continuous wuxia action. Apply these
 - State duration, exact Shot ranges, visible-text/dialogue policy, character and weapon ledger, spatial ledger, boundary contracts, sound and media policy once.
 - Keep Shot instructions concrete enough for `subject_action`, `environment_response` and `additional_direction`; omit discussion about how to force the model.
 
+## Enforce the H3 Generation Budget
+
+Classify every Shot instruction before writing it:
+
+- **Must-complete core (`subject_action`):** the minimum causal action that must visibly finish. Keep no more than three physical beats per five seconds.
+- **Must-preserve state (`continuity_state`):** incoming and outgoing body pose, weapon ownership and position, velocity, screen direction, geography, camera trajectory and any unresolved contact.
+- **Optional flourish (`optional_flourish`):** leaves, sparks, dust, cloth motion, secondary feints, ornamental camera motion and other detail that may disappear without breaking the story.
+- **Required consequence (`environment_response`):** a contact-driven reaction needed to prove cause and effect. Keep no more than two per five seconds. Do not misclassify a necessary impact, landing, break or water contact as decoration.
+
+Budget each five-second interval for at most three must-complete physical beats, two required contact consequences and two optional flourishes. When over budget:
+
+1. Split the material into consecutive, non-overlapping Shot Blocks on the 0.5-second grid when enough duration exists.
+2. Otherwise preserve the trigger, committed action, decisive contact/consequence and exit state; move secondary attacks, repeated counters and decorative reactions to `optional_flourish`.
+3. Rewrite the remaining core as one concise executable causal chain. Never keep an impossible list merely because every source idea was labelled important.
+4. In the final 0.5 to 1.0 second before a native 15-second boundary, introduce no new multi-beat technique. Establish one clean outgoing state for the next segment.
+
+Priority is always: identity/geography/weapon ownership and continuity state, then core action, then required contact consequence, then optional flourish. H3 must omit optional detail before delaying, weakening or replaying a core action.
+
 ## Lock Continuity Ledgers
 
 Before authoring Shots, freeze four ledgers:
@@ -117,9 +135,11 @@ Prefer hard diegetic impacts such as `WHOOSH`, `CLANG`, `THUD`, `CHAIN SNAP`, `T
 Follow the current Director Design JSON schema supplied by the application. Return JSON only when JSON is requested.
 
 - Use exact start and end times with continuous chronological coverage.
-- Put the concrete physical action in `subject_action`.
+- Put only the must-complete physical core in `subject_action`.
 - Put contact-driven set reactions in `environment_response`.
-- Put inherited state, exit vector, visibility rule, camera reacquisition and weapon continuity in `additional_direction`.
+- Put inherited and outgoing physical state in `continuity_state`.
+- Put dispensable atmosphere, secondary motion and ornamental camera detail in `optional_flourish`.
+- Put visibility rules, camera reacquisition and any remaining execution note in `additional_direction`.
 - Add transition and marker directions only when they control an actual boundary, impact, reveal or ending.
 - Use dialogue or visible text only when explicitly requested.
 - End with a brief consequence, escape, visual callback or final hold that follows directly from the last strike.
@@ -129,6 +149,8 @@ Follow the current Director Design JSON schema supplied by the application. Retu
 Before returning the plan, verify:
 
 - every Shot begins from the previous Shot's exact exit state;
+- every five-second interval contains no more than three must-complete physical beats, two required contact consequences and two optional flourishes;
+- every over-budget Shot has been split or priority-compressed, never passed through as an impossible action list;
 - every 15-second segment begins with a new action and does not replay its continuity handle;
 - no neutral resets, teleportation or unexplained airborne motion;
 - every weapon remains owned, countable and rigid;
