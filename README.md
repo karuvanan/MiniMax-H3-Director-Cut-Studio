@@ -13,7 +13,6 @@
 
 源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
 
-版本规则：基础版本使用 `v0.2.4-alpha` 格式，三个基础数字位只使用 `0–9`。同类小优化不改变前面的基础版本，只递增 alpha 后缀，例如 `v0.2.4-alpha.1`、`v0.2.4-alpha.2`。只有进入新的功能版本时才提升基础数字；届时 `v0.2.9-alpha` 的下一基础版本为 `v0.3.0-alpha`。每次更新都会同步写入 `VERSION` 与 `CHANGELOG.md`。Project JSON 的 format version 独立管理，只有 `.h3director.json` 保存结构改变时才提升。
 
 <img width="1280" height="769" alt="MiniMax H3 Director Cut Studio" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
 
