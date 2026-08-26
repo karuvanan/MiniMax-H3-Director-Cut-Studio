@@ -978,6 +978,36 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_recovered_empty_picture_request_uses_its_preferred_physical_slot(self):
+        window = DirectorCutStudio()
+        media_root = PROJECT_ROOT / ".director_cache" / "preferred_design_slot_test"
+        media_root.mkdir(parents=True, exist_ok=True)
+        generated_path = media_root / "recovered_p4.png"
+        Image.new("RGB", (48, 48), (62, 31, 84)).save(generated_path)
+        self.addCleanup(lambda: generated_path.unlink(missing_ok=True))
+        pictures = [
+            asset for asset in window.scan.assets if asset.media_type == "image"
+        ]
+        plan = normalize_design_plan(
+            sample_design(), window.scan.counts
+        )
+        material = {
+            **plan["media_requests"][0],
+            "preferred_media_id": "P4",
+            "local_path": str(generated_path.resolve()),
+            "preview_path": str(generated_path.resolve()),
+            "generated_by_comfyui": True,
+        }
+
+        warnings = window._apply_ai_design_direct(plan, [material], replace=True)
+
+        self.assertEqual(warnings, [])
+        self.assertFalse(bool(pictures[0].local_path))
+        self.assertEqual(pictures[3].local_path, str(generated_path.resolve()))
+        self.assertTrue(pictures[3].timeline_placed)
+        window.project_dirty = False
+        window.close()
+
     def test_lm_planned_image_count_drives_z_image_material_jobs(self):
         window = DirectorCutStudio()
         with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):

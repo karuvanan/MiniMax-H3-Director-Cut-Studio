@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 import math
 import json
@@ -246,6 +247,10 @@ DESIGN_JSON_SCHEMA = {
                     "track": {"type": "string"},
                     "subject_keywords": {"type": "array", "items": {"type": "string"}},
                     "prompt": {"type": "string"},
+                    "preferred_media_id": {
+                        "type": "string",
+                        "pattern": "^P[1-9][0-9]*$",
+                    },
                 },
             },
         },
@@ -330,6 +335,230 @@ def extract_design_json(value: object) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("AI design JSON must be an object")
     return payload
+
+
+def _standalone_image_text(value: object) -> str:
+    """Remove H3-only or circular image references from a T2I description."""
+
+    text = " ".join(str(value or "").split())
+    text = _PICTURE_REFERENCE_RE.sub("the described subject", text)
+    text = re.sub(r"(?<![A-Za-z0-9_])@?[PVA]\d+\b", "the described subject", text, flags=re.I)
+    text = _DEPENDENT_IMAGE_WORDING_RE.sub("a fully described standalone composition", text)
+    text = _NON_STORY_BACKGROUND_RE.sub("the story's real in-world environment", text)
+    return " ".join(text.split()).strip(" ,.;")
+
+
+def _auto_image_request(
+    source: dict,
+    shot: dict,
+    duration: float,
+    *,
+    requirement_id: str,
+    preferred_media_id: str = "",
+    instruction: str = "",
+) -> dict:
+    """Build a deterministic standalone Z-Image request from one story Shot."""
+
+    start, end = _interval(shot, duration)
+    preset = _standalone_image_text(shot.get("preset", "Story action")) or "Story action"
+    framing = _standalone_image_text(shot.get("framing", "Cinematic medium-wide shot"))
+    angle = _standalone_image_text(shot.get("camera_angle", "Eye-level camera"))
+    action = _standalone_image_text(
+        instruction or shot.get("subject_action") or source.get("creative_brief", "")
+    )
+    environment = _standalone_image_text(
+        shot.get("environment_response") or source.get("creative_brief", "")
+    )
+    style = _standalone_image_text(source.get("global_visual_style", "cinematic realism"))
+    prompt = ". ".join(
+        part.rstrip(" .")
+        for part in (
+            f"Standalone cinematic production frame for {preset}",
+            f"Composition: {framing}, {angle}" if framing or angle else "",
+            f"Decisive in-world moment: {action}" if action else "",
+            f"Story environment and physical response: {environment}" if environment else "",
+            f"Visual treatment: {style}" if style else "",
+            (
+                "Show one coherent instant with exact subject count, consistent identity, wardrobe, "
+                "props, ownership, geography and lighting"
+            ),
+        )
+        if part
+    ) + "."
+    request = {
+        "requirement_id": requirement_id,
+        "media_type": "image",
+        "usage": "h3_reference",
+        "reuse_policy": "time_scoped",
+        "start_seconds": start,
+        "end_seconds": end,
+        "track": (
+            str(shot.get("track", "V1")).strip()
+            if str(shot.get("track", "V1")).strip().upper().startswith("V")
+            else "V1"
+        ),
+        "subject_keywords": [preset[:48], requirement_id[:48]],
+        "prompt": prompt,
+    }
+    if preferred_media_id:
+        request["preferred_media_id"] = preferred_media_id
+    return request
+
+
+def repair_design_media_plan(
+    payload: object,
+    capacities: dict[str, int],
+    existing_media: list[dict] | None,
+) -> tuple[dict, list[str]]:
+    """Repair common LM media-planning omissions before strict validation.
+
+    Empty Picture slots are generation capacity, not reusable Media Pool
+    assets.  Some local models nevertheless emit them in
+    ``existing_media_uses``.  Convert those rows into Z-Image requests and add
+    enough time-scoped references to cover the Shot plan at roughly one useful
+    state per five seconds, bounded by Shot count and physical API capacity.
+    """
+
+    source = deepcopy(extract_design_json(payload))
+    duration = max(
+        0.5,
+        snap_half_second(
+            source.get("duration_seconds", 5.0), MAX_DESIGN_DURATION_SECONDS
+        ),
+    )
+    inventory = _media_inventory(existing_media)
+    loaded_image_count = sum(
+        bool(row.get("loaded", False)) and row.get("media_type") == "image"
+        for row in inventory.values()
+    )
+    free_image_slots = max(
+        0, int(capacities.get("image", 0)) - loaded_image_count
+    )
+    requests = [
+        dict(row) for row in source.get("media_requests") or []
+        if isinstance(row, dict)
+    ]
+    request_ids = {
+        _normalized_requirement_id(row.get("requirement_id"), f"request_{index}")
+        for index, row in enumerate(requests, 1)
+    }
+    shots = [dict(row) for row in source.get("shots") or [] if isinstance(row, dict)]
+    valid_uses: list[dict] = []
+    warnings: list[str] = []
+
+    for use_number, raw in enumerate(source.get("existing_media_uses") or [], 1):
+        if not isinstance(raw, dict):
+            continue
+        media_id = _normalized_media_id(raw.get("media_id", ""))
+        media_type = _media_type_for_id(media_id) if media_id else ""
+        ordinal = int(media_id[1:]) if media_id and media_id[1:].isdigit() else 0
+        inventory_row = inventory.get(media_id)
+        is_loaded = bool(inventory_row and inventory_row.get("loaded", False))
+        within_capacity = bool(
+            media_type and 1 <= ordinal <= int(capacities.get(media_type, 0))
+        )
+        if is_loaded or not within_capacity or media_type != "image":
+            valid_uses.append(dict(raw))
+            continue
+
+        requirement_id = _normalized_requirement_id(
+            raw.get("requirement_id"), f"recovered_{media_id.lower()}_{use_number}"
+        )
+        if requirement_id not in request_ids:
+            start, end = _interval(raw, duration)
+            shot = max(
+                shots or [{"start_seconds": start, "end_seconds": end}],
+                key=lambda row: max(
+                    0.0,
+                    min(end, _interval(row, duration)[1])
+                    - max(start, _interval(row, duration)[0]),
+                ),
+            )
+            recovered = _auto_image_request(
+                source,
+                shot,
+                duration,
+                requirement_id=requirement_id,
+                preferred_media_id=media_id,
+                instruction=str(raw.get("instruction", "")),
+            )
+            recovered["start_seconds"], recovered["end_seconds"] = start, end
+            recovered["reuse_policy"] = str(
+                raw.get("reuse_policy", "time_scoped")
+            )
+            requests.append(recovered)
+            request_ids.add(requirement_id)
+        warnings.append(
+            f"{media_id} was empty, so its mistaken existing-media reuse was converted "
+            "into a Z-Image generation request."
+        )
+
+    source["existing_media_uses"] = valid_uses
+
+    valid_picture_ids = {
+        _normalized_media_id(row.get("media_id", ""))
+        for row in valid_uses
+        if _media_type_for_id(_normalized_media_id(row.get("media_id", ""))) == "image"
+    }
+    image_requests = [row for row in requests if row.get("media_type") == "image"]
+    shot_count = len(shots)
+    desired_total = min(
+        int(capacities.get("image", 0)),
+        shot_count,
+        max(1, math.ceil(duration / 5.0)),
+    ) if shot_count else 0
+    usable_total = len(valid_picture_ids) + len(image_requests)
+    remaining_capacity = max(0, free_image_slots - len(image_requests))
+    needed = min(max(0, desired_total - usable_total), remaining_capacity)
+
+    covered_shots: set[int] = set()
+    coverage_rows = [
+        row for row in (*valid_uses, *image_requests)
+        if str(row.get("media_type", "")) == "image"
+    ]
+    for row in coverage_rows:
+        row_start, row_end = _interval(row, duration)
+        best = max(
+            range(len(shots)),
+            key=lambda index: max(
+                0.0,
+                min(row_end, _interval(shots[index], duration)[1])
+                - max(row_start, _interval(shots[index], duration)[0]),
+            ),
+            default=-1,
+        )
+        if best >= 0:
+            covered_shots.add(best)
+    candidates = [index for index in range(len(shots)) if index not in covered_shots]
+    candidates.extend(index for index in range(len(shots)) if index in covered_shots)
+    for shot_index in candidates[:needed]:
+        requirement_id = f"auto_image_s{shot_index + 1}"
+        suffix = 2
+        while requirement_id in request_ids:
+            requirement_id = f"auto_image_s{shot_index + 1}_{suffix}"
+            suffix += 1
+        requests.append(
+            _auto_image_request(
+                source,
+                shots[shot_index],
+                duration,
+                requirement_id=requirement_id,
+            )
+        )
+        request_ids.add(requirement_id)
+        warnings.append(
+            f"Added {requirement_id} to prevent the Shot plan from having too few visual references."
+        )
+
+    final_usable = len(valid_picture_ids) + sum(
+        row.get("media_type") == "image" for row in requests
+    )
+    if desired_total and final_usable < desired_total:
+        warnings.append(
+            f"Visual reference coverage is {final_usable}/{desired_total}; no more empty Picture slots are available."
+        )
+    source["media_requests"] = requests
+    return source, warnings
 
 
 def _normalized_requirement_id(value: object, fallback: str) -> str:
@@ -628,8 +857,15 @@ def normalize_design_plan(
     *,
     existing_media: list[dict] | None = None,
     strict_t2i_prompts: bool = False,
+    repair_media_plan: bool = False,
 ) -> dict:
-    source = extract_design_json(payload)
+    media_repair_warnings: list[str] = []
+    if repair_media_plan:
+        source, media_repair_warnings = repair_design_media_plan(
+            payload, capacities, existing_media
+        )
+    else:
+        source = extract_design_json(payload)
     duration = snap_half_second(
         source.get("duration_seconds", 5.0),
         MAX_DESIGN_DURATION_SECONDS,
@@ -662,7 +898,7 @@ def normalize_design_plan(
     elif "optional flourish" not in plan["constraints"].lower():
         plan["constraints"] = plan["constraints"].rstrip(" .") + ". " + budget_guardrail
 
-    design_warnings: list[str] = []
+    design_warnings: list[str] = list(media_repair_warnings)
     shots: list[dict] = []
     for index, raw in enumerate(source.get("shots") or [], 1):
         if not isinstance(raw, dict):
@@ -972,7 +1208,7 @@ def normalize_design_plan(
                 duration_seconds=duration,
             )
         keywords = _string_list(raw.get("subject_keywords") or [])
-        media_requests.append({
+        normalized_request = {
             "requirement_id": requirement_id,
             "media_type": media_type,
             "usage": (
@@ -986,7 +1222,17 @@ def normalize_design_plan(
             "track": str(raw.get("track", "A1" if media_type == "audio" else "V1")).strip(),
             "subject_keywords": keywords,
             "prompt": prompt,
-        })
+        }
+        preferred_media_id = _normalized_media_id(raw.get("preferred_media_id", ""))
+        if media_type == "image" and preferred_media_id.startswith("P"):
+            preferred_ordinal = int(preferred_media_id[1:])
+            preferred_row = inventory.get(preferred_media_id)
+            if (
+                preferred_ordinal <= int(capacities.get("image", 0))
+                and not bool(preferred_row and preferred_row.get("loaded", False))
+            ):
+                normalized_request["preferred_media_id"] = preferred_media_id
+        media_requests.append(normalized_request)
         requested_requirement_ids.add(requirement_id)
     plan["media_requests"] = media_requests
     return plan
@@ -1055,7 +1301,9 @@ def build_design_system_prompt(context: dict) -> str:
         "composition, action-state or boundary-continuity references are also valid when they reduce ambiguity between story phases. "
         "Choose the useful count and exact timeline ranges yourself. Never force one image per Shot, never fill all available slots merely "
         "because they exist, and never make redundant copies; distinct temporal states of the same subject are allowed when they prevent "
-        "a later segment from replaying an earlier action. "
+        "a later segment from replaying an earlier action. Do not return zero image references when the plan has visual Shots and empty "
+        "Picture capacity. As a coverage floor, provide approximately one useful image state per five seconds, never more than one per "
+        "Shot, while counting genuinely reused Picture assets toward that floor and staying within free capacity. "
         "Every image media_request sent to Z-Image/T2I must contain a complete standalone visual prompt. Never put an H3 <Picture N> "
         "token in a T2I prompt and never ask it to copy, match, continue from or depend on a previous, current/self, next/future, generated "
         "or output image; those H3 slots do not exist when reference images are generated. Restate all required identity, appearance, wardrobe, "

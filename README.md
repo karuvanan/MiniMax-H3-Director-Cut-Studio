@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.4-alpha.5`](VERSION)
+- 当前应用版本：[`v0.2.4-alpha.6`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -357,6 +357,8 @@ H3_DESIGN_IMAGE_CFG=1.0
 4. 本地 BLIP 分析每张概念图，写回实际视觉 caption 与关键词。
 5. Z-Image 工作流执行 `VRAM_Debug → RAMCleanup → VRAMCleanup`，程序随后请求 ComfyUI unload/free。
 6. LM Studio 根据原计划与 BLIP 结果完成最终 Director Design JSON。
+
+若 LM Studio 把空的 P1–P9 错写成现有素材，Studio 会把它自动修复成 Z-Image 请求，并优先放回原本的物理 Picture 栏位，不再阻止 Apply。若视觉 Shot 的图片请求为零或明显不足，Studio 会按约每 5 秒一个有效视觉状态自动补足，最多每个 Shot 一张且不会超过可用 Picture 容量；每张 Z-Image 遇到暂时性 ComfyUI 错误时会自动重试一次。
 7. LM Studio 再次自动 unload。
 8. 点击 `Apply to H3 Workspace` 后关闭 thumbnail 视窗，把素材、时间范围、Shot、主题文字和提示词带回 H3 工作台。
 
@@ -525,13 +527,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**209 tests passed**。
+当前完整验证结果：**213 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 209 tests
+Ran 213 tests
 OK
 ```

@@ -13,7 +13,7 @@ from design_engine import (
     normalize_shot_action_budget,
     normalize_design_plan,
 )
-from design_media_service import image_workflow
+from design_media_service import generate as generate_design_media, image_workflow
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
@@ -287,6 +287,48 @@ class DesignEngineTests(unittest.TestCase):
             ["sampler-any-id", 0],
         )
 
+    def test_z_image_generation_retries_one_transient_failure(self):
+        generated = {
+            "local_path": "recovered.png",
+            "original_local_path": "recovered.png",
+            "seed": 42,
+            "prompt_id": "prompt-ok",
+            "generated": True,
+            "request_index": 0,
+            "background_removal": {},
+        }
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "workflow_path": "",
+            "materials": [{
+                "media_type": "image",
+                "local_path": "recovered.png",
+                "prompt": "A complete standalone production frame.",
+                "subject_keywords": [],
+            }],
+            "settings": {},
+            "poll_interval": 1.0,
+            "generation_timeout": 30,
+            "http_timeout": 10,
+        }
+        with (
+            patch(
+                "design_media_service._generate_request",
+                side_effect=[RuntimeError("transient queue error"), generated],
+            ) as request,
+            patch("design_media_service.emit") as emit,
+        ):
+            result = generate_design_media(job)
+
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(result["outputs"], [generated])
+        self.assertEqual(result["warnings"], [])
+        self.assertTrue(
+            any(
+                "retrying" in str(call.args[0].get("progress", ""))
+                for call in emit.call_args_list
+            )
+        )
     def test_normalize_snaps_director_plan_to_half_seconds(self):
         plan = normalize_design_plan(sample_design(), {"image": 9, "video": 3, "audio": 3})
         self.assertEqual(plan["duration_seconds"], 12.0)
@@ -535,6 +577,66 @@ class DesignEngineTests(unittest.TestCase):
                     {"image": 9, "video": 3, "audio": 3},
                     existing_media=inventory,
                 )
+
+    def test_media_repair_converts_empty_p1_reuse_into_z_image_request(self):
+        payload = sample_design()
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [{
+            "requirement_id": "opening_subject",
+            "media_id": "P1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "track": "V1",
+            "subject_keywords": ["woman", "product"],
+            "instruction": "Use @P1 for the woman holding the product.",
+        }]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[],
+            strict_t2i_prompts=True,
+            repair_media_plan=True,
+        )
+
+        self.assertEqual(plan["existing_media_uses"], [])
+        images = [
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        ]
+        self.assertEqual(len(images), 2)
+        recovered = next(
+            row for row in images if row["requirement_id"] == "opening_subject"
+        )
+        self.assertEqual(recovered["preferred_media_id"], "P1")
+        self.assertNotIn("@P1", recovered["prompt"])
+        self.assertTrue(any("P1 was empty" in row for row in plan["design_warnings"]))
+
+    def test_media_repair_adds_visual_coverage_when_lm_returns_no_images(self):
+        payload = sample_design()
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = []
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[],
+            strict_t2i_prompts=True,
+            repair_media_plan=True,
+        )
+
+        images = [
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        ]
+        self.assertEqual(len(images), 2)
+        self.assertEqual(
+            [row["requirement_id"] for row in images],
+            ["auto_image_s1", "auto_image_s2"],
+        )
+        self.assertTrue(all(row["prompt"] for row in images))
+        self.assertTrue(all(row["reuse_policy"] == "time_scoped" for row in images))
 
     def test_loaded_media_reserves_slots_for_missing_media_requests(self):
         payload = sample_design()

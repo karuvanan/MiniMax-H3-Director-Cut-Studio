@@ -2,6 +2,25 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.4-alpha.6] - 2026-08-26
+
+### Fixed
+
+- AI Design no longer rejects Apply when the model incorrectly lists an empty Media Pool slot such as P1 under `existing_media_uses`; the row is repaired into a Z-Image request and keeps its intended physical Picture slot.
+- AI Design now enforces a bounded visual-reference coverage floor when LM Studio returns too few or zero image requests: approximately one useful Picture state per five seconds, never more than one per Shot and never beyond the available Picture capacity.
+- Z-Image generation now retries each requested Picture once after a transient ComfyUI failure before falling back to a placeholder, reducing partially populated or image-free Design results.
+
+### Changed
+
+- Design validation, JSON loading, LM Studio completion and Apply all use the same media-plan repair path, so an already generated but repairable Design JSON can be validated and applied after restarting Studio.
+- The Design system prompt now explicitly requires visual Shots to receive generated or reused Picture coverage while respecting the nine-Picture physical limit.
+
+### Verification
+
+- Added regressions for empty-Picture recovery, zero-image visual coverage, transient Z-Image retry and preservation of the requested physical Picture slot.
+- The complete bundled test suite passed: `213` tests.
+- The Director Project format remains version `16`; no saved-project migration is required.
+
 ## [0.2.4-alpha.5] - 2026-08-26
 
 ### Added

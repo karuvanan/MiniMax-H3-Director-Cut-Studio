@@ -4805,6 +4805,9 @@ class DesignPageDialog(QDialog):
               "phases. Choose their count, purpose and timeline ranges from the actual concept; do "
               "not force one image per Shot and do not automatically fill every slot. Create no more "
               f"than the currently free {int(free_capacity.get('image', 0))} image slots. "
+              "When the plan contains visual Shots and Picture capacity is free, never return zero image "
+              "references. Target approximately one useful visual state per five seconds, capped at one "
+              "per Shot, and count genuinely reused Pictures toward that coverage floor. "
               "Avoid true duplicates, but allow visually distinct temporal states of the same subject "
               "when they help H3 advance instead of replaying an earlier action."
         )
@@ -4827,6 +4830,7 @@ class DesignPageDialog(QDialog):
                 self.capacities,
                 existing_media=self.context.get("existing_media") or [],
                 strict_t2i_prompts=True,
+                repair_media_plan=True,
             )
             required_media_ids = self._explicit_media_ids(self.pending_requirement)
             planned_media_ids = {
@@ -5052,7 +5056,9 @@ class DesignPageDialog(QDialog):
                 plan = normalize_design_plan(
                     payload.get("text", ""),
                     self.capacities,
+                    existing_media=self.context.get("existing_media") or [],
                     strict_t2i_prompts=True,
+                    repair_media_plan=True,
                 )
             except ValueError as exc:
                 self.json_edit.setPlainText(str(payload.get("text", "")))
@@ -5125,6 +5131,7 @@ class DesignPageDialog(QDialog):
                 self.json_edit.toPlainText(),
                 self.capacities,
                 existing_media=self.context.get("existing_media") or [],
+                repair_media_plan=True,
             )
             selected_ids = {
                 str(item).upper()
@@ -6519,6 +6526,15 @@ class DirectorCutStudio(QMainWindow):
                 and not str(asset.local_path or "").strip()
                 and (replace or not asset.timeline_placed)
             ]
+            preferred_media_id = str(
+                request.get("preferred_media_id", "")
+            ).strip().upper()
+            if preferred_media_id:
+                preferred = assets_by_media_id.get(preferred_media_id)
+                if preferred in candidates:
+                    candidates = [preferred] + [
+                        asset for asset in candidates if asset is not preferred
+                    ]
             if not candidates:
                 warnings.append(
                     f"No empty {request['media_type']} slot for missing requirement "
@@ -6792,6 +6808,7 @@ class DirectorCutStudio(QMainWindow):
                 plan,
                 self.scan.counts,
                 existing_media=self._design_context().get("existing_media") or [],
+                repair_media_plan=True,
             )
             DESIGN_EXAMPLE_ROOT.mkdir(exist_ok=True)
             design_dir, materials = materialize_design_media(
