@@ -38,6 +38,16 @@ class SkillEngineTests(unittest.TestCase):
         self.assertTrue(profile.description)
         self.assertIn("Music Video", profile.display_name)
 
+    def test_wuxia_special_binds_default_h3_skill(self):
+        profile = self.profiles["wuxia-blade-film"]
+        self.assertTrue(profile.special)
+        self.assertFalse(profile.standalone)
+        system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
+        self.assertIn("DEFAULT H3 SKILL", system)
+        self.assertIn("SPECIAL SCENE SKILL (wuxia-blade-film)", system)
+        self.assertIn("weapon-driven causality", system)
+        self.assertIn(self.profiles[DEFAULT_SKILL].h3_reference_guide, system)
+
     def test_ref_prompt_preserves_six_section_order(self):
         spec = PromptSpec(brief="A product rotates.", shots=["Hero product view", "Final hold"])
         asset = MediaAsset("1", "LoadImage", "image", "product.png", "<Picture 1>", "ref_images.ref_image_0", end_seconds=10)

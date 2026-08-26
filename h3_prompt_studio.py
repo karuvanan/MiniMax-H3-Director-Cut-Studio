@@ -140,6 +140,8 @@ class PromptStudio(tk.Tk):
     def _skill_binding_summary(self) -> str:
         default = self.skill_profiles[DEFAULT_SKILL]
         special = self._special_profile()
+        if special is not None and special.standalone:
+            return f"绑定：Standalone Special {special.display_name}"
         special_name = special.display_name if special else "None"
         return f"绑定：Default {default.display_name} + Special {special_name}"
 
@@ -511,10 +513,7 @@ class PromptStudio(tk.Tk):
         self.special_menu_var.set(key or NONE_SPECIAL)
         self._populate_skill_menu()
         self.profile_var.set(self._skill_binding_summary())
-        special_name = self._special_profile().display_name if self._special_profile() else "None"
-        self.status_var.set(
-            f"Skill 绑定已更新：Default {self._default_profile().display_name} + Special {special_name}"
-        )
+        self.status_var.set(f"Skill 绑定已更新：{self._skill_binding_summary().removeprefix('绑定：')}")
 
     def _rescan_skills(self) -> None:
         try:
@@ -542,18 +541,25 @@ class PromptStudio(tk.Tk):
         text_widget.configure(yscrollcommand=scrollbar.set)
         text_widget.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        content = (
-            f"=== DEFAULT · ALWAYS BOUND · {default.display_name} ===\n\n"
-            + default.instruction
-            + "\n\n--- DEFAULT Ref2VA required guide ---\n\n"
-            + default.h3_reference_guide
-        )
-        if special is not None:
+        if special is not None and special.standalone:
+            content = (
+                f"=== STANDALONE SPECIAL · {special.display_name} [{special.key}] ===\n\n"
+                + special.instruction
+                + "\n\nDefault h3-prompt-writing is not bound in this mode."
+            )
+        else:
+            content = (
+                f"=== DEFAULT · BOUND · {default.display_name} ===\n\n"
+                + default.instruction
+                + "\n\n--- DEFAULT Ref2VA required guide ---\n\n"
+                + default.h3_reference_guide
+            )
+        if special is not None and not special.standalone:
             content += (
                 f"\n\n=== SPECIAL · {special.display_name} [{special.key}] ===\n\n"
                 + special.instruction
             )
-        else:
+        elif special is None:
             content += "\n\n=== SPECIAL ===\n\nNone — no scene-specific skill is bound."
         text_widget.insert("1.0", content)
         text_widget.configure(state="disabled")

@@ -482,6 +482,23 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("request-local h3 ordinals", prompt)
         self.assertNotIn("when a treat each asset", prompt)
 
+    def test_system_prompt_honors_standalone_special_binding(self):
+        prompt = build_design_system_prompt({
+            "bound_h3_skills": {
+                "binding_mode": "standalone_special",
+                "default": None,
+                "special": {
+                    "key": "wuxia-blade-film",
+                    "standalone": True,
+                    "instruction": "Ground every aerial action in physical contact.",
+                },
+            }
+        }).lower()
+        self.assertIn("selected standalone special skill", prompt)
+        self.assertIn("default h3 skill", prompt)
+        self.assertIn("intentionally absent", prompt)
+        self.assertNotIn("bound default h3 skill and optional special", prompt)
+
     def test_t2i_prompt_rejects_h3_picture_token(self):
         payload = sample_design()
         payload["media_requests"][0]["prompt"] = (

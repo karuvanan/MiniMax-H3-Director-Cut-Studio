@@ -2,6 +2,7 @@ import os
 import json
 from copy import deepcopy
 from pathlib import Path
+import time
 import unittest
 from unittest.mock import patch
 
@@ -125,6 +126,19 @@ class DirectorTimelineDragTests(unittest.TestCase):
         design_context = window._design_context()
         self.assertEqual(design_context["bound_h3_skills"]["default"]["key"], "h3-prompt-writing")
         self.assertIn("ref2va_format_guide", design_context["bound_h3_skills"]["default"])
+
+        wuxia_index = window.special_combo.findData("wuxia-blade-film")
+        self.assertGreaterEqual(wuxia_index, 0)
+        window.special_combo.setCurrentIndex(wuxia_index)
+        wuxia_context = window._design_context()["bound_h3_skills"]
+        self.app.processEvents()
+        self.assertEqual(wuxia_context["binding_mode"], "default_plus_special")
+        self.assertEqual(wuxia_context["default"]["key"], "h3-prompt-writing")
+        self.assertEqual(wuxia_context["special"]["key"], "wuxia-blade-film")
+        self.assertFalse(wuxia_context["special"]["standalone"])
+        self.assertNotIn("not bound", window.default_skill_label.text().lower())
+        self.assertEqual(window.special_skill_label.text(), "+ Special")
+        window.special_combo.setCurrentIndex(0)
 
         payload = sample_design()
         payload["media_requests"] = payload["media_requests"][:1]
@@ -1376,6 +1390,45 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertTrue(finished)
         self.assertTrue(any(item.get("ready") for item in messages))
         self.assertTrue(any(item.get("error") == "expected failure" for item in messages))
+
+    def test_json_worker_pipe_backpressure_never_blocks_ui_request_queue(self):
+        runner = JsonLineProcess(name="pipe-backpressure-test")
+        messages = []
+        finished = []
+        runner.message.connect(messages.append)
+        runner.finished.connect(lambda code, log: finished.append((code, log)))
+        program = str(PROJECT_ROOT / "ai_libraries_common" / "python_env" / "python.exe")
+        script = (
+            "import json,sys,time;"
+            "print(json.dumps({'ready':True}),flush=True);"
+            "time.sleep(1.0);"
+            "jobs=[json.loads(sys.stdin.readline())['job'] for _ in range(3)];"
+            "print(json.dumps({'received':jobs}),flush=True)"
+        )
+        self.assertTrue(runner.start(program, ["-c", script]))
+        for _ in range(100):
+            QTest.qWait(10)
+            if runner.is_ready():
+                break
+        self.assertTrue(runner.is_ready())
+
+        large_prompt = "semantic evidence " * 45_000
+        started = time.perf_counter()
+        for index in range(3):
+            runner.write_json({"job": f"enrich-{index}", "prompt": large_prompt})
+        enqueue_elapsed = time.perf_counter() - started
+        # The child deliberately does not read stdin for one second.  A direct
+        # pipe write on the Qt thread would therefore take about one second;
+        # queuing all three requests must remain effectively immediate.
+        self.assertLess(enqueue_elapsed, 0.35)
+
+        for _ in range(250):
+            QTest.qWait(10)
+            if finished:
+                break
+        self.assertTrue(finished)
+        received = next(item["received"] for item in messages if "received" in item)
+        self.assertEqual(received, ["enrich-0", "enrich-1", "enrich-2"])
 
     def test_dynamic_tracks_properties_and_clip_properties_are_undoable(self):
         window = DirectorCutStudio()

@@ -31,6 +31,7 @@ class SkillProfile:
     h3_reference_guide: str
     special: bool = False
     description: str = ""
+    standalone: bool = False
 
     @property
     def summary(self) -> str:
@@ -96,6 +97,13 @@ def load_skill_profiles(workspace: str | Path) -> dict[str, SkillProfile]:
                 h3_reference_guide=reference_guide,
                 special=True,
                 description=description,
+                standalone=bool(
+                    re.search(
+                        r"<!--\s*h3-studio-binding:\s*standalone\s*-->",
+                        instruction,
+                        flags=re.I,
+                    )
+                ),
             )
     return profiles
 
@@ -139,6 +147,18 @@ def profile_system_prompt(
     special_profile: SkillProfile | None = None,
 ) -> str:
     """Bind the official H3 writing skill with an optional scene-specific skill."""
+    if special_profile is not None and special_profile.standalone:
+        return "\n\n".join(
+            (
+                "Follow the selected standalone Special Skill exactly.",
+                f"STANDALONE SPECIAL SKILL ({special_profile.key}):\n"
+                + special_profile.instruction,
+                "Do not merge, inject, quote or infer rules from the Default H3 skill. "
+                "The production brief in the app counts as the completed start gate. "
+                "Do not ask follow-up questions. Return only the output required by the "
+                "selected standalone skill and the current task.",
+            )
+        )
     parts = [
         "Follow the official MiniMax H3 prompt-writing skill exactly.",
         "DEFAULT H3 SKILL:\n" + default_profile.instruction,

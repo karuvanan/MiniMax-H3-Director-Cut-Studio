@@ -661,12 +661,23 @@ def normalize_design_plan(
 
 
 def build_design_system_prompt(context: dict) -> str:
+    bound_skills = context.get("bound_h3_skills") or {}
+    if bound_skills.get("binding_mode") == "standalone_special":
+        skill_direction = (
+            "The selected standalone Special skill in the workspace context is authoritative. "
+            "Apply only that skill's planning, continuity, reference, shot, audio and technical rules. "
+            "Do not merge or infer rules from the Default H3 skill; it is intentionally absent from this Design request. "
+        )
+    else:
+        skill_direction = (
+            "The bound Default H3 skill and optional Special skill in the workspace context are authoritative. "
+            "Apply their planning, continuity, reference-retention, shot, audio and technical rules while producing the JSON. "
+        )
     return (
         "You are the AI Design Planner inside a MiniMax H3 Director Cut application. "
         "Convert the user's concept into one production-ready JSON object that exactly matches the supplied schema. "
-        "The bound Default H3 skill and optional Special skill in the workspace context are authoritative. "
-        "Apply their planning, continuity, reference-retention, shot, audio and technical rules while producing the JSON; "
-        "the application will compile this JSON into the final H3 Ref2VA prompt. "
+        + skill_direction
+        + "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
         "subject action, environmental response and additional direction. "
         "Timeline tracks are editorial lanes, not the physical H3 reference-slot count. You may plan V4, V5 and higher "

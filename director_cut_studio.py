@@ -507,7 +507,14 @@ class GenerationBusyOverlay(QWidget):
 
 
 class JsonLineProcess(QObject):
-    """Supervise one crash-isolated JSON worker with a ready-gated input queue."""
+    """Supervise one crash-isolated JSON worker with non-blocking queued input.
+
+    Worker requests can contain large BLIP evidence, schemas and prompts.  A
+    Windows anonymous pipe applies backpressure while the child is busy with
+    an earlier inference, so writing/flushing that pipe from the Qt thread can
+    freeze the whole Studio on the third consecutive request.  Only the
+    dedicated writer thread below may touch worker stdin.
+    """
 
     message = Signal(dict)
     finished = Signal(int, str)
@@ -517,8 +524,11 @@ class JsonLineProcess(QObject):
         self.name = name
         self.process: subprocess.Popen[str] | None = None
         self._thread: threading.Thread | None = None
+        self._writer_thread: threading.Thread | None = None
         self._write_lock = threading.Lock()
+        self._write_event = threading.Event()
         self._pending: list[dict] = []
+        self._writer_error = ""
         self._ready = False
         self._stopping = False
         self.generation = 0
@@ -536,6 +546,8 @@ class JsonLineProcess(QObject):
             return self.is_running()
         self._ready = False
         self._stopping = False
+        self._writer_error = ""
+        self._write_event.clear()
         self.generation += 1
         self.started_monotonic = time.monotonic()
         self.last_output_monotonic = self.started_monotonic
@@ -556,6 +568,13 @@ class JsonLineProcess(QObject):
         )
         self.process = process
         generation = self.generation
+        self._writer_thread = threading.Thread(
+            target=self._write_loop,
+            args=(process, generation),
+            name=f"{self.name}-writer-{generation}",
+            daemon=True,
+        )
+        self._writer_thread.start()
         self._thread = threading.Thread(
             target=self._read_loop,
             args=(process, generation),
@@ -579,7 +598,7 @@ class JsonLineProcess(QObject):
                     with self._write_lock:
                         if self.process is process and generation == self.generation:
                             self._ready = True
-                            self._flush_pending_locked(process)
+                            self._write_event.set()
                 self.message.emit(payload)
             except json.JSONDecodeError:
                 log.append(line)
@@ -600,8 +619,11 @@ class JsonLineProcess(QObject):
             if is_current:
                 self.process = None
                 self._ready = False
+                self._write_event.set()
                 if not self._stopping:
                     log.append(f"{self.name} exited with code {exit_code}")
+                if self._writer_error:
+                    log.append(self._writer_error)
         if log:
             try:
                 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -613,26 +635,49 @@ class JsonLineProcess(QObject):
         if is_current:
             self.finished.emit(exit_code, "\n".join(log[-30:]))
 
-    def _flush_pending_locked(self, process: subprocess.Popen[str]) -> None:
-        if process.stdin is None:
-            raise BrokenPipeError("worker stdin is unavailable")
-        while self._pending:
-            payload = self._pending.pop(0)
-            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        process.stdin.flush()
+    def _write_loop(self, process: subprocess.Popen[str], generation: int) -> None:
+        """Drain requests without ever blocking the GUI or stdout reader."""
+        while True:
+            self._write_event.wait()
+            while True:
+                with self._write_lock:
+                    if (
+                        self.process is not process
+                        or generation != self.generation
+                        or self._stopping
+                    ):
+                        return
+                    if not self._ready or not self._pending:
+                        # Clearing under the same lock used by write_json avoids
+                        # losing a wake-up between the empty check and clear.
+                        self._write_event.clear()
+                        break
+                    payload = self._pending.pop(0)
+                try:
+                    if process.stdin is None:
+                        raise BrokenPipeError("worker stdin is unavailable")
+                    process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError) as exc:
+                    with self._write_lock:
+                        self._writer_error = (
+                            f"input queue failed while writing in background: {exc}"
+                        )
+                        self._pending.clear()
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                    return
 
     def write_json(self, payload: dict) -> None:
         if not self.is_running() or self.process is None or self.process.stdin is None:
             raise RuntimeError("Background worker is not running")
         with self._write_lock:
-            if not self._ready:
-                self._pending.append(payload)
-                return
-            try:
-                self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                self.process.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                raise RuntimeError(f"{self.name} stopped before accepting the job") from exc
+            # Always enqueue.  Even a ready child may be busy processing its
+            # previous line and unable to drain the OS pipe yet.
+            self._pending.append(payload)
+            self._write_event.set()
 
     def discard_pending(self) -> None:
         with self._write_lock:
@@ -653,6 +698,7 @@ class JsonLineProcess(QObject):
         self._stopping = True
         with self._write_lock:
             self._pending.clear()
+            self._write_event.set()
         try:
             if process.stdin:
                 process.stdin.close()
@@ -667,6 +713,9 @@ class JsonLineProcess(QObject):
         thread = self._thread
         if thread and thread is not threading.current_thread() and thread.is_alive():
             thread.join(timeout=0.5)
+        writer = self._writer_thread
+        if writer and writer is not threading.current_thread() and writer.is_alive():
+            writer.join(timeout=0.5)
 
 
 TIMELINE_STATE_FIELDS = (
@@ -5195,13 +5244,15 @@ class DirectorCutStudio(QMainWindow):
         bar.addAction(undo_action)
         bar.addAction(redo_action)
         bar.addSeparator()
-        bar.addWidget(QLabel("Default Skill"))
-        default = QComboBox()
-        default.addItem(self.profiles[DEFAULT_SKILL].display_name, DEFAULT_SKILL)
-        default.setEnabled(False)
-        default.setMinimumWidth(180)
-        bar.addWidget(default)
-        bar.addWidget(QLabel("+ Special"))
+        self.default_skill_label = QLabel("Default Skill")
+        bar.addWidget(self.default_skill_label)
+        self.default_skill_combo = QComboBox()
+        self.default_skill_combo.addItem(self.profiles[DEFAULT_SKILL].display_name, DEFAULT_SKILL)
+        self.default_skill_combo.setEnabled(False)
+        self.default_skill_combo.setMinimumWidth(180)
+        bar.addWidget(self.default_skill_combo)
+        self.special_skill_label = QLabel("+ Special")
+        bar.addWidget(self.special_skill_label)
         self.special_combo = QComboBox()
         self.special_combo.addItem("None", NONE_SPECIAL)
         for key, profile in sorted(self.profiles.items()):
@@ -5983,6 +6034,7 @@ class DirectorCutStudio(QMainWindow):
         special_profile = (
             None if special_key == NONE_SPECIAL else self.profiles.get(special_key)
         )
+        standalone_special = bool(special_profile and special_profile.standalone)
         return {
             "current_duration_seconds": scan.duration_seconds if scan else 5.0,
             "comfyui_server": self.server_url.text().strip(),
@@ -6011,7 +6063,10 @@ class DirectorCutStudio(QMainWindow):
                 "overall_soundscape", "non_diegetic_music",
             ],
             "bound_h3_skills": {
-                "default": {
+                "binding_mode": (
+                    "standalone_special" if standalone_special else "default_plus_special"
+                ),
+                "default": None if standalone_special else {
                     "key": default_profile.key,
                     "instruction": default_profile.instruction,
                     "ref2va_format_guide": default_profile.h3_reference_guide,
@@ -6019,6 +6074,7 @@ class DirectorCutStudio(QMainWindow):
                 "special": None if special_profile is None else {
                     "key": special_profile.key,
                     "instruction": special_profile.instruction,
+                    "standalone": special_profile.standalone,
                 },
             },
         }
@@ -6919,6 +6975,7 @@ class DirectorCutStudio(QMainWindow):
             getattr(self.prompt_panel, name).textChanged.connect(self._mark_prompt_render_dirty)
         self.special_combo.currentIndexChanged.connect(self._mark_dirty)
         self.special_combo.currentIndexChanged.connect(self._mark_all_render_segments_dirty)
+        self.special_combo.currentIndexChanged.connect(self._refresh_skill_binding_display)
         self.special_combo.currentIndexChanged.connect(
             lambda _value: self.schedule_prompt_generation()
         )
@@ -6930,6 +6987,19 @@ class DirectorCutStudio(QMainWindow):
         self.clip_end.valueChanged.connect(lambda _value: self.schedule_prompt_generation())
         self.server_url.textChanged.connect(self._mark_dirty)
         self.prompt_panel.auto_sync.toggled.connect(self._mark_dirty)
+
+    def _refresh_skill_binding_display(self, *_args) -> None:
+        special_key = self.special_combo.currentData()
+        special = None if special_key == NONE_SPECIAL else self.profiles.get(special_key)
+        standalone = bool(special and special.standalone)
+        self.default_skill_label.setText("Default Skill (not bound)" if standalone else "Default Skill")
+        self.default_skill_combo.setItemText(
+            0,
+            "Not bound · standalone Special"
+            if standalone
+            else self.profiles[DEFAULT_SKILL].display_name,
+        )
+        self.special_skill_label.setText("Standalone Special" if standalone else "+ Special")
 
     def _mark_dirty(self, *_args) -> None:
         if self.restoring_project:

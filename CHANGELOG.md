@@ -2,7 +2,84 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
-## [0.1.0-alpha.10] - 2026-08-26
+## [0.2.4-alpha.1] - 2026-08-26
+
+### Added
+
+- Added the complete Chinese companion document `skill special/wuxia-blade-film/SKILL.cn.md`.
+
+### Changed
+
+- Small optimizations now increment only the suffix after `alpha`, leaving the three-part base version unchanged.
+
+### Verification
+
+- Verified the Chinese Skill companion covers the complete English workflow, action continuity, camera, physical qinggong, reference planning and quality gate sections.
+- The Director Project format remains version `15`; no saved-project migration is required.
+
+## [0.2.4-alpha] - 2026-08-26
+
+### Documentation
+
+- Added the public MiniMax H3 Director Cut Studio tutorial link to the README quick-start section.
+- Converted application releases to the `v0.2.4-alpha` numbering style, with each numeric position limited to `0–9` and carrying into the position on its left.
+
+### Verification
+
+- Verified that the README displays the tutorial as a direct clickable link.
+- The Director Project format remains version `15`; no saved-project migration is required.
+
+## [0.2.3-alpha] - 2026-08-26
+
+### Changed
+
+- Changed `wuxia-blade-film` to the standard `Default + Special` binding requested for production use.
+- AI Design now receives both `h3-prompt-writing` with its Ref2VA guide and the scene-specific wuxia blade-action rules whenever this Special Skill is selected.
+- Kept the optional standalone marker mechanism available for future Special Skills, but `wuxia-blade-film` no longer declares it.
+
+### Verification
+
+- Updated the Skill loader and Director Design-context regressions to verify the Default and wuxia Special instructions are both bound.
+- `196` automated tests passed with the bundled Python environment.
+- The Director Project format remains version `15`; no saved-project migration is required.
+
+## [0.2.2-alpha] - 2026-08-26
+
+### Added
+
+- Added the standalone `wuxia-blade-film` Special Skill for fast, physically grounded blade combat, weapon-driven causality, readable signature techniques, kinetic camera loss/reacquisition, synchronized environmental impacts and hard diegetic sound.
+- Added a Design-ready 45-second, nine-Shot adaptation of 《一叶杀》 at `example/one_leaf_kill_45s_design_requirement.txt`.
+- Added per-Skill `standalone` binding metadata through the `<!-- h3-studio-binding: standalone -->` marker.
+
+### Changed
+
+- When a standalone Special Skill is selected, AI Design receives only that Special Skill; `h3-prompt-writing` and its Ref2VA guide are intentionally omitted from the Design context.
+- Updated H3 Prompt Studio binding labels and source preview so standalone Special Skills are no longer presented as `Default + Special`.
+- Existing Special Skills remain `Default + Special`, and `None` remains Default-only.
+
+### Verification
+
+- Added regressions for standalone Skill discovery, AI system-prompt isolation and Director Design context isolation.
+- `196` automated tests passed with the bundled Python environment.
+- The Director Project format remains version `15`; no saved-project migration is required.
+
+## [0.2.1-alpha] - 2026-08-26
+
+### Fixed
+
+- Fixed the Studio UI freezing when AI ENRICH was started consecutively for three or more Media Pool items.
+- Removed all worker stdin writes and flushes from the Qt main thread. Large BLIP evidence, semantic schemas and LM Studio prompts now enter an in-memory queue immediately and are drained by a dedicated background writer thread.
+- Applied the non-blocking queue to every persistent JSON worker, including media preparation, multi-region/video BLIP, audio analysis and AI Semantic Enrichment, so a busy child process can apply Windows pipe backpressure without freezing selection, scrolling or further clicks.
+- Preserved ready-gating, FIFO request order, crash isolation, pending-job cancellation and worker error logging.
+
+### Verification
+
+- Added a Windows-pipe backpressure regression worker that intentionally refuses to read stdin for one second while the Studio queues three approximately 810 KB requests. All three UI-side enqueue calls return immediately and the worker later receives them in exact order.
+- Re-ran multi-region image AI Enrich, video BLIP/audio waiting, manual LM Studio semantic enrichment and worker startup/failure tests.
+- `194` automated tests passed with the bundled Python environment.
+- The Director Project format remains version `15`.
+
+## [0.2.0-alpha] - 2026-08-26
 
 ### Fixed
 
@@ -17,7 +94,7 @@ Every user-visible correction receives an application version and a dated entry 
 - `193` automated tests passed with the bundled Python environment.
 - The Director Project format remains version `15`; no saved-project migration is required.
 
-## [0.1.0-alpha.9] - 2026-08-26
+## [0.1.9-alpha] - 2026-08-26
 
 ### Verified
 
@@ -33,7 +110,7 @@ Every user-visible correction receives an application version and a dated entry 
 - `192` automated tests passed with the bundled Python environment.
 - The Director Project format remains version `15`; no saved-project migration is required.
 
-## [0.1.0-alpha.8] - 2026-08-26
+## [0.1.8-alpha] - 2026-08-26
 
 ### Fixed
 
@@ -50,7 +127,7 @@ Every user-visible correction receives an application version and a dated entry 
 - Added native hidden/Mute mapping, partial-work-area local-time and duplicate-basename upload regression tests.
 - `182` automated tests passed with the bundled Python environment.
 
-## [0.1.0-alpha.7] - 2026-08-26
+## [0.1.7-alpha] - 2026-08-26
 
 ### Fixed
 
@@ -66,7 +143,7 @@ Every user-visible correction receives an application version and a dated entry 
 - All `36` project Python files were statically inspected for reference-number construction, prompt compilation and workflow-binding paths.
 - `178` automated tests passed with the bundled Python environment, including a mixed P4/P7/V2/A3 Segment test and inactive-reference anti-alias checks.
 
-## [0.1.0-alpha.6] - 2026-08-26
+## [0.1.6-alpha] - 2026-08-26
 
 ### Fixed
 
@@ -84,7 +161,7 @@ Every user-visible correction receives an application version and a dated entry 
 
 - `172` automated tests passed with the bundled Python environment.
 
-## [0.1.0-alpha.5] - 2026-08-26
+## [0.1.5-alpha] - 2026-08-26
 
 ### Added
 
@@ -103,7 +180,7 @@ Every user-visible correction receives an application version and a dated entry 
 
 - `168` automated tests passed with the bundled Python environment.
 
-## [0.1.0-alpha.4] - 2026-08-25
+## [0.1.4-alpha] - 2026-08-25
 
 ### Fixed
 
@@ -113,7 +190,7 @@ Every user-visible correction receives an application version and a dated entry 
 
 - `162` automated tests passed with the bundled Python environment.
 
-## [0.1.0-alpha.3] - 2026-08-25
+## [0.1.3-alpha] - 2026-08-25
 
 ### Fixed
 
@@ -123,7 +200,7 @@ Every user-visible correction receives an application version and a dated entry 
 
 - `161` automated tests passed with the bundled Python environment.
 
-## [0.1.0-alpha.2] - 2026-08-25
+## [0.1.2-alpha] - 2026-08-25
 
 ### Added
 
@@ -140,7 +217,7 @@ Every user-visible correction receives an application version and a dated entry 
 
 - `161` automated tests passed with the bundled Python environment.
 
-## [0.1.0-alpha.1] - 2026-08-25
+## [0.1.1-alpha] - 2026-08-25
 
 ### Added
 

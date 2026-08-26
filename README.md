@@ -4,15 +4,16 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.1.0-alpha.10`](VERSION)
+- 当前应用版本：[`v0.2.4-alpha.1`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
+- [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
 - [示范输出影片（YouTube）](https://youtu.be/hALjq11lK_s)
 - 下载源码及 runtime 后，从项目根目录执行 `run_h3_prompt_studio.bat`。
 
 源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
 
-版本规则：每一次用户可见的修正都会提升 `VERSION` 并在 `CHANGELOG.md` 留下日期、修改内容与验证结果。应用版本遵循 Semantic Versioning；Project JSON 的 format version 独立管理，只有 `.h3director.json` 保存结构改变时才提升。
+版本规则：基础版本使用 `v0.2.4-alpha` 格式，三个基础数字位只使用 `0–9`。同类小优化不改变前面的基础版本，只递增 alpha 后缀，例如 `v0.2.4-alpha.1`、`v0.2.4-alpha.2`。只有进入新的功能版本时才提升基础数字；届时 `v0.2.9-alpha` 的下一基础版本为 `v0.3.0-alpha`。每次更新都会同步写入 `VERSION` 与 `CHANGELOG.md`。Project JSON 的 format version 独立管理，只有 `.h3director.json` 保存结构改变时才提升。
 
 <img width="1280" height="769" alt="MiniMax H3 Director Cut Studio" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
 
@@ -417,7 +418,7 @@ example/tang_ting_ci_ying_45s_demo/design_plan.json
 
 ## H3 Prompt Skills
 
-Skill 始终使用两层绑定：
+Skill 默认使用两层绑定，并支持由 Special Skill 明确声明独立模式：
 
 ```text
 skill default/
@@ -428,12 +429,14 @@ skill default/
 skill special/
 ├─ minimalist-product-ad-generator/
 ├─ music-video-subtitle-generator/
+├─ wuxia-blade-film/
 └─ ...每个含 SKILL.md 的子目录
 ```
 
 - Default 固定为 `h3-prompt-writing`，负责 MiniMax H3 官方 Ref2VA 结构。
 - Special 提供场景/风格规则；选择 `None` 时只应用 Default。
-- 实际组合始终是 `Default + Special`，Special 不会替代官方结构。
+- 一般 Special 采用 `Default + Special`；在 `SKILL.md` 写入 `<!-- h3-studio-binding: standalone -->` 的 Special 会独立送入 Design，不会同时注入 `h3-prompt-writing`。
+- `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它负责物理连续、武器因果、写实轻功、碎片式镜头和环境同步的刀战策划。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。45 秒《一叶杀》可直接贴入 Design 的整理稿位于 `example/one_leaf_kill_45s_design_requirement.txt`。
 
 Preset 分别保存于独立文件，均支持选择、新增、修改、删除及 `SAVE + APPLY`：
 
@@ -509,13 +512,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 
 ## 测试
 
-当前主分支验证结果：**193 tests passed**。
+当前主分支验证结果：**194 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 193 tests
+Ran 194 tests
 OK
 ```
