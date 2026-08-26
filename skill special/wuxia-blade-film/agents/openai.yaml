@@ -1,4 +1,4 @@
 interface:
   display_name: "Wuxia Blade Film"
-  short_description: "Budget physical wuxia action across continuous H3 segments"
-  default_prompt: "Use $wuxia-blade-film to turn this story into a physically continuous H3 wuxia design with exact continuity ledgers, renderable five-second action budgets, and no-replay segment boundaries."
+  short_description: "Direct asymmetric survival blade combat for H3"
+  default_prompt: "Use $wuxia-blade-film to turn this story into a physically continuous H3 survival blade fight with explicit limb, damage and weapon-geometry ledgers, brutal inner-circle mechanics, renderable five-second action budgets, and no-replay segment boundaries."
