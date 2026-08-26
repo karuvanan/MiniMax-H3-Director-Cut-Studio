@@ -46,7 +46,38 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("DEFAULT H3 SKILL", system)
         self.assertIn("SPECIAL SCENE SKILL (wuxia-blade-film)", system)
         self.assertIn("weapon-driven causality", system)
+        self.assertIn("Broken-blade inner-circle fighter", system)
+        self.assertIn("Airborne twin-blade predator", system)
+        self.assertIn("one frozen instant", system)
+        self.assertIn("never depend on `he`", system)
+        self.assertIn("Limb ledger", system)
+        self.assertIn("Weapon-geometry ledger", system)
+        self.assertIn("Damage ledger", system)
+        self.assertIn("Feral collapse", system)
         self.assertIn(self.profiles[DEFAULT_SKILL].h3_reference_guide, system)
+
+    def test_wuxia_english_and_chinese_skills_share_asymmetry_guardrails(self):
+        profile = self.profiles["wuxia-blade-film"]
+        english = profile.instruction
+        chinese = (profile.path.parent / "SKILL.cn.md").read_text(encoding="utf-8-sig")
+        for phrase in (
+            "phantom grip",
+            "no usable point",
+            "Damage ledger",
+            "Footing ledger",
+            "Feral collapse",
+            "orientation anchor",
+        ):
+            self.assertIn(phrase, english)
+        for phrase in (
+            "幽灵握持",
+            "没有可用刀尖",
+            "伤势账本",
+            "脚下账本",
+            "野兽式崩解",
+            "方向锚点",
+        ):
+            self.assertIn(phrase, chinese)
 
     def test_ref_prompt_preserves_six_section_order(self):
         spec = PromptSpec(brief="A product rotates.", shots=["Hero product view", "Final hold"])

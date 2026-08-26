@@ -85,6 +85,18 @@ _ACTION_SETUP_RE = re.compile(
     flags=re.I,
 )
 
+_EXPLICIT_ACTION_ACTOR_RE = re.compile(
+    r"\b(?:the\s+)?(?:assassin|general|fighter|warrior|swordsman|swordswoman|"
+    r"hero|villain|attacker|defender|guard|soldier|woman|man|girl|boy|subject|"
+    r"character)\b|(?:刺客|将军|將軍|刀客|剑客|劍客|侠客|俠客|武士|守卫|守衛|"
+    r"士兵|女子|男人|女人|少女|少年|主角|反派)",
+    flags=re.I,
+)
+_LEADING_OUTGOING_RE = re.compile(
+    r"^\s*(?:outgoing|exit|end(?:ing)?\s+state|final\s+state)\s*:\s*",
+    flags=re.I,
+)
+
 
 DESIGN_JSON_SCHEMA = {
     "type": "object",
@@ -363,24 +375,26 @@ def _auto_image_request(
     preset = _standalone_image_text(shot.get("preset", "Story action")) or "Story action"
     framing = _standalone_image_text(shot.get("framing", "Cinematic medium-wide shot"))
     angle = _standalone_image_text(shot.get("camera_angle", "Eye-level camera"))
-    action = _standalone_image_text(
-        instruction or shot.get("subject_action") or source.get("creative_brief", "")
-    )
-    environment = _standalone_image_text(
-        shot.get("environment_response") or source.get("creative_brief", "")
-    )
+    subject_requirement = _standalone_image_text(instruction)
+    frozen_state = _single_frame_shot_state(shot)
+    story_context = _standalone_image_text(source.get("creative_brief", ""))
     style = _standalone_image_text(source.get("global_visual_style", "cinematic realism"))
     prompt = ". ".join(
         part.rstrip(" .")
         for part in (
             f"Standalone cinematic production frame for {preset}",
             f"Composition: {framing}, {angle}" if framing or angle else "",
-            f"Decisive in-world moment: {action}" if action else "",
-            f"Story environment and physical response: {environment}" if environment else "",
+            (
+                f"Required identity, wardrobe and prop ownership: {subject_requirement}"
+                if subject_requirement else ""
+            ),
+            f"Frozen outgoing physical state: {frozen_state}" if frozen_state else "",
+            f"Story location and context: {story_context}" if story_context else "",
             f"Visual treatment: {style}" if style else "",
             (
-                "Show one coherent instant with exact subject count, consistent identity, wardrobe, "
-                "props, ownership, geography and lighting"
+                "Show exactly one frozen instant with exact subject count, consistent identity, "
+                "wardrobe, props, ownership, geography and lighting. Do not show a temporal montage, "
+                "repeated body positions, duplicate fighters, or multiple stages of one action"
             ),
         )
         if part
@@ -438,11 +452,28 @@ def repair_design_media_plan(
         dict(row) for row in source.get("media_requests") or []
         if isinstance(row, dict)
     ]
+    shots = [dict(row) for row in source.get("shots") or [] if isinstance(row, dict)]
+    for request_index, request in enumerate(requests):
+        requirement_id = _normalized_requirement_id(
+            request.get("requirement_id"), f"request_{request_index + 1}"
+        )
+        internal_auto = re.fullmatch(r"auto_image_s(\d+)(?:_\d+)?", requirement_id)
+        if (
+            internal_auto
+            and str(request.get("media_type", "")).strip().lower() == "image"
+            and 1 <= int(internal_auto.group(1)) <= len(shots)
+        ):
+            requests[request_index] = _auto_image_request(
+                source,
+                shots[int(internal_auto.group(1)) - 1],
+                duration,
+                requirement_id=requirement_id,
+                preferred_media_id=str(request.get("preferred_media_id", "")).strip(),
+            )
     request_ids = {
         _normalized_requirement_id(row.get("requirement_id"), f"request_{index}")
         for index, row in enumerate(requests, 1)
     }
-    shots = [dict(row) for row in source.get("shots") or [] if isinstance(row, dict)]
     valid_uses: list[dict] = []
     warnings: list[str] = []
 
@@ -642,6 +673,55 @@ def _join_action_beats(beats: list[str]) -> str:
     return ". ".join(beat.strip().rstrip(".") for beat in beats if beat.strip()).strip()
 
 
+def _bind_action_subjects(beats: list[str]) -> list[str]:
+    """Replace ambiguous actor pronouns before budget compression.
+
+    Selecting only a subset of a multi-fighter action can otherwise detach a
+    clause such as ``He runs`` from its original antecedent and silently assign
+    it to the wrong fighter in the compiled H3 prompt.
+    """
+
+    bound: list[str] = []
+    current_actor = ""
+    for raw in beats:
+        beat = raw.strip()
+        actors = list(_EXPLICIT_ACTION_ACTOR_RE.finditer(beat))
+        if actors:
+            current_actor = actors[0].group(0).strip()
+        elif current_actor:
+            has_subject_pronoun = bool(
+                re.search(r"\b(?:he|she|they)\b", beat, flags=re.I)
+            )
+            if has_subject_pronoun:
+                beat = re.sub(r"\b(?:he|she|they)\b", current_actor, beat, flags=re.I)
+            else:
+                possessive = (
+                    re.sub(r"(?:'s|’s)$", "", current_actor, flags=re.I) + "'s"
+                )
+                beat = re.sub(r"\b(?:his|her|their)\b", possessive, beat, flags=re.I)
+            if re.match(r"^(?:他|她|他们|她们|其)", beat):
+                beat = re.sub(r"^(?:他|她|他们|她们|其)", current_actor, beat, count=1)
+        bound.append(beat)
+    return bound
+
+
+def _single_frame_shot_state(shot: dict) -> str:
+    """Return one frozen physical state suitable for a T2I reference."""
+
+    continuity = _standalone_image_text(shot.get("continuity_state", ""))
+    if continuity:
+        outgoing_match = re.search(
+            r"\bOutgoing\s*:\s*(.+)$", continuity, flags=re.I
+        )
+        state = outgoing_match.group(1).strip() if outgoing_match else continuity
+        state = _LEADING_OUTGOING_RE.sub("", state).strip(" ,.;")
+        if state:
+            return state
+
+    beats = _bind_action_subjects(split_action_beats(shot.get("subject_action", "")))
+    return _standalone_image_text(beats[-1] if beats else "")
+
+
 def _merge_causal_setup_beats(beats: list[str]) -> list[str]:
     """Keep a weapon/setup dependency attached to the decisive action it enables."""
     merged: list[str] = []
@@ -703,7 +783,8 @@ def normalize_shot_action_budget(shot: dict) -> dict:
     continuity = str(result.get("continuity_state", "")).strip()
     optional_text = str(result.get("optional_flourish", "")).strip()
     raw_core_beats = split_action_beats(original_core)
-    core_beats = _merge_causal_setup_beats(raw_core_beats)
+    bound_core_beats = _bind_action_subjects(raw_core_beats)
+    core_beats = _merge_causal_setup_beats(bound_core_beats)
     causal_merge_count = len(raw_core_beats) - len(core_beats)
     optional_beats = split_action_beats(optional_text)
     environment_beats = split_action_beats(original_environment)
@@ -1260,6 +1341,9 @@ def build_design_system_prompt(context: dict) -> str:
         "subject action, environmental response, continuity state, optional flourish and additional direction. "
         "Treat subject_action as the must-complete physical core only. Put the exact incoming and outgoing body pose, "
         "subject and weapon ownership, velocity, screen direction, geography and camera trajectory in continuity_state. "
+        "In every multi-character action clause, repeat the explicit character name or role before its verb and weapon. "
+        "Do not rely on he, she, they, his or her across action beats: action-budget compression must never transfer an "
+        "attack, escape, landing or weapon from one character to another. "
         "Put leaves, sparks, dust, cloth motion, secondary feints, ornamental camera moves and other dispensable detail in "
         "optional_flourish. Keep contact-driven consequences that are necessary for causality in environment_response, not "
         "in optional_flourish. For every five seconds, budget at most three must-complete physical action beats, two required "
@@ -1308,6 +1392,9 @@ def build_design_system_prompt(context: dict) -> str:
         "token in a T2I prompt and never ask it to copy, match, continue from or depend on a previous, current/self, next/future, generated "
         "or output image; those H3 slots do not exist when reference images are generated. Restate all required identity, appearance, wardrobe, "
         "prop, action, composition, lighting and environment facts directly inside each image prompt. "
+        "An action-state image must depict exactly one frozen instant: one body position per character and one physically "
+        "consistent weapon state. Never describe a temporal montage, several sequential moves, repeated poses, duplicate fighters, "
+        "afterimages that resemble extra people, or both the setup and the later outcome in the same still. "
         "For every time-scoped action-state or segment-boundary reference, stage the requested moment inside the story's exact real in-world "
         "location with its recognizable geography and lighting; never use a neutral, blank, plain, isolated or studio background for those "
         "action/boundary images. First infer and preserve an exact character/prop ownership ledger from the story: name which character wears "

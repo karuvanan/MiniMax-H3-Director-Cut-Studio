@@ -2,6 +2,54 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.4-alpha.8] - 2026-08-26
+
+### Added
+
+- Expanded `wuxia-blade-film` with limb, weapon-geometry, attachment, cumulative-damage and footing ledgers for asymmetric survival combat.
+- Added an irreversible combat-degradation curve: unequal threat, committed attack, injury adaptation, feral collapse and visibly costly resolution.
+- Added causal fragmented-editing rules that preserve one orientation anchor, reveal the physical result immediately after impact occlusion and prohibit random camera shake as a substitute for speed.
+
+### Fixed
+
+- A one-armed fighter can no longer regenerate a hand, use a phantom grip, perform a two-handed guard or gain unexplained balance from an absent limb.
+- A broken blade with no usable point can no longer perform a clean thrust or impalement; its permitted actions are constrained to its fixed geometry unless a stable jagged point is explicitly established.
+- Chain/rope actions must now preserve origin, attachment point, controlling hand, tension state and visible release or retraction instead of behaving as a duplicated or intangible weapon.
+- Damage, damaged armor, breath loss, weakened footing, blood, mud and grip failure must persist through subsequent Shots and native 15-second boundaries.
+
+### Verification
+
+- Added an English/Chinese parity regression for the new limb, blade-geometry, attachment, damage, footing and feral-collapse rules.
+- Validated the updated Skill package in UTF-8 mode.
+- The complete bundled test suite passed: `216` tests.
+- The Director Project format remains version `16`; no saved-project migration is required.
+
+## [0.2.4-alpha.7] - 2026-08-26
+
+### Added
+
+- Expanded the English and Chinese `wuxia-blade-film` Skill with a renderable brutal-blade grammar: broken-blade inner-circle entry, tension-axis rotation, adhesive short combinations, grounded twin-blade aerial pressure, the decisive speed paradox and H3 timing translation.
+- Added explicit direction for dense flurries, range asymmetry, gravity-driven attacks, recovery vulnerability, projectile ownership and close handheld impact coverage without copying game stats into generation prompts.
+
+### Fixed
+
+- Action-budget compression now resolves actor pronouns before selecting mandatory beats. An Assassin's throw, low slide or escape can no longer be silently reassigned to the General when intervening clauses are demoted.
+- Automatically recovered or coverage-floor Z-Image requests now describe one frozen outgoing physical state instead of copying a whole multi-action Shot into one still.
+- Legacy internal `auto_image_sN` requests are upgraded to the same atomic still format when an older Design JSON is validated or applied.
+- Generated action-state references explicitly forbid temporal montages, repeated body positions and duplicate fighters, reducing contradictory pose anchors and character multiplication.
+
+### Changed
+
+- AI Design now requires every multi-character action clause to repeat the explicit role before its verb and weapon; cross-clause `he`, `his`, `she` and `they` are rejected as unsafe choreography notation.
+- Action-state image planning now separates identity/ownership requirements, one frozen pose state and story location instead of treating a static reference as a miniature action sequence.
+
+### Verification
+
+- Re-examined the 45-second `one_leaf_kill_20260826_163317_529371` preview at one and three frames per second across all three native segments.
+- Validated the updated Skill package in UTF-8 mode.
+- The complete bundled test suite passed: `215` tests.
+- The Director Project format remains version `16`; no saved-project migration is required.
+
 ## [0.2.4-alpha.6] - 2026-08-26
 
 ### Fixed

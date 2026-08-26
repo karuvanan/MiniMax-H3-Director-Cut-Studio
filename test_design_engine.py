@@ -413,12 +413,41 @@ class DesignEngineTests(unittest.TestCase):
             "continuity_state": "End behind the general.",
             "optional_flourish": "",
         })
-        self.assertIn("draws both blades, then he strikes", budgeted["subject_action"])
+        self.assertIn(
+            "draws both blades, then the assassin strikes",
+            budgeted["subject_action"].lower(),
+        )
         self.assertEqual(budgeted["action_budget"]["required_response_limit"], 2)
         self.assertLessEqual(
             len(budgeted["environment_response"].split(". ")),
             2,
         )
+
+    def test_action_budget_keeps_pronouns_bound_to_the_correct_fighter(self):
+        opening = normalize_shot_action_budget({
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "subject_action": (
+                "The General stands on the bridge. As red leaves fall, he turns his eyes. "
+                "The Assassin runs along the wall. Only his silhouette is visible. "
+                "He raises his right wrist to throw."
+            ),
+            "continuity_state": "Outgoing: The Assassin remains mid-stride.",
+        })
+        self.assertIn("The Assassin raises", opening["subject_action"])
+        self.assertNotIn("The General raises", opening["subject_action"])
+
+        ending = normalize_shot_action_budget({
+            "start_seconds": 40.0,
+            "end_seconds": 45.0,
+            "subject_action": (
+                "The General tries to turn. His armor cracks. He lowers his sword. "
+                "The Assassin does not look back. He runs two steps to the wall and escapes."
+            ),
+            "continuity_state": "Outgoing: The General kneels; The Assassin is gone.",
+        })
+        self.assertIn("The Assassin runs", ending["subject_action"])
+        self.assertNotIn("The General runs", ending["subject_action"])
 
     def test_legacy_shot_gets_continuity_state_and_blank_constraints_get_guardrail(self):
         payload = sample_design()
@@ -637,6 +666,49 @@ class DesignEngineTests(unittest.TestCase):
         )
         self.assertTrue(all(row["prompt"] for row in images))
         self.assertTrue(all(row["reuse_policy"] == "time_scoped" for row in images))
+        self.assertTrue(
+            all("exactly one frozen instant" in row["prompt"] for row in images)
+        )
+        self.assertTrue(
+            all("duplicate fighters" in row["prompt"] for row in images)
+        )
+        self.assertNotIn(
+            "Decisive in-world moment",
+            images[0]["prompt"],
+        )
+
+    def test_media_repair_upgrades_legacy_internal_auto_image_to_one_instant(self):
+        payload = sample_design()
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = [{
+            "requirement_id": "auto_image_s1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "track": "V1",
+            "subject_keywords": ["legacy"],
+            "prompt": (
+                "The fighter starts far away, runs, jumps, strikes, lands, then escapes "
+                "while several action stages appear together."
+            ),
+        }]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[],
+            strict_t2i_prompts=True,
+            repair_media_plan=True,
+        )
+        repaired = next(
+            row for row in plan["media_requests"]
+            if row["requirement_id"] == "auto_image_s1"
+        )
+        self.assertIn("Frozen outgoing physical state", repaired["prompt"])
+        self.assertIn("duplicate fighters", repaired["prompt"])
+        self.assertNotIn("starts far away", repaired["prompt"])
 
     def test_loaded_media_reserves_slots_for_missing_media_requests(self):
         payload = sample_design()
@@ -672,6 +744,9 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("stable @p/@v/@a id", prompt)
         self.assertIn("never write a raw <picture n>", prompt)
         self.assertIn("request-local h3 ordinals", prompt)
+        self.assertIn("repeat the explicit character name", prompt)
+        self.assertIn("exactly one frozen instant", prompt)
+        self.assertIn("duplicate fighters", prompt)
         self.assertIn("three must-complete physical action beats", prompt)
         self.assertIn("continuity_state", prompt)
         self.assertIn("optional_flourish", prompt)
