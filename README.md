@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.4-alpha.1`](VERSION)
+- 当前应用版本：[`v0.2.4-alpha.2`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -436,7 +436,7 @@ skill special/
 - Default 固定为 `h3-prompt-writing`，负责 MiniMax H3 官方 Ref2VA 结构。
 - Special 提供场景/风格规则；选择 `None` 时只应用 Default。
 - 一般 Special 采用 `Default + Special`；在 `SKILL.md` 写入 `<!-- h3-studio-binding: standalone -->` 的 Special 会独立送入 Design，不会同时注入 `h3-prompt-writing`。
-- `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它负责物理连续、武器因果、写实轻功、碎片式镜头和环境同步的刀战策划。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。45 秒《一叶杀》可直接贴入 Design 的整理稿位于 `example/one_leaf_kill_45s_design_requirement.txt`。
+- `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它负责物理连续、武器因果、15 秒无重播边界、人物／武器／空间／消耗品账本、写实轻功、碎片式镜头和环境同步。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。可直接贴入 Design 的《一叶杀》45 秒 V2 位于 `example/one_leaf_kill_45s_design_requirement.txt`。
 
 Preset 分别保存于独立文件，均支持选择、新增、修改、删除及 `SAVE + APPLY`：
 
