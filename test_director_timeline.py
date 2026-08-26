@@ -1024,6 +1024,44 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_ai_design_apply_undo_redo_rebuilds_dynamic_track_headers(self):
+        window = DirectorCutStudio()
+        plan = sample_design()
+        plan["shots"][0]["track"] = "V6"
+        plan = normalize_design_plan(plan, window.scan.counts)
+        before = window._design_workspace_state()
+        design_dir = PROJECT_ROOT / ".director_cache" / "dynamic_track_header_state_test"
+        design_dir.mkdir(parents=True, exist_ok=True)
+
+        window._commit_ai_design(plan, [], True, before, design_dir)
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertIn("V6", [track.track_id for track in window.tracks])
+        self.assertEqual(
+            list(window.track_header_widgets),
+            [track.track_id for track in window.tracks],
+        )
+        self.assertEqual(window.track_header_widgets["V6"].track.kind, "visual")
+
+        window.undo_stack.undo()
+        self.app.processEvents()
+        self.assertNotIn("V6", [track.track_id for track in window.tracks])
+        self.assertEqual(
+            list(window.track_header_widgets),
+            [track.track_id for track in window.tracks],
+        )
+
+        window.undo_stack.redo()
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertIn("V6", window.track_header_widgets)
+        self.assertEqual(
+            list(window.track_header_widgets),
+            [track.track_id for track in window.tracks],
+        )
+        window.project_dirty = False
+        window.close()
+
     def test_ai_design_places_repeated_media_uses_as_independent_clips(self):
         window = DirectorCutStudio()
         media_root = PROJECT_ROOT / ".director_cache" / "repeated_design_media"

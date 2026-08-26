@@ -2,6 +2,21 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.1.0-alpha.10] - 2026-08-26
+
+### Fixed
+
+- Fixed AI Design Apply/Undo/Redo leaving the Track Header on the original V3/V2/V1 model after the Timeline had dynamically created V4/V5/V6. Picture clips remained correctly assigned to visual tracks internally but appeared beside A1/A2/A3 labels because the two panes displayed different track lists.
+- Added the complete dynamic Track list to the AI Design workspace command state, so Undo restores the earlier track model and Redo restores all Design-created V/A tracks together with their media, text and Shot assignments.
+- Rebuilt and resynchronized the fixed Track Header pane whenever an AI Design workspace state is restored.
+
+### Verification
+
+- Reloaded `bangkok_to_meiktila_the_midnight_escape_20260826_080038_515906` and confirmed that both panes expose `V6, V5, V4, V3, V2, V1, A1, A2, A3`; all six placed Picture assets resolve to tracks whose type is `visual`.
+- Added an AI Design dynamic-track Apply/Undo/Redo regression test.
+- `193` automated tests passed with the bundled Python environment.
+- The Director Project format remains version `15`; no saved-project migration is required.
+
 ## [0.1.0-alpha.9] - 2026-08-26
 
 ### Verified

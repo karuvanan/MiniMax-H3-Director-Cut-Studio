@@ -6067,6 +6067,11 @@ class DirectorCutStudio(QMainWindow):
         return {
             "duration_seconds": self.scan.duration_seconds,
             "duration_nodes": duration_nodes,
+            # AI Design may create V4/V5... and A4/A5... dynamically.  Track
+            # geometry is part of the workspace state: without it Undo/Redo
+            # can restore clips whose real V-track rows exist only in the
+            # Timeline scene while the Track Header still shows V3/V2/V1.
+            "tracks": [asdict(track) for track in self.tracks],
             "assets": {asset.node_id: asdict(asset) for asset in self.scan.assets},
             "timeline_clips": [asdict(clip) for clip in self.scan.timeline_clips],
             "text_layers": [asdict(layer) for layer in self.text_layers],
@@ -6082,6 +6087,9 @@ class DirectorCutStudio(QMainWindow):
         if not self.scan or not state:
             return
         duration = max(0.5, float(state["duration_seconds"]))
+        track_rows = state.get("tracks") or []
+        if track_rows:
+            self.tracks = [TimelineTrack(**values) for values in track_rows]
         self.scan.duration_seconds = duration
         for node_id, value in state.get("duration_nodes", {}).items():
             if node_id in self.scan.nodes:
@@ -6123,6 +6131,9 @@ class DirectorCutStudio(QMainWindow):
                 field.setPlainText(str(value))
         self.timeline.set_workflow(self.scan)
         self.timeline.set_tracks(self.tracks)
+        # Keep the fixed Track Header pane and the QGraphics Timeline on the
+        # same dynamic track model after Apply, Undo and Redo.
+        self._rebuild_track_headers()
         self.timeline.set_text_layers(self.text_layers)
         self.timeline.set_director_cues(self.director_cues)
         for asset in self.scan.assets:

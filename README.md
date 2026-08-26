@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.1.0-alpha.9`](VERSION)
+- 当前应用版本：[`v0.1.0-alpha.10`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
 - [示范输出影片（YouTube）](https://youtu.be/hALjq11lK_s)
@@ -509,13 +509,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 
 ## 测试
 
-当前主分支验证结果：**192 tests passed**。
+当前主分支验证结果：**193 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 192 tests
+Ran 193 tests
 OK
 ```
