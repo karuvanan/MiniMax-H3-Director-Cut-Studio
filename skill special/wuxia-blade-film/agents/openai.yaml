@@ -1,4 +1,4 @@
 interface:
   display_name: "Wuxia Blade Film"
-  short_description: "Design brutal physical and continuous wuxia blade fights"
-  default_prompt: "Use $wuxia-blade-film to turn this story into a physically continuous cinematic wuxia blade-fight design."
+  short_description: "Design physical continuous wuxia fights across H3 segments"
+  default_prompt: "Use $wuxia-blade-film to turn this story into a physically continuous cinematic wuxia blade-fight design with exact continuity ledgers and no-replay segment boundaries."
