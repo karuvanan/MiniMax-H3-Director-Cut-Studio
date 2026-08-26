@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 import json
 from pathlib import Path
 import re
@@ -12,6 +13,10 @@ import wave
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
+ACTION_BUDGET_WINDOW_SECONDS = 5.0
+MAX_CORE_ACTIONS_PER_WINDOW = 3
+MAX_REQUIRED_RESPONSES_PER_WINDOW = 2
+MAX_OPTIONAL_ACTIONS_PER_WINDOW = 2
 
 
 _PICTURE_REFERENCE_RE = re.compile(r"<\s*picture\s+\d+\s*>", flags=re.I)
@@ -39,6 +44,43 @@ _NON_STORY_BACKGROUND_RE = re.compile(
     r"|\b(?:on|against)\s+(?:a\s+)?(?:neutral|blank|plain|empty|isolated|generic|seamless)\s+"
     r"(?:backdrop|studio)\b"
     r"|\bstudio\s+(?:background|backdrop)\b",
+    flags=re.I,
+)
+
+_ACTION_BEAT_SPLIT_RE = re.compile(
+    r"(?:[.!?;:\u3002\uff01\uff1f\uff1b\uff1a]+|"
+    r",\s*(?=(?:then|next|after(?:ward)?|immediately|simultaneously)\b)|"
+    r"\b(?:and\s+then|then|next|afterwards?|simultaneously)\b|"
+    r"\s*(?:\u7136\u540e|\u968f\u540e|\u7d27\u63a5\u7740|\u7acb\u5373|\u540c\u65f6|\u4e0e\u6b64\u540c\u65f6)\s*)",
+    flags=re.I,
+)
+_DECORATIVE_ACTION_RE = re.compile(
+    r"\b(?:leaf|leaves|spark|sparks|dust|mist|smoke|cloth|cape|hair|debris|"
+    r"glow|glitter|particle|petal|rain|lightning|lens flare|motion blur)\b|"
+    r"(?:\u843d\u53f6|\u706b\u82b1|\u7070\u5c18|\u70df\u96fe|\u8863\u6446|\u62ab\u98ce|\u5934\u53d1|"
+    r"\u788e\u5c51|\u7c92\u5b50|\u82b1\u74e3|\u95ea\u7535|\u5149\u6655|\u8fd0\u52a8\u6a21\u7cca)",
+    flags=re.I,
+)
+_CRITICAL_ACTION_RE = re.compile(
+    r"\b(?:strike|slash|stab|thrust|block|parry|deflect|impact|contact|collide|"
+    r"land|grip|release|catch|break|fall|escape|exit|finish|end|hold|wound|"
+    r"ricochet|redirect|launch|leap|jump|run|step)\b|"
+    r"(?:\u653b\u51fb|\u65a9|\u523a|\u6321|\u683c\u6321|\u53cd\u5f39|\u78b0\u649e|\u547d\u4e2d|"
+    r"\u843d\u5730|\u6293\u4f4f|\u677e\u5f00|\u6298\u65ad|\u5760\u843d|\u9003\u79bb|\u7ed3\u675f|"
+    r"\u505c\u4f4f|\u8df3|\u8dc3|\u8dd1|\u8e0f|\u8f6c\u5411)",
+    flags=re.I,
+)
+_DECISIVE_CONTACT_RE = re.compile(
+    r"\b(?:strikes?|blocks?|parries|deflects?|hits?|collides?|breaks?|catches)\b|"
+    r"\b(?:strike|slash|stab|thrust|block|parry|deflect|impact|contact|collide|"
+    r"hit|wound|break|ricochet|catch)\b|"
+    r"(?:\u653b\u51fb|\u65a9|\u523a|\u6321|\u683c\u6321|\u53cd\u5f39|\u78b0\u649e|"
+    r"\u547d\u4e2d|\u4f24|\u6298\u65ad|\u6293\u4f4f)",
+    flags=re.I,
+)
+_ACTION_SETUP_RE = re.compile(
+    r"\b(?:draws?|unsheathes?|grips?|raises?|aims?|plants?|crouches?|winds?\s+up|"
+    r"loads?|hooks?)\b|(?:\u62d4|\u63e1|\u4e3e|\u62ac|\u7784|\u8e72|\u84c4\u529b|\u4e0a\u5f26|\u52fe\u4f4f)",
     flags=re.I,
 )
 
@@ -76,7 +118,7 @@ DESIGN_JSON_SCHEMA = {
                     "start_seconds", "end_seconds", "track", "preset", "framing",
                     "camera_angle", "camera_movement", "movement_speed",
                     "movement_amplitude", "subject_action", "environment_response",
-                    "additional_direction",
+                    "continuity_state", "optional_flourish", "additional_direction",
                 ],
                 "properties": {
                     "start_seconds": {"type": "number"},
@@ -90,6 +132,8 @@ DESIGN_JSON_SCHEMA = {
                     "movement_amplitude": {"type": "string"},
                     "subject_action": {"type": "string"},
                     "environment_response": {"type": "string"},
+                    "continuity_state": {"type": "string"},
+                    "optional_flourish": {"type": "string"},
                     "additional_direction": {"type": "string"},
                 },
             },
@@ -353,6 +397,231 @@ def _canonicalize_design_media_mentions(text: object, media_ids: list[str]) -> s
     return result
 
 
+def split_action_beats(value: object) -> list[str]:
+    """Return conservative, ordered physical-action clauses for budget checks."""
+    text = " ".join(str(value or "").split()).strip(" ,")
+    if not text:
+        return []
+    return [
+        part.strip(" ,")
+        for part in _ACTION_BEAT_SPLIT_RE.split(text)
+        if part and part.strip(" ,")
+    ]
+
+
+def _join_action_beats(beats: list[str]) -> str:
+    return ". ".join(beat.strip().rstrip(".") for beat in beats if beat.strip()).strip()
+
+
+def _merge_causal_setup_beats(beats: list[str]) -> list[str]:
+    """Keep a weapon/setup dependency attached to the decisive action it enables."""
+    merged: list[str] = []
+    index = 0
+    while index < len(beats):
+        beat = beats[index]
+        if (
+            index + 1 < len(beats)
+            and _ACTION_SETUP_RE.search(beat)
+            and _DECISIVE_CONTACT_RE.search(beats[index + 1])
+        ):
+            following = beats[index + 1].strip()
+            following = following[:1].lower() + following[1:] if following else following
+            merged.append(f"{beat.rstrip(' .')}, then {following}")
+            index += 2
+            continue
+        merged.append(beat)
+        index += 1
+    return merged
+
+
+def _action_priority(beat: str, index: int, total: int) -> tuple[int, int]:
+    score = 0
+    if index == 0:
+        score += 5
+    if index == total - 1:
+        score += 6
+    if _CRITICAL_ACTION_RE.search(beat):
+        score += 4
+    if _DECISIVE_CONTACT_RE.search(beat):
+        score += 5
+    if _DECORATIVE_ACTION_RE.search(beat):
+        score -= 3
+    return score, index
+
+
+def normalize_shot_action_budget(shot: dict) -> dict:
+    """Compress a Shot into a deterministic H3-executable action hierarchy.
+
+    ``subject_action`` is the must-complete core.  Decorative or lower-priority
+    clauses that exceed the three-actions-per-five-seconds budget are moved to
+    ``optional_flourish``.  The original wording remains inspectable in the
+    action_budget metadata instead of disappearing silently.
+    """
+    result = dict(shot)
+    start = float(result.get("start_seconds", 0.0) or 0.0)
+    end = float(result.get("end_seconds", start + 0.5) or start + 0.5)
+    duration = max(0.5, end - start)
+    core_limit = max(
+        1,
+        int(math.ceil(duration / ACTION_BUDGET_WINDOW_SECONDS * MAX_CORE_ACTIONS_PER_WINDOW)),
+    )
+    optional_limit = max(
+        1,
+        int(math.ceil(duration / ACTION_BUDGET_WINDOW_SECONDS * MAX_OPTIONAL_ACTIONS_PER_WINDOW)),
+    )
+    original_core = str(result.get("subject_action", "")).strip()
+    original_environment = str(result.get("environment_response", "")).strip()
+    continuity = str(result.get("continuity_state", "")).strip()
+    optional_text = str(result.get("optional_flourish", "")).strip()
+    raw_core_beats = split_action_beats(original_core)
+    core_beats = _merge_causal_setup_beats(raw_core_beats)
+    causal_merge_count = len(raw_core_beats) - len(core_beats)
+    optional_beats = split_action_beats(optional_text)
+    environment_beats = split_action_beats(original_environment)
+    response_limit = max(
+        1,
+        int(math.ceil(
+            duration / ACTION_BUDGET_WINDOW_SECONDS * MAX_REQUIRED_RESPONSES_PER_WINDOW
+        )),
+    )
+
+    decorative_core = [
+        beat
+        for beat in core_beats
+        if _DECORATIVE_ACTION_RE.search(beat) and not _CRITICAL_ACTION_RE.search(beat)
+    ]
+    essential_core = [beat for beat in core_beats if beat not in decorative_core]
+    demoted: list[str] = list(decorative_core)
+    if len(essential_core) > core_limit:
+        ranked = sorted(
+            range(len(essential_core)),
+            key=lambda index: _action_priority(
+                essential_core[index], index, len(essential_core)
+            ),
+            reverse=True,
+        )
+        keep = {len(essential_core) - 1}
+        if core_limit > 1:
+            keep.add(0)
+        for candidate in ranked:
+            if len(keep) >= core_limit:
+                break
+            keep.add(candidate)
+        selected_core = [
+            beat for index, beat in enumerate(essential_core) if index in keep
+        ]
+        demoted.extend(
+            beat for index, beat in enumerate(essential_core) if index not in keep
+        )
+    else:
+        selected_core = essential_core
+
+    if len(environment_beats) > response_limit:
+        ranked_environment = sorted(
+            range(len(environment_beats)),
+            key=lambda index: _action_priority(
+                environment_beats[index], index, len(environment_beats)
+            ),
+            reverse=True,
+        )
+        keep_environment = {len(environment_beats) - 1}
+        if response_limit > 1:
+            keep_environment.add(0)
+        for candidate in ranked_environment:
+            if len(keep_environment) >= response_limit:
+                break
+            keep_environment.add(candidate)
+        selected_environment = [
+            beat for index, beat in enumerate(environment_beats)
+            if index in keep_environment
+        ]
+        demoted_environment = [
+            beat for index, beat in enumerate(environment_beats)
+            if index not in keep_environment
+        ]
+    else:
+        selected_environment = environment_beats
+        demoted_environment = []
+
+    # A purely decorative legacy action still needs one visible executable beat.
+    if not selected_core and core_beats:
+        selected_core = [core_beats[0]]
+        demoted = [beat for beat in demoted if beat != core_beats[0]]
+
+    core_was_demoted = bool(demoted) or len(essential_core) > core_limit
+    demoted.extend(demoted_environment)
+    combined_optional = list(dict.fromkeys((*optional_beats, *demoted)))
+    executable_optional = combined_optional[:optional_limit]
+    status = "within_budget"
+    if demoted or len(essential_core) > core_limit or len(raw_core_beats) > core_limit:
+        status = "priority_compressed"
+    elif len(combined_optional) > optional_limit:
+        status = "optional_trimmed"
+
+    result["subject_action"] = (
+        original_core
+        if selected_core == core_beats and not core_was_demoted and not causal_merge_count
+        else _join_action_beats(selected_core)
+    )
+    result["continuity_state"] = continuity or (
+        "Preserve the incoming body positions, exact subject and weapon ownership, "
+        "screen direction, velocity and camera trajectory; end on the final physical "
+        "state created by the core action."
+    )
+    result["environment_response"] = (
+        original_environment
+        if selected_environment == environment_beats
+        else _join_action_beats(selected_environment)
+    )
+    result["optional_flourish"] = (
+        optional_text
+        if combined_optional == optional_beats
+        else _join_action_beats(combined_optional)
+    )
+    result["h3_executable_action"] = result["subject_action"]
+    result["h3_optional_flourish"] = (
+        optional_text
+        if executable_optional == optional_beats
+        else _join_action_beats(executable_optional)
+    )
+    notes: list[str] = []
+    if demoted:
+        notes.append(
+            f"Demoted {len(demoted)} lower-priority action(s); omit them before delaying the core action."
+        )
+    if causal_merge_count:
+        notes.append(
+            f"Merged {causal_merge_count} causal setup beat(s) into the decisive action they enable."
+        )
+    if demoted_environment:
+        notes.append(
+            f"Required environment responses were limited to {response_limit} contact consequence(s)."
+        )
+    if len(combined_optional) > optional_limit:
+        notes.append(
+            f"Only {optional_limit} optional flourish(s) fit this Shot's duration."
+        )
+    if start < math.ceil(start / 15.0) * 15.0 < end:
+        notes.append(
+            "Shot crosses a native 15-second boundary; continuity_state is mandatory on both sides."
+        )
+    result["action_budget"] = {
+        "window_seconds": ACTION_BUDGET_WINDOW_SECONDS,
+        "core_action_count": len(raw_core_beats),
+        "core_action_limit": core_limit,
+        "required_response_count": len(environment_beats),
+        "required_response_limit": response_limit,
+        "optional_action_count": len(combined_optional),
+        "optional_action_limit": optional_limit,
+        "status": status,
+        "demoted_actions": demoted,
+        "notes": " ".join(notes),
+        "original_subject_action": original_core,
+        "original_environment_response": original_environment,
+    }
+    return result
+
+
 def normalize_design_plan(
     payload: object,
     capacities: dict[str, int],
@@ -382,14 +651,32 @@ def normalize_design_plan(
         raise ValueError("Design JSON is missing creative_brief")
     if not plan["global_visual_style"]:
         raise ValueError("Design JSON is missing global_visual_style")
+    budget_guardrail = (
+        "Complete every Shot's core action before any optional flourish. Preserve the stated "
+        "continuity state, exact subject count and identity, prop and weapon ownership, screen "
+        "direction, geography and momentum. Omit optional decoration whenever it would delay "
+        "a core action. No replay, neutral reset, teleportation, duplicated subjects or morphing props."
+    )
+    if not plan["constraints"]:
+        plan["constraints"] = budget_guardrail
+    elif "optional flourish" not in plan["constraints"].lower():
+        plan["constraints"] = plan["constraints"].rstrip(" .") + ". " + budget_guardrail
 
+    design_warnings: list[str] = []
     shots: list[dict] = []
     for index, raw in enumerate(source.get("shots") or [], 1):
         if not isinstance(raw, dict):
             continue
         start, end = _interval(raw, duration)
+        prior_budget = raw.get("action_budget") if isinstance(raw.get("action_budget"), dict) else {}
+        authored_subject_action = str(
+            prior_budget.get("original_subject_action") or raw.get("subject_action", "")
+        ).strip()
+        authored_environment_response = str(
+            prior_budget.get("original_environment_response")
+            or raw.get("environment_response", "")
+        ).strip()
         shots.append({
-            "id": f"S{index}",
             "start_seconds": start,
             "end_seconds": end,
             "track": str(raw.get("track", "V1")).strip() or "V1",
@@ -399,13 +686,45 @@ def normalize_design_plan(
             "camera_movement": str(raw.get("camera_movement", "Static")).strip(),
             "movement_speed": str(raw.get("movement_speed", "Slow")).strip(),
             "movement_amplitude": str(raw.get("movement_amplitude", "Small")).strip(),
-            "subject_action": str(raw.get("subject_action", "")).strip(),
-            "environment_response": str(raw.get("environment_response", "")).strip(),
+            "subject_action": authored_subject_action,
+            "environment_response": authored_environment_response,
+            "continuity_state": str(raw.get("continuity_state", "")).strip(),
+            "optional_flourish": str(raw.get("optional_flourish", "")).strip(),
             "additional_direction": str(raw.get("additional_direction", "")).strip(),
         })
     if not shots:
         raise ValueError("Design JSON must contain at least one shot")
     plan["shots"] = sorted(shots, key=lambda item: (item["start_seconds"], item["end_seconds"]))
+    for index, shot in enumerate(plan["shots"], 1):
+        shot["id"] = f"S{index}"
+        if not shot["subject_action"]:
+            shot["subject_action"] = (
+                "Continue the established physical motion and finish on the stated continuity state."
+            )
+            design_warnings.append(
+                f"S{index} had no core action; inserted a continuity-only executable action."
+            )
+        if index == 1 and shot["start_seconds"] > 0.0:
+            design_warnings.append(
+                f"Timeline has no structured Shot from 0.00s to {shot['start_seconds']:.2f}s."
+            )
+        if index > 1:
+            previous = plan["shots"][index - 2]
+            if shot["start_seconds"] < previous["end_seconds"] - 1e-6:
+                raise ValueError(
+                    f"Shot {previous['id']} overlaps S{index}. H3 camera Shots must be chronological "
+                    "and non-overlapping; use overlapping V tracks only for media layers."
+                )
+            if shot["start_seconds"] > previous["end_seconds"] + 1e-6:
+                design_warnings.append(
+                    f"Timeline has no structured Shot from {previous['end_seconds']:.2f}s "
+                    f"to {shot['start_seconds']:.2f}s."
+                )
+    if plan["shots"][-1]["end_seconds"] < duration - 1e-6:
+        design_warnings.append(
+            f"Timeline has no structured Shot from {plan['shots'][-1]['end_seconds']:.2f}s "
+            f"to {duration:.2f}s."
+        )
 
     roles = {"on_screen_text", "dialogue", "voice_over", "lyrics"}
     text_layers: list[dict] = []
@@ -559,7 +878,8 @@ def normalize_design_plan(
         for row in plan.get("shots") or []:
             for field_name in (
                 "framing", "camera_angle", "camera_movement", "subject_action",
-                "environment_response", "additional_direction",
+                "environment_response", "continuity_state", "optional_flourish",
+                "additional_direction",
             ):
                 row[field_name] = _canonicalize_design_media_mentions(
                     row.get(field_name, ""), reused_media_ids
@@ -576,6 +896,18 @@ def normalize_design_plan(
             row["instruction"] = _canonicalize_design_media_mentions(
                 row.get("instruction", ""), reused_media_ids
             )
+
+    budgeted_shots: list[dict] = []
+    for shot in plan["shots"]:
+        budgeted = normalize_shot_action_budget(shot)
+        budget = budgeted["action_budget"]
+        if budget["status"] != "within_budget":
+            design_warnings.append(
+                f"{budgeted['id']} {budget['status']}: {budget['notes']}"
+            )
+        budgeted_shots.append(budgeted)
+    plan["shots"] = budgeted_shots
+    plan["design_warnings"] = design_warnings
 
     media_requests: list[dict] = []
     counts = {"image": 0, "video": 0, "audio": 0}
@@ -679,7 +1011,18 @@ def build_design_system_prompt(context: dict) -> str:
         + skill_direction
         + "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
-        "subject action, environmental response and additional direction. "
+        "subject action, environmental response, continuity state, optional flourish and additional direction. "
+        "Treat subject_action as the must-complete physical core only. Put the exact incoming and outgoing body pose, "
+        "subject and weapon ownership, velocity, screen direction, geography and camera trajectory in continuity_state. "
+        "Put leaves, sparks, dust, cloth motion, secondary feints, ornamental camera moves and other dispensable detail in "
+        "optional_flourish. Keep contact-driven consequences that are necessary for causality in environment_response, not "
+        "in optional_flourish. For every five seconds, budget at most three must-complete physical action beats, two required "
+        "contact consequences and two optional flourishes. If a draft exceeds that budget, first split it into consecutive non-overlapping Shot Blocks "
+        "on 0.5-second boundaries when the timeline has enough time; otherwise demote secondary beats to optional_flourish "
+        "and rewrite subject_action as a concise causal chain that H3 can fully complete. Never label more actions mandatory "
+        "than the duration can render. Reserve the last 0.5 to 1.0 second before every native 15-second boundary for one "
+        "simple outgoing state; do not introduce a new multi-beat technique there. Shots must be chronological and must not "
+        "overlap; editorial V tracks may overlap for reference/compositing media, but simultaneous conflicting camera Shots may not. "
         "Timeline tracks are editorial lanes, not the physical H3 reference-slot count. You may plan V4, V5 and higher "
         "visual lanes for overlapping action states, titles or compositing, and A4, A5 and higher audio lanes for dialogue, "
         "voice-over, lyrics, ambience or music stems; the Studio creates those tracks automatically. Keep on-screen text on "
@@ -729,6 +1072,9 @@ def build_design_system_prompt(context: dict) -> str:
         "Only create a text_layer or theme_text when the user explicitly requests visible text, dialogue, voice-over or lyrics, and set "
         "explicit_user_requested=true only in that case. Never turn the creative brief or scene description into on-screen text. "
         "Always include a Final Hold marker before the final frame; cue timestamps must be earlier than duration_seconds. "
+        "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
+        "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. The Final Hold must resolve "
+        "the last Shot's outgoing physical state rather than introduce a new action. "
         "Media requests are reference requirements, not final generated media. "
         "Keep exact product/subject continuity, realistic object interaction and H3-friendly concise directions. "
         "Do not include markdown or commentary. Available workspace context: "

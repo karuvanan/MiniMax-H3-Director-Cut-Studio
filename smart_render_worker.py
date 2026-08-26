@@ -30,7 +30,7 @@ from comfy_submit_worker import (
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 6
+SMART_RENDER_POLICY_VERSION = 7
 
 
 def emit(payload: dict) -> None:
@@ -335,7 +335,14 @@ def _patch_continuity(workflow: dict, continuity: dict, uploaded_name: str) -> N
         return
     loader_input = str(continuity.get("loader_input", "file"))
     loader.setdefault("inputs", {})[loader_input] = uploaded_name
-    h3_node.setdefault("inputs", {})[binding] = connection
+    h3_inputs = h3_node.setdefault("inputs", {})
+    occupied = h3_inputs.get(binding)
+    if occupied is not None and occupied != connection:
+        raise RuntimeError(
+            "Continuity reference slot collision at " + binding
+            + "; refusing to overwrite an active Timeline reference."
+        )
+    h3_inputs[binding] = connection
     paired = str(continuity.get("paired_audio_binding", ""))
     paired_connection = continuity.get("paired_audio_connection")
     if paired and isinstance(paired_connection, list):
@@ -344,12 +351,13 @@ def _patch_continuity(workflow: dict, continuity: dict, uploaded_name: str) -> N
 
 
 def _canonicalize_reference_input_order(h3_node: dict) -> None:
-    """Keep Autogrow references in deterministic suffix order.
+    """Keep Autogrow references contiguous and deterministic at runtime.
 
     The continuity binding was disconnected during compilation and is added
-    back at runtime. Rebuilding the mapping removes any ambiguity between JSON
-    insertion order and Autogrow suffix order, so prompt ordinals always match
-    the order consumed by MiniMaxH3ReferenceToVideo.
+    back at runtime. Rebuilding and compacting the mapping removes any
+    ambiguity between JSON insertion order, sparse physical loader slots, and
+    Autogrow suffix order, so prompt ordinals always match the exact fields
+    consumed by MiniMaxH3ReferenceToVideo.
     """
     inputs = h3_node.get("inputs") or {}
     prefixes = {
@@ -359,17 +367,19 @@ def _canonicalize_reference_input_order(h3_node: dict) -> None:
         "ref_audios.ref_audio_": 3,
     }
 
-    def sort_key(item: tuple[str, object]) -> tuple[int, int, str]:
-        name = item[0]
-        for prefix, group in prefixes.items():
-            if name.startswith(prefix):
-                match = re.search(r"_(\d+)$", name)
-                return group, int(match.group(1)) if match else 10_000, name
-        return 10_000, 10_000, name
-
     ordinary = [item for item in inputs.items() if not any(item[0].startswith(p) for p in prefixes)]
-    references = [item for item in inputs.items() if any(item[0].startswith(p) for p in prefixes)]
-    h3_node["inputs"] = dict(ordinary + sorted(references, key=sort_key))
+    references: list[tuple[str, object]] = []
+    for prefix, _group in sorted(prefixes.items(), key=lambda item: item[1]):
+        rows = [item for item in inputs.items() if item[0].startswith(prefix)]
+        rows.sort(
+            key=lambda item: int(re.search(r"_(\d+)$", item[0]).group(1))
+            if re.search(r"_(\d+)$", item[0]) else 10_000
+        )
+        references.extend(
+            (f"{prefix}{request_index}", value)
+            for request_index, (_name, value) in enumerate(rows)
+        )
+    h3_node["inputs"] = dict(ordinary + references)
 
 
 def extract_tail_frames(

@@ -87,7 +87,8 @@ MEDIA_SEMANTIC_ENRICHMENT_SCHEMA: dict[str, Any] = {
                 "required": [
                     "cue_id", "framing", "camera_angle", "camera_movement",
                     "movement_speed", "movement_amplitude", "subject_action",
-                    "environment_response", "additional_direction", "integration_strategy",
+                    "environment_response", "continuity_state", "optional_flourish",
+                    "additional_direction", "integration_strategy",
                 ],
                 "properties": {
                     "cue_id": {"type": "string"},
@@ -98,6 +99,8 @@ MEDIA_SEMANTIC_ENRICHMENT_SCHEMA: dict[str, Any] = {
                     "movement_amplitude": {"type": "string"},
                     "subject_action": {"type": "string"},
                     "environment_response": {"type": "string"},
+                    "continuity_state": {"type": "string"},
+                    "optional_flourish": {"type": "string"},
                     "additional_direction": {"type": "string"},
                     "integration_strategy": {"type": "string"},
                 },
@@ -143,8 +146,12 @@ new media evidence replaces the prior reference interpretation. Reconstruct
 the replacement as part of one coherent moving scene; never display it as a
 flat photo, poster, slideshow card, picture-in-picture insert or pasted overlay.
 Keep authored dialogue and story intent, while updating framing, camera motion,
-subject action, environment response and additional direction where needed for
-natural integration. Do not create a new Shot.
+subject action, environment response, continuity state, optional flourish and
+additional direction where needed for natural integration. subject_action is
+the must-complete core; continuity_state preserves incoming/outgoing physical
+state; optional_flourish contains dispensable decoration. Never expand the core
+beyond three physical action beats or two required contact consequences per
+five seconds. Do not create a new Shot.
 
 Write concise but production-useful English. suggested_h3_usage may explain how
 the asset could function as an H3 identity, environment, action, motion, audio,
@@ -431,7 +438,8 @@ def normalize_semantic_enrichment(
     adaptation_fields = (
         "framing", "camera_angle", "camera_movement", "movement_speed",
         "movement_amplitude", "subject_action", "environment_response",
-        "additional_direction", "integration_strategy",
+        "continuity_state", "optional_flourish", "additional_direction",
+        "integration_strategy",
     )
     for index, item in enumerate(adaptations_value[:24]):
         if not isinstance(item, Mapping):

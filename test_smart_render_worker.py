@@ -152,8 +152,30 @@ class SmartRenderWorkerTests(unittest.TestCase):
             [
                 "ref_images.ref_image_0",
                 "ref_images.ref_image_1",
-                "ref_images.ref_image_4",
+                "ref_images.ref_image_2",
             ],
+        )
+
+    def test_continuity_never_overwrites_an_active_compacted_video_slot(self):
+        workflow = {
+            "9": {"inputs": {"file": "old.mp4"}, "class_type": "LoadVideo"},
+            "136": {
+                "inputs": {"ref_videos.ref_video_0": ["3", 0]},
+                "class_type": "MiniMaxH3ReferenceToVideo",
+            },
+        }
+        continuity = {
+            "kind": "video",
+            "loader_node_id": "9",
+            "loader_input": "file",
+            "h3_node_id": "136",
+            "binding": "ref_videos.ref_video_0",
+            "connection": ["9", 0],
+        }
+        with self.assertRaisesRegex(RuntimeError, "slot collision"):
+            _patch_continuity(workflow, continuity, "continuity_tail.mp4")
+        self.assertEqual(
+            workflow["136"]["inputs"]["ref_videos.ref_video_0"], ["3", 0]
         )
 
     def test_motion_continuity_extracts_exact_silent_24_frame_tail(self):

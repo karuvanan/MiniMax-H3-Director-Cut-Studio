@@ -83,6 +83,7 @@ from design_engine import (
     DESIGN_JSON_SCHEMA,
     build_design_system_prompt,
     materialize_design_media,
+    normalize_shot_action_budget,
     normalize_design_plan,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
@@ -152,7 +153,7 @@ DIRECTOR_LANE_TYPES = ("shot", "transition", "marker")
 DIRECTOR_LANES_TOP = TIMELINE_RULER_HEIGHT + RENDER_STATUS_BAR_HEIGHT
 TIMELINE_TRACKS_TOP = DIRECTOR_LANES_TOP + DIRECTOR_LANE_HEIGHT * len(DIRECTOR_LANE_TYPES)
 TIMELINE_SNAP_SECONDS = 0.5
-SMART_RENDER_POLICY_VERSION = 6
+SMART_RENDER_POLICY_VERSION = 7
 CONTINUITY_MODE_LABELS = (
     "Auto", "Hard Cut", "Match Action", "Motion Reference", "Transition",
 )
@@ -811,6 +812,14 @@ class DirectorCue:
     environment_response: str = ""
     continuity_mode: str = "Auto"
     semantic_reference_directions: dict[str, str] = field(default_factory=dict)
+    continuity_state: str = ""
+    optional_flourish: str = ""
+    h3_executable_action: str = ""
+    h3_optional_flourish: str = ""
+    action_budget_status: str = "within_budget"
+    action_budget_notes: str = ""
+    authored_subject_action: str = ""
+    authored_environment_response: str = ""
 
     def __post_init__(self) -> None:
         if self.cue_type not in DIRECTOR_LANE_TYPES and self.cue_type != "cut":
@@ -827,6 +836,32 @@ class DirectorCue:
                 for node_id, direction in self.semantic_reference_directions.items()
                 if str(node_id).strip() and str(direction).strip()
             }
+        if self.cue_type == "shot" and not self.h3_executable_action:
+            self.authored_subject_action = self.authored_subject_action or self.subject_action
+            self.authored_environment_response = (
+                self.authored_environment_response or self.environment_response
+            )
+            budgeted = normalize_shot_action_budget({
+                "start_seconds": self.start_seconds,
+                "end_seconds": self.end_seconds,
+                "subject_action": self.authored_subject_action,
+                "environment_response": self.authored_environment_response,
+                "continuity_state": self.continuity_state,
+                "optional_flourish": self.optional_flourish,
+            })
+            self.subject_action = budgeted["subject_action"]
+            self.environment_response = budgeted["environment_response"]
+            self.continuity_state = budgeted["continuity_state"]
+            self.optional_flourish = budgeted["optional_flourish"]
+            self.h3_executable_action = budgeted["h3_executable_action"]
+            self.h3_optional_flourish = budgeted["h3_optional_flourish"]
+            self.action_budget_status = budgeted["action_budget"]["status"]
+            self.action_budget_notes = budgeted["action_budget"]["notes"]
+        elif self.cue_type == "shot":
+            self.authored_subject_action = self.authored_subject_action or self.subject_action
+            self.authored_environment_response = (
+                self.authored_environment_response or self.environment_response
+            )
 
 
 def default_timeline_tracks() -> list[TimelineTrack]:
@@ -3519,11 +3554,25 @@ class DirectorCueDialog(QDialog):
             movement_layout.addWidget(self.speed_combo, 1)
             movement_layout.addWidget(self.amplitude_combo, 1)
             self.subject_action_edit = QPlainTextEdit(cue.subject_action)
-            self.subject_action_edit.setPlaceholderText("Subject turns toward camera")
+            self.subject_action_edit.setPlaceholderText(
+                "Must-complete core action only; maximum three physical beats per five seconds"
+            )
             self.subject_action_edit.setFixedHeight(58)
             self.environment_response_edit = QPlainTextEdit(cue.environment_response)
-            self.environment_response_edit.setPlaceholderText("Wind lifts the cape; windows rattle; dust reacts")
+            self.environment_response_edit.setPlaceholderText(
+                "Required contact-driven reaction: impact, water, debris or sound"
+            )
             self.environment_response_edit.setFixedHeight(58)
+            self.continuity_state_edit = QPlainTextEdit(cue.continuity_state)
+            self.continuity_state_edit.setPlaceholderText(
+                "Incoming/outgoing body pose, weapon state, velocity, screen direction and camera trajectory"
+            )
+            self.continuity_state_edit.setFixedHeight(58)
+            self.optional_flourish_edit = QPlainTextEdit(cue.optional_flourish)
+            self.optional_flourish_edit.setPlaceholderText(
+                "Dispensable leaves, sparks, cloth motion, secondary feints or ornamental camera detail"
+            )
+            self.optional_flourish_edit.setFixedHeight(58)
             self.detail_edit.setPlaceholderText("Optional additional shot instruction")
             self.detail_edit.setFixedHeight(58)
             self.continuity_combo = QComboBox()
@@ -3537,9 +3586,25 @@ class DirectorCueDialog(QDialog):
             form.addRow("Framing", self.framing_combo)
             form.addRow("Camera angle", self.angle_combo)
             form.addRow("Camera movement", movement_row)
-            form.addRow("Subject action", self.subject_action_edit)
-            form.addRow("Environment response", self.environment_response_edit)
+            form.addRow("Core action (required)", self.subject_action_edit)
+            form.addRow("Required environment response", self.environment_response_edit)
+            form.addRow("State to preserve", self.continuity_state_edit)
+            form.addRow("Optional flourish", self.optional_flourish_edit)
             form.addRow("Additional direction", self.detail_edit)
+            budget_text = cue.action_budget_status.replace("_", " ").title()
+            if cue.action_budget_notes:
+                budget_text += " · " + cue.action_budget_notes
+            self.action_budget_label = QLabel(budget_text)
+            self.action_budget_label.setWordWrap(True)
+            form.addRow("H3 action budget", self.action_budget_label)
+            for editor in (
+                self.subject_action_edit,
+                self.environment_response_edit,
+                self.optional_flourish_edit,
+            ):
+                editor.textChanged.connect(self._refresh_action_budget_preview)
+            self.start_spin.valueChanged.connect(self._refresh_action_budget_preview)
+            self.end_spin.valueChanged.connect(self._refresh_action_budget_preview)
             if cue.semantic_reference_directions:
                 semantic_reference_text = QPlainTextEdit()
                 semantic_reference_text.setReadOnly(True)
@@ -3567,6 +3632,7 @@ class DirectorCueDialog(QDialog):
             lambda _text: self._apply_recommendation(force=False)
         )
         self._apply_recommendation(force=False)
+        self._refresh_action_budget_preview()
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._validate)
@@ -3581,6 +3647,28 @@ class DirectorCueDialog(QDialog):
             QMessageBox.warning(self, "Invalid range", "Cue end must be later than its start.")
             return
         self.accept()
+
+    def _refresh_action_budget_preview(self, *_args) -> None:
+        if self.cue_type != "shot" or not hasattr(self, "action_budget_label"):
+            return
+        budgeted = normalize_shot_action_budget({
+            "start_seconds": self.start_spin.value(),
+            "end_seconds": self.end_spin.value(),
+            "subject_action": self.subject_action_edit.toPlainText().strip(),
+            "environment_response": self.environment_response_edit.toPlainText().strip(),
+            "continuity_state": self.continuity_state_edit.toPlainText().strip(),
+            "optional_flourish": self.optional_flourish_edit.toPlainText().strip(),
+        })
+        budget = budgeted["action_budget"]
+        label = (
+            f"{budget['status'].replace('_', ' ').title()} · "
+            f"core {budget['core_action_count']}/{budget['core_action_limit']} · "
+            f"response {budget['required_response_count']}/{budget['required_response_limit']} · "
+            f"optional {budget['optional_action_count']}/{budget['optional_action_limit']}"
+        )
+        if budget["notes"]:
+            label += " · " + budget["notes"]
+        self.action_budget_label.setText(label)
 
     def _apply_recommendation(self, *, force: bool) -> None:
         preset = self.preset_combo.currentText().strip()
@@ -3635,7 +3723,29 @@ class DirectorCueDialog(QDialog):
                 movement_amplitude=self.amplitude_combo.currentText().strip(),
                 subject_action=self.subject_action_edit.toPlainText().strip(),
                 environment_response=self.environment_response_edit.toPlainText().strip(),
+                continuity_state=self.continuity_state_edit.toPlainText().strip(),
+                optional_flourish=self.optional_flourish_edit.toPlainText().strip(),
                 continuity_mode=self.continuity_combo.currentText(),
+            )
+            budgeted = normalize_shot_action_budget({
+                "start_seconds": start,
+                "end_seconds": end,
+                "subject_action": state["subject_action"],
+                "environment_response": state["environment_response"],
+                "continuity_state": state["continuity_state"],
+                "optional_flourish": state["optional_flourish"],
+            })
+            state.update(
+                subject_action=budgeted["subject_action"],
+                authored_subject_action=self.subject_action_edit.toPlainText().strip(),
+                environment_response=budgeted["environment_response"],
+                authored_environment_response=self.environment_response_edit.toPlainText().strip(),
+                continuity_state=budgeted["continuity_state"],
+                optional_flourish=budgeted["optional_flourish"],
+                h3_executable_action=budgeted["h3_executable_action"],
+                h3_optional_flourish=budgeted["h3_optional_flourish"],
+                action_budget_status=budgeted["action_budget"]["status"],
+                action_budget_notes=budgeted["action_budget"]["notes"],
             )
         return state
 
@@ -4557,6 +4667,13 @@ class DesignPageDialog(QDialog):
     def _start_lm_refinement(self) -> None:
         if not self.planned_plan:
             return
+        model_plan = deepcopy(self.planned_plan)
+        model_plan.pop("design_warnings", None)
+        for shot in model_plan.get("shots") or []:
+            for field_name in (
+                "id", "h3_executable_action", "h3_optional_flourish", "action_budget",
+            ):
+                shot.pop(field_name, None)
         observations = []
         image_requests = [
             item for item in self.planned_plan.get("media_requests") or []
@@ -4571,12 +4688,14 @@ class DesignPageDialog(QDialog):
         prompt = (
             self.pending_requirement
             + "\n\nCURRENT DIRECTOR DESIGN JSON:\n"
-            + json.dumps(self.planned_plan, ensure_ascii=False, indent=2)
+            + json.dumps(model_plan, ensure_ascii=False, indent=2)
             + "\n\nGENERATED Z-IMAGE MATERIAL OBSERVATIONS:\n"
             + "\n".join(observations)
             + "\n\nRefine the Director Design JSON using these real visual observations. Preserve the "
               "duration, image count, image ordering and timeline ranges. Improve subject_keywords, "
-              "media prompts, shot continuity, framing, action and environment response. The user's "
+              "media prompts, shot continuity, framing, action and environment response. Preserve the "
+              "core-action / continuity-state / optional-flourish hierarchy and never expand a Shot "
+              "beyond its three-core-actions-per-five-seconds budget. The user's "
               "written requirement remains authoritative. Return the complete schema-valid JSON."
         )
         self.pending_refinement_prompt = prompt
@@ -5041,6 +5160,17 @@ class DesignPageDialog(QDialog):
             if media_type in reused:
                 reused[media_type] += 1
             reused_ids.append(str(use.get("media_id", "")))
+        budget_statuses = {
+            "within_budget": 0,
+            "optional_trimmed": 0,
+            "priority_compressed": 0,
+        }
+        for shot in plan.get("shots") or []:
+            status = str((shot.get("action_budget") or {}).get("status", "within_budget"))
+            budget_statuses[status] = budget_statuses.get(status, 0) + 1
+        budget_warnings = [
+            str(item) for item in plan.get("design_warnings") or [] if str(item).strip()
+        ]
         self.summary_edit.setPlainText(
             "\n".join((
                 f"TITLE: {plan['title']}",
@@ -5052,6 +5182,13 @@ class DesignPageDialog(QDialog):
                 "MEDIA POOL REUSE: " + (", ".join(reused_ids) if reused_ids else "none"),
                 f"REUSED: {reused['image']} image / {reused['video']} video / {reused['audio']} audio",
                 f"TO GENERATE: {counts['image']} image / {counts['video']} video / {counts['audio']} audio",
+                (
+                    "ACTION BUDGET: "
+                    f"{budget_statuses.get('within_budget', 0)} within / "
+                    f"{budget_statuses.get('optional_trimmed', 0)} optional trimmed / "
+                    f"{budget_statuses.get('priority_compressed', 0)} priority compressed"
+                ),
+                *("BUDGET WARNING: " + warning for warning in budget_warnings),
                 f"MEDIA: {counts['image']} image · {counts['video']} video · {counts['audio']} audio",
                 "",
                 "LM Studio reuses matching Media Pool intelligence first; Z-Image creates only missing requests.",
@@ -6425,6 +6562,27 @@ class DirectorCutStudio(QMainWindow):
                 shot["framing"], shot["camera_angle"], shot["camera_movement"],
                 shot["movement_speed"], shot["movement_amplitude"],
                 shot["subject_action"], shot["environment_response"],
+                continuity_state=shot.get("continuity_state", ""),
+                optional_flourish=shot.get("optional_flourish", ""),
+                h3_executable_action=shot.get("h3_executable_action", ""),
+                h3_optional_flourish=shot.get("h3_optional_flourish", ""),
+                action_budget_status=str(
+                    (shot.get("action_budget") or {}).get("status", "within_budget")
+                ),
+                action_budget_notes=str(
+                    (shot.get("action_budget") or {}).get("notes", "")
+                ),
+                authored_subject_action=str(
+                    (shot.get("action_budget") or {}).get(
+                        "original_subject_action", shot.get("subject_action", "")
+                    )
+                ),
+                authored_environment_response=str(
+                    (shot.get("action_budget") or {}).get(
+                        "original_environment_response",
+                        shot.get("environment_response", ""),
+                    )
+                ),
             ))
         for index, transition in enumerate(plan["transitions"], 1):
             start = float(transition["time_seconds"])
@@ -8280,12 +8438,16 @@ class DirectorCutStudio(QMainWindow):
                 cue_fields = (
                     "framing", "camera_angle", "camera_movement",
                     "movement_speed", "movement_amplitude", "subject_action",
-                    "environment_response",
+                    "environment_response", "continuity_state", "optional_flourish",
                 )
                 for field_name in cue_fields:
                     value = str(adaptation.get(field_name, "")).strip()
                     if value:
                         after[field_name] = value
+                        if field_name == "subject_action":
+                            after["authored_subject_action"] = value
+                        elif field_name == "environment_response":
+                            after["authored_environment_response"] = value
                 adapted_direction = str(
                     adaptation.get("additional_direction", "")
                 ).strip()
@@ -8334,6 +8496,28 @@ class DirectorCutStudio(QMainWindow):
                         )
                         if part
                     ).rstrip(" .") + "."
+                    after["authored_environment_response"] = after["environment_response"]
+            budgeted = normalize_shot_action_budget({
+                "start_seconds": after["start_seconds"],
+                "end_seconds": after["end_seconds"],
+                "subject_action": after.get("authored_subject_action") or after.get("subject_action", ""),
+                "environment_response": (
+                    after.get("authored_environment_response")
+                    or after.get("environment_response", "")
+                ),
+                "continuity_state": after.get("continuity_state", ""),
+                "optional_flourish": after.get("optional_flourish", ""),
+            })
+            after.update(
+                subject_action=budgeted["subject_action"],
+                environment_response=budgeted["environment_response"],
+                continuity_state=budgeted["continuity_state"],
+                optional_flourish=budgeted["optional_flourish"],
+                h3_executable_action=budgeted["h3_executable_action"],
+                h3_optional_flourish=budgeted["h3_optional_flourish"],
+                action_budget_status=budgeted["action_budget"]["status"],
+                action_budget_notes=budgeted["action_budget"]["notes"],
+            )
             if after == before:
                 continue
             changes.append((cue, before, after))
@@ -8359,6 +8543,62 @@ class DirectorCutStudio(QMainWindow):
         self._mark_dirty()
         self.schedule_prompt_generation()
         return [cue.cue_id for cue, _before, _after in changes]
+
+    def _reconcile_asset_shot_reference_ranges(self, asset: MediaAsset) -> list[str]:
+        """Keep an existing AI reference attached only to overlapping Shots.
+
+        Timeline edits may move, trim, duplicate or remove a Media Pool source
+        after AI Design/AI Enrich has attached its evidence to one or more
+        Shots.  The reference direction is source-owned, so retain the same
+        grounded direction while moving its association to the Shots that now
+        overlap any occurrence of that source.  This method intentionally does
+        not invent a Shot or rewrite authored action.
+        """
+
+        if not self.scan:
+            return []
+        source = self._source_asset_for(asset)
+        media_id = media_shortcut(source)
+        direction = next(
+            (
+                cue.semantic_reference_directions.get(media_id, "")
+                for cue in self.director_cues
+                if cue.semantic_reference_directions.get(media_id, "").strip()
+            ),
+            "",
+        )
+        if not direction:
+            return []
+        occurrences = [
+            item
+            for item in self._timeline_assets()
+            if item.timeline_placed and self._source_asset_for(item) is source
+        ]
+        changed: list[str] = []
+        for cue in self.director_cues:
+            if cue.cue_type != "shot":
+                continue
+            overlaps = any(
+                ranges_intersect(
+                    cue.start_seconds,
+                    cue.end_seconds,
+                    occurrence.start_seconds,
+                    occurrence.end_seconds,
+                )
+                for occurrence in occurrences
+            )
+            references = dict(cue.semantic_reference_directions)
+            before = references.get(media_id, "")
+            if overlaps:
+                references[media_id] = direction
+            else:
+                references.pop(media_id, None)
+            if references != cue.semantic_reference_directions:
+                cue.semantic_reference_directions = references
+                changed.append(cue.cue_id)
+            elif overlaps and not before:
+                changed.append(cue.cue_id)
+        return changed
 
     def _handle_semantic_payload(self, payload: dict) -> None:
         if payload.get("ready"):
@@ -8892,6 +9132,27 @@ class DirectorCutStudio(QMainWindow):
 
     def _refresh_director_cues(self, _cue: DirectorCue | None = None) -> None:
         self.director_cues.sort(key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id))
+        for cue in self.director_cues:
+            if cue.cue_type != "shot":
+                continue
+            budgeted = normalize_shot_action_budget({
+                "start_seconds": cue.start_seconds,
+                "end_seconds": cue.end_seconds,
+                "subject_action": cue.authored_subject_action or cue.subject_action,
+                "environment_response": (
+                    cue.authored_environment_response or cue.environment_response
+                ),
+                "continuity_state": cue.continuity_state,
+                "optional_flourish": cue.optional_flourish,
+            })
+            cue.subject_action = budgeted["subject_action"]
+            cue.environment_response = budgeted["environment_response"]
+            cue.continuity_state = budgeted["continuity_state"]
+            cue.optional_flourish = budgeted["optional_flourish"]
+            cue.h3_executable_action = budgeted["h3_executable_action"]
+            cue.h3_optional_flourish = budgeted["h3_optional_flourish"]
+            cue.action_budget_status = budgeted["action_budget"]["status"]
+            cue.action_budget_notes = budgeted["action_budget"]["notes"]
         self.timeline.set_director_cues(self.director_cues)
         self._sync_prompt_panel_from_timeline(reconcile_brief=True)
 
@@ -9331,6 +9592,8 @@ class DirectorCutStudio(QMainWindow):
     def _refresh_after_asset_command(self, asset: MediaAsset) -> None:
         self.timeline.schedule_rebuild()
         self.asset_timing_changed(asset)
+        self._reconcile_asset_shot_reference_ranges(asset)
+        self._sync_prompt_panel_from_timeline(reconcile_brief=True)
         card = self.cards.get(asset.node_id)
         if card:
             card.refresh_mode(asset.overlaps(self.clip_start.value(), self.clip_end.value()))
@@ -9361,6 +9624,7 @@ class DirectorCutStudio(QMainWindow):
                 self._show_asset_inspector(self.selected_asset, self.selected_asset)
         self.timeline.schedule_rebuild()
         self.refresh_activation()
+        self._reconcile_asset_shot_reference_ranges(clip)
         self._sync_prompt_panel_from_timeline(reconcile_brief=True)
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
 
@@ -9592,15 +9856,15 @@ class DirectorCutStudio(QMainWindow):
         self.render_timeline_at(seconds, force_seek=False)
 
     def _track_for_asset(self, asset: MediaAsset) -> TimelineTrack | None:
+        wanted = "audio" if asset.media_type == "audio" else "visual"
         for track in self.tracks:
-            if track.track_id == asset.timeline_track_id:
+            if track.track_id == asset.timeline_track_id and track.kind == wanted:
                 return track
         if 0 <= asset.timeline_lane < len(self.tracks):
             candidate = self.tracks[asset.timeline_lane]
-            wanted = "audio" if asset.media_type == "audio" else "visual"
             if candidate.kind == wanted:
                 return candidate
-        return None
+        return next((track for track in self.tracks if track.kind == wanted), None)
 
     def _source_position_ms(self, asset: MediaAsset, seconds: float) -> int:
         elapsed = max(0.0, seconds - asset.start_seconds)
@@ -10479,11 +10743,19 @@ class DirectorCutStudio(QMainWindow):
                 f"{cue.framing} · {cue.camera_angle}",
                 f"{cue.camera_movement} · {cue.movement_speed} · {cue.movement_amplitude} amplitude",
             ]
-            if cue.subject_action:
+            executable_action = cue.h3_executable_action or cue.subject_action
+            if executable_action:
                 parts.append(
-                    "Subject: "
+                    "Core action (must complete): "
                     + canonicalize_cue_reference_ids(
-                        cue.subject_action, cue.semantic_reference_directions
+                        executable_action, cue.semantic_reference_directions
+                    )
+                )
+            if cue.continuity_state:
+                parts.append(
+                    "State to preserve: "
+                    + canonicalize_cue_reference_ids(
+                        cue.continuity_state, cue.semantic_reference_directions
                     )
                 )
             if cue.environment_response:
@@ -10492,6 +10764,13 @@ class DirectorCutStudio(QMainWindow):
                     + canonicalize_cue_reference_ids(
                         cue.environment_response,
                         cue.semantic_reference_directions,
+                    )
+                )
+            if cue.h3_optional_flourish:
+                parts.append(
+                    "Optional (omit before delaying core): "
+                    + canonicalize_cue_reference_ids(
+                        cue.h3_optional_flourish, cue.semantic_reference_directions
                     )
                 )
             if cue.detail:
@@ -10619,7 +10898,11 @@ class DirectorCutStudio(QMainWindow):
             )
             story_beats: list[str] = []
             for index, cue in enumerate(ordered_shots, 1):
-                beat_parts = [cue.subject_action, cue.environment_response]
+                beat_parts = [
+                    cue.h3_executable_action or cue.subject_action,
+                    cue.environment_response,
+                    cue.continuity_state,
+                ]
                 if not any(str(part).strip() for part in beat_parts):
                     beat_parts.extend((cue.detail, cue.preset))
                 beat = compact(
@@ -10812,11 +11095,19 @@ class DirectorCutStudio(QMainWindow):
                     f"{cue.camera_angle} camera angle",
                     movement,
                 ]
-                if cue.subject_action:
+                executable_action = cue.h3_executable_action or cue.subject_action
+                if executable_action:
                     parts.append(
-                        "Subject action: "
+                        "MANDATORY CORE ACTION - complete before any flourish: "
                         + canonicalize_cue_reference_ids(
-                            cue.subject_action, cue.semantic_reference_directions
+                            executable_action, cue.semantic_reference_directions
+                        )
+                    )
+                if cue.continuity_state:
+                    parts.append(
+                        "CONTINUITY STATE - preserve exactly: "
+                        + canonicalize_cue_reference_ids(
+                            cue.continuity_state, cue.semantic_reference_directions
                         )
                     )
                 if cue.environment_response:
@@ -10825,6 +11116,13 @@ class DirectorCutStudio(QMainWindow):
                         + canonicalize_cue_reference_ids(
                             cue.environment_response,
                             cue.semantic_reference_directions,
+                    )
+                )
+                if cue.h3_optional_flourish:
+                    parts.append(
+                        "OPTIONAL FLOURISH - omit before delaying, replaying or weakening the core action: "
+                        + canonicalize_cue_reference_ids(
+                            cue.h3_optional_flourish, cue.semantic_reference_directions
                         )
                     )
                 if cue.detail:
@@ -11054,12 +11352,11 @@ class DirectorCutStudio(QMainWindow):
                 terminal_state = self._terminal_state_from_shot(previous_shot)
                 if terminal_state:
                     brief_parts.append(
-                        "Text-only boundary state: "
+                        "Boundary state contract: "
                         f"{previous_shot.cue_id} has already finished with {terminal_state} "
                         "Use that only as the inherited physical state immediately before frame "
                         "one. Begin with the next action; do not show, reconstruct, hold or replay "
-                        "the completed terminal pose. No previous rendered frame is supplied as a "
-                        "visual reference."
+                        "the completed terminal pose."
                     )
             if local_shots:
                 first_shot = min(
@@ -11068,7 +11365,8 @@ class DirectorCutStudio(QMainWindow):
                 )
                 brief_parts.append(
                     f"The first visible event belongs to {first_shot.cue_id}, "
-                    f"{first_shot.preset}. Enter its already-in-progress physical state in the "
+                    f"{first_shot.preset.strip() or first_shot.cue_id}. "
+                    "Enter its already-in-progress physical state in the "
                     "first second; do not insert an establishing view, neutral ready pose, or "
                     "reference-image tableau before it."
                 )
@@ -11086,7 +11384,9 @@ class DirectorCutStudio(QMainWindow):
                 brief_parts.append(
                     "Follow this segment's " + str(len(local_shots))
                     + " structured shot block(s): "
-                    + ", ".join(cue.preset for cue in local_shots) + "."
+                    + ", ".join(
+                        cue.preset.strip() or cue.cue_id for cue in local_shots
+                    ) + "."
                 )
             if local_layers:
                 brief_parts.append("Preserve this segment's authored dialogue and visible text exactly.")
@@ -11228,7 +11528,9 @@ class DirectorCutStudio(QMainWindow):
         media_type = "video"
         if mode not in {"motion_reference", "transition"}:
             return {}
-        active_ids = {asset.node_id for asset in active_assets}
+        active_ids = {
+            asset.source_node_id or asset.node_id for asset in active_assets
+        }
         h3_id = self.scan.h3_node_ids[0]
         h3_inputs = (self.scan.nodes.get(h3_id, {}).get("inputs") or {})
         candidates = [
@@ -11252,6 +11554,14 @@ class DirectorCutStudio(QMainWindow):
         # Autogrow input order after injection, while the prompt compiler uses
         # this exact binding index to calculate H3's effective ordinal.
         asset = min(candidates, key=binding_index)
+        active_video_sources = {
+            (item.source_node_id or item.node_id, item.binding)
+            for item in active_assets
+            if item.media_type == "video"
+        }
+        request_binding = (
+            "ref_videos.ref_video_" + str(len(active_video_sources))
+        )
         result = {
             "kind": media_type,
             "mode": mode,
@@ -11259,7 +11569,12 @@ class DirectorCutStudio(QMainWindow):
             "loader_node_id": asset.node_id,
             "loader_input": "file" if media_type == "video" else "image",
             "h3_node_id": h3_id,
-            "binding": asset.binding,
+            # The free loader remains a permanent Media Pool source, but the
+            # hidden continuity clip is appended after the request's compacted
+            # user-video references.  Never reuse the loader's sparse physical
+            # suffix here or it can collide with a compiled user reference.
+            "binding": request_binding,
+            "source_binding": asset.binding,
             "connection": list(h3_inputs[asset.binding]),
             "frame_count": 24,
             "fps": 24,
@@ -11345,36 +11660,57 @@ class DirectorCutStudio(QMainWindow):
 
     @staticmethod
     def _terminal_state_from_shot(cue: DirectorCue) -> str:
-        """Extract a concise authored final-state sentence for text continuity."""
-        source = " ".join(
-            part.strip()
-            for part in (cue.subject_action, cue.environment_response, cue.detail)
-            if part.strip()
+        """Extract a concrete terminal pose instead of a generic boundary note."""
+
+        def split_sentences(value: str) -> list[str]:
+            return [
+                part.strip()
+                for part in re.split(
+                    r"(?<=[.!?\u3002\uff01\uff1f])\s+", value.strip()
+                )
+                if part.strip()
+            ]
+
+        action_rows = split_sentences(cue.h3_executable_action or cue.subject_action)
+        continuity_rows = split_sentences(cue.continuity_state)
+        environment_rows = split_sentences(cue.environment_response)
+        direction_rows = split_sentences(cue.detail)
+        selected: list[str] = []
+        if continuity_rows:
+            selected.append(continuity_rows[-1])
+        if action_rows:
+            selected.append(action_rows[-1])
+        elif environment_rows:
+            selected.append(environment_rows[-1])
+
+        anchors = (
+            "final frame", "continuity anchor", "end with", "ends with",
+            "ending state", "at the end", "at ",
+            "\u6700\u540e\u4e00\u5e27", "\u7ed3\u5c3e", "\u7ed3\u675f\u65f6",
+            "\u8fb9\u754c",
         )
-        if not source:
-            return ""
-        sentences = [
-            part.strip()
-            for part in re.split(r"(?<=[.!?。！？])\s+", source)
-            if part.strip()
-        ]
-        anchor_words = (
-            "final frame",
-            "continuity anchor",
-            "end with",
-            "ends with",
-            "ending state",
-            "最后一帧",
-            "结尾",
-            "结束时",
+        first_anchor = next(
+            (
+                index for index, sentence in enumerate(direction_rows)
+                if any(word in sentence.lower() for word in anchors)
+            ),
+            None,
         )
-        explicit = [
-            sentence
-            for sentence in sentences
-            if any(word in sentence.lower() for word in anchor_words)
-        ]
-        selected = explicit[-2:] if explicit else sentences[-1:]
-        return " ".join(selected)[:600]
+        if first_anchor is not None:
+            for sentence in direction_rows[first_anchor:first_anchor + 3]:
+                normalized = sentence.lower().strip(" .")
+                if normalized in {
+                    "this is the boundary for part 2",
+                    "this is the boundary for part 3",
+                    "this serves as the transition to part 2",
+                    "this serves as the transition to part 3",
+                }:
+                    continue
+                selected.append(sentence)
+
+        if not selected and direction_rows:
+            selected.append(direction_rows[-1])
+        return " ".join(dict.fromkeys(selected))[:900]
 
     @staticmethod
     def _media_fingerprint_rows(assets: list[MediaAsset]) -> list[dict]:

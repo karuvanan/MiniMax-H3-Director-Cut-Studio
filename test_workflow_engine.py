@@ -134,10 +134,12 @@ class WorkflowEngineTests(unittest.TestCase):
             extra_kind="image",
             extra_binding=pictures[1].binding,
         )
-        self.assertEqual(continuity_tag, "<Picture 2>")
+        # Hidden context is always appended after ordinary request references;
+        # its spare physical loader slot must not renumber active media.
+        self.assertEqual(continuity_tag, "<Picture 3>")
         self.assertEqual(
             [asset.tag for asset in effective if asset.media_type == "image"],
-            ["<Picture 1>", "<Picture 3>"],
+            ["<Picture 1>", "<Picture 2>"],
         )
 
     def test_stable_reference_ids_come_from_physical_bindings(self):
@@ -252,14 +254,23 @@ class WorkflowEngineTests(unittest.TestCase):
 
         compiled_workflow, compiled_assets = compile_active_workflow(scan, 20.0, 25.0)
         inputs = compiled_workflow[scan.h3_node_ids[0]]["inputs"]
-        self.assertIn(pictures[3].binding, inputs)
-        self.assertIn(pictures[6].binding, inputs)
-        self.assertIn(videos[1].binding, inputs)
-        self.assertIn(videos[1].paired_audio_binding, inputs)
-        self.assertIn(audios[2].binding, inputs)
-        self.assertNotIn(pictures[0].binding, inputs)
-        self.assertNotIn(videos[0].binding, inputs)
-        self.assertNotIn(audios[0].binding, inputs)
+        self.assertEqual(inputs["ref_images.ref_image_0"], [pictures[3].node_id, 0])
+        self.assertEqual(inputs["ref_images.ref_image_1"], [pictures[6].node_id, 0])
+        self.assertEqual(
+            inputs["ref_videos.ref_video_0"],
+            scan.nodes[scan.h3_node_ids[0]]["inputs"][videos[1].binding],
+        )
+        self.assertEqual(
+            inputs["ref_video_audios.ref_video_audio_0"],
+            scan.nodes[scan.h3_node_ids[0]]["inputs"][videos[1].paired_audio_binding],
+        )
+        self.assertEqual(
+            inputs["ref_audios.ref_audio_0"],
+            scan.nodes[scan.h3_node_ids[0]]["inputs"][audios[2].binding],
+        )
+        self.assertNotIn("ref_images.ref_image_2", inputs)
+        self.assertNotIn("ref_videos.ref_video_1", inputs)
+        self.assertNotIn("ref_audios.ref_audio_1", inputs)
 
         effective, _ = effective_reference_assets(compiled_assets)
         compiled_prompt = remap_reference_tokens(

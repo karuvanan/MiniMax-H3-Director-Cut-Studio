@@ -48,7 +48,7 @@ from prompt_presets import (
 )
 from workflow_engine import assign_local_media
 from test_design_engine import sample_design
-from version_info import APP_VERSION
+from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
@@ -1471,7 +1471,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertAlmostEqual(asset.source_in_seconds, 0.25)
         self.assertEqual(asset.transition_out, "Cross Dissolve")
         payload = window._project_payload()
-        self.assertEqual(payload["version"], 15)
+        self.assertEqual(payload["version"], PROJECT_FORMAT_VERSION)
         self.assertEqual(payload["application_version"], APP_VERSION)
         self.assertEqual(len(payload["tracks"]), 8)
         self.assertIn("playback_speed", payload["assets"][asset.node_id])
@@ -1593,7 +1593,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.undo_stack.redo()
         self.assertEqual((layer.position_x, layer.position_y), moved_position)
         payload = window._project_payload()
-        self.assertEqual(payload["version"], 15)
+        self.assertEqual(payload["version"], PROJECT_FORMAT_VERSION)
         self.assertEqual(payload["text_layers"][0]["font_size"], 52)
 
         before = layer.__dict__ if hasattr(layer, "__dict__") else {
@@ -1888,7 +1888,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("Whip Pan", spec.transition)
         self.assertIn("GET READY", " ".join(spec.shots))
         payload = window._project_payload()
-        self.assertEqual(payload["version"], 15)
+        self.assertEqual(payload["version"], PROJECT_FORMAT_VERSION)
         self.assertEqual(len(payload["director_cues"]), 3)
         window.project_dirty = False
         window.close()
@@ -1929,6 +1929,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(state["camera_angle"], "Low angle")
         self.assertEqual(state["camera_movement"], "Push in")
         self.assertEqual(state["subject_action"], "Subject turns toward camera")
+        self.assertIn("core", dialog.action_budget_label.text().lower())
+        self.assertTrue(state["continuity_state"])
         dialog.close()
         window.project_dirty = False
         window.close()
@@ -2186,11 +2188,25 @@ class DirectorTimelineDragTests(unittest.TestCase):
         # V2's synchronized soundtrack is Audio 1, so standalone A3 is Audio 2.
         self.assertIn("<Audio 2>", prompt)
         h3_inputs = compiled[window.scan.h3_node_ids[0]]["inputs"]
-        self.assertNotIn(pictures[0].binding, h3_inputs)
-        self.assertIn(pictures[3].binding, h3_inputs)
-        self.assertIn(videos[1].paired_audio_binding, h3_inputs)
-        self.assertNotIn(audios[0].binding, h3_inputs)
-        self.assertIn(audios[2].binding, h3_inputs)
+        self.assertEqual(
+            h3_inputs["ref_images.ref_image_0"], [pictures[3].node_id, 0]
+        )
+        self.assertNotEqual(
+            h3_inputs["ref_images.ref_image_0"], [pictures[0].node_id, 0]
+        )
+        self.assertEqual(
+            h3_inputs["ref_videos.ref_video_0"],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][videos[1].binding],
+        )
+        self.assertEqual(
+            h3_inputs["ref_video_audios.ref_video_audio_0"],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"]
+            [videos[1].paired_audio_binding],
+        )
+        self.assertEqual(
+            h3_inputs["ref_audios.ref_audio_0"],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][audios[2].binding],
+        )
         window.project_dirty = False
         window.close()
 
@@ -2297,8 +2313,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("<Picture 1>", first_prompt)
         self.assertNotIn("<Picture 2>", first_prompt)
         self.assertIn("<Picture 1>", second_prompt)
-        self.assertIn("<Video 1> contains exactly the preceding segment", second_prompt)
-        self.assertIn("<Video 2>", second_prompt)
+        self.assertIn("<Video 2> contains exactly the preceding segment", second_prompt)
+        self.assertIn("<Video 1>", second_prompt)
         self.assertIn("<Audio 1> is the enabled synchronized soundtrack", second_prompt)
         self.assertIn("<Audio 2>", second_prompt)
         self.assertNotIn("@P", first_prompt + second_prompt)
@@ -2338,8 +2354,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(active, [picture])
         self.assertIn("<Picture 1>", prompt)
         self.assertNotIn("<Picture 2>", prompt)
-        self.assertIn(picture.binding, h3)
-        self.assertEqual(h3[picture.binding], [picture.node_id, 0])
+        self.assertEqual(h3["ref_images.ref_image_0"], [picture.node_id, 0])
+        self.assertNotIn("ref_images.ref_image_1", h3)
         window.project_dirty = False
         window.close()
 
@@ -2366,8 +2382,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("[Shot 2 | 00:02.000-00:06.000]", prompt)
         self.assertIn("<Picture 1>", prompt)
         self.assertIn("<Picture 2>", prompt)
-        self.assertEqual(h3[first.binding], [first.node_id, 0])
-        self.assertEqual(h3[second.binding], [second.node_id, 0])
+        self.assertEqual(h3["ref_images.ref_image_0"], [first.node_id, 0])
+        self.assertEqual(h3["ref_images.ref_image_1"], [second.node_id, 0])
         window.project_dirty = False
         window.close()
 
@@ -2399,11 +2415,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("Second half", self._workflow_prompt(second_job["workflow"]))
         self.assertNotIn("First half", self._workflow_prompt(second_job["workflow"]))
         self.assertEqual(
-            self._h3_inputs(window, first_job["workflow"])[first.binding],
+            self._h3_inputs(window, first_job["workflow"])["ref_images.ref_image_0"],
             [first.node_id, 0],
         )
         self.assertEqual(
-            self._h3_inputs(window, second_job["workflow"])[second.binding],
+            self._h3_inputs(window, second_job["workflow"])["ref_images.ref_image_0"],
             [second.node_id, 0],
         )
         window.project_dirty = False
@@ -2426,16 +2442,88 @@ class DirectorTimelineDragTests(unittest.TestCase):
         h3 = self._h3_inputs(window, second["workflow"])
         self.assertEqual(second["continuity"]["kind"], "video")
         self.assertEqual(second["continuity"]["frame_count"], 24)
-        self.assertEqual(second["continuity"]["tag"], "<Video 1>")
-        self.assertIn("<Video 1> contains exactly the preceding segment", prompt)
-        self.assertIn("<Video 2>", prompt)
-        self.assertIn(video.binding, h3)
+        self.assertEqual(second["continuity"]["tag"], "<Video 2>")
+        self.assertEqual(second["continuity"]["binding"], "ref_videos.ref_video_1")
+        self.assertIn("<Video 2> contains exactly the preceding segment", prompt)
+        self.assertIn("<Video 1>", prompt)
+        self.assertIn("ref_videos.ref_video_0", h3)
+        self.assertNotIn("ref_videos.ref_video_1", h3)
         self.assertEqual(
-            h3[video.binding],
+            h3["ref_videos.ref_video_0"],
             window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][video.binding],
         )
         window.project_dirty = False
         window.close()
+
+    def test_mapping_regression_third_segment_compacts_p5_to_picture_4(self):
+        """Reproduce the sparse P1/P2/P3/P5 layout from One Leaf Kill."""
+        window = DirectorCutStudio()
+        window._set_design_duration(45.0)
+        pictures = [a for a in window.scan.assets if a.media_type == "image"]
+        for asset in window.scan.assets:
+            asset.timeline_placed = False
+        for index, asset in enumerate(pictures[:3], 1):
+            self._place(asset, 0.0, 45.0, f"V{index}", f"Global identity @P{index}.")
+        water = self._place(
+            pictures[4], 35.0, 40.0, "V4",
+            "Use @P5 only as the single water-step action reference.",
+        )
+        water.recognition = "AI DESIGN GENERATED REFERENCE\nUsage: h3_reference"
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 15.0, "Opening", track_id="V1"),
+            DirectorCue(
+                "S2", "shot", 15.0, 30.0, "Roof pursuit",
+                detail="Final frame: both fighters remain airborne and rising.",
+                track_id="V1",
+            ),
+            DirectorCue("S3", "shot", 30.0, 45.0, "Finish", track_id="V1"),
+        ]
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(45.0)
+
+        job_path, count = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=111,
+            enable_rtx_vsr=False,
+        )
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        self.assertEqual(count, 3)
+        third = job["segments"][2]
+        prompt = self._workflow_prompt(third["workflow"])
+        h3 = self._h3_inputs(window, third["workflow"])
+
+        self.assertIn("<Picture 4>", prompt)
+        self.assertIn("single water-step", prompt)
+        self.assertEqual(h3["ref_images.ref_image_3"], [water.node_id, 0])
+        self.assertNotIn("ref_images.ref_image_4", h3)
+        self.assertEqual(third["continuity"]["tag"], "<Video 1>")
+        self.assertEqual(
+            third["continuity"]["binding"], "ref_videos.ref_video_0"
+        )
+        self.assertIn("<Video 1> contains exactly the preceding segment", prompt)
+        self.assertNotIn("No previous rendered frame is supplied", prompt)
+        window.project_dirty = False
+        window.close()
+
+    def test_boundary_state_keeps_pose_positions_and_camera_not_generic_label(self):
+        cue = DirectorCue(
+            "S6", "shot", 25.0, 30.0, "Airborne boundary",
+            subject_action=(
+                "The Assassin kicks off the wall. Both characters are now "
+                "airborne, rising vertically above the courtyard."
+            ),
+            environment_response="Red leaves swirl upward from their leap.",
+            detail=(
+                "At 30.0s, both characters must be clearly separated in the sky: "
+                "Assassin upper-left, General lower-right. The camera is pointing "
+                "at the sky. This is the boundary for Part 3."
+            ),
+            track_id="V1",
+        )
+        state = DirectorCutStudio._terminal_state_from_shot(cue)
+        self.assertIn("airborne, rising vertically", state)
+        self.assertIn("Assassin upper-left, General lower-right", state)
+        self.assertIn("camera is pointing at the sky", state)
+        self.assertNotIn("boundary for Part 3", state)
 
     def test_mapping_matrix_edit_each_segment_changes_only_its_fingerprint(self):
         window = DirectorCutStudio()
@@ -2539,9 +2627,15 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(active_before, [picture])
         self.assertEqual(active_deleted, [])
         self.assertEqual(active_readded, [picture])
-        self.assertIn(picture.binding, self._h3_inputs(window, before))
-        self.assertNotIn(picture.binding, self._h3_inputs(window, deleted))
-        self.assertIn(picture.binding, self._h3_inputs(window, readded))
+        self.assertEqual(
+            self._h3_inputs(window, before)["ref_images.ref_image_0"],
+            [picture.node_id, 0],
+        )
+        self.assertNotIn("ref_images.ref_image_0", self._h3_inputs(window, deleted))
+        self.assertEqual(
+            self._h3_inputs(window, readded)["ref_images.ref_image_0"],
+            [picture.node_id, 0],
+        )
         self.assertIn("<Picture 1>", self._workflow_prompt(readded))
         window.project_dirty = False
         window.close()
@@ -2604,11 +2698,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(second_assets, [picture])
         self.assertEqual(first_fingerprint, second_fingerprint)
         self.assertEqual(
-            self._h3_inputs(window, first)[picture.binding],
-            self._h3_inputs(window, second)[picture.binding],
+            self._h3_inputs(window, first)["ref_images.ref_image_0"],
+            self._h3_inputs(window, second)["ref_images.ref_image_0"],
         )
         self.assertEqual(hidden_assets, [])
-        self.assertNotIn(picture.binding, self._h3_inputs(window, hidden))
+        self.assertNotIn("ref_images.ref_image_0", self._h3_inputs(window, hidden))
         window.project_dirty = False
         window.close()
 
@@ -2639,9 +2733,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
             self.assertIn("<Picture 1>", prompt)
             self.assertEqual(
                 [key for key in h3 if key.startswith("ref_images.ref_image_")],
-                [picture.binding],
+                ["ref_images.ref_image_0"],
             )
-            self.assertEqual(h3[picture.binding], [picture.node_id, 0])
+            self.assertEqual(
+                h3["ref_images.ref_image_0"], [picture.node_id, 0]
+            )
         self.assertIn("Opening occurrence", self._workflow_prompt(first["workflow"]))
         self.assertNotIn("Closing occurrence", self._workflow_prompt(first["workflow"]))
         self.assertIn("Closing occurrence", self._workflow_prompt(second["workflow"]))
@@ -2708,7 +2804,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
         self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 6)
+        self.assertEqual(job["render_policy_version"], 7)
         window.project_dirty = False
         window.close()
 
@@ -2935,7 +3031,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 6,
+            "render_policy_version": 7,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -2984,6 +3080,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "S1", "shot", 0.0, 6.0, "Product Demonstration",
             subject_action="The woman presents the bag.",
             environment_response="A light breeze moves her hair.",
+            continuity_state="Keep the bag in her right hand and finish facing screen-right.",
+            optional_flourish="Loose hair catches one soft highlight.",
             track_id="V1",
         )
         ending = DirectorCue("M1", "marker", 5.5, 6.0, "Ending Hold", "Hold the hero pose.")
@@ -2997,6 +3095,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window._sync_prompt_panel_from_timeline(force=True)
         self.assertIn("facial identity", window.prompt_panel.brief.toPlainText())
         self.assertIn("Product Demonstration", window.prompt_panel.shots.toPlainText())
+        self.assertIn("Core action (must complete)", window.prompt_panel.shots.toPlainText())
+        self.assertIn("State to preserve", window.prompt_panel.shots.toPlainText())
+        self.assertIn("Optional (omit before delaying core)", window.prompt_panel.shots.toPlainText())
         self.assertIn("S1 [English, Confident, lip sync]", window.prompt_panel.dialogue.toPlainText())
         self.assertIn("Hold the hero pose", window.prompt_panel.ending.toPlainText())
         QTest.qWait(250)
@@ -3095,7 +3196,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertTrue((archive / "render_manifest.json").is_file())
         self.assertTrue(project.is_file())
         payload = json.loads(project.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 15)
+        self.assertEqual(payload["version"], PROJECT_FORMAT_VERSION)
         self.assertEqual(payload["generated_output_timeline_start"], 0.0)
         self.assertEqual(len(payload["monitor_compare_sizes"]), 2)
         # Simulate the user's portable version 12 example folder: its saved
@@ -3298,7 +3399,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 6,
+            "render_policy_version": 7,
             "segments": completed,
         }
         window._refresh_render_status_bar()

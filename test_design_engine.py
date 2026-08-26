@@ -10,6 +10,7 @@ from design_engine import (
     DESIGN_JSON_SCHEMA,
     build_design_system_prompt,
     materialize_design_media,
+    normalize_shot_action_budget,
     normalize_design_plan,
 )
 from design_media_service import image_workflow
@@ -302,6 +303,95 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("requirement_id", media_request["required"])
         self.assertIn("reuse_policy", media_request["required"])
 
+    def test_shot_schema_separates_core_state_and_optional_flourish(self):
+        shot = DESIGN_JSON_SCHEMA["properties"]["shots"]["items"]
+        self.assertIn("continuity_state", shot["required"])
+        self.assertIn("optional_flourish", shot["required"])
+        self.assertNotIn("h3_executable_action", shot["properties"])
+        self.assertNotIn("action_budget", shot["properties"])
+
+    def test_five_second_action_budget_demotes_secondary_beats(self):
+        budgeted = normalize_shot_action_budget({
+            "start_seconds": 0.0,
+            "end_seconds": 5.0,
+            "subject_action": (
+                "The assassin leaps. The assassin throws one dart. The general blocks. "
+                "The assassin draws a sword. The assassin strikes. Red leaves swirl."
+            ),
+            "continuity_state": "End with both fighters moving screen-right.",
+            "optional_flourish": "The cape snaps. Dust drifts.",
+        })
+        budget = budgeted["action_budget"]
+        self.assertEqual(budget["core_action_limit"], 3)
+        self.assertEqual(budget["status"], "priority_compressed")
+        self.assertLessEqual(
+            len(normalize_shot_action_budget({
+                **budgeted,
+                "subject_action": budgeted["h3_executable_action"],
+            })["h3_executable_action"].split(". ")),
+            3,
+        )
+        self.assertIn("Red leaves swirl", budgeted["optional_flourish"])
+        self.assertIn("omit", budget["notes"].lower())
+
+    def test_action_budget_survives_normalizing_an_already_normalized_plan(self):
+        payload = sample_design()
+        payload["shots"][0]["end_seconds"] = 5.0
+        payload["shots"][1]["start_seconds"] = 5.0
+        payload["shots"][0]["subject_action"] = (
+            "The assassin leaps. The assassin throws. The general blocks. "
+            "The assassin lands. The assassin strikes."
+        )
+        payload["shots"][0]["environment_response"] = (
+            "Tiles crack. Dust erupts. Leaves scatter. Water ripples."
+        )
+        first = normalize_design_plan(payload, {"image": 9, "video": 3, "audio": 3})
+        second = normalize_design_plan(first, {"image": 9, "video": 3, "audio": 3})
+        self.assertEqual(
+            second["shots"][0]["action_budget"]["original_subject_action"],
+            first["shots"][0]["action_budget"]["original_subject_action"],
+        )
+        self.assertEqual(second["shots"][0]["action_budget"]["status"], "priority_compressed")
+        self.assertEqual(
+            second["shots"][0]["action_budget"]["original_environment_response"],
+            first["shots"][0]["action_budget"]["original_environment_response"],
+        )
+
+    def test_budget_keeps_causal_setup_with_contact_and_limits_required_responses(self):
+        budgeted = normalize_shot_action_budget({
+            "start_seconds": 0.0,
+            "end_seconds": 5.0,
+            "subject_action": (
+                "The assassin launches. The assassin feints. The assassin draws both blades. "
+                "He strikes. He lands behind the general."
+            ),
+            "environment_response": (
+                "Tiles crack. Sparks burst. Leaves scatter. Dust erupts."
+            ),
+            "continuity_state": "End behind the general.",
+            "optional_flourish": "",
+        })
+        self.assertIn("draws both blades, then he strikes", budgeted["subject_action"])
+        self.assertEqual(budgeted["action_budget"]["required_response_limit"], 2)
+        self.assertLessEqual(
+            len(budgeted["environment_response"].split(". ")),
+            2,
+        )
+
+    def test_legacy_shot_gets_continuity_state_and_blank_constraints_get_guardrail(self):
+        payload = sample_design()
+        payload["constraints"] = ""
+        plan = normalize_design_plan(payload, {"image": 9, "video": 3, "audio": 3})
+        self.assertIn("Preserve the incoming body positions", plan["shots"][0]["continuity_state"])
+        self.assertIn("core action", plan["constraints"])
+        self.assertIn("action_budget", plan["shots"][0])
+
+    def test_overlapping_camera_shots_are_rejected(self):
+        payload = sample_design()
+        payload["shots"][1]["start_seconds"] = 3.0
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            normalize_design_plan(payload, {"image": 9, "video": 3, "audio": 3})
+
     def test_legacy_design_defaults_new_media_planning_fields(self):
         plan = normalize_design_plan(sample_design(), {"image": 9, "video": 3, "audio": 3})
         self.assertEqual(plan["existing_media_uses"], [])
@@ -480,6 +570,10 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("stable @p/@v/@a id", prompt)
         self.assertIn("never write a raw <picture n>", prompt)
         self.assertIn("request-local h3 ordinals", prompt)
+        self.assertIn("three must-complete physical action beats", prompt)
+        self.assertIn("continuity_state", prompt)
+        self.assertIn("optional_flourish", prompt)
+        self.assertIn("shots must be chronological and must not overlap", prompt)
         self.assertNotIn("when a treat each asset", prompt)
 
     def test_system_prompt_honors_standalone_special_binding(self):

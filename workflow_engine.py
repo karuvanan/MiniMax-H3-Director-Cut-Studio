@@ -352,6 +352,62 @@ REFERENCE_INPUT_PREFIXES = (
 )
 
 
+REFERENCE_INPUT_GROUPS = (
+    "ref_images.ref_image_",
+    "ref_videos.ref_video_",
+    "ref_video_audios.ref_video_audio_",
+    "ref_audios.ref_audio_",
+)
+
+
+def compact_h3_reference_inputs(
+    workflow: dict[str, dict[str, Any]],
+    h3_node_ids: list[str] | tuple[str, ...],
+) -> None:
+    """Rewrite active H3 reference inputs into contiguous request-local slots.
+
+    Media Pool identities remain permanently tied to their loader/binding (P5,
+    V2, A3, and so on), but MiniMax prompt labels describe the references in a
+    *single compiled request*.  Leaving a sparse physical field such as
+    ``ref_image_4`` connected while calling it ``<Picture 4>`` makes the prompt
+    and graph disagree.  This pass preserves each upstream connection and its
+    relative source order while removing every gap independently for pictures,
+    videos, paired video audio, and standalone audio.
+    """
+
+    def suffix(name: str) -> int:
+        match = re.search(r"_(\d+)$", name)
+        return int(match.group(1)) if match else 10_000
+
+    for h3_id in h3_node_ids:
+        node = workflow.get(str(h3_id))
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        ordinary = [
+            (name, value)
+            for name, value in inputs.items()
+            if not name.startswith(REFERENCE_INPUT_GROUPS)
+        ]
+        compacted: list[tuple[str, Any]] = []
+        for prefix in REFERENCE_INPUT_GROUPS:
+            rows = sorted(
+                (
+                    (name, value)
+                    for name, value in inputs.items()
+                    if name.startswith(prefix)
+                ),
+                key=lambda row: suffix(row[0]),
+            )
+            compacted.extend(
+                (f"{prefix}{request_index}", value)
+                for request_index, (_name, value) in enumerate(rows)
+            )
+        node["inputs"] = dict(ordinary + compacted)
+
+
 ASPECT_RATIO_NODE_VALUES = {
     "16:9": "16:9 (Widescreen)",
     "9:16": "9:16 (Portrait Widescreen)",
@@ -451,6 +507,11 @@ def compile_active_workflow(
             if input_name.startswith(REFERENCE_INPUT_PREFIXES) and input_name not in active_bindings:
                 inputs.pop(input_name)
 
+    # Prompt ordinals are request-local, so the executable graph must use the
+    # same contiguous ordering.  Asset objects deliberately retain their
+    # permanent Media Pool bindings for stable @P/@V/@A identity remapping.
+    compact_h3_reference_inputs(compiled, scan.h3_node_ids)
+
     clip_duration = clip_end - clip_start
     for node in compiled.values():
         if node.get("class_type") != "PrimitiveFloat":
@@ -484,9 +545,11 @@ def effective_reference_assets(
     windows routinely disconnect inactive inputs, so the editor's permanent
     pool labels cannot safely be used in a compiled prompt.
 
-    ``extra_kind``/``extra_binding`` represent the hidden previous-segment
-    continuity reference.  The returned string is its effective H3 tag. Source
-    assets are never mutated.
+    ``extra_kind`` represents the hidden previous-segment continuity reference,
+    which is always appended after ordinary Timeline references. The retained
+    ``extra_binding`` argument is compatibility metadata only; a spare physical
+    loader can never renumber active request references. The returned string is
+    the hidden reference's effective H3 tag. Source assets are never mutated.
     """
     clones = [deepcopy(asset) for asset in assets]
 
@@ -495,10 +558,6 @@ def effective_reference_assets(
         return int(match.group(1)) if match else 10_000
 
     extra_tag = ""
-    extra_match = re.search(r"_(\d+)$", extra_binding)
-    # An unknown binding is appended after the known active bindings, matching
-    # the worker's fallback insertion order.
-    extra_index = int(extra_match.group(1)) if extra_match else 20_000
 
     def unique_binding_rows(kind: str) -> list[tuple[int, list[MediaAsset] | None]]:
         groups: dict[tuple[str, str], list[MediaAsset]] = {}
@@ -512,42 +571,31 @@ def effective_reference_assets(
             for group in groups.values()
         ]
 
-    images = unique_binding_rows("image")
+    images = sorted(unique_binding_rows("image"), key=lambda row: row[0])
+    for ordinal, (_index, group) in enumerate(images, 1):
+        for asset in group or []:
+            asset.tag = f"<Picture {ordinal}>"
     if extra_kind == "image":
-        images.append((extra_index, None))
-    for ordinal, (_index, group) in enumerate(sorted(images, key=lambda row: row[0]), 1):
-        if group is None:
-            extra_tag = f"<Picture {ordinal}>"
-        else:
-            for asset in group:
-                asset.tag = f"<Picture {ordinal}>"
+        extra_tag = f"<Picture {len(images) + 1}>"
 
-    videos = unique_binding_rows("video")
+    videos = sorted(unique_binding_rows("video"), key=lambda row: row[0])
+    for ordinal, (_index, group) in enumerate(videos, 1):
+        for asset in group or []:
+            asset.tag = f"<Video {ordinal}>"
     if extra_kind == "video":
-        videos.append((extra_index, None))
-    for ordinal, (_index, group) in enumerate(sorted(videos, key=lambda row: row[0]), 1):
-        if group is None:
-            extra_tag = f"<Video {ordinal}>"
-        else:
-            for asset in group:
-                asset.tag = f"<Video {ordinal}>"
+        extra_tag = f"<Video {len(videos) + 1}>"
 
     paired_audio_count = sum(
         bool(group and group[0].paired_audio_binding) for _index, group in videos
     )
     if extra_kind == "video" and extra_has_paired_audio:
         paired_audio_count += 1
-    audios = unique_binding_rows("audio")
+    audios = sorted(unique_binding_rows("audio"), key=lambda row: row[0])
+    for ordinal, (_index, group) in enumerate(audios, paired_audio_count + 1):
+        for asset in group or []:
+            asset.tag = f"<Audio {ordinal}>"
     if extra_kind == "audio":
-        audios.append((extra_index, None))
-    for ordinal, (_index, group) in enumerate(
-        sorted(audios, key=lambda row: row[0]), paired_audio_count + 1
-    ):
-        if group is None:
-            extra_tag = f"<Audio {ordinal}>"
-        else:
-            for asset in group:
-                asset.tag = f"<Audio {ordinal}>"
+        extra_tag = f"<Audio {paired_audio_count + len(audios) + 1}>"
     return clones, extra_tag
 
 
