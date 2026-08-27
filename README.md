@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.8`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.9`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -227,7 +227,7 @@ video_minimax_h3_r2v API 3IMAGE 1AUDIO 1VIDEO.json
 | CUDA runtime | `12.6` |
 | Transformers | `5.12.1` |
 | Dialogue audio | 默认 `MiniMax H3 Native Dialogue`；Settings／Design 可切换 `VoxCPM2 Local` 或 `Edge TTS`，Edge 使用 `edge-tts 7.2.7` |
-| VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；权重不随 runtime／GitHub 提供，用户自行下载 `openbmb/VoxCPM2` 到项目 `models/VoxCPM2/`；Studio 自动采用 CUDA 优先、失败后 CPU 重试 |
+| VoxCPM2 runtime | 已兼容 PyPI `voxcpm 2.0.3` 与较新的 GitHub API；权重不随 runtime／GitHub 提供，用户自行下载 `openbmb/VoxCPM2` 到项目 `models/VoxCPM2/`；Studio 自动采用 CUDA 优先、失败后 CPU 重试 |
 | FFmpeg / FFprobe | `ai_libraries_common/engine_ffmpeg/bin/`，2026-05-25 build |
 
 ### 完整 Python library 版本清单
@@ -383,7 +383,7 @@ tzdata==2026.3
 umap-learn==0.5.12
 urllib3==2.7.0
 uvicorn==0.52.4
-voxcpm==2.0.0
+voxcpm==2.0.3
 websockets==17.0.1
 wetext==0.1.6
 wheel==0.47.0
@@ -717,6 +717,14 @@ VoxCPM2 Local · model ready on cpu
 
 注意：CUDA 可用不代表模型一定能放进显存。GTX 1050 4GB 会先真实尝试 CUDA，但仍可能因为显存不足自动回退 CPU；这属于正常保护行为。关闭其他占用显存的软件、ComfyUI 正在驻留的模型或浏览器 GPU 页面，可以提高成功使用 CUDA 的机会。若 CUDA 持续失败，请查看阶段信息括号内的原始错误，不要同时手动启动多个 VoxCPM2 实例。
 
+#### `VoxCPM._generate() got an unexpected keyword argument 'seed'`
+
+这是 VoxCPM 官方版本之间的 API 差异：PyPI `voxcpm 2.0.3` 的 `_generate()` 没有 `seed` 参数，较新的 GitHub 源码版本则支持。`v0.2.5-alpha.9` 已兼容两者：Studio 不再传入该关键字，而是在每句对白生成前设置隔离 worker 的 Python、NumPy 和 Torch 随机种子，因此相同 Speaker 仍保持确定性声音。
+
+如果 Vox／Edge TTS 在 Design Apply 阶段失败，Studio 不会再令新项目保持空 Timeline：Shots、图片素材、Dialogue／Voice-over／Lyrics Text Layers 会照常 Apply，失败的静音 Audio 占位不会进入 Timeline。随后可以直接到 Settings 改成 `Edge TTS`，再点击 Preview／Run；Studio 会自动建立新的 Audio reference 和 WAV，不需要重新 Load Design JSON。
+
+GTX 1050 4GB 的实际限制：当前 VoxCPM2 `model.safetensors` 约 4.58GB，`audiovae.pth` 约 0.38GB，尚未计算运行时张量就已经超过 4GB 显存；而模型配置使用 `bfloat16`，GTX 1050 也没有原生 BF16 加速。因此这张卡无法可靠完整运行 VoxCPM2 CUDA，自动回退 CPU 是预期结果。实测 CPU 每个推理 step 约需数秒，一句短对白可能需要二十分钟以上；在该硬件上建议使用 `Etts` 或 `Ori`。要实际使用 VoxCPM2 GPU，建议使用支持 BF16 且至少 8GB（较稳妥为 12GB 以上）显存的较新 NVIDIA GPU。
+
 > **Note — 新电脑找不到 `voxcpm`：** 复制项目到另一台电脑后，如果出现 `ModuleNotFoundError: No module named 'voxcpm'`，请先进入 `ai_libraries_common\python_env\Scripts`，再依次执行以下命令。`..\python.exe` 会明确使用 Studio 自带的 Python，不会修改系统 Python。
 
 ```powershell
@@ -790,13 +798,13 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**249 tests passed**。
+当前完整验证结果：**250 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 249 tests
+Ran 250 tests
 OK
 ```

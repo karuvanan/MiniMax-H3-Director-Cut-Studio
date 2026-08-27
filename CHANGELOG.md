@@ -2,6 +2,21 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.9] - 2026-08-27
+
+### Fixed
+
+- VoxCPM PyPI `2.0.3` compatibility: Studio no longer passes the unsupported `seed=` keyword to `VoxCPM._generate()`. The isolated worker seeds Python, NumPy and Torch RNGs before each line, preserving deterministic Speaker voices across both the PyPI and newer GitHub APIs.
+- A Design-authored TTS failure no longer leaves a new project with an empty Timeline. Studio commits the planned Shots, visual materials and exact Text Layers, excludes the failed/silent Audio placeholder, and marks authored speech stale so the user can switch to `Etts` and rebuild on Preview/Run without loading the Design JSON again.
+- CPU fallback progress now retains the CUDA failure reason instead of immediately overwriting it with a generic `loading model on cpu` message.
+
+### Verification
+
+- Added regressions for the seedless VoxCPM 2.0.3 API and recoverable Design Apply after authored TTS failure.
+- A project-local VoxCPM2 CPU smoke run loaded the complete model and entered waveform inference without the previous `unexpected keyword argument 'seed'` exception; the long CPU benchmark was then stopped intentionally.
+- The complete bundled test suite passed: `250` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.8] - 2026-08-27
 
 ### Added

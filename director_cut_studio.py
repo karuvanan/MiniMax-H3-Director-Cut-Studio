@@ -7084,6 +7084,7 @@ class DirectorCutStudio(QMainWindow):
         before: dict,
         design_dir: Path,
         warnings: list[str] | None = None,
+        timeline_tts_stale: bool = False,
     ) -> None:
         warnings = list(warnings or [])
         warnings.extend(self._apply_ai_design_direct(plan, materials, replace))
@@ -7094,7 +7095,7 @@ class DirectorCutStudio(QMainWindow):
             WorkspaceDesignCommand(before, after, self._restore_design_workspace_state)
         )
         self.example_work_dir = design_dir.resolve()
-        self.timeline_tts_stale = False
+        self.timeline_tts_stale = bool(timeline_tts_stale)
         self._mark_dirty()
         message = f"AI Design applied · {plan['duration_seconds']:.2f}s · {design_dir}"
         if warnings:
@@ -7511,16 +7512,46 @@ class DirectorCutStudio(QMainWindow):
             self.design_button.setEnabled(True)
             return
         if exit_code or result.get("error"):
-            self.generation_overlay.stop()
-            self._restore_monitor_after_generation()
-            self.design_button.setEnabled(True)
-            QMessageBox.critical(
-                self,
-                "Mandarin TTS failed",
-                "Exact authored dialogue was detected, so Apply was stopped instead of using "
-                "a silent placeholder.\n\n"
-                + str(result.get("error") or log[-1000:] or f"worker exit {exit_code}"),
+            error_detail = str(
+                result.get("error") or log[-1000:] or f"worker exit {exit_code}"
             )
+            plan = pending["plan"]
+            plan["media_requests"] = [
+                item for item in plan.get("media_requests") or []
+                if item.get("requirement_id") != "authored_speech_tts"
+            ]
+            materials = [
+                item for item in pending["materials"]
+                if item.get("requirement_id") != "authored_speech_tts"
+            ]
+            warnings = list(pending["warnings"])
+            failed_engine = (
+                "VoxCPM2" if self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+                else "Edge TTS"
+            )
+            warnings.append(
+                f"{failed_engine} authored speech failed, but the Design Timeline, Shots and exact "
+                "Text Layers were preserved. The failed/silent Audio placeholder was not "
+                "added to the Timeline. Change Dialogue Text Layer TTS to another provider "
+                "(for example Edge TTS / Etts), then click Preview or Run to build a fresh "
+                "WAV. Details: " + error_detail
+            )
+            if pending["generate_images"]:
+                self._start_design_media_generation(
+                    plan, materials, pending["replace"], pending["before"],
+                    pending["design_dir"], pending["settings"],
+                    initial_warnings=warnings,
+                    timeline_tts_stale=True,
+                )
+                return
+            self.generation_overlay.stop()
+            self.design_button.setEnabled(True)
+            self._commit_ai_design(
+                plan, materials, pending["replace"], pending["before"],
+                pending["design_dir"], warnings,
+                timeline_tts_stale=True,
+            )
+            self._restore_monitor_after_generation()
             return
         material = pending["tts_material"]
         material["generated_by_tts"] = True
@@ -7590,6 +7621,7 @@ class DirectorCutStudio(QMainWindow):
         design_dir: Path,
         settings: DesignAISettings,
         initial_warnings: list[str] | None = None,
+        timeline_tts_stale: bool = False,
     ) -> None:
         if self.submit_runner and self.submit_runner.is_running():
             raise RuntimeError("A ComfyUI video generation job is already running")
@@ -7620,6 +7652,7 @@ class DirectorCutStudio(QMainWindow):
             "before": before,
             "design_dir": design_dir,
             "warnings": list(initial_warnings or []),
+            "timeline_tts_stale": bool(timeline_tts_stale),
         }
         self.design_media_result = {}
         runner = JsonLineProcess(self, "design-media")
@@ -7671,6 +7704,7 @@ class DirectorCutStudio(QMainWindow):
                 self._commit_ai_design(
                     pending["plan"], pending["materials"], pending["replace"],
                     pending["before"], pending["design_dir"], warnings,
+                    timeline_tts_stale=bool(pending.get("timeline_tts_stale")),
                 )
         finally:
             self.pending_ai_design = None

@@ -3660,6 +3660,54 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_design_tts_failure_preserves_timeline_plan_without_silent_audio(self):
+        window = DirectorCutStudio()
+        plan = {
+            "media_requests": [
+                {"requirement_id": "authored_speech_tts", "media_type": "audio"},
+                {"requirement_id": "scene_image", "media_type": "image"},
+            ]
+        }
+        materials = [
+            {"requirement_id": "authored_speech_tts", "media_type": "audio"},
+            {"requirement_id": "scene_image", "media_type": "image"},
+        ]
+        window.pending_design_tts = {
+            "plan": plan,
+            "materials": materials,
+            "replace": True,
+            "before": {},
+            "design_dir": Path("example") / "tts_recovery",
+            "settings": None,
+            "warnings": [],
+            "generate_images": False,
+            "tts_material": materials[0],
+        }
+        window.design_tts_result = {
+            "error": "VoxCPM._generate() got an unexpected keyword argument 'seed'"
+        }
+        with (
+            patch.object(window, "_commit_ai_design") as commit,
+            patch.object(window, "_restore_monitor_after_generation"),
+        ):
+            window._design_tts_finished(1, "")
+        self.assertEqual(commit.call_count, 1)
+        args, kwargs = commit.call_args
+        committed_plan = args[0]
+        committed_materials = args[1]
+        self.assertFalse(any(
+            item.get("requirement_id") == "authored_speech_tts"
+            for item in committed_plan["media_requests"]
+        ))
+        self.assertFalse(any(
+            item.get("requirement_id") == "authored_speech_tts"
+            for item in committed_materials
+        ))
+        self.assertTrue(kwargs["timeline_tts_stale"])
+        self.assertIn("Text Layers were preserved", args[5][0])
+        window.project_dirty = False
+        window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

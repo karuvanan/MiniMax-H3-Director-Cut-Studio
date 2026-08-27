@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import uuid
@@ -204,7 +205,7 @@ class VoxCPM2LocalSynthesizer:
             })
             self.device = "cpu"
             try:
-                self._load_model("cpu")
+                self._load_model("cpu", fallback_reason=self._short_error(first_exc))
             except Exception as cpu_exc:
                 raise RuntimeError(
                     "VoxCPM2 Local model failed on both CUDA and CPU. "
@@ -228,8 +229,11 @@ class VoxCPM2LocalSynthesizer:
         detail = " ".join(str(exc).split()) or exc.__class__.__name__
         return detail[:240]
 
-    def _load_model(self, device: str) -> None:
-        emit({"progress": f"VoxCPM2 Local · loading model on {device}"})
+    def _load_model(self, device: str, *, fallback_reason: str = "") -> None:
+        stage = f"VoxCPM2 Local · loading model on {device}"
+        if fallback_reason:
+            stage += f" · CUDA fallback reason: {fallback_reason}"
+        emit({"progress": stage})
         self.model = self._voxcpm_class.from_pretrained(
             self.model_id,
             load_denoiser=False,
@@ -258,6 +262,25 @@ class VoxCPM2LocalSynthesizer:
     def _generate(self, layer: dict):
         text = str(layer.get("content", "")).strip()
         control = voxcpm_voice_control(layer)
+        seed = voxcpm_speaker_seed(layer.get("speaker", "S1"))
+        # VoxCPM 2.0.3 (PyPI) does not accept ``seed=`` while newer GitHub
+        # revisions do.  Seed this isolated worker's RNGs instead, then pass
+        # only the arguments shared by both official APIs.
+        random.seed(seed)
+        try:
+            import numpy as np
+
+            np.random.seed(seed % (2**32))
+        except Exception:
+            pass
+        try:
+            import torch
+
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
         return self.model.generate(
             text=f"({control}){text}",
             cfg_value=2.0,
@@ -265,7 +288,6 @@ class VoxCPM2LocalSynthesizer:
             normalize=True,
             denoise=False,
             retry_badcase=True,
-            seed=voxcpm_speaker_seed(layer.get("speaker", "S1")),
         )
 
     def _fallback_after_cuda_inference(self, cuda_exc: Exception) -> None:
@@ -278,7 +300,7 @@ class VoxCPM2LocalSynthesizer:
         })
         self.device = "cpu"
         try:
-            self._load_model("cpu")
+            self._load_model("cpu", fallback_reason=self._short_error(cuda_exc))
         except Exception as cpu_exc:
             raise RuntimeError(
                 "VoxCPM2 Local CUDA synthesis failed and the CPU fallback model "

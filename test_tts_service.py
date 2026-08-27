@@ -31,8 +31,10 @@ class _FakeModel:
     def __init__(self, *, generate_error=None):
         self.generate_error = generate_error
         self.tts_model = types.SimpleNamespace(sample_rate=24000)
+        self.last_kwargs = {}
 
     def generate(self, **kwargs):
+        self.last_kwargs = dict(kwargs)
         if self.generate_error is not None:
             raise self.generate_error
         return [0.0, 0.0]
@@ -114,6 +116,7 @@ class VoxCPMCudaFallbackTests(unittest.TestCase):
                     )
                 self.assertEqual(Loader.calls, ["cuda", "cpu"])
                 self.assertEqual(synthesizer.device, "cpu")
+                self.assertNotIn("seed", synthesizer.model.last_kwargs)
             finally:
                 synthesizer.release()
 
