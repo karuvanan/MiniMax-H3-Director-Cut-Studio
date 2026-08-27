@@ -67,6 +67,11 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
+from blip_summary import (
+    clean_blip_caption,
+    remove_previous_blip_output,
+    render_blip_summary,
+)
 from media_engine import (
     media_type_for_path,
     probe_media,
@@ -5352,13 +5357,15 @@ class DirectorCutStudio(QMainWindow):
         self.media_runner = JsonLineProcess(self, "media-prepare")
         self.media_runner.message.connect(self._handle_media_prepare_payload)
         self.media_runner.finished.connect(self._media_prepare_service_finished)
-        self.blip_jobs: dict[str, tuple[MediaAsset, str, Path]] = {}
+        self.blip_jobs: dict[str, tuple[MediaAsset, str, Path, str]] = {}
+        self.blip_results: dict[str, list[dict[str, str]]] = {}
         self.analysis_paths: dict[str, list[tuple[str, Path]]] = {}
         self.blip_runner = JsonLineProcess(self, "blip")
         self.blip_runner.message.connect(self._handle_blip_payload)
         self.blip_runner.finished.connect(self._blip_service_finished)
         self.blip_cpu_fallback_attempted = False
-        self.blip_cpu_mode = False
+        self.blip_cpu_mode = self.render_settings.blip_device == "cpu"
+        self.blip_restart_after_jobs = False
         self.audio_jobs: dict[str, MediaAsset] = {}
         self.audio_runner = JsonLineProcess(self, "audio")
         self.audio_runner.message.connect(self._handle_audio_payload)
@@ -5601,6 +5608,21 @@ class DirectorCutStudio(QMainWindow):
             "VoxCPM2 loads from the local model cache only; systems below 8 GB VRAM "
             "use the slower safe CPU mode."
         )
+        self.settings_blip_device = QComboBox()
+        self.settings_blip_device.addItem(
+            "Auto · CPU-safe start, verified CUDA when available",
+            "auto",
+        )
+        self.settings_blip_device.addItem(
+            "CUDA preferred · automatic CPU fallback",
+            "cuda",
+        )
+        self.settings_blip_device.addItem("CPU only", "cpu")
+        self.settings_blip_device.setToolTip(
+            "Auto is the first-run default: BLIP loads safely on CPU, verifies a real "
+            "CUDA operation, then moves to CUDA. Any CUDA startup or inference failure "
+            "automatically retries the same analysis on CPU."
+        )
         self.settings_node_map = QLabel("Load an API workflow to inspect mapped nodes.")
         self.settings_node_map.setWordWrap(True)
         form.addRow("Mega pixels", self.settings_megapixels)
@@ -5611,6 +5633,7 @@ class DirectorCutStudio(QMainWindow):
         form.addRow("Generation timeout", self.settings_generation_timeout)
         form.addRow("HTTP request timeout", self.settings_http_timeout)
         form.addRow("Dialogue Text Layer TTS", self.settings_dialogue_tts)
+        form.addRow("BLIP inference device", self.settings_blip_device)
         form.addRow("Mapped API nodes", self.settings_node_map)
         buttons = QHBoxLayout()
         save_button = QPushButton("SAVE SETTINGS TO .ENV")
@@ -5632,6 +5655,7 @@ class DirectorCutStudio(QMainWindow):
             widget.valueChanged.connect(self._settings_ui_changed)
         self.settings_rtx_vsr.toggled.connect(self._settings_ui_changed)
         self.settings_dialogue_tts.currentIndexChanged.connect(self._settings_ui_changed)
+        self.settings_blip_device.currentIndexChanged.connect(self._blip_device_ui_changed)
         return page
 
     def _sync_settings_ui(self) -> None:
@@ -5645,12 +5669,31 @@ class DirectorCutStudio(QMainWindow):
         self.settings_http_timeout.setValue(settings.http_request_timeout)
         tts_index = self.settings_dialogue_tts.findData(settings.dialogue_tts_engine)
         self.settings_dialogue_tts.setCurrentIndex(max(0, tts_index))
+        blip_index = self.settings_blip_device.findData(settings.blip_device)
+        self.settings_blip_device.setCurrentIndex(max(0, blip_index))
 
     def _settings_ui_changed(self, *_args) -> None:
         self._read_settings_ui()
         self.preview_ready = False
         self.accept_preview_button.setEnabled(False)
         self._mark_dirty()
+
+    def _blip_device_ui_changed(self, *_args) -> None:
+        previous = self.render_settings.blip_device
+        self._settings_ui_changed()
+        selected = self.render_settings.blip_device
+        if selected == previous:
+            return
+        self.blip_cpu_mode = selected == "cpu"
+        self.blip_cpu_fallback_attempted = False
+        if self.blip_runner.is_running():
+            if self.blip_jobs:
+                self.blip_restart_after_jobs = True
+            else:
+                self.blip_runner.stop()
+        self.statusBar().showMessage(
+            f"BLIP device changed to {selected.upper()} · applies to the next analysis"
+        )
 
     def _read_settings_ui(self) -> None:
         self.render_settings = RenderSettings.from_mapping(
@@ -5666,6 +5709,7 @@ class DirectorCutStudio(QMainWindow):
                 "generation_timeout": self.settings_generation_timeout.value(),
                 "http_request_timeout": self.settings_http_timeout.value(),
                 "dialogue_tts_engine": self.settings_dialogue_tts.currentData(),
+                "blip_device": self.settings_blip_device.currentData(),
             }
         )
 
@@ -5680,6 +5724,13 @@ class DirectorCutStudio(QMainWindow):
         index = self.aspect_ratio_combo.findData(self.render_settings.aspect_ratio)
         self.aspect_ratio_combo.setCurrentIndex(max(0, index))
         self._sync_settings_ui()
+        self.blip_cpu_mode = self.render_settings.blip_device == "cpu"
+        self.blip_cpu_fallback_attempted = False
+        if self.blip_runner.is_running():
+            if self.blip_jobs:
+                self.blip_restart_after_jobs = True
+            else:
+                self.blip_runner.stop()
         save_settings(SETTINGS_ENV, self.render_settings)
         self.statusBar().showMessage("Default settings restored and saved to .env")
 
@@ -8069,6 +8120,7 @@ class DirectorCutStudio(QMainWindow):
             return
         self.media_jobs.clear()
         self.blip_jobs.clear()
+        self.blip_results.clear()
         self.audio_jobs.clear()
         previous_lm_request = next(
             (
@@ -9641,6 +9693,16 @@ class DirectorCutStudio(QMainWindow):
     def _blip_caption_for_asset(asset: MediaAsset) -> str:
         captions: list[str] = []
         for line in asset.recognition.splitlines():
+            compact = re.match(
+                r"\s*BLIP\s*·\s*[^:]+:\s*(.+?)\s*$",
+                line,
+                flags=re.I,
+            )
+            if compact:
+                caption = compact.group(1).strip()
+                if caption and caption not in captions:
+                    captions.append(caption)
+                continue
             match = re.match(
                 r"\s*BLIP visual (?:caption|region)(?:\s*·\s*[^:]+)?\s*:\s*(.+?)\s*$",
                 line,
@@ -10861,6 +10923,7 @@ class DirectorCutStudio(QMainWindow):
             removed = True
         if removed:
             if base_removed:
+                self.blip_results.pop(asset.node_id, None)
                 asset.recognition += "\n\nAnalysis cancelled. Any late worker response will be ignored."
             card = self.cards.get(asset.node_id)
             if card:
@@ -10879,6 +10942,7 @@ class DirectorCutStudio(QMainWindow):
         for job_id, job in list(self.blip_jobs.items()):
             if job[0] is asset:
                 self.blip_jobs.pop(job_id, None)
+        self.blip_results[asset.node_id] = []
         try:
             if not self.blip_runner.is_running():
                 arguments = [
@@ -10886,8 +10950,11 @@ class DirectorCutStudio(QMainWindow):
                     "--model",
                     str(self.runtime.blip_snapshot),
                 ]
-                if self.blip_cpu_mode:
+                configured_device = self.render_settings.blip_device
+                if self.blip_cpu_mode or configured_device == "cpu":
                     arguments.append("--cpu")
+                elif configured_device == "auto":
+                    arguments.append("--auto")
                 if not self.blip_runner.start(str(self.runtime.python), arguments):
                     raise RuntimeError("BLIP service is still stopping")
             card = self.cards.get(asset.node_id)
@@ -10896,15 +10963,14 @@ class DirectorCutStudio(QMainWindow):
             requests: list[tuple[str, Path, str]] = []
             for label, source in sources:
                 if asset.media_type == "image" and label != "full frame":
-                    prompts = (
-                        "a photograph of",
-                        "the central scene shows",
-                        "the lighting reveals",
-                    )
-                    requests.extend(
-                        (f"{label} · {prompt}", source, prompt)
-                        for prompt in prompts
-                    )
+                    lowered = label.casefold()
+                    if "subject detail" in lowered:
+                        prompt = "the central subject is"
+                    elif "upper scene" in lowered:
+                        prompt = "the scene shows"
+                    else:
+                        prompt = "the lighting and environment show"
+                    requests.append((label, source, prompt))
                 else:
                     requests.append((label, source, ""))
             for label, source, prompt in requests:
@@ -10912,7 +10978,7 @@ class DirectorCutStudio(QMainWindow):
                     (str(source) + label + prompt + str(time.time_ns())).encode()
                 ).hexdigest()[:12]
                 job_id = f"blip:{asset.node_id}:{digest}"
-                self.blip_jobs[job_id] = (asset, label, source)
+                self.blip_jobs[job_id] = (asset, label, source, prompt)
                 request = {"job": job_id, "image": str(source)}
                 if prompt:
                     request["prompt"] = prompt
@@ -10942,31 +11008,74 @@ class DirectorCutStudio(QMainWindow):
             return
         job = self.blip_jobs.pop(payload.get("job", ""), None)
         if job:
-            self._apply_blip_result(job[0], job[1], payload)
+            self._apply_blip_result(job[0], job[1], job[3], payload)
 
-    def _apply_blip_result(self, asset: MediaAsset, frame_label: str, payload: dict) -> None:
+    @staticmethod
+    def _blip_display_label(frame_label: str, media_type: str) -> str:
+        lowered = frame_label.casefold()
+        if frame_label == "full frame":
+            return "Overview"
+        if media_type == "video":
+            return f"Frame {frame_label}"
+        if "subject detail" in lowered:
+            return "Subject detail"
+        if "upper scene" in lowered:
+            return "Upper scene"
+        if "central scene" in lowered:
+            return "Scene context"
+        return frame_label
+
+    def _apply_blip_result(
+        self,
+        asset: MediaAsset,
+        frame_label: str,
+        prompt: str,
+        payload: dict,
+    ) -> None:
         if not asset:
             return
+        results = self.blip_results.setdefault(asset.node_id, [])
         if payload.get("caption"):
-            if asset.media_type == "image":
-                prefix = (
-                    "BLIP visual caption · full frame"
-                    if frame_label == "full frame"
-                    else f"BLIP visual region · {frame_label}"
-                )
-            else:
-                prefix = f"BLIP video frame · {frame_label}"
-            asset.recognition += f"\n\n{prefix}: {payload['caption']}\nInference device: {payload.get('device', '-') }"
+            results.append({
+                "label": self._blip_display_label(frame_label, asset.media_type),
+                "caption": clean_blip_caption(payload["caption"], prompt),
+                "device": str(payload.get("device", "")),
+                "error": "",
+            })
         else:
             error = payload.get("error") or "BLIP returned no caption"
-            asset.recognition += f"\n\nBLIP error: {error}"
+            results.append({
+                "label": self._blip_display_label(frame_label, asset.media_type),
+                "caption": "",
+                "device": str(payload.get("device", "")),
+                "error": str(error),
+            })
+        pending = any(item[0] is asset for item in self.blip_jobs.values())
+        card = self.cards.get(asset.node_id)
+        if pending:
+            if card:
+                card.set_analysis_status("识别 …")
+            return
+        summary = render_blip_summary(
+            (
+                (item["label"], item["caption"])
+                for item in results
+                if item["caption"]
+            ),
+            (item["device"] for item in results if item["device"]),
+            (item["error"] for item in results if item["error"]),
+        )
+        base = remove_previous_blip_output(asset.recognition)
+        asset.recognition = f"{base}\n\n{summary}".strip()
+        self.blip_results.pop(asset.node_id, None)
+        if self.blip_restart_after_jobs and not self.blip_jobs:
+            self.blip_restart_after_jobs = False
+            self.blip_runner.stop()
         self._sync_timeline_clip_sources(asset)
         self._mark_dirty()
         self.schedule_prompt_generation()
-        card = self.cards.get(asset.node_id)
         if card:
-            pending = any(item[0] is asset for item in self.blip_jobs.values())
-            card.set_analysis_status("识别 …" if pending else ("识别 ✓" if payload.get("caption") else "识别 !"))
+            card.set_analysis_status("识别 ✓" if "BLIP VISUAL SUMMARY" in summary else "识别 !")
         if asset is self.selected_asset:
             self._refresh_recognition_inspector(asset)
         self._maybe_auto_enrich(asset)
@@ -10975,6 +11084,7 @@ class DirectorCutStudio(QMainWindow):
     def _blip_service_finished(self, exit_code: int, log: str) -> None:
         if self._closing:
             self.blip_jobs.clear()
+            self.blip_results.clear()
             return
         pending_jobs = list(self.blip_jobs.items())
         if pending_jobs and exit_code != 0 and not self.blip_cpu_fallback_attempted:
@@ -10991,25 +11101,44 @@ class DirectorCutStudio(QMainWindow):
                         "--cpu",
                     ],
                 )
-                for job_id, (_asset, _label, source) in pending_jobs:
-                    self.blip_runner.write_json({"job": job_id, "image": str(source)})
+                for job_id, (_asset, _label, source, prompt) in pending_jobs:
+                    request = {"job": job_id, "image": str(source)}
+                    if prompt:
+                        request["prompt"] = prompt
+                    self.blip_runner.write_json(request)
                 self.statusBar().showMessage("BLIP GPU failed; retrying pending frames on CPU")
                 return
             except Exception as exc:
                 log = f"{log}\nCPU fallback failed: {exc}".strip()
         seen: set[int] = set()
         affected_assets: list[MediaAsset] = []
-        for asset, _label, _source in self.blip_jobs.values():
+        for asset, _label, _source, _prompt in self.blip_jobs.values():
             if id(asset) in seen:
                 continue
             seen.add(id(asset))
             affected_assets.append(asset)
-            detail = f" · {log[-300:]}" if log else ""
-            asset.recognition += f"\n\nBLIP service stopped unexpectedly (exit {exit_code}){detail}."
             card = self.cards.get(asset.node_id)
             if card:
                 card.set_analysis_status("识别 !")
         self.blip_jobs.clear()
+        for asset in affected_assets:
+            results = self.blip_results.pop(asset.node_id, [])
+            results.append({
+                "label": "Analysis",
+                "caption": "",
+                "device": "",
+                "error": (
+                    f"BLIP service stopped unexpectedly (exit {exit_code})"
+                    + (f": {log[-300:]}" if log else "")
+                ),
+            })
+            base = remove_previous_blip_output(asset.recognition)
+            summary = render_blip_summary(
+                ((item["label"], item["caption"]) for item in results if item["caption"]),
+                (item["device"] for item in results if item["device"]),
+                (item["error"] for item in results if item["error"]),
+            )
+            asset.recognition = f"{base}\n\n{summary}".strip()
         self.blip_runner.discard_pending()
         for asset in affected_assets:
             self._maybe_auto_enrich(asset)

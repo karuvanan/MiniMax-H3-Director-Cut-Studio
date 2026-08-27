@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.3`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.4`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -450,9 +450,10 @@ H3_HISTORY_POLL_INTERVAL=1.0
 H3_GENERATION_TIMEOUT=1800
 H3_HTTP_REQUEST_TIMEOUT=30
 H3_DIALOGUE_TTS_ENGINE=edge_tts
+H3_BLIP_DEVICE=auto
 ```
 
-请把 URL 改成自己的 ComfyUI 地址。`H3_DIALOGUE_TTS_ENGINE` 可设为 `edge_tts` 或 `voxcpm2_local`，也可直接在主页 `SETTINGS → Dialogue Text Layer TTS` 选择后保存。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
+请把 URL 改成自己的 ComfyUI 地址。`H3_DIALOGUE_TTS_ENGINE` 可设为 `edge_tts` 或 `voxcpm2_local`。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
 
 ### Design AI 设置
 
@@ -581,7 +582,7 @@ preset_env/non_diegetic_music.env
 
 ## 媒体分析与稳定性
 
-- 图片使用 Pillow 与 BLIP；若边缘取样确认素材具有高度一致且与边缘连通的单色背景，会自动建立透明 PNG 衍生素材供预览、识别、Design 与 H3 引用，原图保持不变。复杂背景会安全跳过。
+- 图片使用 Pillow 与 BLIP；BLIP 对整图和三个有目的的区域各分析一次，自动删除 conditional prompt 回声、合并没有新增视觉证据的相似描述，并只显示一次实际推理设备。若边缘取样确认素材具有高度一致且与边缘连通的单色背景，会自动建立透明 PNG 衍生素材供预览、识别、Design 与 H3 引用，原图保持不变。复杂背景会安全跳过。
 - 视频使用 FFprobe 获取元数据，并抽取开头 10%、中段 50%、结尾 90% 多帧进行 BLIP 分析。
 - 音频按 8 秒分块流式解码，总解码长度不超过 Timeline 秒数。
 - 音频先执行 VAD，再只对语音区间执行 Whisper，并以 FFT 估算节拍。
@@ -711,7 +712,7 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**236 tests passed**。
+当前完整验证结果：**241 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v

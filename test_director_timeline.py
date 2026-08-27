@@ -753,7 +753,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
-    def test_ai_enrich_collects_conditional_multi_region_blip_evidence_first(self):
+    def test_ai_enrich_collects_one_purposeful_blip_observation_per_region(self):
         window = DirectorCutStudio()
         media_root = PROJECT_ROOT / ".director_cache" / "media_semantic_ui_tests"
         media_root.mkdir(parents=True, exist_ok=True)
@@ -778,11 +778,15 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.enrich_selected_media()
 
         requests = [call.args[0] for call in write_json.call_args_list]
-        self.assertEqual(len(requests), 10)
-        self.assertEqual(sum("prompt" in request for request in requests), 9)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(sum("prompt" in request for request in requests), 3)
         self.assertEqual(
             {request.get("prompt") for request in requests if request.get("prompt")},
-            {"a photograph of", "the central scene shows", "the lighting reveals"},
+            {
+                "the scene shows",
+                "the lighting and environment show",
+                "the central subject is",
+            },
         )
         self.assertIn(picture.node_id, window.semantic_waiting_assets)
         self.assertEqual(window.semantic_jobs, {})

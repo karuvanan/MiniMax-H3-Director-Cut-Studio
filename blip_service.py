@@ -33,6 +33,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Load safely on CPU first, then use CUDA only after a runtime probe.",
+    )
     args = parser.parse_args()
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -44,7 +49,8 @@ def main() -> int:
 
         model_path = Path(args.model).resolve()
         processor = BlipProcessor.from_pretrained(model_path, local_files_only=True)
-        device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
+        cuda_available = bool(torch.cuda.is_available())
+        device = "cpu" if args.cpu or args.auto or not cuda_available else "cuda"
 
         def load_model(target_device: str):
             loaded = BlipForConditionalGeneration.from_pretrained(
@@ -54,22 +60,47 @@ def main() -> int:
             return loaded
 
         startup_warning = ""
-        try:
-            model = load_model(device)
-        except Exception as cuda_exc:
-            if device != "cuda" or not is_cuda_fallback_error(cuda_exc):
-                raise
-            gc.collect()
+        if args.auto:
+            model = load_model("cpu")
+            if cuda_available:
+                try:
+                    probe = torch.ones(1, device="cuda")
+                    probe.add_(1)
+                    torch.cuda.synchronize()
+                    del probe
+                    model = model.to("cuda")
+                    model.eval()
+                    device = "cuda"
+                except Exception as cuda_exc:
+                    del model
+                    gc.collect()
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    device = "cpu"
+                    model = load_model(device)
+                    startup_warning = (
+                        "Automatic CUDA verification failed; using CPU: "
+                        f"{type(cuda_exc).__name__}: {cuda_exc}"
+                    )
+        else:
             try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            device = "cpu"
-            model = load_model(device)
-            startup_warning = (
-                "CUDA BLIP startup is incompatible with this GPU/Torch build; "
-                f"using CPU: {type(cuda_exc).__name__}: {cuda_exc}"
-            )
+                model = load_model(device)
+            except Exception as cuda_exc:
+                if device != "cuda" or not is_cuda_fallback_error(cuda_exc):
+                    raise
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                device = "cpu"
+                model = load_model(device)
+                startup_warning = (
+                    "CUDA BLIP startup is incompatible with this GPU/Torch build; "
+                    f"using CPU: {type(cuda_exc).__name__}: {cuda_exc}"
+                )
     except Exception as exc:
         print(
             json.dumps({"fatal": True, "stage": "startup", "error": f"{type(exc).__name__}: {exc}"}),

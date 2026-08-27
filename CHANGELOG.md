@@ -2,6 +2,24 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.4] - 2026-08-27
+
+### Added
+
+- Added `Auto`, `CUDA preferred` and `CPU only` BLIP inference choices to the main Settings page and the persistent `H3_BLIP_DEVICE` environment setting.
+- Auto is the safe first-run default: it loads BLIP on CPU, verifies a real CUDA operation, moves the model to CUDA when supported, and retains the existing same-job CPU fallback for any later inference failure.
+
+### Changed
+
+- Image BLIP analysis now runs one purposeful observation per crop instead of three repetitive conditional prompts per crop.
+- Raw Recognition now removes echoed prompt prefixes, merges captions that add no meaningful visual evidence, replaces older BLIP blocks on re-analysis, and reports the inference device once in one compact summary.
+
+### Verification
+
+- Added deterministic tests for repeated prompt cleanup, semantic deduplication, preservation of genuinely new region evidence, legacy-output replacement, and the safe Auto settings default.
+- Confirmed the actual local BLIP model loads CPU-first in Auto mode, selects CUDA after its runtime probe, and completes an image caption on CUDA.
+- The complete bundled test suite passed: `241` tests.
+
 ## [0.2.5-alpha.3] - 2026-08-27
 
 ### Fixed

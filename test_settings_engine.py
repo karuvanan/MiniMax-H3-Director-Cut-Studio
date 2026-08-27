@@ -20,6 +20,7 @@ class SettingsEngineTests(unittest.TestCase):
             generation_timeout=900,
             http_request_timeout=45,
             dialogue_tts_engine="voxcpm2_local",
+            blip_device="cuda",
         )
         save_settings(path, settings)
         restored = load_settings(path)
@@ -28,10 +29,12 @@ class SettingsEngineTests(unittest.TestCase):
         self.assertEqual(restored.sampling_steps, 12)
         self.assertFalse(restored.rtx_video_super_resolution)
         self.assertEqual(restored.dialogue_tts_engine, "voxcpm2_local")
+        self.assertEqual(restored.blip_device, "cuda")
         self.assertIn(
             "H3_DIALOGUE_TTS_ENGINE=voxcpm2_local",
             path.read_text(encoding="utf-8"),
         )
+        self.assertIn("H3_BLIP_DEVICE=cuda", path.read_text(encoding="utf-8"))
         self.assertIn("UNRELATED=keep", path.read_text(encoding="utf-8"))
 
     def test_invalid_ranges_are_clamped(self):
@@ -45,6 +48,13 @@ class SettingsEngineTests(unittest.TestCase):
     def test_unknown_tts_engine_returns_to_safe_default(self):
         settings = RenderSettings.from_mapping({"dialogue_tts_engine": "mystery"})
         self.assertEqual(settings.dialogue_tts_engine, "edge_tts")
+
+    def test_blip_device_defaults_to_safe_auto(self):
+        self.assertEqual(RenderSettings.defaults().blip_device, "auto")
+        self.assertEqual(
+            RenderSettings.from_mapping({"blip_device": "mystery"}).blip_device,
+            "auto",
+        )
 
 
 if __name__ == "__main__":
