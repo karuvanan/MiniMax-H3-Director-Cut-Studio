@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.6`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.7`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -227,7 +227,7 @@ video_minimax_h3_r2v API 3IMAGE 1AUDIO 1VIDEO.json
 | CUDA runtime | `12.6` |
 | Transformers | `5.12.1` |
 | Dialogue audio | 默认 `MiniMax H3 Native Dialogue`；Settings／Design 可切换 `VoxCPM2 Local` 或 `Edge TTS`，Edge 使用 `edge-tts 7.2.7` |
-| VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；本地模型 `openbmb/VoxCPM2`，不在生成时联网下载 |
+| VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；本地模型 `openbmb/VoxCPM2`，不在生成时联网下载；Studio 自动采用 CUDA 优先、失败后 CPU 重试 |
 | FFmpeg / FFprobe | `ai_libraries_common/engine_ffmpeg/bin/`，2026-05-25 build |
 
 ### 完整 Python library 版本清单
@@ -651,6 +651,42 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 
 如果希望在新电脑继续使用 GPU 加速，应在该电脑单独安装一组官方支持其 GPU 架构的 PyTorch 与 Torchaudio，而不是直接复制来源电脑的机器相关环境。Torch 与 Torchaudio 必须使用彼此匹配的版本；安装前应先备份 `ai_libraries_common/python_env`。
 
+### VoxCPM2 加载在 CPU 很慢，怎样使用 CUDA
+
+在 Design Requirement 选择 `Vox`，或在主页 Settings 把 Dialogue Text Layer 改成 `VoxCPM2 Local`。Studio 直接通过独立的 `tts_service.py` worker 载入 VoxCPM2，不需要另外启动 VoxCPM2 WebUI。
+
+从 `v0.2.5-alpha.7` 开始，`voxcpm_device=auto` 的执行顺序如下：
+
+1. 使用 bundled `python_env` 检查 `torch.cuda.is_available()`。
+2. 检测到 CUDA 时明确使用 `device=cuda` 载入 `openbmb/VoxCPM2`；不会再因为显存少于 8GB 而预先强制 CPU。
+3. CUDA 模型载入成功后，整批 Dialogue Text Layers 共用同一个 GPU 模型。
+4. 如果模型载入阶段发生 CUDA、显存不足或架构兼容错误，worker 会删除不完整模型、执行 CUDA cache 清理，再以 `device=cpu` 重载。
+5. 如果模型已成功载入 CUDA，但生成某一句对白时才失败，worker 同样会释放 CUDA、载入 CPU，并自动重试当前这句对白；已经确定的逐字内容、Speaker、时间范围不会改变。
+6. 整批对白完成后释放模型与 CUDA cache。VoxCPM2 失败不会静默改用 Edge TTS。
+
+Program Monitor 的实时阶段会显示实际路径，例如：
+
+```text
+VoxCPM2 Local · loading model on cuda
+VoxCPM2 Local · model ready on cuda
+```
+
+发生自动回退时会显示：
+
+```text
+VoxCPM2 Local · CUDA model load failed; releasing GPU memory and retrying on CPU (...)
+VoxCPM2 Local · loading model on cpu
+VoxCPM2 Local · model ready on cpu
+```
+
+检查 bundled 环境是否能够看到 GPU：
+
+```powershell
+.\ai_libraries_common\python_env\python.exe -c "import torch; print('Torch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+```
+
+注意：CUDA 可用不代表模型一定能放进显存。GTX 1050 4GB 会先真实尝试 CUDA，但仍可能因为显存不足自动回退 CPU；这属于正常保护行为。关闭其他占用显存的软件、ComfyUI 正在驻留的模型或浏览器 GPU 页面，可以提高成功使用 CUDA 的机会。若 CUDA 持续失败，请查看阶段信息括号内的原始错误，不要同时手动启动多个 VoxCPM2 实例。
+
 ### Design 超时
 
 - `H3_DESIGN_TIMEOUT` 是单次 Design 流程的总等待上限，当前默认 900 秒。
@@ -714,13 +750,13 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**246 tests passed**。
+当前完整验证结果：**248 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 235 tests
+Ran 248 tests
 OK
 ```
