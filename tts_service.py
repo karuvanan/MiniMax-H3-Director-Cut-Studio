@@ -159,29 +159,12 @@ def voxcpm_speaker_seed(speaker: object) -> int:
 
 
 class VoxCPM2LocalSynthesizer:
-    """Load VoxCPM2 once per isolated job and release it when the worker exits."""
+    """Load VoxCPM2 once per isolated job, preferring CUDA with CPU fallback."""
 
     def __init__(self, job: dict):
-        model_id = str(job.get("voxcpm_model") or "openbmb/VoxCPM2").strip()
-        device = str(job.get("voxcpm_device") or "auto").strip() or "auto"
-        local_only = bool(job.get("voxcpm_local_files_only", True))
-        if device.lower() == "auto":
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    total_vram = int(torch.cuda.get_device_properties(0).total_memory)
-                    if total_vram < 8 * 1024**3:
-                        device = "cpu"
-                        emit({
-                            "progress": (
-                                "VoxCPM2 Local · GPU has less than 8 GB VRAM; "
-                                "using safe CPU mode"
-                            )
-                        })
-            except Exception:
-                pass
-        emit({"progress": f"VoxCPM2 Local · loading model on {device}"})
+        self.model_id = str(job.get("voxcpm_model") or "openbmb/VoxCPM2").strip()
+        requested_device = str(job.get("voxcpm_device") or "auto").strip() or "auto"
+        self.local_only = bool(job.get("voxcpm_local_files_only", True))
         try:
             import soundfile
             from voxcpm import VoxCPM
@@ -190,41 +173,65 @@ class VoxCPM2LocalSynthesizer:
                 "VoxCPM2 Local is not available in ai_libraries_common/python_env: "
                 f"{exc}"
             ) from exc
-        try:
-            self.model = VoxCPM.from_pretrained(
-                model_id,
-                load_denoiser=False,
-                local_files_only=local_only,
-                optimize=False,
-                device=device,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "VoxCPM2 Local model could not be loaded. Prepare openbmb/VoxCPM2 in "
-                f"the local Hugging Face cache first. Details: {exc}"
-            ) from exc
+        self._voxcpm_class = VoxCPM
         self.soundfile = soundfile
+        self.model = None
+        self.device = self._resolve_device(requested_device)
 
-    def synthesize(self, layer: dict, output: Path) -> None:
-        text = str(layer.get("content", "")).strip()
-        control = voxcpm_voice_control(layer)
-        wav = self.model.generate(
-            text=f"({control}){text}",
-            cfg_value=2.0,
-            inference_timesteps=10,
-            normalize=True,
-            denoise=False,
-            retry_badcase=True,
-            seed=voxcpm_speaker_seed(layer.get("speaker", "S1")),
-        )
-        sample_rate = int(self.model.tts_model.sample_rate)
-        self.soundfile.write(
-            str(output), wav, sample_rate, format="WAV", subtype="PCM_16"
-        )
-        if not output.is_file() or output.stat().st_size <= 44:
-            raise RuntimeError("VoxCPM2 Local produced no usable audio")
+        try:
+            self._load_model(self.device)
+        except Exception as first_exc:
+            if not self.device.startswith("cuda"):
+                raise RuntimeError(
+                    "VoxCPM2 Local model could not be loaded. Prepare openbmb/VoxCPM2 in "
+                    f"the local Hugging Face cache first. Details: {first_exc}"
+                ) from first_exc
+            self._clear_model_and_cuda()
+            emit({
+                "progress": (
+                    "VoxCPM2 Local · CUDA model load failed; releasing GPU memory and "
+                    f"retrying on CPU ({self._short_error(first_exc)})"
+                )
+            })
+            self.device = "cpu"
+            try:
+                self._load_model("cpu")
+            except Exception as cpu_exc:
+                raise RuntimeError(
+                    "VoxCPM2 Local model failed on both CUDA and CPU. "
+                    f"CUDA: {first_exc}; CPU: {cpu_exc}"
+                ) from cpu_exc
 
-    def release(self) -> None:
+    @staticmethod
+    def _resolve_device(requested_device: str) -> str:
+        requested = str(requested_device or "auto").strip().lower() or "auto"
+        if requested != "auto":
+            return requested
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    @staticmethod
+    def _short_error(exc: Exception) -> str:
+        detail = " ".join(str(exc).split()) or exc.__class__.__name__
+        return detail[:240]
+
+    def _load_model(self, device: str) -> None:
+        emit({"progress": f"VoxCPM2 Local · loading model on {device}"})
+        self.model = self._voxcpm_class.from_pretrained(
+            self.model_id,
+            load_denoiser=False,
+            local_files_only=self.local_only,
+            optimize=False,
+            device=device,
+        )
+        self.device = device
+        emit({"progress": f"VoxCPM2 Local · model ready on {device}"})
+
+    def _clear_model_and_cuda(self) -> None:
         model = getattr(self, "model", None)
         self.model = None
         if model is not None:
@@ -238,6 +245,60 @@ class VoxCPM2LocalSynthesizer:
                 torch.cuda.ipc_collect()
         except Exception:
             pass
+
+    def _generate(self, layer: dict):
+        text = str(layer.get("content", "")).strip()
+        control = voxcpm_voice_control(layer)
+        return self.model.generate(
+            text=f"({control}){text}",
+            cfg_value=2.0,
+            inference_timesteps=10,
+            normalize=True,
+            denoise=False,
+            retry_badcase=True,
+            seed=voxcpm_speaker_seed(layer.get("speaker", "S1")),
+        )
+
+    def _fallback_after_cuda_inference(self, cuda_exc: Exception) -> None:
+        self._clear_model_and_cuda()
+        emit({
+            "progress": (
+                "VoxCPM2 Local · CUDA synthesis failed; releasing GPU memory and "
+                f"retrying the current dialogue on CPU ({self._short_error(cuda_exc)})"
+            )
+        })
+        self.device = "cpu"
+        try:
+            self._load_model("cpu")
+        except Exception as cpu_exc:
+            raise RuntimeError(
+                "VoxCPM2 Local CUDA synthesis failed and the CPU fallback model "
+                f"could not be loaded. CUDA: {cuda_exc}; CPU: {cpu_exc}"
+            ) from cpu_exc
+
+    def synthesize(self, layer: dict, output: Path) -> None:
+        try:
+            wav = self._generate(layer)
+        except Exception as first_exc:
+            if not self.device.startswith("cuda"):
+                raise
+            self._fallback_after_cuda_inference(first_exc)
+            try:
+                wav = self._generate(layer)
+            except Exception as cpu_exc:
+                raise RuntimeError(
+                    "VoxCPM2 Local synthesis failed on both CUDA and CPU. "
+                    f"CUDA: {first_exc}; CPU: {cpu_exc}"
+                ) from cpu_exc
+        sample_rate = int(self.model.tts_model.sample_rate)
+        self.soundfile.write(
+            str(output), wav, sample_rate, format="WAV", subtype="PCM_16"
+        )
+        if not output.is_file() or output.stat().st_size <= 44:
+            raise RuntimeError("VoxCPM2 Local produced no usable audio")
+
+    def release(self) -> None:
+        self._clear_model_and_cuda()
 
 
 class EdgeTTSSynthesizer:

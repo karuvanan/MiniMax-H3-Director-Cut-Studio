@@ -2,6 +2,20 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.7] - 2026-08-27
+
+### Changed
+
+- VoxCPM2 Local `auto` mode now attempts explicit CUDA whenever the bundled PyTorch runtime reports CUDA availability; the previous automatic CPU selection below 8 GB VRAM has been removed.
+- If CUDA fails while loading VoxCPM2 or while synthesizing a dialogue line, the isolated worker releases the model and CUDA cache, reloads on CPU and retries the same line automatically.
+- Runtime progress now identifies the attempted device, the ready device and any CUDA-to-CPU fallback stage.
+
+### Verification
+
+- Added regressions for CUDA model-load failure and CUDA inference failure, including exact CPU retry behavior.
+- The complete bundled test suite passed: `248` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.6] - 2026-08-27
 
 ### Added
