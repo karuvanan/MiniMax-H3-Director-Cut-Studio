@@ -687,6 +687,16 @@ VoxCPM2 Local · model ready on cpu
 
 注意：CUDA 可用不代表模型一定能放进显存。GTX 1050 4GB 会先真实尝试 CUDA，但仍可能因为显存不足自动回退 CPU；这属于正常保护行为。关闭其他占用显存的软件、ComfyUI 正在驻留的模型或浏览器 GPU 页面，可以提高成功使用 CUDA 的机会。若 CUDA 持续失败，请查看阶段信息括号内的原始错误，不要同时手动启动多个 VoxCPM2 实例。
 
+> **Note — 新电脑找不到 `voxcpm`：** 复制项目到另一台电脑后，如果出现 `ModuleNotFoundError: No module named 'voxcpm'`，请先进入 `ai_libraries_common\python_env\Scripts`，再依次执行以下命令。`..\python.exe` 会明确使用 Studio 自带的 Python，不会修改系统 Python。
+
+```powershell
+..\python.exe -m pip install --upgrade --force-reinstall --no-cache-dir --no-deps voxcpm
+..\python.exe -c "from voxcpm import VoxCPM; print('VoxCPM is ready')"
+..\python.exe -m pip show voxcpm
+```
+
+第二条显示 `VoxCPM is ready`，第三条能够列出 VoxCPM 的版本及安装位置，才表示该电脑的 bundled 环境已经可以导入 VoxCPM。`--no-deps` 只补装 VoxCPM 本体并保留项目已经固定的 Torch、Torchaudio、NumPy 及其他依赖版本；如果随后仍提示缺少其他模块，应按照 README 的完整依赖清单修复 bundled 环境，不要改用系统 Python 启动 Studio。
+
 ### Design 超时
 
 - `H3_DESIGN_TIMEOUT` 是单次 Design 流程的总等待上限，当前默认 900 秒。
