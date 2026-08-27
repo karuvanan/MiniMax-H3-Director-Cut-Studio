@@ -122,6 +122,11 @@ from prompt_preset_store import (
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 from settings_engine import RenderSettings, load_settings, save_settings
 from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
+from voxcpm_runtime import (
+    VOXCPM_MODEL_DIR,
+    voxcpm_missing_message,
+    voxcpm_model_missing,
+)
 from skill_engine import (
     DEFAULT_SKILL,
     NONE_SPECIAL,
@@ -3987,6 +3992,10 @@ class DesignPageDialog(QDialog):
             self.dialogue_mode_buttons[engine] = button
             requirement_header.addWidget(button)
         concept_layout.addLayout(requirement_header)
+        self.dialogue_model_warning = QLabel()
+        self.dialogue_model_warning.setWordWrap(True)
+        concept_layout.addWidget(self.dialogue_model_warning)
+        self._refresh_design_voxcpm_model_status()
         self.requirement_edit = QPlainTextEdit()
         self.requirement_edit.setPlaceholderText(
             "Example: I need a 12-second video. Begin with a hand gripping a can of cola, "
@@ -5083,7 +5092,38 @@ class DesignPageDialog(QDialog):
         button = self.dialogue_mode_buttons.get(engine)
         if button and not button.isChecked():
             button.setChecked(True)
+        self._refresh_design_voxcpm_model_status()
         self._invalidate_json()
+
+    def _refresh_design_voxcpm_model_status(self) -> None:
+        missing = voxcpm_model_missing()
+        button = self.dialogue_mode_buttons.get("voxcpm2_local")
+        if button is not None:
+            if missing:
+                button.setStyleSheet(
+                    "background:#6b321f; border:1px solid #ffad42; "
+                    "color:#fff2dc; font-weight:700;"
+                )
+                button.setToolTip(
+                    "VoxCPM2 MODEL MISSING · download openbmb/VoxCPM2 to "
+                    + str(VOXCPM_MODEL_DIR)
+                )
+            else:
+                button.setStyleSheet("")
+                button.setToolTip(
+                    "VoxCPM2 Local · model ready in " + str(VOXCPM_MODEL_DIR)
+                )
+        selected_missing = bool(missing) and self.design_tts_engine == "voxcpm2_local"
+        self.dialogue_model_warning.setVisible(selected_missing)
+        if selected_missing:
+            self.dialogue_model_warning.setText(
+                "⚠ VOXCPM2 MODEL MISSING · Download openbmb/VoxCPM2 to "
+                f"{VOXCPM_MODEL_DIR}\nMissing: {', '.join(missing)}"
+            )
+            self.dialogue_model_warning.setStyleSheet(
+                "background:#4a251a; color:#ffd28b; border:1px solid #ff9d38; "
+                "padding:5px; font-weight:700;"
+            )
 
     def _service_message(self, payload: dict) -> None:
         if payload.get("ready"):
@@ -5346,6 +5386,24 @@ class DesignPageDialog(QDialog):
         if self.validated_plan is None and not self.validate_json():
             return
         plan = dict(self.validated_plan)
+        has_authored_speech = any(
+            str(item.get("role", "")).strip().lower()
+            in {"dialogue", "voice_over", "lyrics"}
+            and str(item.get("content", "")).strip()
+            for item in plan.get("text_layers") or []
+        )
+        if (
+            self.design_tts_engine == "voxcpm2_local"
+            and has_authored_speech
+            and voxcpm_model_missing()
+        ):
+            self._refresh_design_voxcpm_model_status()
+            QMessageBox.warning(
+                self,
+                "VoxCPM2 model missing",
+                voxcpm_missing_message(),
+            )
+            return
         requirement = (
             self.pending_requirement
             or self.requirement_edit.toPlainText().strip()
@@ -5673,9 +5731,11 @@ class DirectorCutStudio(QMainWindow):
         self.settings_dialogue_tts.setToolTip(
             "Speech mode used for Dialogue, Voice-over and Lyrics text layers. "
             "H3 Native sends exact Timeline text without creating a WAV. "
-            "VoxCPM2 loads from the local model cache only; systems below 8 GB VRAM "
-            "use the slower safe CPU mode."
+            "VoxCPM2 loads only from project models/VoxCPM2, prefers CUDA, and "
+            "automatically retries on CPU if CUDA fails."
         )
+        self.settings_voxcpm_model_status = QLabel()
+        self.settings_voxcpm_model_status.setWordWrap(True)
         self.settings_blip_device = QComboBox()
         self.settings_blip_device.addItem(
             "Auto · CPU-safe start, verified CUDA when available",
@@ -5701,6 +5761,7 @@ class DirectorCutStudio(QMainWindow):
         form.addRow("Generation timeout", self.settings_generation_timeout)
         form.addRow("HTTP request timeout", self.settings_http_timeout)
         form.addRow("Dialogue Text Layer TTS", self.settings_dialogue_tts)
+        form.addRow("VoxCPM2 model", self.settings_voxcpm_model_status)
         form.addRow("BLIP inference device", self.settings_blip_device)
         form.addRow("Mapped API nodes", self.settings_node_map)
         buttons = QHBoxLayout()
@@ -5741,6 +5802,35 @@ class DirectorCutStudio(QMainWindow):
         self.settings_dialogue_tts.setCurrentIndex(max(0, tts_index))
         blip_index = self.settings_blip_device.findData(settings.blip_device)
         self.settings_blip_device.setCurrentIndex(max(0, blip_index))
+        self._refresh_voxcpm_model_status_ui()
+
+    def _refresh_voxcpm_model_status_ui(self) -> bool:
+        missing = voxcpm_model_missing()
+        ready = not missing
+        if ready:
+            self.settings_voxcpm_model_status.setText(
+                "READY · " + str(VOXCPM_MODEL_DIR)
+            )
+            self.settings_voxcpm_model_status.setStyleSheet(
+                "color:#72d69a; font-weight:700; padding:3px;"
+            )
+            self.settings_dialogue_tts.setStyleSheet("")
+        else:
+            self.settings_voxcpm_model_status.setText(
+                "⚠ MODEL MISSING · Download openbmb/VoxCPM2 to "
+                f"{VOXCPM_MODEL_DIR}\nMissing: {', '.join(missing)}"
+            )
+            self.settings_voxcpm_model_status.setStyleSheet(
+                "background:#4a251a; color:#ffd28b; border:1px solid #ff9d38; "
+                "padding:4px; font-weight:700;"
+            )
+            if self.settings_dialogue_tts.currentData() == "voxcpm2_local":
+                self.settings_dialogue_tts.setStyleSheet(
+                    "border:2px solid #ff9d38; background:#3f261d; color:#ffe0ad;"
+                )
+            else:
+                self.settings_dialogue_tts.setStyleSheet("")
+        return ready
 
     def _settings_ui_changed(self, *_args) -> None:
         self._read_settings_ui()
@@ -5769,6 +5859,7 @@ class DirectorCutStudio(QMainWindow):
         previous = self.render_settings.dialogue_tts_engine
         self._settings_ui_changed()
         selected = self.render_settings.dialogue_tts_engine
+        model_ready = self._refresh_voxcpm_model_status_ui()
         if selected == previous:
             return
         if selected == "h3_native":
@@ -5787,6 +5878,13 @@ class DirectorCutStudio(QMainWindow):
                 10000,
             )
             return
+        if selected == "voxcpm2_local" and not model_ready:
+            self.statusBar().showMessage(
+                "VoxCPM2 MODEL MISSING · download openbmb/VoxCPM2 to "
+                + str(VOXCPM_MODEL_DIR),
+                15000,
+            )
+            return
         if self._speech_layers_for_tts():
             self.timeline_tts_stale = True
         label = "VoxCPM2 Local" if selected == "voxcpm2_local" else "Edge TTS"
@@ -5794,6 +5892,17 @@ class DirectorCutStudio(QMainWindow):
             f"Dialogue mode changed to {label} · WAV will rebuild before Preview/Run",
             10000,
         )
+
+    def _require_voxcpm_model(self, *, notify: bool = False) -> bool:
+        missing = voxcpm_model_missing()
+        self._refresh_voxcpm_model_status_ui()
+        if not missing:
+            return True
+        message = voxcpm_missing_message()
+        self.statusBar().showMessage(message, 15000)
+        if notify:
+            QMessageBox.warning(self, "VoxCPM2 model missing", message)
+        return False
 
     def _read_settings_ui(self) -> None:
         self.render_settings = RenderSettings.from_mapping(
@@ -7008,6 +7117,11 @@ class DirectorCutStudio(QMainWindow):
     ) -> None:
         if self.design_tts_runner and self.design_tts_runner.is_running():
             raise RuntimeError("AI Design Mandarin TTS is already running")
+        if (
+            self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+            and not self._require_voxcpm_model()
+        ):
+            raise RuntimeError(voxcpm_missing_message())
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         job_path = CACHE_ROOT / f"design_tts_{time.time_ns()}.json"
         job_path.write_text(json.dumps({
@@ -7017,7 +7131,7 @@ class DirectorCutStudio(QMainWindow):
             "ffmpeg": str(self.runtime.ffmpeg),
             "sapi_script": str(PROJECT_ROOT / "tts_sapi.ps1"),
             "engine": self.render_settings.dialogue_tts_engine,
-            "voxcpm_model": "openbmb/VoxCPM2",
+            "voxcpm_model": str(VOXCPM_MODEL_DIR),
             "voxcpm_device": "auto",
             "voxcpm_local_files_only": True,
         }, ensure_ascii=False), encoding="utf-8")
@@ -7224,6 +7338,11 @@ class DirectorCutStudio(QMainWindow):
         if self.render_settings.dialogue_tts_engine == "h3_native":
             self._use_h3_native_dialogue()
             return False
+        if (
+            self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+            and not self._require_voxcpm_model(notify=bool(resume))
+        ):
+            return False
         layers = self._speech_layers_for_tts()
         if not layers:
             latest_signature = self._timeline_tts_signature()
@@ -7257,7 +7376,7 @@ class DirectorCutStudio(QMainWindow):
             "ffmpeg": str(self.runtime.ffmpeg),
             "sapi_script": str(PROJECT_ROOT / "tts_sapi.ps1"),
             "engine": self.render_settings.dialogue_tts_engine,
-            "voxcpm_model": "openbmb/VoxCPM2",
+            "voxcpm_model": str(VOXCPM_MODEL_DIR),
             "voxcpm_device": "auto",
             "voxcpm_local_files_only": True,
         }, ensure_ascii=False), encoding="utf-8")
@@ -7618,6 +7737,12 @@ class DirectorCutStudio(QMainWindow):
             tts_required = self._ensure_authored_tts_request(
                 plan, authored_requirement
             )
+            if (
+                tts_required
+                and self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+                and not self._require_voxcpm_model()
+            ):
+                raise ValueError(voxcpm_missing_message())
             DESIGN_EXAMPLE_ROOT.mkdir(exist_ok=True)
             design_dir, materials = materialize_design_media(
                 plan, DESIGN_EXAMPLE_ROOT, self.runtime.ffmpeg
@@ -13285,6 +13410,12 @@ class DirectorCutStudio(QMainWindow):
             return
         self._read_settings_ui()
         speech_layers = self._speech_layers_for_tts()
+        if (
+            speech_layers
+            and self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+            and not self._require_voxcpm_model(notify=True)
+        ):
+            return
         if self.render_settings.dialogue_tts_engine == "h3_native":
             self._use_h3_native_dialogue()
         authored_asset = (

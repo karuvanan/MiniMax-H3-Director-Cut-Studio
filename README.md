@@ -227,7 +227,7 @@ video_minimax_h3_r2v API 3IMAGE 1AUDIO 1VIDEO.json
 | CUDA runtime | `12.6` |
 | Transformers | `5.12.1` |
 | Dialogue audio | 默认 `MiniMax H3 Native Dialogue`；Settings／Design 可切换 `VoxCPM2 Local` 或 `Edge TTS`，Edge 使用 `edge-tts 7.2.7` |
-| VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；本地模型 `openbmb/VoxCPM2`，不在生成时联网下载；Studio 自动采用 CUDA 优先、失败后 CPU 重试 |
+| VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；权重不随 runtime／GitHub 提供，用户自行下载 `openbmb/VoxCPM2` 到项目 `models/VoxCPM2/`；Studio 自动采用 CUDA 优先、失败后 CPU 重试 |
 | FFmpeg / FFprobe | `ai_libraries_common/engine_ffmpeg/bin/`，2026-05-25 build |
 
 ### 完整 Python library 版本清单
@@ -421,6 +421,36 @@ FFmpeg: 2026-05-25-git-34dfa8bf2b-full_build-www.gyan.dev
 .\run_h3_prompt_studio.bat
 ```
 
+### VoxCPM2 模型需要用户自行下载
+
+VoxCPM2 权重约数 GB，不放入 `ai_libraries_common`，也不会上传到 GitHub／runtime 压缩包。每台电脑需要自行下载完整的 [`openbmb/VoxCPM2`](https://huggingface.co/openbmb/VoxCPM2) snapshot，并保持以下目录：
+
+```text
+minimax h3 reference r2v/
+└── models/
+    └── VoxCPM2/
+        ├── config.json
+        ├── tokenizer.json
+        ├── tokenizer_config.json
+        ├── special_tokens_map.json
+        ├── tokenization_voxcpm2.py
+        ├── model.safetensors
+        └── audiovae.pth
+```
+
+主模型也可使用 `pytorch_model.bin`，AudioVAE 也可使用 `audiovae.safetensors`。Studio 不会从隐藏的 Hugging Face cache 猜测或联网下载权重，只会检查项目内固定路径：
+
+```text
+models\VoxCPM2
+```
+
+如果目录或必要文件缺失：
+
+- Design 的 `Vox` 按钮会以橙色高亮；点击后在输入区显示 `VOXCPM2 MODEL MISSING`。
+- 主页 Settings 的 `VoxCPM2 model` 状态会列出固定路径与缺少的文件。
+- Apply、Preview 和 Run 会在建立 Audio reference 或启动 TTS worker 前停止并提示，不会长时间等待后才失败。
+- 下载完成后重新打开 Settings 或再次点击 Design 的 `Vox`，Studio 会重新检查。
+
 独立启动 VoxCPM2 WebUI（固定使用 bundled `python_env`，默认仅限本机 `127.0.0.1:8088`）：
 
 ```powershell
@@ -430,7 +460,7 @@ FFmpeg: 2026-05-25-git-34dfa8bf2b-full_build-www.gyan.dev
 不要在 `VoxCPM-main` 内直接运行 `app -port 8088`；这会使用系统 Python，而且正确参数是 `--port`。等价的手动命令是：
 
 ```powershell
-.\ai_libraries_common\python_env\python.exe .\ai_libraries_common\VoxCPM-main\app.py --host 127.0.0.1 --port 8088
+.\ai_libraries_common\python_env\python.exe .\ai_libraries_common\VoxCPM-main\app.py --host 127.0.0.1 --port 8088 --model-id ".\models\VoxCPM2"
 ```
 
 默认启动 `director_cut_studio.py`。旧 Tkinter 程序保留在 `h3_prompt_studio.py`。
@@ -507,7 +537,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics；文字层可以放入任意空 V Track，不需要与原素材重叠。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
 - Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Qwen 会从故事、Shot 与素材证据判断实际说话角色：女声分配 `S1`，男声分配 `S2`，并跨 Shot 保持一致；若用户明确写了 S1／S2 则以用户指定为准。逐字保护器只保护文字和时间，不会再把 Qwen 的合法 Speaker 选择覆盖回默认 S1。
 - Design Requirement 标题同一排提供三种对白模式按钮：`Ori` = MiniMax H3 Native Dialogue、`Vox` = VoxCPM2 Local、`Etts` = Edge TTS。默认 `Ori`；按钮选择会随 Apply 成为当前项目设置并写入 `.env`。回到 Timeline 后仍可在主页 Settings 改换，不必重新进入 Design。
-- `Ori` 不建立 authored WAV，H3 Prompt 会要求 MiniMax H3 根据最新 Text Layer 生成原语言对白与口型，并排除旧 authored-speech Audio。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 使用本地缓存的 `openbmb/VoxCPM2`、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
+- `Ori` 不建立 authored WAV，H3 Prompt 会要求 MiniMax H3 根据最新 Text Layer 生成原语言对白与口型，并排除旧 authored-speech Audio。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 只使用项目 `models/VoxCPM2/` 的完整 snapshot、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
 - Design 会自动建立与场景相符的 diegetic ambience、环境底噪和接触拟音；H3 Prompt 会要求对白始终位于前景，并在说话时自动压低背景声与音乐。背景声由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会重复对白。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、必须完成的 Core Action、必须保持的 Continuity State、Required Environment Response、可以省略的 Optional Flourish、Additional Direction 与 Shot Prompt Preset。
@@ -653,12 +683,12 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 
 ### VoxCPM2 加载在 CPU 很慢，怎样使用 CUDA
 
-在 Design Requirement 选择 `Vox`，或在主页 Settings 把 Dialogue Text Layer 改成 `VoxCPM2 Local`。Studio 直接通过独立的 `tts_service.py` worker 载入 VoxCPM2，不需要另外启动 VoxCPM2 WebUI。
+在 Design Requirement 选择 `Vox`，或在主页 Settings 把 Dialogue Text Layer 改成 `VoxCPM2 Local`。Studio 直接通过独立的 `tts_service.py` worker 从 `models/VoxCPM2/` 载入 VoxCPM2，不需要另外启动 VoxCPM2 WebUI。
 
 从 `v0.2.5-alpha.7` 开始，`voxcpm_device=auto` 的执行顺序如下：
 
 1. 使用 bundled `python_env` 检查 `torch.cuda.is_available()`。
-2. 检测到 CUDA 时明确使用 `device=cuda` 载入 `openbmb/VoxCPM2`；不会再因为显存少于 8GB 而预先强制 CPU。
+2. 检测到 CUDA 时明确使用 `device=cuda` 载入项目 `models/VoxCPM2/` 内的 `openbmb/VoxCPM2` snapshot；不会再因为显存少于 8GB 而预先强制 CPU。
 3. CUDA 模型载入成功后，整批 Dialogue Text Layers 共用同一个 GPU 模型。
 4. 如果模型载入阶段发生 CUDA、显存不足或架构兼容错误，worker 会删除不完整模型、执行 CUDA cache 清理，再以 `device=cpu` 重载。
 5. 如果模型已成功载入 CUDA，但生成某一句对白时才失败，worker 同样会释放 CUDA、载入 CPU，并自动重试当前这句对白；已经确定的逐字内容、Speaker、时间范围不会改变。
@@ -760,13 +790,13 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**248 tests passed**。
+当前完整验证结果：**249 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 248 tests
+Ran 249 tests
 OK
 ```

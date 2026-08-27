@@ -14,6 +14,12 @@ import subprocess
 import uuid
 import wave
 
+from voxcpm_runtime import (
+    VOXCPM_MODEL_DIR,
+    voxcpm_missing_message,
+    voxcpm_model_missing,
+)
+
 
 TTS_ENGINE_LABELS = {
     "edge_tts": "Edge neural Mandarin TTS with Windows SAPI fallback",
@@ -162,9 +168,12 @@ class VoxCPM2LocalSynthesizer:
     """Load VoxCPM2 once per isolated job, preferring CUDA with CPU fallback."""
 
     def __init__(self, job: dict):
-        self.model_id = str(job.get("voxcpm_model") or "openbmb/VoxCPM2").strip()
+        self.model_id = str(job.get("voxcpm_model") or VOXCPM_MODEL_DIR).strip()
         requested_device = str(job.get("voxcpm_device") or "auto").strip() or "auto"
         self.local_only = bool(job.get("voxcpm_local_files_only", True))
+        missing = voxcpm_model_missing(self.model_id)
+        if missing:
+            raise RuntimeError(voxcpm_missing_message(self.model_id))
         try:
             import soundfile
             from voxcpm import VoxCPM
@@ -183,8 +192,8 @@ class VoxCPM2LocalSynthesizer:
         except Exception as first_exc:
             if not self.device.startswith("cuda"):
                 raise RuntimeError(
-                    "VoxCPM2 Local model could not be loaded. Prepare openbmb/VoxCPM2 in "
-                    f"the local Hugging Face cache first. Details: {first_exc}"
+                    "VoxCPM2 Local model could not be loaded from the project models "
+                    f"folder. Details: {first_exc}"
                 ) from first_exc
             self._clear_model_and_cuda()
             emit({

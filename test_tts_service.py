@@ -53,6 +53,14 @@ def _fake_modules(loader):
 
 
 class VoxCPMCudaFallbackTests(unittest.TestCase):
+    def test_missing_project_model_is_rejected_before_voxcpm_import(self):
+        with patch(
+            "tts_service.voxcpm_model_missing",
+            return_value=["model folder"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "models.VoxCPM2"):
+                VoxCPM2LocalSynthesizer({"voxcpm_device": "auto"})
+
     def test_auto_tries_cuda_then_cpu_when_model_load_fails(self):
         class Loader:
             calls = []
@@ -64,7 +72,10 @@ class VoxCPMCudaFallbackTests(unittest.TestCase):
                     raise RuntimeError("CUDA out of memory")
                 return _FakeModel()
 
-        with patch.dict(sys.modules, _fake_modules(Loader)):
+        with (
+            patch("tts_service.voxcpm_model_missing", return_value=[]),
+            patch.dict(sys.modules, _fake_modules(Loader)),
+        ):
             synthesizer = VoxCPM2LocalSynthesizer({"voxcpm_device": "auto"})
             try:
                 self.assertEqual(Loader.calls, ["cuda", "cpu"])
@@ -83,7 +94,10 @@ class VoxCPMCudaFallbackTests(unittest.TestCase):
                     return _FakeModel(generate_error=RuntimeError("CUDA kernel failure"))
                 return _FakeModel()
 
-        with patch.dict(sys.modules, _fake_modules(Loader)):
+        with (
+            patch("tts_service.voxcpm_model_missing", return_value=[]),
+            patch.dict(sys.modules, _fake_modules(Loader)),
+        ):
             synthesizer = VoxCPM2LocalSynthesizer({"voxcpm_device": "auto"})
             try:
                 output = Path("dialogue.wav")

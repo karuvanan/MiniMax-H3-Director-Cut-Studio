@@ -2,6 +2,26 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.8] - 2026-08-27
+
+### Added
+
+- Added one explicit project-local VoxCPM2 weight location: `models/VoxCPM2/`. Large weights are excluded from GitHub and the bundled `ai_libraries_common` runtime so users can download them separately.
+- Design highlights the `Vox` button and shows a `VOXCPM2 MODEL MISSING` panel when the required snapshot is absent or incomplete.
+- Main Settings now displays a persistent ready/missing VoxCPM2 model status with the exact expected path and missing files.
+- Apply, Preview and Run now preflight the local snapshot before reserving or rebuilding authored speech.
+
+### Changed
+
+- The VoxCPM2 worker no longer resolves `openbmb/VoxCPM2` through a hidden Hugging Face cache and never downloads model weights during generation.
+- Added `models/README.md` with the accepted weight and AudioVAE filename alternatives; `.gitignore` retains the instructions while excluding downloaded weights.
+
+### Verification
+
+- Added regression coverage for the missing-model worker guard and both highlighted UI entry points.
+- The complete bundled test suite passed: `249` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.7] - 2026-08-27
 
 ### Changed

@@ -4,6 +4,7 @@ setlocal
 set "H3_ROOT=%~dp0"
 set "H3_PYTHON=%H3_ROOT%ai_libraries_common\python_env\python.exe"
 set "H3_VOXCPM=%H3_ROOT%ai_libraries_common\VoxCPM-main"
+set "H3_VOXMODEL=%H3_ROOT%models\VoxCPM2"
 
 if not exist "%H3_PYTHON%" (
     echo [VoxCPM2] Bundled Python was not found:
@@ -19,10 +20,18 @@ if not exist "%H3_VOXCPM%\app.py" (
     exit /b 1
 )
 
+if not exist "%H3_VOXMODEL%\config.json" (
+    echo [VoxCPM2] Project-local model was not found:
+    echo %H3_VOXMODEL%
+    echo Download the complete openbmb/VoxCPM2 snapshot into models\VoxCPM2 first.
+    pause
+    exit /b 1
+)
+
 pushd "%H3_VOXCPM%"
 echo [VoxCPM2] Starting local WebUI at http://127.0.0.1:8088
-echo [VoxCPM2] The first model load may download the VoxCPM2 weights.
-"%H3_PYTHON%" app.py --host 127.0.0.1 --port 8088 %*
+echo [VoxCPM2] Loading project-local model: %H3_VOXMODEL%
+"%H3_PYTHON%" app.py --host 127.0.0.1 --port 8088 --model-id "%H3_VOXMODEL%" %*
 set "H3_EXIT=%ERRORLEVEL%"
 popd
 

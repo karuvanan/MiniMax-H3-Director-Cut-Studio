@@ -5,5 +5,7 @@ __pycache__/
 ai_libraries_common/python_env/
 ai_libraries_common/engine_ffmpeg/
 ai_libraries_common/models/
+models/*
+!models/README.md
 .director_cache/
 director_projects/

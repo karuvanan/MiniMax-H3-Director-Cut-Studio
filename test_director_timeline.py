@@ -3609,16 +3609,39 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window = DirectorCutStudio()
         context = window._design_context()
         context["dialogue_tts_engine"] = "h3_native"
-        dialog = DesignPageDialog(
-            window.runtime, context, window.scan.counts, window,
-            context_provider=window._design_context,
-        )
-        self.assertEqual(dialog.design_tts_engine, "h3_native")
-        self.assertTrue(dialog.dialogue_mode_buttons["h3_native"].isChecked())
-        dialog.dialogue_mode_buttons["voxcpm2_local"].click()
-        self.assertEqual(dialog.design_tts_engine, "voxcpm2_local")
-        self.assertTrue(dialog.dialogue_mode_buttons["voxcpm2_local"].isChecked())
-        dialog.close()
+        with patch(
+            "director_cut_studio.voxcpm_model_missing",
+            return_value=["model folder"],
+        ):
+            dialog = DesignPageDialog(
+                window.runtime, context, window.scan.counts, window,
+                context_provider=window._design_context,
+            )
+            self.assertEqual(dialog.design_tts_engine, "h3_native")
+            self.assertTrue(dialog.dialogue_mode_buttons["h3_native"].isChecked())
+            self.assertIn(
+                "ffad42",
+                dialog.dialogue_mode_buttons["voxcpm2_local"].styleSheet(),
+            )
+            dialog.dialogue_mode_buttons["voxcpm2_local"].click()
+            self.assertEqual(dialog.design_tts_engine, "voxcpm2_local")
+            self.assertTrue(dialog.dialogue_mode_buttons["voxcpm2_local"].isChecked())
+            self.assertFalse(dialog.dialogue_model_warning.isHidden())
+            self.assertIn("MODEL MISSING", dialog.dialogue_model_warning.text())
+            dialog.close()
+
+        with patch(
+            "director_cut_studio.voxcpm_model_missing",
+            return_value=["model.safetensors or pytorch_model.bin"],
+        ):
+            window.settings_dialogue_tts.setCurrentIndex(
+                window.settings_dialogue_tts.findData("voxcpm2_local")
+            )
+            self.assertFalse(window._refresh_voxcpm_model_status_ui())
+            self.assertIn(
+                "MODEL MISSING", window.settings_voxcpm_model_status.text()
+            )
+            self.assertIn("ff9d38", window.settings_dialogue_tts.styleSheet())
 
         window.text_layers = [TextLayer(
             "T1", "Exact words", 0.0, 3.0, "A4",
