@@ -2,6 +2,18 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.9.1] - 2026-08-27
+
+### Changed
+
+- VoxCPM2 now unloads immediately after the final source utterance WAV is written, before FFmpeg Timeline composition begins, so the multi-gigabyte model is not retained during audio post-processing.
+- Model release is explicit and idempotent: it drops model references, runs Python garbage collection, clears CUDA cache/IPC, and reports both the unloading and released stages. All success and exception paths still terminate the isolated worker, allowing Windows to reclaim any remaining VRAM and DRAM.
+
+### Verification
+
+- Five focused provider lifecycle regressions passed, covering Timeline composition, CUDA-load fallback, CUDA-inference fallback, missing-model validation and idempotent model release.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.9] - 2026-08-27
 
 ### Fixed

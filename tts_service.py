@@ -186,12 +186,14 @@ class VoxCPM2LocalSynthesizer:
         self._voxcpm_class = VoxCPM
         self.soundfile = soundfile
         self.model = None
+        self._released = False
         self.device = self._resolve_device(requested_device)
 
         try:
             self._load_model(self.device)
         except Exception as first_exc:
             if not self.device.startswith("cuda"):
+                self._clear_model_and_cuda()
                 raise RuntimeError(
                     "VoxCPM2 Local model could not be loaded from the project models "
                     f"folder. Details: {first_exc}"
@@ -207,6 +209,7 @@ class VoxCPM2LocalSynthesizer:
             try:
                 self._load_model("cpu", fallback_reason=self._short_error(first_exc))
             except Exception as cpu_exc:
+                self._clear_model_and_cuda()
                 raise RuntimeError(
                     "VoxCPM2 Local model failed on both CUDA and CPU. "
                     f"CUDA: {first_exc}; CPU: {cpu_exc}"
@@ -241,6 +244,7 @@ class VoxCPM2LocalSynthesizer:
             optimize=False,
             device=device,
         )
+        self._released = False
         self.device = device
         emit({"progress": f"VoxCPM2 Local · model ready on {device}"})
 
@@ -329,7 +333,12 @@ class VoxCPM2LocalSynthesizer:
             raise RuntimeError("VoxCPM2 Local produced no usable audio")
 
     def release(self) -> None:
+        if self._released:
+            return
+        emit({"progress": "VoxCPM2 Local · unloading model and releasing VRAM/RAM"})
         self._clear_model_and_cuda()
+        self._released = True
+        emit({"progress": "VoxCPM2 Local · model unloaded · VRAM/RAM released"})
 
 
 class EdgeTTSSynthesizer:
@@ -421,6 +430,13 @@ def synthesize_timeline(job: dict) -> dict:
                 "tempo_factor": round(speed, 4),
                 "tts_engine": engine,
             })
+
+        # VoxCPM is no longer needed once all source utterances exist. Release
+        # its CUDA/CPU tensors before FFmpeg composition instead of retaining
+        # several gigabytes until the whole worker exits.
+        if engine == "voxcpm2_local":
+            synthesizer.release()
+            synthesizer = None
 
         labels = "".join(f"[speech{index}]" for index in range(len(inputs)))
         filters.append(

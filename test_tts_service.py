@@ -120,6 +120,26 @@ class VoxCPMCudaFallbackTests(unittest.TestCase):
             finally:
                 synthesizer.release()
 
+    def test_release_is_idempotent_and_drops_model_reference(self):
+        class Loader:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                return _FakeModel()
+
+        with (
+            patch("tts_service.voxcpm_model_missing", return_value=[]),
+            patch.dict(sys.modules, _fake_modules(Loader)),
+        ):
+            synthesizer = VoxCPM2LocalSynthesizer({"voxcpm_device": "cuda"})
+            with patch.object(
+                synthesizer, "_clear_model_and_cuda", wraps=synthesizer._clear_model_and_cuda
+            ) as clear:
+                synthesizer.release()
+                synthesizer.release()
+            self.assertIsNone(synthesizer.model)
+            self.assertTrue(synthesizer._released)
+            clear.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

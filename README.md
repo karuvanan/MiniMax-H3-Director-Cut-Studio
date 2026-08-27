@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.9`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.9.1`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -692,7 +692,9 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 3. CUDA 模型载入成功后，整批 Dialogue Text Layers 共用同一个 GPU 模型。
 4. 如果模型载入阶段发生 CUDA、显存不足或架构兼容错误，worker 会删除不完整模型、执行 CUDA cache 清理，再以 `device=cpu` 重载。
 5. 如果模型已成功载入 CUDA，但生成某一句对白时才失败，worker 同样会释放 CUDA、载入 CPU，并自动重试当前这句对白；已经确定的逐字内容、Speaker、时间范围不会改变。
-6. 整批对白完成后释放模型与 CUDA cache。VoxCPM2 失败不会静默改用 Edge TTS。
+6. 最后一句源 WAV 完成后、进入 FFmpeg 音轨合成前，立即删除 VoxCPM2 模型与张量、执行 Python GC、清空 CUDA cache／IPC，并显示 `model unloaded · VRAM/RAM released`；成功、失败与 CUDA→CPU 回退都走同一释放路径。独立 TTS worker 结束后，Windows 还会回收其剩余进程内存。VoxCPM2 失败不会静默改用 Edge TTS。
+
+Studio 的自动卸载只管理它自己启动的 `tts_service.py` 隔离 worker。如果另外手动运行了 `run_voxcpm2_webui.bat`／`app.py`，那是独立的常驻 WebUI 进程，会继续占用自己的 VRAM／DRAM；完成调试后需要关闭该 WebUI，Studio 不会擅自终止用户手动启动的服务。
 
 Program Monitor 的实时阶段会显示实际路径，例如：
 
