@@ -2,6 +2,46 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.6] - 2026-08-27
+
+### Added
+
+- Added three exclusive Dialogue mode buttons beside `DESIGN REQUIREMENT`: `Ori` (MiniMax H3 Native Dialogue), `Vox` (VoxCPM2 Local) and `Etts` (Edge TTS).
+- Added `h3_native` as the persistent Settings／`.env` mode and made it the safe default for new workspaces.
+- Switching an Ori Design to Vox／Etts from Timeline Settings now reserves an empty physical Audio slot, builds the authored WAV and restores it to Timeline automatically before Preview／Run.
+
+### Changed
+
+- The Design button choice is applied to the current project and persisted to `.env`; users can still override it later from the main Settings page without reopening Design.
+- Ori mode explicitly bypasses and disables any previous authored-speech WAV while retaining the editable Text Layers for native H3 dialogue generation.
+- Vox／Etts mode restores a deleted Timeline authored-speech clip when its reusable Media Pool source remains, or creates a fresh authored Audio reference when a free slot exists.
+
+### Verification
+
+- Added regressions for the three Design buttons, native default validation, Ori-to-Vox Audio reservation and native exclusion of an old TTS reference.
+- The complete bundled test suite passed: `246` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
+## [0.2.5-alpha.5] - 2026-08-27
+
+### Added
+
+- Qwen Design planning now assigns female on-screen speakers to `S1` and male on-screen speakers to `S2`, keeps the identity stable across Shots, and preserves an explicit user Speaker override.
+- Added automatic diegetic ambience and contact-foley planning, with dialogue foregrounding and background/music ducking instructions.
+
+### Fixed
+
+- Exact-text protection no longer overwrites Qwen's valid gender-aware Speaker assignment with default `S1`.
+- Editing Timeline Dialogue, Voice-over or Lyrics now makes the previous authored WAV stale, rebuilds it through the selected Edge/VoxCPM2 provider, refreshes the Shot/H3 Prompt, and prevents generation from resuming with an intermediate obsolete WAV.
+- Preview and Run automatically enable, un-bypass and unmute the generated authored-speech Audio reference; if other A Tracks are soloed, the speech track joins the solo set.
+- The current Timeline text becomes the updated authored-text contract after an intentional edit, so validation protects the edited words instead of demanding the superseded Design wording.
+
+### Verification
+
+- Added regressions for gender-aware Speaker preservation, explicit Speaker priority, automatic soundscape generation, edited-dialogue TTS invalidation/signatures and authored A Track recovery.
+- The complete bundled test suite passed: `244` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.4] - 2026-08-27
 
 ### Added

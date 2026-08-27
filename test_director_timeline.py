@@ -187,6 +187,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
 
     def test_authored_dialogue_reserves_tts_audio_and_run_guard_detects_loss(self):
         window = DirectorCutStudio()
+        window.render_settings.dialogue_tts_engine = "edge_tts"
         plan = normalize_design_plan(
             sample_design(), window.scan.counts,
             existing_media=window._design_context().get("existing_media") or [],
@@ -1313,6 +1314,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
 
     def test_truly_empty_slot_is_rejected_without_scene_mutation(self):
         window = DirectorCutStudio()
+        window.prompt_generation_timer.stop()
         window.resize(1400, 900)
         window.show()
         self.app.processEvents()
@@ -3568,6 +3570,70 @@ class DirectorTimelineDragTests(unittest.TestCase):
         with patch.object(window.generated_player, "setPosition") as set_position:
             window._generated_media_status_changed(QMediaPlayer.BufferedMedia)
         set_position.assert_not_called()
+        window.project_dirty = False
+        window.close()
+
+    def test_edited_dialogue_invalidates_tts_contract_and_unmutes_reference_track(self):
+        window = DirectorCutStudio()
+        audio = next(asset for asset in window.scan.assets if asset.media_type == "audio")
+        audio.local_path = str(PROJECT_ROOT / "authored-dialogue-test.wav")
+        audio.filename = "authored-dialogue-test.wav"
+        audio.timeline_placed = True
+        audio.timeline_track_id = "A1"
+        audio.start_seconds = 0.0
+        audio.end_seconds = 3.0
+        audio.recognition = "AI DESIGN AUTHORED SPEECH TTS\nAUTHORED TTS TRANSCRIPT:"
+        track = next(item for item in window.tracks if item.track_id == "A1")
+        track.muted = True
+        layer = TextLayer(
+            "T1", "Updated exact words", 0.0, 3.0, "A4",
+            content_role="dialogue", speaker="S2", language="Mandarin Chinese",
+            delivery="Low adult male voice", lip_sync=True, shot_id="",
+        )
+        window.text_layers = [layer]
+        window._refresh_text_layers(layer)
+        window.timeline_tts_refresh_timer.stop()
+
+        self.assertTrue(window.timeline_tts_stale)
+        self.assertEqual(window.authored_text_requirements[0]["content"], "Updated exact words")
+        self.assertEqual(window.authored_text_requirements[0]["speaker"], "S2")
+        signature = window._timeline_tts_signature()
+        window._write_tts_signature(audio, signature)
+        self.assertEqual(window._stored_tts_signature(audio), signature)
+        self.assertTrue(window._activate_authored_speech_reference(audio))
+        self.assertFalse(track.muted)
+        window.project_dirty = False
+        window.close()
+
+    def test_design_dialogue_mode_buttons_and_native_to_vox_asset_reservation(self):
+        window = DirectorCutStudio()
+        context = window._design_context()
+        context["dialogue_tts_engine"] = "h3_native"
+        dialog = DesignPageDialog(
+            window.runtime, context, window.scan.counts, window,
+            context_provider=window._design_context,
+        )
+        self.assertEqual(dialog.design_tts_engine, "h3_native")
+        self.assertTrue(dialog.dialogue_mode_buttons["h3_native"].isChecked())
+        dialog.dialogue_mode_buttons["voxcpm2_local"].click()
+        self.assertEqual(dialog.design_tts_engine, "voxcpm2_local")
+        self.assertTrue(dialog.dialogue_mode_buttons["voxcpm2_local"].isChecked())
+        dialog.close()
+
+        window.text_layers = [TextLayer(
+            "T1", "Exact words", 0.0, 3.0, "A4",
+            content_role="dialogue", speaker="S2", language="Mandarin Chinese",
+        )]
+        window.render_settings.dialogue_tts_engine = "voxcpm2_local"
+        asset = window._ensure_timeline_tts_asset()
+        self.assertIsNotNone(asset)
+        self.assertTrue(asset.timeline_placed)
+        self.assertIn("AI DESIGN AUTHORED SPEECH TTS", asset.recognition)
+
+        window.render_settings.dialogue_tts_engine = "h3_native"
+        window._use_h3_native_dialogue()
+        self.assertEqual(asset.activation_mode, "bypass")
+        self.assertFalse(asset.enabled)
         window.project_dirty = False
         window.close()
 

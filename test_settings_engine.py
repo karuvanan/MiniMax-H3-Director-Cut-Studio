@@ -47,7 +47,14 @@ class SettingsEngineTests(unittest.TestCase):
 
     def test_unknown_tts_engine_returns_to_safe_default(self):
         settings = RenderSettings.from_mapping({"dialogue_tts_engine": "mystery"})
-        self.assertEqual(settings.dialogue_tts_engine, "edge_tts")
+        self.assertEqual(settings.dialogue_tts_engine, "h3_native")
+
+    def test_native_h3_dialogue_is_the_default_and_valid_choice(self):
+        self.assertEqual(RenderSettings.defaults().dialogue_tts_engine, "h3_native")
+        self.assertEqual(
+            RenderSettings.from_mapping({"dialogue_tts_engine": "h3_native"}).dialogue_tts_engine,
+            "h3_native",
+        )
 
     def test_blip_device_defaults_to_safe_auto(self):
         self.assertEqual(RenderSettings.defaults().blip_device, "auto")

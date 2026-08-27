@@ -32,7 +32,7 @@ class RenderSettings:
     history_poll_interval: float = 1.0
     generation_timeout: int = 1800
     http_request_timeout: int = 30
-    dialogue_tts_engine: str = "edge_tts"
+    dialogue_tts_engine: str = "h3_native"
     blip_device: str = "auto"
 
     @classmethod
@@ -50,7 +50,7 @@ class RenderSettings:
                 return cast(defaults[name])
 
         dialogue_tts_engine = str(merged["dialogue_tts_engine"]).strip().lower()
-        if dialogue_tts_engine not in {"edge_tts", "voxcpm2_local"}:
+        if dialogue_tts_engine not in {"h3_native", "edge_tts", "voxcpm2_local"}:
             dialogue_tts_engine = defaults["dialogue_tts_engine"]
         blip_device = str(merged["blip_device"]).strip().lower()
         if blip_device not in {"auto", "cuda", "cpu"}:

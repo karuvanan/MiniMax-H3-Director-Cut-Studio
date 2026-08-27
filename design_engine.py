@@ -280,6 +280,10 @@ def extract_explicit_timed_text_layers(
             "content": content,
             "role": role,
             "speaker": (label_match.group("speaker") or "S1").upper(),
+            # Kept only through the pre-normalization protection pass.  An
+            # omitted speaker means the planner may assign S1/S2 from the
+            # speaking character's gender; an explicit S1/S2 remains binding.
+            "_speaker_explicit": bool(label_match.group("speaker")),
             "language": language,
             "delivery": _timed_text_delivery(" ".join(active_context), role),
             "lip_sync": role == "dialogue",
@@ -295,12 +299,59 @@ def extract_explicit_timed_text_layers(
     return layers
 
 
+def authored_text_layers_with_plan_assignments(
+    requirement: str,
+    plan: dict,
+    duration_seconds: float | None = None,
+) -> list[dict]:
+    """Restore exact authored words while retaining safe LM voice assignments.
+
+    Qwen is allowed to decide S1 (female) versus S2 (male) only when the user
+    did not write an explicit S1/S2 label.  Timing and verbatim content always
+    remain owned by the deterministic parser.
+    """
+    required = extract_explicit_timed_text_layers(requirement, duration_seconds)
+    candidates = [
+        item for item in plan.get("text_layers") or [] if isinstance(item, dict)
+    ]
+    for authored in required:
+        if authored.get("_speaker_explicit"):
+            continue
+        matches = [
+            item for item in candidates
+            if str(item.get("role", "")) == authored["role"]
+            and float(item.get("start_seconds", 0.0)) < authored["end_seconds"] - 1e-6
+            and float(item.get("end_seconds", 0.0)) > authored["start_seconds"] + 1e-6
+        ]
+        if not matches:
+            continue
+        best = max(
+            matches,
+            key=lambda item: min(
+                authored["end_seconds"], float(item.get("end_seconds", 0.0))
+            ) - max(
+                authored["start_seconds"], float(item.get("start_seconds", 0.0))
+            ),
+        )
+        speaker = str(best.get("speaker", "")).strip().upper()
+        if speaker in {"S1", "S2"}:
+            authored["speaker"] = speaker
+        for key in ("delivery", "language"):
+            value = str(best.get(key, "")).strip()
+            if value:
+                authored[key] = value
+        if authored["role"] == "dialogue":
+            authored["lip_sync"] = bool(best.get("lip_sync", True))
+    return required
+
+
 def protect_explicit_timed_text_layers(plan: dict, requirement: str) -> dict:
     """Merge deterministic authored text into a plan, overriding LM paraphrases."""
     result = deepcopy(plan)
     authored_duration = infer_explicit_design_duration(requirement)
-    required = extract_explicit_timed_text_layers(
+    required = authored_text_layers_with_plan_assignments(
         requirement,
+        result,
         authored_duration
         or float(result.get("duration_seconds", 0.0) or 0.0)
         or None,
@@ -360,6 +411,36 @@ def validate_explicit_timed_text_contract(requirement: str, plan: dict) -> list[
             "silent video generation. Regenerate or restore the authored text layers."
         )
     return required
+
+
+def automatic_background_soundscape(plan: dict) -> str:
+    """Return a concise H3-ready ambience bed when the LM omitted one."""
+    existing = " ".join(str(plan.get("overall_soundscape", "")).split())
+    if existing:
+        base = existing
+    else:
+        evidence = " ".join(
+            str(value or "")
+            for value in (
+                plan.get("creative_brief"),
+                *(item.get("environment_response", "") for item in plan.get("shots") or []),
+                *(item.get("subject_action", "") for item in plan.get("shots") or []),
+            )
+        ).lower()
+        if any(word in evidence for word in ("office", "desk", "computer", "workspace")):
+            base = "Natural office room tone, restrained HVAC, subtle keyboard and desk foley."
+        elif any(word in evidence for word in ("city", "street", "traffic", "car", "road")):
+            base = "Natural city ambience, distant traffic, location room tone and synchronized movement foley."
+        elif any(word in evidence for word in ("forest", "mountain", "garden", "courtyard", "roof")):
+            base = "Natural outdoor ambience, wind through the environment, footsteps, cloth and contact-driven foley."
+        else:
+            base = "Natural location room tone with synchronized footsteps, cloth, object and environmental foley."
+    guard = (
+        " Keep authored speech in the foreground unchanged; duck ambience and music under every spoken line."
+    )
+    if "authored speech" not in base.lower():
+        base = base.rstrip(". ") + "." + guard
+    return base.strip()
 
 
 DESIGN_JSON_SCHEMA = {
@@ -1281,6 +1362,10 @@ def normalize_design_plan(
         raise ValueError("Design JSON is missing creative_brief")
     if not plan["global_visual_style"]:
         raise ValueError("Design JSON is missing global_visual_style")
+    plan["overall_soundscape"] = automatic_background_soundscape({
+        **plan,
+        "shots": source.get("shots") or [],
+    })
     budget_guardrail = (
         "Complete every Shot's core action before any optional flourish. Preserve the stated "
         "continuity state, exact subject count and identity, prop and weapon ownership, screen "
@@ -1734,6 +1819,13 @@ def build_design_system_prompt(context: dict) -> str:
         "to agree with an incorrect BLIP observation, and never approve the conflicting image as an H3 reference. "
         "Only create a text_layer or theme_text when the user explicitly requests visible text, dialogue, voice-over or lyrics, and set "
         "explicit_user_requested=true only in that case. Never turn the creative brief or scene description into on-screen text. "
+        "For every dialogue text_layer, infer the gender of the speaking on-screen character from the user's story, Shot action and "
+        "reference-media evidence. Assign S1 to a female speaker and S2 to a male speaker, keep the assignment consistent across every "
+        "Shot, and never use the narrator's gender when the visible character is speaking. If the user explicitly writes S1 or S2, "
+        "preserve that explicit assignment. Put the intended emotion and pace in delivery without changing the authored words. "
+        "Always design a useful overall_soundscape containing diegetic location ambience and contact-synchronized foley. Keep dialogue "
+        "in the foreground, duck background ambience and non-diegetic music beneath speech, and never replace or echo authored dialogue "
+        "as part of the background sound. "
         "Always include a Final Hold marker before the final frame; cue timestamps must be earlier than duration_seconds. "
         "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
         "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. The Final Hold must resolve "

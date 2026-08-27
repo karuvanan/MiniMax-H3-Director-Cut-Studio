@@ -10,6 +10,8 @@ from design_ai_service import handle as handle_design_ai_job
 from design_engine import (
     DESIGN_JSON_SCHEMA,
     DesignDurationContractError,
+    automatic_background_soundscape,
+    authored_text_layers_with_plan_assignments,
     build_design_system_prompt,
     extract_explicit_timed_text_layers,
     infer_explicit_design_duration,
@@ -337,6 +339,43 @@ On-screen text: "EXACT TITLE"'''
         self.assertEqual(len(validate_explicit_timed_text_contract(requirement, protected)), 1)
         with self.assertRaisesRegex(ValueError, "Apply/Run is blocked"):
             validate_explicit_timed_text_contract(requirement, {**plan, "text_layers": []})
+
+    def test_qwen_gender_speaker_survives_verbatim_text_protection(self):
+        requirement = '[00:00-00:03]\nMandarin dialogue: "This exact line stays unchanged."'
+        plan = sample_design()
+        plan["duration_seconds"] = 3.0
+        plan["text_layers"] = [{
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "track": "A4",
+            "content": "LM paraphrase that must not survive.",
+            "role": "dialogue",
+            "speaker": "S2",
+            "language": "Mandarin Chinese",
+            "delivery": "Low adult male voice",
+            "lip_sync": True,
+            "explicit_user_requested": True,
+        }]
+        protected = protect_explicit_timed_text_layers(plan, requirement)
+        self.assertEqual(protected["text_layers"][0]["content"], "This exact line stays unchanged.")
+        self.assertEqual(protected["text_layers"][0]["speaker"], "S2")
+        self.assertEqual(protected["text_layers"][0]["delivery"], "Low adult male voice")
+
+        explicit = '[00:00-00:03]\nS1 Mandarin dialogue: "Keep the female assignment."'
+        rows = authored_text_layers_with_plan_assignments(explicit, plan, 3.0)
+        self.assertEqual(rows[0]["speaker"], "S1")
+
+    def test_design_prompt_defines_gender_speakers_and_background_audio(self):
+        prompt = build_design_system_prompt({})
+        self.assertIn("Assign S1 to a female speaker and S2 to a male speaker", prompt)
+        self.assertIn("diegetic location ambience", prompt)
+        soundscape = automatic_background_soundscape({
+            "creative_brief": "A man talks inside a quiet office.",
+            "overall_soundscape": "",
+            "shots": [],
+        })
+        self.assertIn("office room tone", soundscape)
+        self.assertIn("duck ambience and music", soundscape)
 
     def test_design_ai_worker_releases_comfy_models_before_refinement(self):
         with patch("design_ai_service.request_json", return_value={}) as request:

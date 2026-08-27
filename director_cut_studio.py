@@ -25,6 +25,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -87,6 +88,8 @@ from media_semantic_enrichment import (
 from design_engine import (
     DESIGN_JSON_SCHEMA,
     DesignDurationContractError,
+    automatic_background_soundscape,
+    authored_text_layers_with_plan_assignments,
     build_design_system_prompt,
     extract_explicit_timed_text_layers,
     infer_explicit_design_duration,
@@ -3943,7 +3946,47 @@ class DesignPageDialog(QDialog):
         concept_panel = QWidget()
         concept_layout = QVBoxLayout(concept_panel)
         concept_layout.setContentsMargins(0, 0, 4, 0)
-        concept_layout.addWidget(QLabel("DESIGN REQUIREMENT"))
+        requirement_header = QHBoxLayout()
+        requirement_header.addWidget(QLabel("DESIGN REQUIREMENT"))
+        requirement_header.addStretch(1)
+        self.dialogue_mode_group = QButtonGroup(self)
+        self.dialogue_mode_group.setExclusive(True)
+        self.dialogue_mode_buttons: dict[str, QPushButton] = {}
+        dialogue_modes = (
+            (
+                "h3_native", "Ori",
+                "MiniMax H3 Native Dialogue · no WAV; H3 generates the latest Timeline words",
+            ),
+            (
+                "voxcpm2_local", "Vox",
+                "VoxCPM2 Local · create an exact local authored-speech WAV",
+            ),
+            (
+                "edge_tts", "Etts",
+                "Edge TTS · create an exact online neural authored-speech WAV",
+            ),
+        )
+        selected_dialogue_mode = str(
+            self.context.get("dialogue_tts_engine", "h3_native")
+        ).strip().lower()
+        if selected_dialogue_mode not in {item[0] for item in dialogue_modes}:
+            selected_dialogue_mode = "h3_native"
+        self.design_tts_engine = selected_dialogue_mode
+        for engine, short_label, tooltip in dialogue_modes:
+            button = QPushButton(short_label)
+            button.setObjectName(f"designDialogueMode_{short_label}")
+            button.setCheckable(True)
+            button.setChecked(engine == selected_dialogue_mode)
+            button.setToolTip(tooltip)
+            button.setMaximumWidth(54)
+            button.clicked.connect(
+                lambda checked, value=engine: self._select_design_dialogue_mode(value)
+                if checked else None
+            )
+            self.dialogue_mode_group.addButton(button)
+            self.dialogue_mode_buttons[engine] = button
+            requirement_header.addWidget(button)
+        concept_layout.addLayout(requirement_header)
         self.requirement_edit = QPlainTextEdit()
         self.requirement_edit.setPlaceholderText(
             "Example: I need a 12-second video. Begin with a hand gripping a can of cola, "
@@ -5033,6 +5076,15 @@ class DesignPageDialog(QDialog):
         self.concept_blip_caption = ""
         self._start_lm_design()
 
+    def _select_design_dialogue_mode(self, engine: str) -> None:
+        if engine not in {"h3_native", "voxcpm2_local", "edge_tts"}:
+            return
+        self.design_tts_engine = engine
+        button = self.dialogue_mode_buttons.get(engine)
+        if button and not button.isChecked():
+            button.setChecked(True)
+        self._invalidate_json()
+
     def _service_message(self, payload: dict) -> None:
         if payload.get("ready"):
             return
@@ -5304,8 +5356,11 @@ class DesignPageDialog(QDialog):
             QMessageBox.critical(self, "Authored text is missing", str(exc))
             return
         plan["_authored_requirement"] = requirement
-        plan["_required_text_layers"] = extract_explicit_timed_text_layers(
-            requirement, float(plan.get("duration_seconds", 0.0) or 0.0) or None
+        plan["_dialogue_tts_engine"] = self.design_tts_engine
+        plan["_required_text_layers"] = authored_text_layers_with_plan_assignments(
+            requirement,
+            plan,
+            float(plan.get("duration_seconds", 0.0) or 0.0) or None,
         )
         plan["_design_images_pre_generated"] = bool(self.generated_references)
         plan["_generated_references"] = [dict(item) for item in self.generated_references]
@@ -5396,6 +5451,14 @@ class DirectorCutStudio(QMainWindow):
         self.design_tts_runner: JsonLineProcess | None = None
         self.design_tts_result: dict = {}
         self.pending_design_tts: dict | None = None
+        self.pending_generation_after_tts: dict | None = None
+        self.timeline_tts_stale = False
+        self.timeline_tts_refresh_timer = QTimer(self)
+        self.timeline_tts_refresh_timer.setSingleShot(True)
+        self.timeline_tts_refresh_timer.setInterval(450)
+        self.timeline_tts_refresh_timer.timeout.connect(
+            self._regenerate_timeline_tts_if_needed
+        )
         self.design_cleanup_runner: JsonLineProcess | None = None
         self.design_cleanup_result: dict = {}
         self.preview_seed: int | None = None
@@ -5601,10 +5664,15 @@ class DirectorCutStudio(QMainWindow):
         self.settings_http_timeout.setRange(1, 600)
         self.settings_http_timeout.setSuffix(" s")
         self.settings_dialogue_tts = QComboBox()
+        self.settings_dialogue_tts.addItem(
+            "MiniMax H3 Native Dialogue · no authored WAV",
+            "h3_native",
+        )
         self.settings_dialogue_tts.addItem("Edge TTS · online neural voices", "edge_tts")
         self.settings_dialogue_tts.addItem("VoxCPM2 Local · offline model", "voxcpm2_local")
         self.settings_dialogue_tts.setToolTip(
-            "Speech engine used for Dialogue, Voice-over and Lyrics text layers. "
+            "Speech mode used for Dialogue, Voice-over and Lyrics text layers. "
+            "H3 Native sends exact Timeline text without creating a WAV. "
             "VoxCPM2 loads from the local model cache only; systems below 8 GB VRAM "
             "use the slower safe CPU mode."
         )
@@ -5654,7 +5722,9 @@ class DirectorCutStudio(QMainWindow):
         ):
             widget.valueChanged.connect(self._settings_ui_changed)
         self.settings_rtx_vsr.toggled.connect(self._settings_ui_changed)
-        self.settings_dialogue_tts.currentIndexChanged.connect(self._settings_ui_changed)
+        self.settings_dialogue_tts.currentIndexChanged.connect(
+            self._dialogue_tts_ui_changed
+        )
         self.settings_blip_device.currentIndexChanged.connect(self._blip_device_ui_changed)
         return page
 
@@ -5693,6 +5763,36 @@ class DirectorCutStudio(QMainWindow):
                 self.blip_runner.stop()
         self.statusBar().showMessage(
             f"BLIP device changed to {selected.upper()} · applies to the next analysis"
+        )
+
+    def _dialogue_tts_ui_changed(self, *_args) -> None:
+        previous = self.render_settings.dialogue_tts_engine
+        self._settings_ui_changed()
+        selected = self.render_settings.dialogue_tts_engine
+        if selected == previous:
+            return
+        if selected == "h3_native":
+            self.timeline_tts_refresh_timer.stop()
+            if (
+                self.design_tts_runner
+                and self.design_tts_runner.is_running()
+                and (self.pending_design_tts or {}).get("mode") == "timeline_refresh"
+            ):
+                self.pending_design_tts = None
+                self.pending_generation_after_tts = None
+                self.design_tts_runner.stop()
+            self._use_h3_native_dialogue()
+            self.statusBar().showMessage(
+                "Dialogue mode changed to Ori · MiniMax H3 will generate the latest Timeline dialogue",
+                10000,
+            )
+            return
+        if self._speech_layers_for_tts():
+            self.timeline_tts_stale = True
+        label = "VoxCPM2 Local" if selected == "voxcpm2_local" else "Edge TTS"
+        self.statusBar().showMessage(
+            f"Dialogue mode changed to {label} · WAV will rebuild before Preview/Run",
+            10000,
         )
 
     def _read_settings_ui(self) -> None:
@@ -6348,6 +6448,7 @@ class DirectorCutStudio(QMainWindow):
             "comfyui_history_poll_interval": self.render_settings.history_poll_interval,
             "comfyui_generation_timeout": self.render_settings.generation_timeout,
             "comfyui_http_timeout": self.render_settings.http_request_timeout,
+            "dialogue_tts_engine": self.render_settings.dialogue_tts_engine,
             "aspect_ratio": self.aspect_ratio_combo.currentData(),
             "available_tracks": [track.track_id for track in self.tracks],
             "media_capacity": total_capacity,
@@ -6757,6 +6858,8 @@ class DirectorCutStudio(QMainWindow):
                     f"{row.get('speaker', 'S1')}: {row.get('content', '')}"
                     for row in request["tts_transcript"]
                 )
+            if request.get("tts_signature"):
+                asset.recognition += "\nTTS SIGNATURE: " + str(request["tts_signature"])
             if request.get("concept_blip_caption"):
                 asset.recognition += (
                     "\nBLIP concept analysis: " + str(request["concept_blip_caption"])
@@ -6882,6 +6985,7 @@ class DirectorCutStudio(QMainWindow):
             WorkspaceDesignCommand(before, after, self._restore_design_workspace_state)
         )
         self.example_work_dir = design_dir.resolve()
+        self.timeline_tts_stale = False
         self._mark_dirty()
         message = f"AI Design applied · {plan['duration_seconds']:.2f}s · {design_dir}"
         if warnings:
@@ -6952,6 +7056,248 @@ class DirectorCutStudio(QMainWindow):
         ):
             raise RuntimeError("Mandarin TTS worker is still stopping")
 
+    def _speech_layers_for_tts(self) -> list[dict]:
+        return [
+            {
+                "start_seconds": layer.start_seconds,
+                "end_seconds": layer.end_seconds,
+                "content": layer.text,
+                "role": layer.content_role,
+                "speaker": layer.speaker,
+                "language": layer.language,
+                "delivery": layer.delivery,
+                "lip_sync": layer.lip_sync,
+            }
+            for layer in sorted(
+                self.text_layers,
+                key=lambda item: (item.start_seconds, item.end_seconds, item.layer_id),
+            )
+            if layer.content_role in {"dialogue", "voice_over", "lyrics"}
+            and layer.text.strip()
+        ]
+
+    def _timeline_tts_signature(self, layers: list[dict] | None = None) -> str:
+        payload = {
+            "engine": self.render_settings.dialogue_tts_engine,
+            "duration_seconds": self.scan.duration_seconds if self.scan else 0.0,
+            "text_layers": layers if layers is not None else self._speech_layers_for_tts(),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _authored_tts_asset(self) -> MediaAsset | None:
+        if not self.scan:
+            return None
+        return next(
+            (
+                asset for asset in self.scan.timeline_assets()
+                if asset.media_type == "audio"
+                and "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
+                and str(asset.local_path or "").strip()
+            ),
+            None,
+        )
+
+    def _ensure_timeline_tts_asset(self) -> MediaAsset | None:
+        asset = self._authored_tts_asset()
+        if asset is not None or not self.scan:
+            return asset
+        asset = next(
+            (
+                item for item in self.scan.assets
+                if item.media_type == "audio" and not str(item.local_path or "").strip()
+            ),
+            None,
+        )
+        if asset is None:
+            return None
+        output_root = (
+            self.example_work_dir
+            if self.example_work_dir is not None
+            else CACHE_ROOT / "timeline_tts"
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+        duration = self.scan.duration_seconds
+        output = output_root / f"authored_timeline_dialogue_{duration:.2f}s.wav"
+        track = self._design_track("A1", "audio")
+        asset.local_path = str(output.resolve())
+        asset.filename = output.name
+        asset.timeline_placed = True
+        asset.timeline_track_id = track.track_id
+        asset.timeline_lane = self.tracks.index(track)
+        asset.start_seconds = 0.0
+        asset.end_seconds = duration
+        asset.activation_mode = "auto"
+        asset.enabled = True
+        asset.monitor_visible = True
+        asset.clip_prompt = (
+            "Use this exact authored Timeline speech for voice identity, wording and lip sync."
+        )
+        asset.recognition = (
+            "AI DESIGN AUTHORED SPEECH TTS\n"
+            "Usage: h3_reference\n"
+            "Requirement: exact Timeline speech and lip sync"
+        )
+        self.timeline_tts_stale = True
+        return asset
+
+    def _use_h3_native_dialogue(self) -> None:
+        if not self.scan:
+            return
+        changed = False
+        for asset in self.scan.timeline_assets():
+            if (
+                asset.media_type == "audio"
+                and "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
+            ):
+                if asset.activation_mode != "bypass":
+                    asset.activation_mode = "bypass"
+                    changed = True
+                if asset.enabled:
+                    asset.enabled = False
+                    changed = True
+        self.timeline_tts_stale = False
+        if changed:
+            self.refresh_activation()
+            self._mark_dirty()
+            self.statusBar().showMessage(
+                "MiniMax H3 Native Dialogue active · authored TTS WAV excluded",
+                8000,
+            )
+
+    @staticmethod
+    def _stored_tts_signature(asset: MediaAsset) -> str:
+        match = re.search(r"^TTS SIGNATURE:\s*([0-9a-f]{64})$", asset.recognition, re.M)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _write_tts_signature(asset: MediaAsset, signature: str) -> None:
+        line = f"TTS SIGNATURE: {signature}"
+        if re.search(r"^TTS SIGNATURE:.*$", asset.recognition, re.M):
+            asset.recognition = re.sub(
+                r"^TTS SIGNATURE:.*$", line, asset.recognition, flags=re.M
+            )
+        else:
+            asset.recognition = asset.recognition.rstrip() + "\n" + line
+
+    def _activate_authored_speech_reference(self, asset: MediaAsset) -> bool:
+        track = self._track_for_asset(asset)
+        if not track or track.kind != "audio":
+            return False
+        changed = False
+        if not asset.timeline_placed:
+            asset.timeline_placed = True
+            asset.start_seconds = 0.0
+            asset.end_seconds = self.scan.duration_seconds if self.scan else asset.end_seconds
+            changed = True
+        if not track.enabled:
+            track.enabled = True
+            changed = True
+        if track.muted:
+            track.muted = False
+            changed = True
+        if any(item.enabled and item.solo for item in self.tracks if item.kind == "audio"):
+            if not track.solo:
+                track.solo = True
+                changed = True
+        if not asset.enabled:
+            asset.enabled = True
+            changed = True
+        if asset.activation_mode == "bypass":
+            asset.activation_mode = "auto"
+            changed = True
+        if changed:
+            self._rebuild_track_headers()
+            self.refresh_activation()
+            self._mark_dirty()
+            self.statusBar().showMessage(
+                f"Exact authored speech automatically enabled on {track.track_id} for H3 lip sync",
+                8000,
+            )
+        return True
+
+    def _start_timeline_tts_regeneration(self, resume: dict | None = None) -> bool:
+        if not self.scan:
+            return False
+        if self.render_settings.dialogue_tts_engine == "h3_native":
+            self._use_h3_native_dialogue()
+            return False
+        layers = self._speech_layers_for_tts()
+        if not layers:
+            latest_signature = self._timeline_tts_signature()
+            if latest_signature != str(pending["target_signature"]):
+                # A second edit landed while VoxCPM/Edge was rendering.  Never
+                # resume H3 with the now-obsolete intermediate WAV.
+                self.timeline_tts_stale = True
+                resume = self.pending_generation_after_tts
+                self.pending_generation_after_tts = None
+                QTimer.singleShot(
+                    0,
+                    lambda values=resume: self._start_timeline_tts_regeneration(values),
+                )
+                return
+            self.timeline_tts_stale = False
+            return False
+        asset = self._ensure_timeline_tts_asset()
+        if asset is None:
+            return False
+        if self.design_tts_runner and self.design_tts_runner.is_running():
+            if resume:
+                self.pending_generation_after_tts = dict(resume)
+            return True
+        target_signature = self._timeline_tts_signature(layers)
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        job_path = CACHE_ROOT / f"timeline_tts_{time.time_ns()}.json"
+        job_path.write_text(json.dumps({
+            "output_path": asset.local_path,
+            "duration_seconds": self.scan.duration_seconds,
+            "text_layers": layers,
+            "ffmpeg": str(self.runtime.ffmpeg),
+            "sapi_script": str(PROJECT_ROOT / "tts_sapi.ps1"),
+            "engine": self.render_settings.dialogue_tts_engine,
+            "voxcpm_model": "openbmb/VoxCPM2",
+            "voxcpm_device": "auto",
+            "voxcpm_local_files_only": True,
+        }, ensure_ascii=False), encoding="utf-8")
+        self.pending_design_tts = {
+            "mode": "timeline_refresh",
+            "asset_node_id": asset.node_id,
+            "target_signature": target_signature,
+        }
+        self.pending_generation_after_tts = dict(resume) if resume else None
+        self.design_tts_result = {}
+        runner = JsonLineProcess(self, "timeline-dialogue-tts")
+        runner.message.connect(self._design_tts_message)
+        runner.finished.connect(self._design_tts_finished)
+        self.design_tts_runner = runner
+        self.generation_previous_monitor = self.monitor_display_stack.currentWidget()
+        engine_label = (
+            "VoxCPM2 Local"
+            if self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+            else "Edge TTS"
+        )
+        self.generation_overlay.start(
+            f"{engine_label} · rebuilding edited Timeline dialogue"
+        )
+        self.statusBar().showMessage(
+            f"Dialogue changed · rebuilding exact WAV with {engine_label}"
+        )
+        if not runner.start(
+            str(self.runtime.python),
+            [str(PROJECT_ROOT / "tts_service.py"), str(job_path)],
+        ):
+            self.design_tts_runner = None
+            return False
+        return True
+
+    def _regenerate_timeline_tts_if_needed(self) -> None:
+        if self.restoring_project or not self.timeline_tts_stale:
+            return
+        self._read_settings_ui()
+        self._start_timeline_tts_regeneration()
+
     def _design_tts_message(self, payload: dict) -> None:
         if payload.get("progress"):
             message = str(payload["progress"])
@@ -6969,6 +7315,78 @@ class DirectorCutStudio(QMainWindow):
         self.pending_design_tts = None
         if runner:
             runner.deleteLater()
+        if pending and pending.get("mode") == "timeline_refresh":
+            self.generation_overlay.stop()
+            self._restore_monitor_after_generation()
+            if exit_code or result.get("error"):
+                self.pending_generation_after_tts = None
+                QMessageBox.critical(
+                    self,
+                    "Timeline dialogue TTS failed",
+                    "The edited dialogue WAV could not be rebuilt, so H3 generation remains "
+                    "blocked to prevent repeated, omitted or paraphrased speech.\n\n"
+                    + str(result.get("error") or log[-1000:] or f"worker exit {exit_code}"),
+                )
+                return
+            asset = next(
+                (
+                    item for item in (self.scan.timeline_assets() if self.scan else [])
+                    if item.node_id == pending.get("asset_node_id")
+                ),
+                None,
+            )
+            if asset:
+                transcript = list(result.get("transcript") or [])
+                output_path = Path(str(result.get("output_path") or asset.local_path))
+                if output_path.is_file() and self.scan:
+                    placement = (
+                        asset.timeline_placed,
+                        asset.timeline_track_id,
+                        asset.timeline_lane,
+                        asset.start_seconds,
+                        asset.end_seconds,
+                    )
+                    assign_local_media(self.scan, asset, output_path)
+                    (
+                        asset.timeline_placed,
+                        asset.timeline_track_id,
+                        asset.timeline_lane,
+                        asset.start_seconds,
+                        asset.end_seconds,
+                    ) = placement
+                prefix = asset.recognition.split("AUTHORED TTS TRANSCRIPT:", 1)[0].rstrip()
+                asset.recognition = prefix + "\nAUTHORED TTS TRANSCRIPT:\n" + "\n".join(
+                    f"[{float(row.get('start_seconds', 0.0)):.2f}-"
+                    f"{float(row.get('end_seconds', 0.0)):.2f}] "
+                    f"{row.get('speaker', 'S1')}: {row.get('content', '')}"
+                    for row in transcript
+                )
+                self._write_tts_signature(asset, str(pending["target_signature"]))
+                self._activate_authored_speech_reference(asset)
+                sidecar = Path(asset.local_path).with_suffix(
+                    Path(asset.local_path).suffix + ".request.json"
+                )
+                if sidecar.is_file():
+                    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+                    metadata["tts_generation"] = {
+                        "engine": result.get("engine", "Unknown TTS engine"),
+                        "output_path": result.get("output_path", ""),
+                        "transcript": transcript,
+                        "signature": pending["target_signature"],
+                    }
+                    sidecar.write_text(
+                        json.dumps(metadata, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+            self.timeline_tts_stale = False
+            self._sync_prompt_panel_from_timeline(force=True, reconcile_brief=True)
+            self._mark_all_render_segments_dirty()
+            self._mark_dirty()
+            resume = self.pending_generation_after_tts
+            self.pending_generation_after_tts = None
+            if resume:
+                QTimer.singleShot(0, lambda values=resume: self._start_generation(**values))
+            return
         if not pending:
             self.generation_overlay.stop()
             self.design_button.setEnabled(True)
@@ -6988,6 +7406,32 @@ class DirectorCutStudio(QMainWindow):
         material = pending["tts_material"]
         material["generated_by_tts"] = True
         material["tts_transcript"] = list(result.get("transcript") or [])
+        signature_payload = {
+            "engine": self.render_settings.dialogue_tts_engine,
+            "duration_seconds": float(pending["plan"].get("duration_seconds", 0.0)),
+            "text_layers": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "start_seconds", "end_seconds", "content", "role", "speaker",
+                        "language", "delivery", "lip_sync",
+                    )
+                }
+                for item in (
+                    pending["plan"].get("_required_text_layers")
+                    or pending["plan"].get("text_layers")
+                    or []
+                )
+                if str(item.get("role", "")) in {"dialogue", "voice_over", "lyrics"}
+                and str(item.get("content", "")).strip()
+            ],
+        }
+        material["tts_signature"] = hashlib.sha256(
+            json.dumps(
+                signature_payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         sidecar = Path(material["local_path"]).with_suffix(
             Path(material["local_path"]).suffix + ".request.json"
         )
@@ -6997,6 +7441,7 @@ class DirectorCutStudio(QMainWindow):
                 "engine": result.get("engine", "Unknown TTS engine"),
                 "output_path": result.get("output_path", ""),
                 "transcript": material["tts_transcript"],
+                "signature": material["tts_signature"],
             }
             sidecar.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -7129,6 +7574,20 @@ class DirectorCutStudio(QMainWindow):
             )
             return
         try:
+            selected_tts_engine = str(
+                plan.pop("_dialogue_tts_engine", self.render_settings.dialogue_tts_engine)
+            ).strip().lower()
+            self.render_settings = RenderSettings.from_mapping({
+                **asdict(self.render_settings),
+                "dialogue_tts_engine": selected_tts_engine,
+            })
+            tts_index = self.settings_dialogue_tts.findData(
+                self.render_settings.dialogue_tts_engine
+            )
+            self.settings_dialogue_tts.blockSignals(True)
+            self.settings_dialogue_tts.setCurrentIndex(max(0, tts_index))
+            self.settings_dialogue_tts.blockSignals(False)
+            save_settings(SETTINGS_ENV, self.render_settings)
             authored_requirement = str(plan.get("_authored_requirement", ""))
             required_text_layers = deepcopy(
                 plan.get("_required_text_layers") or []
@@ -7249,6 +7708,12 @@ class DirectorCutStudio(QMainWindow):
         authored_requirement: str,
     ) -> bool:
         """Reserve one real Audio slot for exact authored speech when needed."""
+        if self.render_settings.dialogue_tts_engine == "h3_native":
+            plan["media_requests"] = [
+                item for item in plan.get("media_requests") or []
+                if item.get("requirement_id") != "authored_speech_tts"
+            ]
+            return False
         speech_layers = [
             item for item in plan.get("_required_text_layers") or plan.get("text_layers") or []
             if str(item.get("role", "")) in {"dialogue", "voice_over", "lyrics"}
@@ -9466,6 +9931,36 @@ class DirectorCutStudio(QMainWindow):
         self._mark_dirty()
 
     def _refresh_text_layers(self, _layer: TextLayer | None = None) -> None:
+        if not self.restoring_project:
+            # Once the user edits a Timeline text layer, the Timeline becomes
+            # the authored contract.  This keeps validation, Shot prompts and
+            # the synthesized WAV on the same exact words and timing.
+            self.authored_text_requirements = [
+                {
+                    "start_seconds": layer.start_seconds,
+                    "end_seconds": layer.end_seconds,
+                    "track": layer.track_id,
+                    "content": layer.text,
+                    "role": layer.content_role,
+                    "speaker": layer.speaker,
+                    "language": layer.language,
+                    "delivery": layer.delivery,
+                    "lip_sync": layer.lip_sync,
+                    "explicit_user_requested": True,
+                }
+                for layer in self.text_layers
+                if layer.text.strip()
+            ]
+            if (
+                _layer is not None
+                and _layer.content_role in {"dialogue", "voice_over", "lyrics"}
+            ):
+                self.timeline_tts_stale = True
+                if (
+                    self.render_settings.dialogue_tts_engine != "h3_native"
+                    and self._authored_tts_asset() is not None
+                ):
+                    self.timeline_tts_refresh_timer.start()
         self.timeline.set_text_layers(self.text_layers)
         self._sync_prompt_panel_from_timeline(reconcile_brief=True)
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
@@ -11548,6 +12043,19 @@ class DirectorCutStudio(QMainWindow):
         self._sync_timeline_clip_sources()
         if interactive:
             self._sync_prompt_panel_from_timeline()
+        soundscape = automatic_background_soundscape({
+            "overall_soundscape": self.prompt_panel.soundscape.toPlainText(),
+            "creative_brief": self.prompt_panel.brief.toPlainText(),
+            "shots": [
+                {
+                    "subject_action": cue.subject_action,
+                    "environment_response": cue.environment_response,
+                }
+                for cue in self.director_cues if cue.cue_type == "shot"
+            ],
+        })
+        if soundscape != self.prompt_panel.soundscape.toPlainText().strip():
+            self.prompt_panel.soundscape.setPlainText(soundscape)
         base_spec = self.prompt_panel.spec()
         if not base_spec.brief:
             self.prompt_panel.output.clear()
@@ -12775,6 +13283,42 @@ class DirectorCutStudio(QMainWindow):
     ) -> None:
         if not self._validate_authored_text_before_run():
             return
+        self._read_settings_ui()
+        speech_layers = self._speech_layers_for_tts()
+        if self.render_settings.dialogue_tts_engine == "h3_native":
+            self._use_h3_native_dialogue()
+        authored_asset = (
+            self._ensure_timeline_tts_asset()
+            if speech_layers and self.render_settings.dialogue_tts_engine != "h3_native"
+            else None
+        )
+        if (
+            speech_layers
+            and self.render_settings.dialogue_tts_engine != "h3_native"
+            and authored_asset is None
+        ):
+            QMessageBox.critical(
+                self,
+                "No Audio reference slot for authored TTS",
+                "VoxCPM2/Edge TTS needs one free physical Audio slot. Clear one Media Pool "
+                "Audio slot, or select MiniMax H3 Native Dialogue (Ori).",
+            )
+            return
+        if authored_asset is not None:
+            self._activate_authored_speech_reference(authored_asset)
+            expected_signature = self._timeline_tts_signature()
+            if (
+                self.timeline_tts_stale
+                or self._stored_tts_signature(authored_asset) != expected_signature
+            ):
+                resume = {
+                    "request_kind": request_kind,
+                    "megapixels": megapixels,
+                    "seed": seed,
+                    "enable_rtx_vsr": enable_rtx_vsr,
+                }
+                if self._start_timeline_tts_regeneration(resume):
+                    return
         if self.design_media_runner and self.design_media_runner.is_running():
             QMessageBox.information(
                 self,

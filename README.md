@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.4`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.6`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -226,7 +226,7 @@ video_minimax_h3_r2v API 3IMAGE 1AUDIO 1VIDEO.json
 | Torchaudio | `2.11.0+cu126` |
 | CUDA runtime | `12.6` |
 | Transformers | `5.12.1` |
-| Mandarin TTS | Settings 可切换 `Edge TTS` 或 `VoxCPM2 Local`；Edge 使用 `edge-tts 7.2.7` |
+| Dialogue audio | 默认 `MiniMax H3 Native Dialogue`；Settings／Design 可切换 `VoxCPM2 Local` 或 `Edge TTS`，Edge 使用 `edge-tts 7.2.7` |
 | VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；本地模型 `openbmb/VoxCPM2`，不在生成时联网下载 |
 | FFmpeg / FFprobe | `ai_libraries_common/engine_ffmpeg/bin/`，2026-05-25 build |
 
@@ -449,11 +449,11 @@ H3_RTX_VIDEO_SUPER_RESOLUTION=true
 H3_HISTORY_POLL_INTERVAL=1.0
 H3_GENERATION_TIMEOUT=1800
 H3_HTTP_REQUEST_TIMEOUT=30
-H3_DIALOGUE_TTS_ENGINE=edge_tts
+H3_DIALOGUE_TTS_ENGINE=h3_native
 H3_BLIP_DEVICE=auto
 ```
 
-请把 URL 改成自己的 ComfyUI 地址。`H3_DIALOGUE_TTS_ENGINE` 可设为 `edge_tts` 或 `voxcpm2_local`。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
+请把 URL 改成自己的 ComfyUI 地址。`H3_DIALOGUE_TTS_ENGINE` 可设为 `h3_native`、`voxcpm2_local` 或 `edge_tts`；默认 `h3_native` 直接让 MiniMax H3 根据最新 Timeline Text Layer 生成对白，不建立 WAV。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
 
 ### Design AI 设置
 
@@ -505,8 +505,10 @@ H3_DESIGN_IMAGE_CFG=1.0
 - Clip 支持速度、源入点/出点、淡入淡出与转场。
 - Selection Tool 可移动 clip 及 Program Monitor 文字；Hand Tool 用于平移 Timeline。
 - Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics；文字层可以放入任意空 V Track，不需要与原素材重叠。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
-- Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Apply 与 Preview / Run 另有缺失闸门，明确台词若从 Timeline 消失会中止生成，不会静默输出无对白影片。
-- 没有真实 Audio 时，H3 Prompt 会要求生成准确的原语言对白和口型；若用户明确提供有效 `@A1`，或 Design 自动生成 authored-speech WAV，Prompt 才会指向实际 `<Audio N>` 并要求逐音素同步。主页 Settings 的 `Dialogue Text Layer TTS` 可选择 `Edge TTS` 或 `VoxCPM2 Local`：Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 使用本地缓存的 `openbmb/VoxCPM2`、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型，worker 完成后自动释放 CUDA cache，并且不会静默回退到 Edge。自动模式检测到少于 8 GB VRAM 时会使用较慢但不会 GPU OOM 的 CPU 模式。WAV 自动放入 A Track，长片隐藏 Segment 会收到按自身时间窗裁切的音频，不会从第一句重播。所选引擎失败时 Apply 会明确停止，而不是写入静音文件。
+- Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Qwen 会从故事、Shot 与素材证据判断实际说话角色：女声分配 `S1`，男声分配 `S2`，并跨 Shot 保持一致；若用户明确写了 S1／S2 则以用户指定为准。逐字保护器只保护文字和时间，不会再把 Qwen 的合法 Speaker 选择覆盖回默认 S1。
+- Design Requirement 标题同一排提供三种对白模式按钮：`Ori` = MiniMax H3 Native Dialogue、`Vox` = VoxCPM2 Local、`Etts` = Edge TTS。默认 `Ori`；按钮选择会随 Apply 成为当前项目设置并写入 `.env`。回到 Timeline 后仍可在主页 Settings 改换，不必重新进入 Design。
+- `Ori` 不建立 authored WAV，H3 Prompt 会要求 MiniMax H3 根据最新 Text Layer 生成原语言对白与口型，并排除旧 authored-speech Audio。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 使用本地缓存的 `openbmb/VoxCPM2`、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型，worker 完成后自动释放 CUDA cache，并且不会静默回退到 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
+- Design 会自动建立与场景相符的 diegetic ambience、环境底噪和接触拟音；H3 Prompt 会要求对白始终位于前景，并在说话时自动压低背景声与音乐。背景声由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会重复对白。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、必须完成的 Core Action、必须保持的 Continuity State、Required Environment Response、可以省略的 Optional Flourish、Additional Direction 与 Shot Prompt Preset。
 - Design 与 Shot Tool 共用 H3 动作预算：每 5 秒最多三个必须完成的物理动作、两个必要接触后果和两个可选装饰。超出预算时优先把次要攻击、重复反击与纯装饰降级；最终 Prompt 明确要求先省略 Optional Flourish，不能因此延迟、削弱或重播 Core Action。Design Summary 会列出 `within / optional trimmed / priority compressed` 状态及压缩说明。
@@ -712,7 +714,7 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**241 tests passed**。
+当前完整验证结果：**246 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
