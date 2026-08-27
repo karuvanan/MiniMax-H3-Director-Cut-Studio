@@ -289,6 +289,19 @@ def preflight_smart_render(job: dict) -> dict:
     if not ffmpeg.is_file() or not ffprobe.is_file():
         raise FileNotFoundError("Bundled FFmpeg or FFprobe is missing.")
 
+    missing_media = []
+    for item in job.get("media", []):
+        raw_path = item.get("path", "") if isinstance(item, dict) else item
+        media_path = Path(str(raw_path))
+        if not media_path.is_file():
+            missing_media.append(str(media_path))
+    if missing_media:
+        preview = "\n".join(missing_media[:8])
+        raise FileNotFoundError(
+            "Reference media is missing before ComfyUI upload. Re-link the "
+            "Media Pool source or reopen the portable project folder:\n" + preview
+        )
+
     output_parent = Path(job["master_output"]).parent
     output_parent.mkdir(parents=True, exist_ok=True)
     free_bytes = shutil.disk_usage(output_parent).free

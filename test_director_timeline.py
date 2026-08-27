@@ -31,6 +31,7 @@ from director_cut_studio import (
     TextLayer,
     TrackHeaderWidget,
     media_shortcut,
+    resolve_project_media_path,
     snap_timeline_range,
     snap_timeline_seconds,
     timeline_state,
@@ -1293,6 +1294,26 @@ class DirectorTimelineDragTests(unittest.TestCase):
         restored.project_dirty = False
         restored.close()
 
+    def test_portable_project_media_path_rebases_from_old_work_folder(self):
+        root = PROJECT_ROOT / ".director_cache" / "portable_media_restore_test"
+        nested = root / "3d"
+        nested.mkdir(parents=True, exist_ok=True)
+        media = nested / "reference.png"
+        media.write_bytes(b"portable-reference")
+        project = root / "director_project.h3director.json"
+        old_root = Path("D:/old-machine/example/project")
+        saved = {
+            "filename": media.name,
+            "local_path": str(old_root / "3d" / media.name),
+        }
+        try:
+            resolved = resolve_project_media_path(project, saved, old_root)
+            self.assertEqual(resolved, media.resolve())
+        finally:
+            media.unlink(missing_ok=True)
+            nested.rmdir()
+            root.rmdir()
+
     def test_timeline_uses_half_second_snap_grid(self):
         self.assertEqual(snap_timeline_seconds(0.24), 0.0)
         self.assertEqual(snap_timeline_seconds(0.26), 0.5)
@@ -2423,13 +2444,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         uploads_by_node = {
             row["loader_node_id"]: row for row in job["media"]
         }
-        active_nodes_by_segment = (
-            {pictures[3].node_id},
-            {pictures[6].node_id, videos[1].node_id, audios[2].node_id},
-        )
-        for segment, active_nodes in zip(job["segments"], active_nodes_by_segment):
-            for node_id in active_nodes:
-                upload = uploads_by_node[node_id]
+        # Every physical loader is patched in every Segment because ComfyUI
+        # validates orphan loader widgets too. H3 activation remains scoped by
+        # the compacted reference connections tested above.
+        for segment in job["segments"]:
+            for node_id, upload in uploads_by_node.items():
                 node = segment["workflow"][node_id]
                 self.assertEqual(
                     node["inputs"][upload["loader_input"]],

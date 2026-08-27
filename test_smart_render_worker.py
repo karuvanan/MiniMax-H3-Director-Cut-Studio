@@ -227,6 +227,26 @@ class SmartRenderWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid duration"):
             preflight_smart_render(job)
 
+    def test_preflight_rejects_declared_missing_reference_before_queue(self):
+        runtime = load_runtime_paths()
+        missing = PROJECT_ROOT / ".director_cache" / "missing_reference.png"
+        missing.unlink(missing_ok=True)
+        job = {
+            "segments": [
+                {"start_seconds": 0.0, "end_seconds": 10.0, "workflow": {}},
+                {"start_seconds": 10.0, "end_seconds": 20.0, "workflow": {}},
+            ],
+            "media": [{"path": str(missing)}],
+            "ffmpeg": str(runtime.ffmpeg),
+            "ffprobe": str(runtime.ffprobe),
+            "master_output": str(
+                PROJECT_ROOT / ".director_cache" / "missing_preflight" / "master.mp4"
+            ),
+            "server": "http://127.0.0.1:8188",
+        }
+        with self.assertRaisesRegex(FileNotFoundError, "Reference media is missing"):
+            preflight_smart_render(job)
+
     def test_assembly_trims_each_leading_overlap(self):
         root = Path("assembly-test")
         paths = [root / f"segment{index}.mp4" for index in range(3)]

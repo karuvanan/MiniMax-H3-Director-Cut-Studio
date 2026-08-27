@@ -183,10 +183,13 @@ def main() -> int:
         if upload_key in seen_uploads:
             continue
         seen_uploads.add(upload_key)
-        if path.is_file():
-            result = upload_file(server, path, http_timeout, upload_name)
-            uploaded.append({"file": path.name, "upload_name": upload_name, "result": result})
-            print(json.dumps({"progress": f"Uploaded {path.name} as {upload_name}"}, ensure_ascii=False), flush=True)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Reference media is missing before ComfyUI upload: {path}"
+            )
+        result = upload_file(server, path, http_timeout, upload_name)
+        uploaded.append({"file": path.name, "upload_name": upload_name, "result": result})
+        print(json.dumps({"progress": f"Uploaded {path.name} as {upload_name}"}, ensure_ascii=False), flush=True)
     payload = json.dumps(
         {"prompt": job["workflow"], "client_id": "h3-director-" + uuid.uuid4().hex},
         ensure_ascii=False,

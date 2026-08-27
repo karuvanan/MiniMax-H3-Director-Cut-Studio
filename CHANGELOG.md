@@ -2,6 +2,22 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.9.2] - 2026-08-27
+
+### Fixed
+
+- Reopened long projects now patch every physical image/video/audio loader in every Segment to its collision-safe ComfyUI upload name. Inactive H3 references remain disconnected, but ComfyUI validation no longer reports misleading missing original basenames for orphan loader widgets.
+- Portable project loading now rebases missing absolute media paths against the loaded project folder, including paths relative to the former `example_work_dir` and unambiguous nested matches. A recovered local file is no longer overwritten by the stale saved absolute path.
+- Reopened projects continue saving beside the project that was actually opened instead of writing into an old work folder from another machine or drive.
+- Regular and Smart Render workers now stop before queueing when a declared local reference is genuinely missing, with an actionable re-link error instead of silently skipping its upload.
+
+### Verification
+
+- Added regressions for all-loader Segment patching, portable nested-media rebasing and missing-reference preflight.
+- Thirty-three relevant workflow, Smart Render, portable-project and project-round-trip regressions passed.
+- The mandatory four-part Standard Pipeline Release Gate passed: sparse P/V/A executable mapping, post-Design Timeline reconciliation, V/A track-kind integrity, and native 15-second 24-frame continuity without replay or slot collision.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.9.1] - 2026-08-27
 
 ### Changed

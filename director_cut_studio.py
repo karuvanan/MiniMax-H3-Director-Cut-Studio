@@ -209,6 +209,48 @@ def media_shortcut(asset: MediaAsset) -> str:
     return stable_reference_id(asset)
 
 
+def resolve_project_media_path(
+    project_path: Path,
+    saved: dict,
+    saved_work_dir: Path | None = None,
+) -> Path | None:
+    """Recover a saved media path after a portable project folder is moved."""
+    project_dir = project_path.expanduser().resolve().parent
+    raw_path = str(saved.get("local_path") or "").strip()
+    filename = str(saved.get("filename") or "").strip()
+    original = Path(raw_path).expanduser() if raw_path else None
+    candidates: list[Path] = []
+    if original is not None:
+        candidates.append(original)
+    if original is not None and saved_work_dir:
+        try:
+            relative = original.relative_to(saved_work_dir)
+        except (ValueError, OSError):
+            relative = None
+        if relative is not None:
+            candidates.append(project_dir / relative)
+    if filename:
+        candidates.append(project_dir / filename)
+    if original is not None and original.name:
+        candidates.append(project_dir / original.name)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            return candidate.resolve()
+
+    basename = filename or (original.name if original is not None else "")
+    if basename:
+        matches = [item for item in project_dir.rglob(basename) if item.is_file()]
+        if len(matches) == 1:
+            return matches[0].resolve()
+    return None
+
+
 def canonicalize_cue_reference_ids(text: str, media_ids: object) -> str:
     """Add ``@`` to explicit stable IDs owned by one Director Cue.
 
@@ -8565,6 +8607,10 @@ class DirectorCutStudio(QMainWindow):
                 raise ValueError("This is not an H3 Director Project file.")
             workflow_path = Path(payload["workflow_path"])
             if not workflow_path.is_file():
+                portable_workflow = PROJECT_ROOT / workflow_path.name
+                if portable_workflow.is_file():
+                    workflow_path = portable_workflow
+            if not workflow_path.is_file():
                 raise FileNotFoundError(f"Workflow not found: {workflow_path}")
             self._clear_generated_output()
             self.restoring_project = True
@@ -8589,16 +8635,18 @@ class DirectorCutStudio(QMainWindow):
             ]
             self.timeline.set_director_cues(self.director_cues)
             asset_map = {asset.node_id: asset for asset in self.scan.assets}  # type: ignore[union-attr]
+            raw_saved_work_dir = str(payload.get("example_work_dir") or "").strip()
+            saved_media_root = Path(raw_saved_work_dir) if raw_saved_work_dir else None
             for node_id, saved in payload.get("assets", {}).items():
                 asset = asset_map.get(node_id)
                 if not asset:
                     continue
-                local_path = saved.get("local_path", "")
-                if local_path and Path(local_path).is_file():
-                    assign_local_media(self.scan, asset, local_path)  # type: ignore[arg-type]
+                resolved_media = resolve_project_media_path(
+                    path, saved, saved_media_root
+                )
+                if resolved_media is not None:
+                    assign_local_media(self.scan, asset, resolved_media)  # type: ignore[arg-type]
                 for name in (
-                    "filename",
-                    "local_path",
                     "recognition",
                     "semantic_enrichment",
                     "semantic_enrichment_source_hash",
@@ -8623,7 +8671,10 @@ class DirectorCutStudio(QMainWindow):
                 ):
                     if name in saved:
                         setattr(asset, name, saved[name])
-                if local_path and Path(local_path).is_file():
+                if resolved_media is None:
+                    asset.filename = str(saved.get("filename") or asset.filename)
+                    asset.local_path = ""
+                if resolved_media is not None:
                     self.queue_media_preparation(
                         asset,
                         auto_analyze=False,
@@ -8691,12 +8742,9 @@ class DirectorCutStudio(QMainWindow):
             }
             self.render_runtime_status.clear()
             self._refresh_render_status_bar()
-            saved_work_dir = Path(str(payload.get("example_work_dir", "")))
-            self.example_work_dir = (
-                saved_work_dir.resolve()
-                if saved_work_dir.is_dir()
-                else path.resolve().parent
-            )
+            # Continue saving beside the project that was actually opened, not
+            # into a stale example_work_dir from another machine or drive.
+            self.example_work_dir = path.resolve().parent
             compare_sizes = payload.get("monitor_compare_sizes") or []
             if len(compare_sizes) == 2 and any(int(value) > 0 for value in compare_sizes):
                 self.monitor_compare_splitter.setSizes(
@@ -13193,6 +13241,18 @@ class DirectorCutStudio(QMainWindow):
             )
             segment_rows.append(row)
 
+        # ComfyUI validates loader widgets even when their H3 input is
+        # disconnected for this Segment. Point every physical loader at the
+        # collision-safe name uploaded for the complete render job. This does
+        # not reactivate any H3 reference; it only removes stale-basename
+        # warnings from orphan loader validation after reopening a project.
+        unique_media = list({
+            (row["loader_node_id"], row["upload_name"]): row
+            for row in all_media
+        }.values())
+        for row in segment_rows:
+            patch_media_upload_names(row["workflow"], unique_media)
+
         cache_key = "preview" if request_kind == "preview" else "production"
         cached_manifest = self.smart_render_manifests.get(cache_key, {})
         cached_rows = (
@@ -13222,10 +13282,7 @@ class DirectorCutStudio(QMainWindow):
             "action": "smart_render",
             "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "server": self.server_url.text().strip(),
-            "media": list({
-                (row["loader_node_id"], row["upload_name"]): row
-                for row in all_media
-            }.values()),
+            "media": unique_media,
             "segments": segment_rows,
             "segment_count": len(segment_rows),
             "progress_shots": self._progress_shot_rows(start, end),

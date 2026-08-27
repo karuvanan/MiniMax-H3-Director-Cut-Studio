@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.9.1`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.9.2`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -660,6 +660,19 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 - 先更新 ComfyUI，取得 `comfy_extras` 内置节点。
 - 使用 ComfyUI Manager 的 Find Missing Nodes 安装缺少的 custom node。
 - 重启后访问相应 `/object_info/节点名`，确认接口可以返回结果。
+
+### Load Project 后 ComfyUI 显示 `No such file or directory`，但 Media Pool 有图片
+
+旧版长视频 Segment 只会改写当前时间窗正在使用的 Loader 文件名；没有连接到该 Segment 的孤立 LoadImage 节点仍保留原始 basename。ComfyUI 验证整份 workflow JSON 时可能为这些未激活节点打印 `No such file`，形成素材丢失的假象。项目移动到另一台电脑或磁盘后，旧绝对路径也可能覆盖已经找到的同目录素材。
+
+从 `v0.2.5-alpha.9.2` 开始：
+
+- Load Project 会把旧绝对路径按原 `example_work_dir` 的相对结构重定位到当前 project folder，并支持唯一的同名嵌套素材。
+- 每个 Segment 的全部物理 Loader 都指向本次已经上传的 collision-safe 名称；未使用素材的 H3 reference 仍保持断开，不会改变动态 mapping 或影响画面。
+- 若素材真的不存在，Preview／Run 会在提交 ComfyUI 前列出缺失本地路径并停止，不会再静默跳过上传。
+- 重新打开的项目会继续保存到当前 project folder，不会写回旧电脑的工作目录。
+
+升级后完全关闭并重新启动 Studio，再重新 Open Project 后执行 Preview／Run。无需重新拖入仍然存在于 project folder 的素材。
 
 ### RTX Video Super Resolution 失败
 
