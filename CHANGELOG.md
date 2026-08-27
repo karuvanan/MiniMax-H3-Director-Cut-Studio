@@ -2,6 +2,177 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.5-alpha.3] - 2026-08-27
+
+### Fixed
+
+- BLIP now detects incompatible CUDA runtime／GPU-kernel failures during both model startup and individual image inference.
+- The exact pending BLIP job is automatically retried with a freshly loaded CPU model instead of returning a permanent `no kernel image is available for execution on the device` error.
+- Studio remembers an internal BLIP CUDA fallback for the current session, so later worker restarts begin directly on CPU.
+- The legacy one-shot BLIP worker now follows the same safe CPU fallback policy.
+
+### Documentation
+
+- Added cross-computer deployment guidance explaining why the destination driver's CUDA version does not replace the CUDA runtime bundled with its copied PyTorch environment.
+
+### Verification
+
+- Added regression coverage for CUDA architecture errors and confirmed unrelated media errors do not trigger a misleading CPU retry.
+- The complete bundled test suite passed: `236` tests.
+
+## [0.2.5-alpha.2] - 2026-08-27
+
+### Fixed
+
+- Explicit Design duration now comes deterministically from phrases such as `30秒的视频`／`2分钟的视频` and the latest authored timecode, rather than the current workspace Timeline duration.
+- Added an immutable Duration Contract to LM planning; an initial mismatch receives one automatic full-plan retry, while a refinement mismatch retains the validated first plan.
+- Normalize, Load JSON, Apply and Run now reject plans that condense or stretch an explicitly requested duration.
+- Timed Dialogue, Voice-over, Lyrics and On-screen Text now use the user-authored duration when preserving and validating cues, preventing all text after an incorrect LM duration from being silently clipped.
+
+### Verification
+
+- Added the exact 30-second four-dialogue regression and a 12-second workspace precedence regression.
+- Confirmed explicit 30-second, 2-minute, final-timecode-only and 45-second Chinese duration inference while rejecting age text such as `39岁` as a duration.
+- The complete bundled test suite passed: `235` tests.
+
+## [0.2.5-alpha.1] - 2026-08-27
+
+### Documentation
+
+- Added a Common Issues explanation for action／boundary image requests that incorrectly use neutral, blank or studio backgrounds.
+- Clarified that `Image media request N` is the ordinal image request in Design JSON and is not necessarily Media Pool `PN`.
+- Added incorrect and corrected Prompt examples, the global Identity Reference exception and exact repair steps.
+
+### Verification
+
+- Confirmed README version and complete-suite count now match `v0.2.5-alpha.1` and the latest `233`-test result.
+
+## [0.2.4-alpha.9.6] - 2026-08-27
+
+### Added
+
+- Added a persistent `Dialogue Text Layer TTS` selector to the main Settings page with `Edge TTS` and `VoxCPM2 Local` choices.
+- Added the first native VoxCPM2 adapter to `tts_service.py`: local-only model loading, deterministic per-Speaker Voice Design, exact Timeline WAV composition and provider metadata in the generated sidecar.
+
+### Changed
+
+- VoxCPM2 is loaded once for all authored lines in one Design Apply job. The crash-isolated worker releases the model and CUDA cache after composition.
+- Auto device selection uses safe CPU mode below 8 GB VRAM instead of attempting a likely GPU out-of-memory load.
+- A selected VoxCPM2 failure now stops Apply explicitly instead of silently falling back to Edge; Edge retains its existing Windows SAPI fallback.
+
+### Verification
+
+- Added Settings persistence, invalid-provider, provider-selection and deterministic VoxCPM2 voice-control regressions.
+- Confirmed the cached `openbmb/VoxCPM2` checkpoint loads through the bundled runtime in safe CPU mode; the complete waveform/compositor path is covered by an isolated provider integration test.
+- The complete bundled test suite passed: `233` tests.
+
+## [0.2.4-alpha.9.5] - 2026-08-27
+
+### Added
+
+- Added `run_voxcpm2_webui.bat`, which always launches VoxCPM2 through the bundled `ai_libraries_common/python_env` and defaults to the local-only `127.0.0.1:8088` endpoint.
+
+### Fixed
+
+- Documented that `app -port 8088` invokes the wrong Python association and uses an invalid single-dash argument; the supported direct form is `python app.py --port 8088`.
+
+### Verification
+
+- Confirmed `funasr 1.4.3`, `voxcpm 2.0.0` and the VoxCPM2 `app.py` argument parser through the bundled runtime.
+
+## [0.2.4-alpha.9.4] - 2026-08-26
+
+### Fixed
+
+- AI Design no longer treats an editorial `A1` track chosen for authored Dialogue, Voice-over or Lyrics as proof that a real Media Pool `@A1` asset exists.
+- Deterministically extracted timed text is now restored before media-plan repair, allowing an empty hallucinated A1 speech reuse to be removed and replaced later by the real `authored_speech_tts` request during Apply.
+- Missing non-TTS Audio references remain strict validation errors, so the repair cannot hide a genuinely missing ambience, music or supplied-audio dependency.
+
+### Verification
+
+- Added regressions for the exact empty-A1 dialogue failure and for preservation of strict missing-audio validation.
+- The complete bundled test suite passed: `229` tests.
+
+## [0.2.4-alpha.9.3] - 2026-08-26
+
+### Added
+
+- Installed the complete official VoxCPM2 source dependency set into the bundled `ai_libraries_common/python_env`, including audio I/O, text normalization, ModelScope, FunASR, Gradio and voice-cloning support libraries.
+- Installed the local `ai_libraries_common/VoxCPM-main` checkout as editable package `voxcpm 2.0.0`; the ZIP checkout receives a local build-version override because it does not contain Git metadata for `setuptools-scm`.
+
+### Changed
+
+- Replaced the unmatched `torch 2.12.1+cu126` runtime with the official ABI-matched `torch 2.11.0+cu126` and `torchaudio 2.11.0+cu126` pair. CUDA 12.6 remains active.
+
+### Verification
+
+- Verified imports for `voxcpm`, `torchcodec`, `torchaudio`, `librosa`, `soundfile`, `einops`, `pydantic`, `gradio`, `funasr`, `modelscope` and `wetext`.
+- Verified that BLIP classes still import after the Torch change, CUDA remains available, and `pip check` reports no broken requirements.
+- VoxCPM2 model weights are not part of this dependency installation; Edge TTS remains the active Studio engine until the local VoxCPM2 adapter is enabled.
+
+## [0.2.4-alpha.9.2] - 2026-08-26
+
+### Added
+
+- Added a deterministic, timecode-aware Design parser for exact `Dialogue`, `普通话对白`, `旁白`, `Voice-over`, `Lyrics` and `On-screen Text`; these cues are created with `explicit_user_requested=true` before LM planning.
+- Added an authored-text contract saved in Director projects. Apply and Preview / Run now stop with a precise error if explicit timed words have been lost or silently changed.
+- Added asynchronous Mandarin neural TTS through `edge-tts 7.2.7`, with S1/S2 Mandarin voices, Windows SAPI fallback, exact Timeline placement, long-line tempo fitting, WAV composition and automatic A Track loading.
+- Added hidden-segment TTS window extraction, so Smart Long Render and local Segment re-renders receive the correct part of the full authored speech instead of replaying the first line.
+
+### Fixed
+
+- LM image-caption Refinement can no longer erase or paraphrase Dialogue, Voice-over, Lyrics, On-screen Text or an explicitly requested theme from the first Design Plan.
+- H3 prompts no longer claim that supplied audio exists when no valid Audio reference is active. Without Audio they request exact native-language speech; with Audio they identify the actual request-local `<Audio N>` and require precise phoneme/lip synchronization.
+- AI Design no longer commits the old silent audio placeholder when explicit speech synthesis fails; Apply is stopped and the failure is shown to the user.
+
+### Verification
+
+- Added deterministic text-role, exact-word protection, Apply/Run contract, audio-conditional prompt, TTS tempo-chain and A-slot reservation regressions.
+- Confirmed a real `zh-CN-XiaoxiaoNeural` Mandarin WAV through the bundled runtime and FFmpeg compositor.
+- The complete bundled test suite passed: `227` tests.
+- Director Project format is now version `17`; older projects remain loadable, and newly saved projects retain the authored-text contract.
+
+## [0.2.4-alpha.9.1] - 2026-08-26
+
+### Added
+
+- Added a mandatory input-repair compiler to the English and Chinese `wuxia-blade-film` Skill. User-supplied Shot wording is now treated as creative intent rather than an immutable execution contract.
+- Added preflight detection for missing or uneven timing, overloaded five-second windows, conflicting slow/fast instructions, repeated bullet-time, qi used as a movement shortcut, unsupported flight, full 360-degree combat orbits, competing camera programs and multi-phase still-reference prompts.
+- Added deterministic rewrite rules that translate those failure patterns into exact 0.5-second ranges, contact-driven environmental reactions, visible launch and landing mechanics, 60–120-degree orientation-preserving coverage, two or three readable contacts and one primary camera movement per Shot.
+
+### Changed
+
+- Action-heavy 45-second inputs now default to nine five-second Shots across three native 15-second movements when the source timing is unusable; the user's story goal, identities, required weapons, key outcome and intensity remain protected while raw Shot count and unrenderable decoration may be restructured.
+- The Skill now performs a final clause-level compiler pass and must simplify or split the causal chain until mandatory actions are unlikely to be demoted and the normalized Design is expected to produce zero action-budget warnings.
+- Updated the Skill picker metadata so its default prompt explicitly requests diagnosis and repair before H3 choreography.
+
+### Verification
+
+- Added English/Chinese parity coverage for the new repair stage, timing fallback, 360-degree rewrite, camera limit and zero-warning compiler target.
+- Validated the updated Skill package in UTF-8 mode.
+- The complete bundled test suite passed: `219` tests.
+- The Director Project format remains version `16`; no saved-project migration is required.
+
+## [0.2.4-alpha.9] - 2026-08-26
+
+### Added
+
+- Added `example/one_leaf_kill_45s_design_requirement_v3.txt` and the directly loadable `example/one_leaf_kill_45s_design_plan_v3.json`, organized as nine exact 5-second Shots across three native 15-second render segments.
+- Added stable character, weapon, projectile, hat, wound and footing ledgers, plus explicit 15-second boundary states so separately generated segments continue the same physical action without replay.
+- Added one-frozen-instant reference-image rules and per-Shot reference budgets to prevent multi-action collages from becoming contradictory H3 guidance.
+
+### Changed
+
+- Replaced visible qi, magical aura, unsupported hovering, long aerial freezes and full 360-degree hero orbits with contact-driven airflow, grounded wall steps, gravity, tile breakage and a short orientation-preserving orbit.
+- Limited each Shot to at most three mandatory physical beats and moved leaves, sparks, dust, cloth motion and secondary camera decoration outside the core action budget.
+
+### Verification
+
+- Added regressions for the V3 Shot count, exact timing, native-boundary continuity, projectile direction, duplication guard, frozen-reference rule and direct Design JSON normalization.
+- Validated the updated Skill package in UTF-8 mode.
+- The complete bundled test suite passed: `218` tests.
+- The Director Project format remains version `16`; no saved-project migration is required.
+
 ## [0.2.4-alpha.8] - 2026-08-26
 
 ### Added

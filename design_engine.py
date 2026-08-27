@@ -20,6 +20,10 @@ MAX_REQUIRED_RESPONSES_PER_WINDOW = 2
 MAX_OPTIONAL_ACTIONS_PER_WINDOW = 2
 
 
+class DesignDurationContractError(ValueError):
+    """The model changed a duration that the user specified explicitly."""
+
+
 _PICTURE_REFERENCE_RE = re.compile(r"<\s*picture\s+\d+\s*>", flags=re.I)
 _MEDIA_ID_RE = re.compile(r"^@?([PVA])(\d+)$", flags=re.I)
 _H3_MEDIA_TAG_RE = re.compile(r"^<\s*(Picture|Video|Audio)\s+(\d+)\s*>$", flags=re.I)
@@ -96,6 +100,266 @@ _LEADING_OUTGOING_RE = re.compile(
     r"^\s*(?:outgoing|exit|end(?:ing)?\s+state|final\s+state)\s*:\s*",
     flags=re.I,
 )
+
+_TIMED_TEXT_RANGE_RE = re.compile(
+    r"[\[【(（]?\s*"
+    r"(?P<start>(?:\d{1,2}:){1,2}\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:s|秒)?\s*"
+    r"(?:-|–|—|~|～|至|到)\s*"
+    r"(?P<end>(?:\d{1,2}:){1,2}\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:s|秒)?\s*"
+    r"[\]】)）]?",
+    flags=re.I,
+)
+_TIMED_TEXT_LABEL_RE = re.compile(
+    r"^\s*(?:[-*#>]+\s*)?"
+    r"(?:(?P<speaker>S[12])\s*)?"
+    r"(?P<label>"
+    r"(?:(?:普通话|普通話|国语|國語|Mandarin)\s*)?(?:对白|對白|台词|台詞|dialogue)"
+    r"|(?:(?:普通话|普通話|国语|國語|Mandarin)\s*)?(?:旁白|画外音|畫外音|voice[\s-]*over|voiceover|narration)"
+    r"|(?:歌词|歌詞|lyrics?)"
+    r"|(?:屏幕文字|螢幕文字|画面文字|畫面文字|字幕|标题文字|標題文字|on[\s-]*screen\s*text)"
+    r")\s*[：:]\s*(?P<content>.*)$",
+    flags=re.I,
+)
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
+
+
+def _parse_design_timecode(value: str) -> float:
+    parts = [float(item) for item in str(value).strip().split(":")]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return parts[0] * 60.0 + parts[1]
+    return parts[-3] * 3600.0 + parts[-2] * 60.0 + parts[-1]
+
+
+_EXPLICIT_VIDEO_DURATION_PATTERNS = (
+    re.compile(
+        r"(?:时长|時長|片长|片長|总长|總長|总时长|總時長|"
+        r"创作|創作|制作|製作|生成|我要|我想要|需要|duration|length)"
+        r"[^\n。！？.!?]{0,28}?"
+        r"(?P<value>\d+(?:\.\d+)?)\s*"
+        r"(?P<unit>秒|秒钟|秒鐘|s|sec(?:ond)?s?|分钟|分鐘|min(?:ute)?s?)",
+        flags=re.I,
+    ),
+    re.compile(
+        r"(?P<value>\d+(?:\.\d+)?)\s*"
+        r"(?P<unit>秒|秒钟|秒鐘|s|sec(?:ond)?s?|分钟|分鐘|min(?:ute)?s?)"
+        r"[^\n。！？.!?]{0,16}?(?:视频|影片|短片|片段|video|film)",
+        flags=re.I,
+    ),
+)
+
+
+def infer_explicit_design_duration(requirement: str) -> float | None:
+    """Return an explicit user duration, preferring the latest authored timecode.
+
+    Workspace Timeline duration is deliberately excluded: it is editing context, not
+    authority to shorten a newly requested Design.
+    """
+    text = str(requirement or "")
+    candidates: list[float] = []
+    for pattern in _EXPLICIT_VIDEO_DURATION_PATTERNS:
+        for match in pattern.finditer(text):
+            value = float(match.group("value"))
+            unit = match.group("unit").lower()
+            if unit.startswith("分") or unit.startswith("min"):
+                value *= 60.0
+            if value > 0.0:
+                candidates.append(value)
+    for match in _TIMED_TEXT_RANGE_RE.finditer(text):
+        end = _parse_design_timecode(match.group("end"))
+        if end > 0.0:
+            candidates.append(end)
+    if not candidates:
+        return None
+    duration = min(MAX_DESIGN_DURATION_SECONDS, max(candidates))
+    return round(round(duration * 2.0) / 2.0, 6)
+
+
+def _strip_authored_text_quotes(value: str) -> str:
+    text = str(value).strip()
+    quote_pairs = (("「", "」"), ("『", "』"), ("“", "”"), ('"', '"'), ("'", "'"))
+    changed = True
+    while changed and len(text) >= 2:
+        changed = False
+        for left, right in quote_pairs:
+            if text.startswith(left) and text.endswith(right):
+                text = text[len(left):len(text) - len(right)].strip()
+                changed = True
+                break
+    return text
+
+
+def _timed_text_role(label: str) -> str:
+    lowered = str(label).lower().replace("-", " ")
+    if any(token in lowered for token in ("旁白", "画外音", "畫外音", "voice over", "voiceover", "narration")):
+        return "voice_over"
+    if any(token in lowered for token in ("歌词", "歌詞", "lyric")):
+        return "lyrics"
+    if any(token in lowered for token in ("屏幕文字", "螢幕文字", "画面文字", "畫面文字", "字幕", "标题文字", "標題文字", "on screen text")):
+        return "on_screen_text"
+    return "dialogue"
+
+
+def _timed_text_delivery(context: str, role: str) -> str:
+    if role == "on_screen_text":
+        return "Readable and precisely timed"
+    if re.search(r"委屈|含泪|含淚|眼泪|眼淚|哭|tearful|cry", context, flags=re.I):
+        return "Natural, tearful and emotionally controlled"
+    if re.search(r"坚定|堅定|坚决|堅決|determined|firm", context, flags=re.I):
+        return "Natural, firm and determined"
+    if re.search(r"激昂|爆发|爆發|愤怒|憤怒|angry|intense", context, flags=re.I):
+        return "Natural and emotionally intense"
+    return "Natural"
+
+
+def extract_explicit_timed_text_layers(
+    requirement: str,
+    duration_seconds: float | None = None,
+) -> list[dict]:
+    """Deterministically recover exact, timed authored speech/text from Design prose.
+
+    This parser intentionally runs before and after the language model.  The model may
+    refine cinematography, but it is never allowed to decide whether a user's verbatim
+    Dialogue, Voice-over, Lyrics or On-screen Text exists.
+    """
+    text = str(requirement or "")
+    if not text.strip():
+        return []
+    lines = text.splitlines()
+    active_range: tuple[float, float] | None = None
+    active_context: list[str] = []
+    layers: list[dict] = []
+    for line_number, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        range_match = _TIMED_TEXT_RANGE_RE.search(line)
+        if range_match:
+            start = _parse_design_timecode(range_match.group("start"))
+            end = _parse_design_timecode(range_match.group("end"))
+            if end > start:
+                if duration_seconds is not None:
+                    start = min(max(0.0, start), float(duration_seconds))
+                    end = min(max(start, end), float(duration_seconds))
+                active_range = (start, end) if end > start else None
+                active_context = [line]
+        label_line = _TIMED_TEXT_RANGE_RE.sub("", line).strip(" -–—[]【】()（）")
+        label_match = _TIMED_TEXT_LABEL_RE.match(label_line)
+        if not label_match:
+            if active_range:
+                active_context.append(line)
+            continue
+        if not active_range:
+            # Untimed narrative labels are not enough to build a deterministic layer.
+            continue
+        content = _strip_authored_text_quotes(label_match.group("content"))
+        if not content and line_number + 1 < len(lines):
+            candidate = _strip_authored_text_quotes(lines[line_number + 1])
+            if candidate and not _TIMED_TEXT_RANGE_RE.search(candidate):
+                content = candidate
+        if not content or content.lower() in {"如下", "as follows"}:
+            continue
+        label = label_match.group("label")
+        role = _timed_text_role(label)
+        language = (
+            "Mandarin Chinese"
+            if re.search(r"普通话|普通話|国语|國語|Mandarin", label, flags=re.I)
+            else "Chinese"
+            if _CJK_RE.search(content)
+            else "Original language"
+        )
+        start, end = active_range
+        layer = {
+            "start_seconds": round(start, 6),
+            "end_seconds": round(end, 6),
+            "track": {
+                "dialogue": "A4", "voice_over": "A5", "lyrics": "A6",
+                "on_screen_text": "V4",
+            }[role],
+            "content": content,
+            "role": role,
+            "speaker": (label_match.group("speaker") or "S1").upper(),
+            "language": language,
+            "delivery": _timed_text_delivery(" ".join(active_context), role),
+            "lip_sync": role == "dialogue",
+            "explicit_user_requested": True,
+        }
+        identity = (role, round(start, 3), round(end, 3), content)
+        if not any(
+            (item["role"], round(item["start_seconds"], 3), round(item["end_seconds"], 3), item["content"])
+            == identity
+            for item in layers
+        ):
+            layers.append(layer)
+    return layers
+
+
+def protect_explicit_timed_text_layers(plan: dict, requirement: str) -> dict:
+    """Merge deterministic authored text into a plan, overriding LM paraphrases."""
+    result = deepcopy(plan)
+    authored_duration = infer_explicit_design_duration(requirement)
+    required = extract_explicit_timed_text_layers(
+        requirement,
+        authored_duration
+        or float(result.get("duration_seconds", 0.0) or 0.0)
+        or None,
+    )
+    if not required:
+        return result
+    retained: list[dict] = []
+    for existing in result.get("text_layers") or []:
+        if not isinstance(existing, dict):
+            continue
+        role = str(existing.get("role", ""))
+        start = float(existing.get("start_seconds", 0.0))
+        end = float(existing.get("end_seconds", start))
+        conflicts = any(
+            role == authored["role"]
+            and start < authored["end_seconds"] - 1e-6
+            and end > authored["start_seconds"] + 1e-6
+            for authored in required
+        )
+        if not conflicts:
+            retained.append(deepcopy(existing))
+    result["text_layers"] = required + retained
+    warnings = [str(item) for item in result.get("design_warnings") or []]
+    notice = f"Protected {len(required)} exact timed user-authored text layer(s) from LM rewriting."
+    if notice not in warnings:
+        warnings.append(notice)
+    result["design_warnings"] = warnings
+    return result
+
+
+def validate_explicit_timed_text_contract(requirement: str, plan: dict) -> list[dict]:
+    """Raise if a plan silently loses exact text explicitly supplied by the user."""
+    authored_duration = infer_explicit_design_duration(requirement)
+    required = extract_explicit_timed_text_layers(
+        requirement,
+        authored_duration
+        or float(plan.get("duration_seconds", 0.0) or 0.0)
+        or None,
+    )
+    if not required:
+        return []
+    actual = [item for item in plan.get("text_layers") or [] if isinstance(item, dict)]
+    missing = [
+        item for item in required
+        if not any(
+            str(candidate.get("role", "")) == item["role"]
+            and str(candidate.get("content", "")).strip() == item["content"]
+            and abs(float(candidate.get("start_seconds", -1.0)) - item["start_seconds"]) <= 0.01
+            and abs(float(candidate.get("end_seconds", -1.0)) - item["end_seconds"]) <= 0.01
+            for candidate in actual
+        )
+    ]
+    if missing:
+        raise ValueError(
+            "The Design requirement contains explicit timed Dialogue/Voice-over/Lyrics/On-screen "
+            f"Text, but {len(missing)} exact layer(s) are missing. Apply/Run is blocked to prevent "
+            "silent video generation. Regenerate or restore the authored text layers."
+        )
+    return required
 
 
 DESIGN_JSON_SCHEMA = {
@@ -476,6 +740,13 @@ def repair_design_media_plan(
     }
     valid_uses: list[dict] = []
     warnings: list[str] = []
+    has_authored_speech = any(
+        isinstance(row, dict)
+        and str(row.get("role", "")).strip().lower()
+        in {"dialogue", "voice_over", "lyrics"}
+        and str(row.get("content", "")).strip()
+        for row in source.get("text_layers") or []
+    )
 
     for use_number, raw in enumerate(source.get("existing_media_uses") or [], 1):
         if not isinstance(raw, dict):
@@ -488,6 +759,28 @@ def repair_design_media_plan(
         within_capacity = bool(
             media_type and 1 <= ordinal <= int(capacities.get(media_type, 0))
         )
+        authored_audio_hint = " ".join((
+            str(raw.get("requirement_id", "")),
+            str(raw.get("instruction", "")),
+            " ".join(_string_list(raw.get("subject_keywords") or [])),
+        ))
+        if (
+            not is_loaded
+            and within_capacity
+            and media_type == "audio"
+            and has_authored_speech
+            and re.search(
+                r"dialogue|voice[-_ ]?over|speech|spoken|narrat|tts|lip[-_ ]?sync|"
+                r"台词|臺詞|对白|對白|旁白|语音|語音|普通话|普通話|口型",
+                authored_audio_hint,
+                flags=re.I,
+            )
+        ):
+            warnings.append(
+                f"{media_id} was empty and described authored speech, so its mistaken "
+                "existing-media reuse was removed; Apply will reserve a generated TTS Audio slot."
+            )
+            continue
         if is_loaded or not within_capacity or media_type != "image":
             valid_uses.append(dict(raw))
             continue
@@ -939,14 +1232,34 @@ def normalize_design_plan(
     existing_media: list[dict] | None = None,
     strict_t2i_prompts: bool = False,
     repair_media_plan: bool = False,
+    authored_requirement: str = "",
 ) -> dict:
     media_repair_warnings: list[str] = []
+    prepared_payload = extract_design_json(payload)
+    authored_duration = infer_explicit_design_duration(authored_requirement)
+    if authored_duration is not None:
+        returned_duration = snap_half_second(
+            prepared_payload.get("duration_seconds", 5.0),
+            MAX_DESIGN_DURATION_SECONDS,
+        )
+        if abs(returned_duration - authored_duration) > 0.01:
+            raise DesignDurationContractError(
+                "Duration contract mismatch: the user explicitly requested "
+                f"{authored_duration:.2f}s, but Design JSON returned "
+                f"{returned_duration:.2f}s. Do not condense, summarize, stretch or "
+                "inherit the current workspace Timeline duration; regenerate every Shot, "
+                "text layer, cue and media range for the exact requested duration."
+            )
+    if authored_requirement.strip():
+        prepared_payload = protect_explicit_timed_text_layers(
+            prepared_payload, authored_requirement
+        )
     if repair_media_plan:
         source, media_repair_warnings = repair_design_media_plan(
-            payload, capacities, existing_media
+            prepared_payload, capacities, existing_media
         )
     else:
-        source = extract_design_json(payload)
+        source = prepared_payload
     duration = snap_half_second(
         source.get("duration_seconds", 5.0),
         MAX_DESIGN_DURATION_SECONDS,
@@ -1332,10 +1645,20 @@ def build_design_system_prompt(context: dict) -> str:
             "The bound Default H3 skill and optional Special skill in the workspace context are authoritative. "
             "Apply their planning, continuity, reference-retention, shot, audio and technical rules while producing the JSON. "
         )
+    requested_duration = context.get("requested_duration_seconds")
+    duration_contract = ""
+    if requested_duration is not None:
+        duration_contract = (
+            f"DURATION CONTRACT: The user explicitly requested exactly {float(requested_duration):.2f} seconds. "
+            f"Set duration_seconds to {float(requested_duration):.2f}; preserve all authored timecodes through that "
+            "final timestamp. Never condense, summarize, stretch or replace this duration with "
+            "current_duration_seconds from the workspace. The current Timeline duration is context only. "
+        )
     return (
         "You are the AI Design Planner inside a MiniMax H3 Director Cut application. "
         "Convert the user's concept into one production-ready JSON object that exactly matches the supplied schema. "
         + skill_direction
+        + duration_contract
         + "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
         "subject action, environmental response, continuity state, optional flourish and additional direction. "
@@ -1356,8 +1679,13 @@ def build_design_system_prompt(context: dict) -> str:
         "Timeline tracks are editorial lanes, not the physical H3 reference-slot count. You may plan V4, V5 and higher "
         "visual lanes for overlapping action states, titles or compositing, and A4, A5 and higher audio lanes for dialogue, "
         "voice-over, lyrics, ambience or music stems; the Studio creates those tracks automatically. Keep on-screen text on "
-        "a V track and place dialogue, voice-over and lyrics on A tracks. The renderer will select only the temporally relevant "
-        "references for each native 15-second H3 window, so never exceed the supplied physical media_capacity merely because "
+        "a V track and place dialogue, voice-over and lyrics on A tracks. "
+        "An editorial A-track label such as A1 is not proof that an Audio asset exists. When the user supplies authored "
+        "Dialogue, Voice-over or Lyrics without an explicitly loaded @A reference, put the exact words in text_layers only; "
+        "never invent A1 in existing_media_uses and never create a placeholder speech-audio request. The application reserves "
+        "the generated TTS Audio slot after validation. "
+        "The renderer will select only the temporally relevant references for each native 15-second H3 window, so never exceed "
+        "the supplied physical media_capacity merely because "
         "additional editorial tracks exist. "
         "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. The user may "
         "refer to its stable Media Pool IDs as @P1, @P2, @V1 or @A1; write the ID without @ in existing_media_uses.media_id. "

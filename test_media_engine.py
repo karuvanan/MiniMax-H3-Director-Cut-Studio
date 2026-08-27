@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 
 from audio_engine import SAMPLE_RATE, estimate_tempo, stream_audio_chunks, voice_activity
+from blip_service import is_cuda_fallback_error
 from media_engine import (
     create_image_analysis_regions,
     create_video_analysis_frames,
@@ -16,6 +17,21 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class MediaEngineTests(unittest.TestCase):
+    def test_blip_cuda_architecture_failure_is_safe_for_cpu_retry(self):
+        self.assertTrue(
+            is_cuda_fallback_error(
+                RuntimeError(
+                    "CUDA error: no kernel image is available for execution on the device"
+                )
+            )
+        )
+        self.assertTrue(
+            is_cuda_fallback_error(
+                RuntimeError("cudaErrorNoKernelImageForDevice from AcceleratorError")
+            )
+        )
+        self.assertFalse(is_cuda_fallback_error(FileNotFoundError("missing image")))
+
     def test_common_runtime_is_self_contained(self):
         runtime = load_runtime_paths()
         self.assertEqual(runtime.missing(), [])

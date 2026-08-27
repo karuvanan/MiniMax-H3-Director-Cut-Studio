@@ -185,6 +185,70 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_authored_dialogue_reserves_tts_audio_and_run_guard_detects_loss(self):
+        window = DirectorCutStudio()
+        plan = normalize_design_plan(
+            sample_design(), window.scan.counts,
+            existing_media=window._design_context().get("existing_media") or [],
+        )
+        authored = {
+            "start_seconds": 0.0,
+            "end_seconds": 7.0,
+            "track": "A4",
+            "content": "我今年三十九岁了。",
+            "role": "dialogue",
+            "speaker": "S1",
+            "language": "Mandarin Chinese",
+            "delivery": "Natural",
+            "lip_sync": True,
+            "explicit_user_requested": True,
+        }
+        plan["_required_text_layers"] = [authored]
+        self.assertTrue(window._ensure_authored_tts_request(plan, "普通话对白"))
+        audio_requests = [
+            item for item in plan["media_requests"] if item["media_type"] == "audio"
+        ]
+        self.assertEqual(audio_requests[0]["requirement_id"], "authored_speech_tts")
+        self.assertEqual(audio_requests[0]["track"], "A1")
+
+        window.authored_text_requirements = [authored]
+        window.text_layers = []
+        with patch("director_cut_studio.QMessageBox.critical") as warning:
+            self.assertFalse(window._validate_authored_text_before_run())
+        warning.assert_called_once()
+        window.text_layers = [TextLayer(
+            "T1", authored["content"], 0.0, 7.0, "A4",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            delivery="Natural", lip_sync=True,
+        )]
+        self.assertTrue(window._validate_authored_text_before_run())
+        window.project_dirty = False
+        window.close()
+
+    def test_dialogue_prompt_names_supplied_audio_only_when_present(self):
+        window = DirectorCutStudio()
+        window.director_cues = [DirectorCue(
+            "S1", "shot", 0.0, 5.0, "Dialogue close-up", "", "V1",
+            "Close-up", "Eye level", "Static", "Slow", "Small",
+            "The woman looks into the camera.", "",
+        )]
+        window.text_layers = [TextLayer(
+            "T1", "请听我说。", 0.0, 5.0, "A4",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            delivery="Natural", lip_sync=True, shot_id="S1",
+        )]
+        without_audio = window._prompt_spec_with_director_cues(
+            window.prompt_panel.spec()
+        )
+        self.assertIn("Generate this exact audible Mandarin Chinese dialogue", without_audio.shots[0])
+        self.assertNotIn("supplied speech", without_audio.shots[0])
+        with_audio = window._prompt_spec_with_director_cues(
+            window.prompt_panel.spec(), supplied_dialogue_audio_tag="<Audio 2>"
+        )
+        self.assertIn("Use <Audio 2> exactly as the supplied speech", with_audio.shots[0])
+        window.project_dirty = False
+        window.close()
+
     def test_design_page_fits_screen_scrolls_and_uses_compact_checkpoint_controls(self):
         window = DirectorCutStudio()
         with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):

@@ -3,19 +3,32 @@ from pathlib import Path
 import shutil
 import unittest
 from unittest.mock import patch
+import wave
 
 from design_cleanup_service import cleanup, lm_origin, unload_lm_studio
 from design_ai_service import handle as handle_design_ai_job
 from design_engine import (
     DESIGN_JSON_SCHEMA,
+    DesignDurationContractError,
     build_design_system_prompt,
+    extract_explicit_timed_text_layers,
+    infer_explicit_design_duration,
     materialize_design_media,
     normalize_shot_action_budget,
     normalize_design_plan,
+    protect_explicit_timed_text_layers,
+    validate_explicit_timed_text_contract,
 )
 from design_media_service import generate as generate_design_media, image_workflow
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
+from tts_service import (
+    atempo_filters,
+    normalize_tts_engine,
+    synthesize_timeline,
+    voxcpm_speaker_seed,
+    voxcpm_voice_control,
+)
 
 
 def sample_design() -> dict:
@@ -86,6 +99,245 @@ def sample_design() -> dict:
 
 
 class DesignEngineTests(unittest.TestCase):
+    LATE_SINGLE_WOMAN_REQUIREMENT = """帮我创作30秒的视频，内容和旁白如下：
+题目：大齡剩女的困惑
+[00:00 - 00:07] 畫面：女主角一臉委屈、眼眶泛淚地看著鏡頭。
+普通话对白：「我今年 39 歲了。他們都叫我『大齡剩女』，勸我年紀大了，差不多就得了。」
+[00:07 - 00:15] 畫面：女主角情緒爆發，一邊哭泣一邊不甘心地質問。
+普通话对白：「但我憑什麼要降低要求？我自己能賺錢、能生活，我想找個年收入 100 萬、能心靈契合的人，真的錯了嗎？」
+[00:15 - 00:23] 畫面：女主角無奈苦笑並看著手機上的嘲諷評論。
+普通话对白：「古人說『女子無才便是德』，意思是有才華而不炫耀、不傲物才是美德。怎麼到了今天，獨立和優秀反而成了罪過？」
+[00:23 - 00:30] 畫面：女主角擦乾眼淚，眼神堅定。
+普通话对白：「我不是被剩下的，我只是在堅持我想要的。這份不將就的困惑，你，懂嗎？」"""
+
+    def test_explicit_30_second_requirement_outranks_12_second_workspace(self):
+        requirement = self.LATE_SINGLE_WOMAN_REQUIREMENT
+        self.assertEqual(infer_explicit_design_duration(requirement), 30.0)
+        with self.assertRaisesRegex(DesignDurationContractError, "30.00s"):
+            normalize_design_plan(
+                sample_design(),
+                {"image": 9, "video": 3, "audio": 3},
+                authored_requirement=requirement,
+            )
+
+        payload = sample_design()
+        payload["duration_seconds"] = 30.0
+        payload["shots"] = [{
+            **payload["shots"][0],
+            "start_seconds": 0.0,
+            "end_seconds": 30.0,
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            authored_requirement=requirement,
+        )
+        self.assertEqual(plan["duration_seconds"], 30.0)
+        self.assertEqual(len(plan["text_layers"]), 4)
+        self.assertEqual(
+            [(row["start_seconds"], row["end_seconds"]) for row in plan["text_layers"]],
+            [(0.0, 7.0), (7.0, 15.0), (15.0, 23.0), (23.0, 30.0)],
+        )
+
+    def test_duration_contract_is_injected_into_design_system_prompt(self):
+        prompt = build_design_system_prompt({
+            "requested_duration_seconds": 30.0,
+            "current_duration_seconds": 12.0,
+        })
+        self.assertIn("exactly 30.00 seconds", prompt)
+        self.assertIn("current Timeline duration is context only", prompt)
+
+    def test_empty_a1_hallucination_is_removed_before_authored_tts_reservation(self):
+        requirement = """[00:00-00:01.50]
+普通话对白：「你好，你是新来的？」
+[00:01.50-00:03.00]
+普通话对白：「对，今天刚到。」"""
+        payload = sample_design()
+        payload["duration_seconds"] = 3.0
+        payload["shots"] = [{
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "track": "V1",
+            "preset": "Dialogue Test",
+            "framing": "Medium two-shot",
+            "camera_angle": "Eye level",
+            "camera_movement": "Static",
+            "movement_speed": "Still",
+            "movement_amplitude": "None",
+            "subject_action": "The woman asks; the man answers.",
+            "environment_response": "Natural blinking and restrained expressions.",
+            "additional_direction": "Keep both mouths visible for lip sync.",
+        }]
+        payload["transitions"] = []
+        payload["markers"] = []
+        payload["text_layers"] = []  # Simulate an LM that omitted deterministic text.
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [{
+            "requirement_id": "dialogue_audio",
+            "media_id": "A1",
+            "media_type": "audio",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "track": "A1",
+            "subject_keywords": ["Mandarin dialogue", "lip sync"],
+            "instruction": "Use A1 for exact Mandarin dialogue and lip sync.",
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[],
+            repair_media_plan=True,
+            authored_requirement=requirement,
+        )
+        self.assertEqual(plan["existing_media_uses"], [])
+        self.assertEqual(len(plan["text_layers"]), 2)
+        self.assertTrue(all(row["role"] == "dialogue" for row in plan["text_layers"]))
+        self.assertTrue(any("generated TTS Audio slot" in row for row in plan["design_warnings"]))
+
+    def test_empty_non_tts_a1_reference_still_fails_validation(self):
+        payload = sample_design()
+        payload["text_layers"] = []
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [{
+            "requirement_id": "location_ambience",
+            "media_id": "A1",
+            "media_type": "audio",
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "track": "A1",
+            "instruction": "Preserve the supplied room ambience.",
+        }]
+        with self.assertRaisesRegex(ValueError, "A1 is not present"):
+            normalize_design_plan(
+                payload,
+                {"image": 9, "video": 3, "audio": 3},
+                existing_media=[],
+                repair_media_plan=True,
+            )
+
+    def test_tts_tempo_chain_supports_long_authored_lines(self):
+        filters = atempo_filters(5.0)
+        factors = [float(item.split("=", 1)[1]) for item in filters]
+        self.assertTrue(all(0.5 <= value <= 2.0 for value in factors))
+        product = 1.0
+        for value in factors:
+            product *= value
+        self.assertAlmostEqual(product, 5.0, places=5)
+
+    def test_voxcpm2_local_engine_and_speaker_voice_are_deterministic(self):
+        self.assertEqual(normalize_tts_engine("voxcpm2_local"), "voxcpm2_local")
+        self.assertEqual(voxcpm_speaker_seed("S1"), voxcpm_speaker_seed("s1"))
+        self.assertNotEqual(voxcpm_speaker_seed("S1"), voxcpm_speaker_seed("S2"))
+        female = voxcpm_voice_control({"speaker": "S1", "delivery": "克制而坚定"})
+        male = voxcpm_voice_control({"speaker": "S2"})
+        self.assertIn("female voice", female)
+        self.assertIn("male voice", male)
+        self.assertIn("克制而坚定", female)
+
+    def test_unknown_tts_engine_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            normalize_tts_engine("unknown")
+
+    def test_voxcpm2_provider_composes_timeline_and_releases_worker_model(self):
+        output = PROJECT_ROOT / ".director_cache" / "voxcpm_provider_test.wav"
+        output.unlink(missing_ok=True)
+        events = []
+
+        class FakeVoxCPM2:
+            def __init__(self, job):
+                events.append(("load", job["engine"]))
+
+            def synthesize(self, layer, target):
+                events.append(("synthesize", layer["speaker"]))
+                with wave.open(str(target), "wb") as sink:
+                    sink.setnchannels(1)
+                    sink.setsampwidth(2)
+                    sink.setframerate(24000)
+                    sink.writeframes(b"\0\0" * 2400)
+
+            def release(self):
+                events.append(("release", None))
+
+        try:
+            with patch("tts_service.VoxCPM2LocalSynthesizer", FakeVoxCPM2):
+                result = synthesize_timeline({
+                    "engine": "voxcpm2_local",
+                    "output_path": str(output),
+                    "duration_seconds": 1.0,
+                    "text_layers": [{
+                        "start_seconds": 0.0,
+                        "end_seconds": 1.0,
+                        "role": "dialogue",
+                        "speaker": "S1",
+                        "language": "Mandarin Chinese",
+                        "content": "你好。",
+                    }],
+                    "ffmpeg": str(load_runtime_paths().ffmpeg),
+                })
+            self.assertTrue(result["completed"])
+            self.assertIn("VoxCPM2 Local", result["engine"])
+            self.assertTrue(output.is_file())
+            self.assertEqual(
+                events,
+                [("load", "voxcpm2_local"), ("synthesize", "S1"), ("release", None)],
+            )
+        finally:
+            output.unlink(missing_ok=True)
+
+    def test_timed_mandarin_dialogue_is_recovered_without_lm_cooperation(self):
+        requirement = """[00:00 - 00:07] 畫面：女主角眼眶泛淚。
+普通话对白：「我今年 39 歲了。他們都叫我大齡剩女。」
+[00:07 - 00:15] 畫面：她情緒爆發。
+普通話對白：「但我憑什麼要降低要求？」"""
+        layers = extract_explicit_timed_text_layers(requirement, 30.0)
+        self.assertEqual(len(layers), 2)
+        self.assertEqual(layers[0]["role"], "dialogue")
+        self.assertEqual(layers[0]["language"], "Mandarin Chinese")
+        self.assertEqual(layers[0]["content"], "我今年 39 歲了。他們都叫我大齡剩女。")
+        self.assertEqual((layers[1]["start_seconds"], layers[1]["end_seconds"]), (7.0, 15.0))
+        self.assertTrue(layers[0]["lip_sync"])
+        self.assertTrue(layers[0]["explicit_user_requested"])
+
+    def test_all_authored_text_roles_are_deterministically_classified(self):
+        requirement = '''[0-2秒]
+旁白：「第一句旁白。」
+[2-4秒]
+Lyrics: "sing this line"
+[4-6秒]
+On-screen text: "EXACT TITLE"'''
+        layers = extract_explicit_timed_text_layers(requirement, 6.0)
+        self.assertEqual(
+            [item["role"] for item in layers],
+            ["voice_over", "lyrics", "on_screen_text"],
+        )
+        self.assertEqual([item["track"] for item in layers], ["A5", "A6", "V4"])
+
+    def test_authored_text_overrides_lm_paraphrase_and_contract_detects_loss(self):
+        requirement = """[00:00-00:05]
+普通话对白：「不要改写这一句话。」"""
+        plan = sample_design()
+        plan["duration_seconds"] = 5.0
+        plan["text_layers"] = [{
+            "start_seconds": 0.0,
+            "end_seconds": 5.0,
+            "track": "A4",
+            "content": "模型擅自改写。",
+            "role": "dialogue",
+            "speaker": "S1",
+            "language": "Chinese",
+            "delivery": "Natural",
+            "lip_sync": True,
+            "explicit_user_requested": True,
+        }]
+        protected = protect_explicit_timed_text_layers(plan, requirement)
+        self.assertEqual(protected["text_layers"][0]["content"], "不要改写这一句话。")
+        self.assertEqual(len(protected["text_layers"]), 1)
+        self.assertEqual(len(validate_explicit_timed_text_contract(requirement, protected)), 1)
+        with self.assertRaisesRegex(ValueError, "Apply/Run is blocked"):
+            validate_explicit_timed_text_contract(requirement, {**plan, "text_layers": []})
+
     def test_design_ai_worker_releases_comfy_models_before_refinement(self):
         with patch("design_ai_service.request_json", return_value={}) as request:
             result = handle_design_ai_job({

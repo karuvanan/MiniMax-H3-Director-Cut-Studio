@@ -1,1 +1,1 @@
-# Add Python packages here
+edge-tts==7.2.7

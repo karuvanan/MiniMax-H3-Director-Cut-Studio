@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.4-alpha.8`](VERSION)
+- 当前应用版本：[`v0.2.5-alpha.3`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -222,60 +222,173 @@ video_minimax_h3_r2v API 3IMAGE 1AUDIO 1VIDEO.json
 | Python | `3.11.15` — `ai_libraries_common/python_env/python.exe` |
 | PySide6 | `6.11.2` |
 | Pillow | `12.2.0` |
-| Torch | `2.12.1+cu126` |
+| Torch | `2.11.0+cu126` |
+| Torchaudio | `2.11.0+cu126` |
 | CUDA runtime | `12.6` |
 | Transformers | `5.12.1` |
+| Mandarin TTS | Settings 可切换 `Edge TTS` 或 `VoxCPM2 Local`；Edge 使用 `edge-tts 7.2.7` |
+| VoxCPM2 runtime | `voxcpm 2.0.0` 源码与完整依赖；本地模型 `openbmb/VoxCPM2`，不在生成时联网下载 |
 | FFmpeg / FFprobe | `ai_libraries_common/engine_ffmpeg/bin/`，2026-05-25 build |
 
 ### 完整 Python library 版本清单
 
-以下清单直接读取自当前项目的 `ai_libraries_common/python_env`，共 **44 个已安装 distribution**。这是应用实际运行环境的版本快照，不是建议版本范围：
+以下清单直接读取自当前项目的 `ai_libraries_common/python_env`，共 **154 个已安装 distribution**。这是应用实际运行环境的版本快照，不是建议版本范围：
 
 ```text
 accelerate==1.14.0
+addict==2.4.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+aliyun-python-sdk-core==2.16.1
+aliyun-python-sdk-kms==2.16.5
 annotated-doc==0.0.4
+annotated-types==0.8.0
+antlr4-python3-runtime==4.9.3
+anyascii==0.3.3
 anyio==4.14.1
+argbind==0.3.9
+attrs==26.1.0
+audioread==3.1.0
+brotli==1.2.0
 certifi==2026.6.17
+cffi==2.1.1
+charset-normalizer==3.5.1
 click==8.4.2
 colorama==0.4.6
-filelock==3.29.0
-fsspec==2026.4.0
+contourpy==1.3.3
+contractions==0.1.73
+crcmod==1.7
+cryptography==50.0.1
+cycler==0.12.1
+datasets==3.6.0
+decorator==5.3.1
+dill==0.3.8
+docstring_parser==0.18.0
+edge-tts==7.2.7
+einops==0.8.2
+fastapi==0.141.1
+filelock==3.32.4
+fonttools==4.63.0
+frozenlist==1.8.0
+fsspec==2025.3.0
+funasr==1.4.3
+gradio==6.26.0
+gradio_client==2.6.1
+groovy==0.1.2
 h11==0.16.0
+hf-gradio==0.4.1
 hf-xet==1.5.1
 httpcore==1.0.9
 httpx==0.28.1
 huggingface_hub==1.21.0
+hydra-core==1.3.5
 idna==3.18
+inflect==7.5.0
+jaconv==0.5.0
+jamo==0.4.1
+jieba==0.42.1
 Jinja2==3.1.6
+jmespath==1.1.0
+joblib==1.5.3
+kaldifst==1.8.0
+kaldiio==2.18.1
+kiwisolver==1.5.0
+lazy-loader==0.5
+librosa==0.11.0
+llvmlite==0.49.0
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
+matplotlib==3.11.1
 mdurl==0.1.2
+modelscope==1.39.1
+modelscope-hub==0.2.0
+more-itertools==11.1.0
 mpmath==1.3.0
+msgpack==1.2.1
+multidict==6.7.1
+multiprocess==0.70.16
+narwhals==2.25.0
 networkx==3.6.1
+numba==0.67.0
 numpy==2.4.6
+omegaconf==2.3.1
+orjson==3.12.0
+oss2==2.19.1
 packaging==26.0
+pandas==3.0.5
 pillow==12.2.0
 pip==26.1.2
+platformdirs==4.11.4
+pooch==1.9.0
+propcache==0.5.2
+protobuf==7.36.0
 psutil==7.2.2
+pyahocorasick==2.3.1
+pyarrow==25.0.1
+pycparser==3.0
+pycryptodome==3.23.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pydub==0.25.1
 Pygments==2.20.0
+pynndescent==0.6.0
+pyparsing==3.3.2
 PySide6==6.11.2
 PySide6_Addons==6.11.2
 PySide6_Essentials==6.11.2
+python-dateutil==2.9.0.post0
+python-multipart==0.0.32
+pytz==2026.3.post1
 PyYAML==6.0.3
+RapidFuzz==3.14.5
 regex==2026.6.28
+requests==2.34.2
 rich==15.0.0
+safehttpx==0.1.7
 safetensors==0.8.0
-setuptools==70.2.0
+scikit-learn==1.9.0
+scipy==1.17.1
+semantic-version==2.10.0
+sentencepiece==0.2.2
+setuptools==81.0.0
 shellingham==1.5.4
 shiboken6==6.11.2
+simplejson==4.1.1
+six==1.17.0
+sortedcontainers==2.4.0
+soundfile==0.14.0
+soxr==1.1.0
+spaces==0.51.1
+starlette==1.6.0
 sympy==1.14.0
+tabulate==0.10.0
+tensorboardX==2.6.5
+textsearch==0.0.24
+threadpoolctl==3.6.0
+tiktoken==0.14.0
 tokenizers==0.22.2
-torch==2.12.1+cu126
+tomlkit==0.14.0
+torch==2.11.0+cu126
+torch-complex==0.4.4
+torchaudio==2.11.0+cu126
+torchcodec==0.16.0
 tqdm==4.68.3
 transformers==5.12.1
+typeguard==4.6.0
 typer==0.25.1
-typing_extensions==4.15.0
+typing_extensions==4.16.0
+typing-inspection==0.4.4
+tzdata==2026.3
+umap-learn==0.5.12
+urllib3==2.7.0
+uvicorn==0.52.4
+voxcpm==2.0.0
+websockets==17.0.1
+wetext==0.1.6
 wheel==0.47.0
+xxhash==4.0.1
+yarl==1.24.5
 ```
 
 额外运行环境信息：
@@ -308,6 +421,18 @@ FFmpeg: 2026-05-25-git-34dfa8bf2b-full_build-www.gyan.dev
 .\run_h3_prompt_studio.bat
 ```
 
+独立启动 VoxCPM2 WebUI（固定使用 bundled `python_env`，默认仅限本机 `127.0.0.1:8088`）：
+
+```powershell
+.\run_voxcpm2_webui.bat
+```
+
+不要在 `VoxCPM-main` 内直接运行 `app -port 8088`；这会使用系统 Python，而且正确参数是 `--port`。等价的手动命令是：
+
+```powershell
+.\ai_libraries_common\python_env\python.exe .\ai_libraries_common\VoxCPM-main\app.py --host 127.0.0.1 --port 8088
+```
+
 默认启动 `director_cut_studio.py`。旧 Tkinter 程序保留在 `h3_prompt_studio.py`。
 
 ### ComfyUI 设置
@@ -324,9 +449,10 @@ H3_RTX_VIDEO_SUPER_RESOLUTION=true
 H3_HISTORY_POLL_INTERVAL=1.0
 H3_GENERATION_TIMEOUT=1800
 H3_HTTP_REQUEST_TIMEOUT=30
+H3_DIALOGUE_TTS_ENGINE=edge_tts
 ```
 
-请把 URL 改成自己的 ComfyUI 地址。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
+请把 URL 改成自己的 ComfyUI 地址。`H3_DIALOGUE_TTS_ENGINE` 可设为 `edge_tts` 或 `voxcpm2_local`，也可直接在主页 `SETTINGS → Dialogue Text Layer TTS` 选择后保存。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
 
 ### Design AI 设置
 
@@ -378,6 +504,8 @@ H3_DESIGN_IMAGE_CFG=1.0
 - Clip 支持速度、源入点/出点、淡入淡出与转场。
 - Selection Tool 可移动 clip 及 Program Monitor 文字；Hand Tool 用于平移 Timeline。
 - Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics；文字层可以放入任意空 V Track，不需要与原素材重叠。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
+- Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Apply 与 Preview / Run 另有缺失闸门，明确台词若从 Timeline 消失会中止生成，不会静默输出无对白影片。
+- 没有真实 Audio 时，H3 Prompt 会要求生成准确的原语言对白和口型；若用户明确提供有效 `@A1`，或 Design 自动生成 authored-speech WAV，Prompt 才会指向实际 `<Audio N>` 并要求逐音素同步。主页 Settings 的 `Dialogue Text Layer TTS` 可选择 `Edge TTS` 或 `VoxCPM2 Local`：Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 使用本地缓存的 `openbmb/VoxCPM2`、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型，worker 完成后自动释放 CUDA cache，并且不会静默回退到 Edge。自动模式检测到少于 8 GB VRAM 时会使用较慢但不会 GPU OOM 的 CPU 模式。WAV 自动放入 A Track，长片隐藏 Segment 会收到按自身时间窗裁切的音频，不会从第一句重播。所选引擎失败时 Apply 会明确停止，而不是写入静音文件。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、必须完成的 Core Action、必须保持的 Continuity State、Required Environment Response、可以省略的 Optional Flourish、Additional Direction 与 Shot Prompt Preset。
 - Design 与 Shot Tool 共用 H3 动作预算：每 5 秒最多三个必须完成的物理动作、两个必要接触后果和两个可选装饰。超出预算时优先把次要攻击、重复反击与纯装饰降级；最终 Prompt 明确要求先省略 Optional Flourish，不能因此延迟、削弱或重播 Core Action。Design Summary 会列出 `within / optional trimmed / priority compressed` 状态及压缩说明。
@@ -410,7 +538,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - FFmpeg 会裁掉重复的重叠区，将所有段重编码为一个带音频的 `master.mp4`。Program Monitor 与 Export 始终只显示完整 Master。
 - Pre-run Preview 会为所有内部段建立稳定 seed；Accept 以 1.0MP 复用同一组 seed。
 
-Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 **version 16**，并记录独立 Timeline Clip Instance、Master、各段 manifest、归档工作文件夹、生成视频时间起点、Program Monitor 分割比例、Prompt Auto Sync 状态，以及 Shot 的 Continuity State、Optional Flourish 与动作预算结果。旧版项目会把原有素材位置自动视为第一次 Timeline 使用；version 15 加入重复出现的 Clip Instance，version 16 加入可执行动作层级。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
+Smart Long Render 的恢复资料保存在 `.director_cache/generated_outputs/`，项目文件格式为 **version 17**，并记录独立 Timeline Clip Instance、Master、各段 manifest、归档工作文件夹、生成视频时间起点、Program Monitor 分割比例、Prompt Auto Sync 状态、Shot 的 Continuity State／Optional Flourish／动作预算结果，以及必须保留的逐字 authored text contract。旧版项目会把原有素材位置自动视为第一次 Timeline 使用；version 15 加入重复出现的 Clip Instance，version 16 加入可执行动作层级，version 17 加入 Dialogue／Voice-over／Lyrics／On-screen Text 的 Apply/Run 防丢失资料。每次 Preview / Run 会预先建立对应的 `example` 工作文件夹；完成后自动写入 `generated_preview.mp4` 或 `generated_output.mp4`、`director_project.h3director.json`，以及长片的 `render_manifest.json`。Design JSON 的 Timeline 长度上限为 600 秒；实际可行长度仍取决于磁盘空间、ComfyUI 稳定性和总生成时间。
 
 Design 页的 `LOAD JSON` 可以载入人工校准或先前保存的 Director Design。若载入的 JSON 尚无预生成图片，点击 Apply 后仍会自动执行所需的 Z-Image reference generation。项目附带的 45 秒长片示范位于：
 
@@ -438,7 +566,7 @@ skill special/
 - Default 固定为 `h3-prompt-writing`，负责 MiniMax H3 官方 Ref2VA 结构。
 - Special 提供场景/风格规则；选择 `None` 时只应用 Default。
 - 一般 Special 采用 `Default + Special`；在 `SKILL.md` 写入 `<!-- h3-studio-binding: standalone -->` 的 Special 会独立送入 Design，不会同时注入 `h3-prompt-writing`。
-- `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它负责物理连续、武器因果、每 5 秒动作预算、15 秒无重播边界、人物／武器／空间／消耗品账本、写实轻功、碎片式镜头和环境同步。最新版加入断刀内圈贴身流、链索张力轴心、凌空双刀掠食流、“一秒生死”距离判定、明确动作主语及单一冻结动作参考图规则；并锁定肢体、刀身几何、链索连接、累积伤势与脚下条件，防止独臂恢复、无尖断刀直刺或伤势跨镜消失。高速连斩以两至三次清楚接触和局部后果表达，不把游戏帧数或九次独立攻击直接交给 H3。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。可直接贴入 Design 的《一叶杀》45 秒 V2 位于 `example/one_leaf_kill_45s_design_requirement.txt`。
+- `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它会先诊断并自动改写不适合 H3 的武侠输入，再建立物理连续、武器因果、每 5 秒动作预算、15 秒无重播边界、人物／武器／空间／消耗品账本、写实轻功、碎片式镜头和环境同步。输入修正会自动重新分配缺失或不均匀的 Shot 时间，压缩同镜多招，把气劲捷径、无支点飞行、长时间 Bullet-time、完整 360 度环绕及多个竞争镜头运动改写成可执行的接触、动量和镜头重构，并在输出前以零预算警告为目标再次编译。最新版亦包含断刀内圈贴身流、链索张力轴心、凌空双刀掠食流、“一秒生死”距离判定、肢体／刀身几何／累积伤势锁定，以及单一冻结动作参考图规则。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。旧版《一叶杀》V2 保留于 `example/one_leaf_kill_45s_design_requirement.txt`；推荐的长枪将军对双短剑刺客 V3 同时提供可贴入 Design 的 `example/one_leaf_kill_45s_design_requirement_v3.txt` 与可直接 Load JSON 的 `example/one_leaf_kill_45s_design_plan_v3.json`。
 
 Preset 分别保存于独立文件，均支持选择、新增、修改、删除及 `SAVE + APPLY`：
 
@@ -506,11 +634,67 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 - 可在 Settings 取消 `Enable RTX Video Super Resolution`，先以基础分辨率验证完整生成流程。
 - RTX 节点不需要另行下载 `.safetensors` 模型。
 
+### BLIP 报错 `CUDA error: no kernel image is available for execution on the device`
+
+新电脑显示的 CUDA 版本通常是 NVIDIA 驱动能够支持的最高 CUDA 版本，不代表复制过去的 Python 环境已经换成该版本。比如 Studio 随附的是 `torch 2.11.0+cu126`，即使新电脑显示 CUDA 13.3，BLIP 仍会运行随 Torch 打包的 CUDA 12.6 内核。
+
+此错误通常表示目的电脑的 GPU Compute Capability 不在当前 Torch wheel 编译的内核架构范围内，并不是图片损坏。从 `v0.2.5-alpha.3` 开始，BLIP 在模型载入或单张图片推理遇到这种 CUDA 兼容错误时，会保留原任务、释放 CUDA 模型、自动改用 CPU 并重试；AI Enrich 可以继续完成，但首次 CPU 载入及分析会较慢。
+
+可以用随附环境检查实际组合：
+
+```powershell
+.\ai_libraries_common\python_env\python.exe -c "import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0)); print(torch.cuda.get_arch_list())"
+```
+
+如果希望在新电脑继续使用 GPU 加速，应在该电脑单独安装一组官方支持其 GPU 架构的 PyTorch 与 Torchaudio，而不是直接复制来源电脑的机器相关环境。Torch 与 Torchaudio 必须使用彼此匹配的版本；安装前应先备份 `ai_libraries_common/python_env`。
+
 ### Design 超时
 
 - `H3_DESIGN_TIMEOUT` 是单次 Design 流程的总等待上限，当前默认 900 秒。
 - 先检查 LM Studio 是否仍在加载 GGUF、ComfyUI queue 是否有旧任务，以及 Z-Image 是否已经输出图片。
 - 可减少参考图数量、宽高或 steps 后重试。
+
+### 明确要求 30 秒，Design 却压缩成 12 秒
+
+旧版可能把工作区现有的 12 秒 Timeline 当成新 Design 的目标长度，即使需求已经写明“创作30秒的视频”及 `[00:23-00:30]`，仍会让 LM 把四段内容压缩到 12 秒。随后对白保护器也会以错误的 12 秒裁切，令 15 秒之后的 Dialogue／Voice-over 消失。
+
+从 `v0.2.5-alpha.2` 开始，Studio 会在调用 LM 前确定性读取“30秒／2分钟”等明确片长及最后一个时间码，建立不可覆盖的 Duration Contract：
+
+- 用户明确片长与最后时间码优先于当前工作区 Timeline。
+- LM 不得压缩、总结、延长或继承旧 Timeline 时长。
+- 第一次返回错误时长会自动要求 LM 完整重做一次。
+- Refinement 擅改时长时会保留已验证的首次计划。
+- Normalize、Load JSON、Apply 与 Run 都会拦截时长冲突。
+- 逐字对白以用户明确时长为裁切边界，不再使用 LM 返回的错误时长。
+
+已经生成的 12 秒错误 JSON 不能只修改 `duration_seconds`，因为 Shots、参考图范围、Transitions、Markers 和 TTS 都已经被压缩；升级后应把原始 30 秒需求重新执行一次 Design。
+
+### `Image media request N is an action/boundary reference with a neutral, blank or studio background`
+
+这不是 VoxCPM2、ComfyUI 或 Media Pool 编号错误。`Image media request N` 表示 Design JSON 中第 N 个图片生成请求，不一定等于 `@PN`／Media Pool 的 `PN`。
+
+错误表示该图片被安排为某个 Shot 或 15 秒 Segment 边界的动作参考，但它的 `prompt` 同时要求 `neutral background`、`blank background`、`plain background` 或 `studio background`。动作／边界参考图必须显示故事真实发生的环境，让 H3 可以判断人物位置、身体动量、武器归属及下一段的连续状态；空白棚拍背景会导致场景跳变、人物或武器复制，因此 Studio 会阻止 Apply。
+
+错误示例：
+
+```text
+The assassin holding dual blades, neutral studio background.
+```
+
+唐代庭院故事的正确示例：
+
+```text
+The same black-clad assassin holding exactly two short blades inside the real Tang dynasty courtyard, beside the koi pond and bronze cauldron, with white walls and black tiled roofs visible. Preserve the same character identity, costume, weapons and ownership. Show one frozen physical instant from the relevant Shot, no duplicate character, no extra weapon, no text.
+```
+
+处理方法：
+
+1. 在 Design JSON 的 `media_requests` 中找到错误所说的第 N 个 `image` 请求。
+2. 从该请求的 `prompt` 删除空白／棚拍背景描述。
+3. 写入故事实际地点，并明确同一人物、服装、道具、武器数量与归属。
+4. 只描述对应 Shot 的一个冻结动作瞬间，然后重新 Validate／Apply。
+
+只有覆盖整个项目的全局人物／产品 Identity Reference 才适合使用纯色或棚拍背景；只要图片具有特定 `start_seconds`／`end_seconds`、负责 Shot 动作或 Segment 接缝，就应放在故事的真实环境中。
 
 ## 测试
 
@@ -527,13 +711,13 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
 
-当前完整验证结果：**216 tests passed**。
+当前完整验证结果：**236 tests passed**。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 216 tests
+Ran 235 tests
 OK
 ```

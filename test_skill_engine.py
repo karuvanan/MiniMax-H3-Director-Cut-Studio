@@ -1,6 +1,9 @@
 from pathlib import Path
 from copy import deepcopy
+import re
 import unittest
+
+from design_engine import normalize_design_plan
 
 from media_semantic_enrichment import enrichment_fingerprint
 from prompt_engine import PromptSpec
@@ -78,6 +81,84 @@ class SkillEngineTests(unittest.TestCase):
             "方向锚点",
         ):
             self.assertIn(phrase, chinese)
+
+    def test_wuxia_skill_repairs_unsuitable_input_before_design(self):
+        profile = self.profiles["wuxia-blade-film"]
+        english = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
+        chinese = (profile.path.parent / "SKILL.cn.md").read_text(encoding="utf-8-sig")
+        for phrase in (
+            "Repair Unsuitable Input Before Planning",
+            "Always run an input-repair pass",
+            "Do not preserve the raw Shot count",
+            "nine five-second Shots",
+            "roughly 60–120 degrees",
+            "one primary camera movement per Shot",
+            "zero budget warnings",
+        ):
+            self.assertIn(phrase, english)
+        for phrase in (
+            "规划前自动修正不合适的输入",
+            "必须先执行输入修正",
+            "原始 Shot 数量",
+            "九个 5 秒 Shot",
+            "大约 60–120 度",
+            "每个 Shot 只选择一种主要镜头运动",
+            "零条预算警告",
+        ):
+            self.assertIn(phrase, chinese)
+
+    def test_wuxia_v3_design_brief_has_three_native_segments_and_nine_budgeted_shots(self):
+        brief = (
+            Path(__file__).parent / "example" / "one_leaf_kill_45s_design_requirement_v3.txt"
+        ).read_text(encoding="utf-8-sig")
+        headings = re.findall(
+            r"^SHOT\s+(\d+)｜(\d+\.\d{2})–(\d+\.\d{2})s｜",
+            brief,
+            flags=re.M,
+        )
+        self.assertEqual(
+            headings,
+            [
+                (str(index), f"{(index - 1) * 5:.2f}", f"{index * 5:.2f}")
+                for index in range(1, 10)
+            ],
+        )
+        self.assertIn("三个原生 15 秒 Segment", brief)
+        self.assertIn("每个 Shot 的 `subject_action` 最多三个", brief)
+        self.assertIn("飞镖始终飞向将军", brief)
+        self.assertIn("禁止人物或武器复制", brief)
+        self.assertIn("每张动作参考图只能表现一个冻结瞬间", brief)
+
+    def test_wuxia_v3_design_json_loads_as_nine_exact_shots(self):
+        import json
+
+        source = json.loads(
+            (Path(__file__).parent / "example" / "one_leaf_kill_45s_design_plan_v3.json")
+            .read_text(encoding="utf-8")
+        )
+        plan = normalize_design_plan(
+            source,
+            {"image": 9, "video": 3, "audio": 3},
+        )
+        self.assertEqual(plan["duration_seconds"], 45.0)
+        self.assertEqual(len(plan["shots"]), 9)
+        self.assertEqual(
+            [(shot["start_seconds"], shot["end_seconds"]) for shot in plan["shots"]],
+            [(float(start), float(start + 5)) for start in range(0, 45, 5)],
+        )
+        self.assertEqual(
+            [row["preferred_media_id"] for row in plan["media_requests"]],
+            ["P1", "P2", "P3", "P4", "P5", "P6"],
+        )
+        self.assertEqual(plan["existing_media_uses"], [])
+        self.assertEqual(plan["design_warnings"], [])
+        self.assertEqual(
+            [row["time_seconds"] for row in plan["transitions"]],
+            [15.0, 30.0],
+        )
+        self.assertTrue(
+            all("<Picture" not in row["prompt"] for row in plan["media_requests"])
+        )
 
     def test_ref_prompt_preserves_six_section_order(self):
         spec = PromptSpec(brief="A product rotates.", shots=["Hero product view", "Final hold"])

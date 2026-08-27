@@ -16,6 +16,7 @@ ENV_KEYS = {
     "history_poll_interval": "H3_HISTORY_POLL_INTERVAL",
     "generation_timeout": "H3_GENERATION_TIMEOUT",
     "http_request_timeout": "H3_HTTP_REQUEST_TIMEOUT",
+    "dialogue_tts_engine": "H3_DIALOGUE_TTS_ENGINE",
 }
 
 
@@ -30,6 +31,7 @@ class RenderSettings:
     history_poll_interval: float = 1.0
     generation_timeout: int = 1800
     http_request_timeout: int = 30
+    dialogue_tts_engine: str = "edge_tts"
 
     @classmethod
     def defaults(cls) -> "RenderSettings":
@@ -45,6 +47,10 @@ class RenderSettings:
             except (TypeError, ValueError):
                 return cast(defaults[name])
 
+        dialogue_tts_engine = str(merged["dialogue_tts_engine"]).strip().lower()
+        if dialogue_tts_engine not in {"edge_tts", "voxcpm2_local"}:
+            dialogue_tts_engine = defaults["dialogue_tts_engine"]
+
         return cls(
             server_url=str(merged["server_url"]).strip() or defaults["server_url"],
             aspect_ratio=str(merged["aspect_ratio"]),
@@ -55,6 +61,7 @@ class RenderSettings:
             history_poll_interval=max(0.1, number("history_poll_interval", float)),
             generation_timeout=max(10, number("generation_timeout", int)),
             http_request_timeout=max(1, number("http_request_timeout", int)),
+            dialogue_tts_engine=dialogue_tts_engine,
         )
 
 

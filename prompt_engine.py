@@ -48,6 +48,7 @@ class PromptSpec:
     must_keep: str = ""
     technical: str = ""
     transition_ranges: list[dict] = field(default_factory=list)
+    has_supplied_dialogue_audio: bool = False
 
 
 @dataclass(slots=True)
@@ -121,9 +122,17 @@ def build_structured_prompt(spec: PromptSpec) -> str:
         cut_parts = [_sentence(shot)]
         if index in dialogue:
             exact_lines = " / ".join(f'"{line}"' for line in dialogue[index])
-            cut_parts.append(
-                f"Spoken dialogue: {exact_lines}. Preserve the wording exactly and synchronize the visible lip movement to the supplied audio."
-            )
+            if spec.has_supplied_dialogue_audio:
+                cut_parts.append(
+                    f"Spoken dialogue: {exact_lines}. Preserve the wording exactly and synchronize "
+                    "the visible lip movement and phoneme timing to the supplied audio."
+                )
+            else:
+                cut_parts.append(
+                    f"Generate the exact spoken dialogue in its authored language: {exact_lines}. "
+                    "Use a natural native voice with accurate visible lip sync; do not paraphrase, "
+                    "translate, omit or replace any word."
+                )
         blocks.append(f"CUT {index}: {' '.join(cut_parts)}")
         if index < len(shots):
             transition = spec.transition.strip() or "Use a motivated cinematic transition that preserves screen direction and visual continuity."

@@ -34,6 +34,17 @@ class PromptEngineTests(unittest.TestCase):
         self.assertIn('"READY"', result)
         self.assertIn("END:", result)
 
+    def test_dialogue_without_audio_requests_exact_native_generation(self):
+        result = build_structured_prompt(self.spec)
+        self.assertIn("Generate the exact spoken dialogue", result)
+        self.assertIn("natural native voice", result)
+        self.assertNotIn("to the supplied audio", result)
+
+    def test_dialogue_with_audio_requests_exact_supplied_sync(self):
+        self.spec.has_supplied_dialogue_audio = True
+        result = build_structured_prompt(self.spec)
+        self.assertIn("phoneme timing to the supplied audio", result)
+
     def test_validation_keeps_reference_tags(self):
         prompt = build_structured_prompt(self.spec)
         report = validate_prompt(prompt, reference_tags_from_spec(self.spec))

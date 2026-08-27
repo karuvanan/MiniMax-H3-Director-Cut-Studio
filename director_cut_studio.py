@@ -81,10 +81,15 @@ from media_semantic_enrichment import (
 )
 from design_engine import (
     DESIGN_JSON_SCHEMA,
+    DesignDurationContractError,
     build_design_system_prompt,
+    extract_explicit_timed_text_layers,
+    infer_explicit_design_duration,
     materialize_design_media,
     normalize_shot_action_budget,
     normalize_design_plan,
+    protect_explicit_timed_text_layers,
+    validate_explicit_timed_text_contract,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from prompt_engine import PromptSpec, split_shots
@@ -2182,6 +2187,9 @@ class TimelineView(QGraphicsView):
         self.tool_mode = "selection"
         self.tracks = default_timeline_tracks()
         self.text_layers: list[TextLayer] = []
+        # Exact user-authored timed text is retained separately from editable
+        # Timeline objects so Apply/Run can detect accidental silent loss.
+        self.authored_text_requirements: list[dict] = []
         self.director_cues: list[DirectorCue] = []
         self.render_segments: list[dict] = []
         self.scan: WorkflowScan | None = None
@@ -3804,6 +3812,8 @@ class DesignPageDialog(QDialog):
         self.validated_plan: dict | None = None
         self.pipeline_stage = ""
         self.pending_requirement = ""
+        self.required_text_layers: list[dict] = []
+        self.duration_contract_retry_count = 0
         self.concept_image_path: Path | None = None
         self.concept_blip_caption = ""
         self.concept_media_result: dict = {}
@@ -4790,8 +4800,19 @@ class DesignPageDialog(QDialog):
             if available_ids
             else " No Media Pool assets are selected, so request only the genuinely necessary missing material."
         )
+        requested_duration = infer_explicit_design_duration(self.pending_requirement)
+        duration_rule = (
+            "\n\nMANDATORY DURATION CONTRACT: The requested output is exactly "
+            f"{requested_duration:.2f} seconds. Set duration_seconds to exactly "
+            f"{requested_duration:.2f}. Keep every authored time range through "
+            f"{requested_duration:.2f}s. Do not condense the story to the current "
+            "workspace Timeline duration and do not rewrite, merge or drop later Dialogue."
+            if requested_duration is not None
+            else ""
+        )
         prompt = (
             self.pending_requirement
+            + duration_rule
             + "\n\nMEDIA POOL RULE: @P1, @V1 and @A1 are stable references to the "
               "selected workspace assets, not generated placeholders. An explicit @ID in the "
               "requirement is mandatory: include it in existing_media_uses and preserve its "
@@ -4831,6 +4852,27 @@ class DesignPageDialog(QDialog):
                 existing_media=self.context.get("existing_media") or [],
                 strict_t2i_prompts=True,
                 repair_media_plan=True,
+                authored_requirement=self.pending_requirement,
+            )
+            if self.pipeline_stage == "lm_refine" and self.planned_plan:
+                # Refinement may improve generated-image prompts and shot language,
+                # but the first Plan owns every explicit authored text cue.
+                plan["text_layers"] = deepcopy(
+                    self.planned_plan.get("text_layers") or []
+                )
+                plan["theme_text"] = str(
+                    self.planned_plan.get("theme_text", "")
+                )
+                plan["theme_text_explicit_user_requested"] = bool(
+                    self.planned_plan.get(
+                        "theme_text_explicit_user_requested", False
+                    )
+                )
+            plan = protect_explicit_timed_text_layers(
+                plan, self.pending_requirement
+            )
+            validate_explicit_timed_text_contract(
+                self.pending_requirement, plan
             )
             required_media_ids = self._explicit_media_ids(self.pending_requirement)
             planned_media_ids = {
@@ -4856,6 +4898,34 @@ class DesignPageDialog(QDialog):
                     + ", ".join("@" + item for item in ignored_ids)
                     + ". Regenerate or add them to existing_media_uses."
                 )
+        except DesignDurationContractError as exc:
+            if self.pipeline_stage == "lm_refine" and self.planned_plan:
+                self.design_image_warnings.append(
+                    "LM refinement tried to change the protected duration; retained the "
+                    "validated first Design Plan instead. " + str(exc)
+                )
+                self._finish_design_pipeline(self.planned_plan)
+                return
+            if self.pipeline_stage == "lm_plan" and self.duration_contract_retry_count < 1:
+                self.duration_contract_retry_count += 1
+                requested_duration = infer_explicit_design_duration(
+                    self.pending_requirement
+                )
+                self._start_lm_design(
+                    fallback_note=(
+                        "DURATION CONTRACT CORRECTION: The previous response was rejected. "
+                        f"Rebuild the complete plan at exactly {requested_duration:.2f}s, "
+                        "including every later Shot, exact Dialogue cue, transition, marker "
+                        "and media range. Do not return the workspace's old duration."
+                    )
+                )
+                return
+            self._set_pipeline_busy(False)
+            self.design_busy_overlay.stop()
+            self.json_edit.setPlainText(str(payload.get("text", "")))
+            self.status_label.setText("AI returned the wrong explicit duration")
+            QMessageBox.warning(self, "Invalid AI Design duration", str(exc))
+            return
         except ValueError as exc:
             self._set_pipeline_busy(False)
             self.design_busy_overlay.stop()
@@ -4939,9 +5009,14 @@ class DesignPageDialog(QDialog):
         if not self._select_explicit_media_references(requirement):
             return
         self.active_design_context = self._selected_design_context()
+        requested_duration = infer_explicit_design_duration(requirement)
+        if requested_duration is not None:
+            self.active_design_context["requested_duration_seconds"] = requested_duration
         self._persist_settings()
         self.validated_plan = None
         self.pending_requirement = requirement
+        self.required_text_layers = extract_explicit_timed_text_layers(requirement)
+        self.duration_contract_retry_count = 0
         self.planned_plan = None
         self.generated_references = []
         self.design_image_warnings = []
@@ -5059,6 +5134,7 @@ class DesignPageDialog(QDialog):
                     existing_media=self.context.get("existing_media") or [],
                     strict_t2i_prompts=True,
                     repair_media_plan=True,
+                    authored_requirement=self.pending_requirement,
                 )
             except ValueError as exc:
                 self.json_edit.setPlainText(str(payload.get("text", "")))
@@ -5127,12 +5203,19 @@ class DesignPageDialog(QDialog):
     def validate_json(self) -> bool:
         try:
             context = self._selected_design_context()
+            requirement = (
+                self.pending_requirement
+                or self.requirement_edit.toPlainText().strip()
+            )
             plan = normalize_design_plan(
                 self.json_edit.toPlainText(),
                 self.capacities,
                 existing_media=self.context.get("existing_media") or [],
                 repair_media_plan=True,
+                authored_requirement=requirement,
             )
+            plan = protect_explicit_timed_text_layers(plan, requirement)
+            validate_explicit_timed_text_contract(requirement, plan)
             selected_ids = {
                 str(item).upper()
                 for item in context.get("selected_existing_media_ids") or []
@@ -5206,6 +5289,19 @@ class DesignPageDialog(QDialog):
         if self.validated_plan is None and not self.validate_json():
             return
         plan = dict(self.validated_plan)
+        requirement = (
+            self.pending_requirement
+            or self.requirement_edit.toPlainText().strip()
+        )
+        try:
+            validate_explicit_timed_text_contract(requirement, plan)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Authored text is missing", str(exc))
+            return
+        plan["_authored_requirement"] = requirement
+        plan["_required_text_layers"] = extract_explicit_timed_text_layers(
+            requirement, float(plan.get("duration_seconds", 0.0) or 0.0) or None
+        )
         plan["_design_images_pre_generated"] = bool(self.generated_references)
         plan["_generated_references"] = [dict(item) for item in self.generated_references]
         plan["_design_image_warnings"] = list(self.design_image_warnings)
@@ -5290,6 +5386,9 @@ class DirectorCutStudio(QMainWindow):
         self.design_media_runner: JsonLineProcess | None = None
         self.design_media_result: dict = {}
         self.pending_ai_design: dict | None = None
+        self.design_tts_runner: JsonLineProcess | None = None
+        self.design_tts_result: dict = {}
+        self.pending_design_tts: dict | None = None
         self.design_cleanup_runner: JsonLineProcess | None = None
         self.design_cleanup_result: dict = {}
         self.preview_seed: int | None = None
@@ -5494,6 +5593,14 @@ class DirectorCutStudio(QMainWindow):
         self.settings_http_timeout = QSpinBox()
         self.settings_http_timeout.setRange(1, 600)
         self.settings_http_timeout.setSuffix(" s")
+        self.settings_dialogue_tts = QComboBox()
+        self.settings_dialogue_tts.addItem("Edge TTS · online neural voices", "edge_tts")
+        self.settings_dialogue_tts.addItem("VoxCPM2 Local · offline model", "voxcpm2_local")
+        self.settings_dialogue_tts.setToolTip(
+            "Speech engine used for Dialogue, Voice-over and Lyrics text layers. "
+            "VoxCPM2 loads from the local model cache only; systems below 8 GB VRAM "
+            "use the slower safe CPU mode."
+        )
         self.settings_node_map = QLabel("Load an API workflow to inspect mapped nodes.")
         self.settings_node_map.setWordWrap(True)
         form.addRow("Mega pixels", self.settings_megapixels)
@@ -5503,6 +5610,7 @@ class DirectorCutStudio(QMainWindow):
         form.addRow("History poll interval", self.settings_history_poll)
         form.addRow("Generation timeout", self.settings_generation_timeout)
         form.addRow("HTTP request timeout", self.settings_http_timeout)
+        form.addRow("Dialogue Text Layer TTS", self.settings_dialogue_tts)
         form.addRow("Mapped API nodes", self.settings_node_map)
         buttons = QHBoxLayout()
         save_button = QPushButton("SAVE SETTINGS TO .ENV")
@@ -5523,6 +5631,7 @@ class DirectorCutStudio(QMainWindow):
         ):
             widget.valueChanged.connect(self._settings_ui_changed)
         self.settings_rtx_vsr.toggled.connect(self._settings_ui_changed)
+        self.settings_dialogue_tts.currentIndexChanged.connect(self._settings_ui_changed)
         return page
 
     def _sync_settings_ui(self) -> None:
@@ -5534,6 +5643,8 @@ class DirectorCutStudio(QMainWindow):
         self.settings_history_poll.setValue(settings.history_poll_interval)
         self.settings_generation_timeout.setValue(settings.generation_timeout)
         self.settings_http_timeout.setValue(settings.http_request_timeout)
+        tts_index = self.settings_dialogue_tts.findData(settings.dialogue_tts_engine)
+        self.settings_dialogue_tts.setCurrentIndex(max(0, tts_index))
 
     def _settings_ui_changed(self, *_args) -> None:
         self._read_settings_ui()
@@ -5554,6 +5665,7 @@ class DirectorCutStudio(QMainWindow):
                 "history_poll_interval": self.settings_history_poll.value(),
                 "generation_timeout": self.settings_generation_timeout.value(),
                 "http_request_timeout": self.settings_http_timeout.value(),
+                "dialogue_tts_engine": self.settings_dialogue_tts.currentData(),
             }
         )
 
@@ -6275,6 +6387,9 @@ class DirectorCutStudio(QMainWindow):
             "assets": {asset.node_id: asdict(asset) for asset in self.scan.assets},
             "timeline_clips": [asdict(clip) for clip in self.scan.timeline_clips],
             "text_layers": [asdict(layer) for layer in self.text_layers],
+            "authored_text_requirements": deepcopy(
+                self.authored_text_requirements
+            ),
             "director_cues": [asdict(cue) for cue in self.director_cues],
             "prompt": {
                 name: getattr(self.prompt_panel, name).toPlainText() for name in prompt_names
@@ -6308,6 +6423,9 @@ class DirectorCutStudio(QMainWindow):
         ]
         self._sync_timeline_clip_sources()
         self.text_layers = [TextLayer(**values) for values in state.get("text_layers", [])]
+        self.authored_text_requirements = deepcopy(
+            state.get("authored_text_requirements") or []
+        )
         self.director_cues = [DirectorCue(**values) for values in state.get("director_cues", [])]
         self.preview_paths = {
             key: Path(value) for key, value in state.get("preview_paths", {}).items()
@@ -6412,6 +6530,30 @@ class DirectorCutStudio(QMainWindow):
             self.scan.timeline_clips.clear()
             self.text_layers = []
             self.director_cues = []
+
+        required_rows = deepcopy(plan.get("_required_text_layers") or [])
+        if replace:
+            self.authored_text_requirements = required_rows
+        else:
+            identities = {
+                (
+                    str(item.get("role", "")),
+                    round(float(item.get("start_seconds", 0.0)), 3),
+                    round(float(item.get("end_seconds", 0.0)), 3),
+                    str(item.get("content", "")).strip(),
+                )
+                for item in self.authored_text_requirements
+            }
+            for item in required_rows:
+                identity = (
+                    str(item.get("role", "")),
+                    round(float(item.get("start_seconds", 0.0)), 3),
+                    round(float(item.get("end_seconds", 0.0)), 3),
+                    str(item.get("content", "")).strip(),
+                )
+                if identity not in identities:
+                    self.authored_text_requirements.append(item)
+                    identities.add(identity)
 
         warnings: list[str] = []
         used_nodes: set[str] = set()
@@ -6545,17 +6687,25 @@ class DirectorCutStudio(QMainWindow):
             used_nodes.add(asset.node_id)
             assign_local_media(self.scan, asset, request["local_path"])
             place_asset(asset, request, "prompt")
+            if request.get("generated_by_tts"):
+                source_heading = "AI DESIGN AUTHORED SPEECH TTS\n"
+            elif request.get("generated_by_comfyui"):
+                source_heading = "AI DESIGN GENERATED REFERENCE\n"
+            else:
+                source_heading = "AI DESIGN PLACEHOLDER\n"
             asset.recognition = (
-                (
-                    "AI DESIGN GENERATED REFERENCE\n"
-                    if request.get("generated_by_comfyui")
-                    else "AI DESIGN PLACEHOLDER\n"
-                )
-                +
+                source_heading +
                 f"Usage: {request.get('usage', 'h3_reference')}\n"
                 f"Keywords: {', '.join(request.get('subject_keywords') or [])}\n"
                 f"Requirement: {asset.clip_prompt}"
             )
+            if request.get("tts_transcript"):
+                asset.recognition += "\nAUTHORED TTS TRANSCRIPT:\n" + "\n".join(
+                    f"[{float(row.get('start_seconds', 0.0)):.2f}-"
+                    f"{float(row.get('end_seconds', 0.0)):.2f}] "
+                    f"{row.get('speaker', 'S1')}: {row.get('content', '')}"
+                    for row in request["tts_transcript"]
+                )
             if request.get("concept_blip_caption"):
                 asset.recognition += (
                     "\nBLIP concept analysis: " + str(request["concept_blip_caption"])
@@ -6689,6 +6839,133 @@ class DirectorCutStudio(QMainWindow):
         if warnings:
             QMessageBox.warning(self, "AI Design applied with warnings", "\n".join(warnings))
 
+    def _start_design_tts_generation(
+        self,
+        plan: dict,
+        materials: list[dict],
+        replace: bool,
+        before: dict,
+        design_dir: Path,
+        settings: DesignAISettings,
+        warnings: list[str],
+        generate_images: bool,
+        tts_material: dict,
+    ) -> None:
+        if self.design_tts_runner and self.design_tts_runner.is_running():
+            raise RuntimeError("AI Design Mandarin TTS is already running")
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        job_path = CACHE_ROOT / f"design_tts_{time.time_ns()}.json"
+        job_path.write_text(json.dumps({
+            "output_path": tts_material["local_path"],
+            "duration_seconds": plan["duration_seconds"],
+            "text_layers": plan.get("_required_text_layers") or plan.get("text_layers") or [],
+            "ffmpeg": str(self.runtime.ffmpeg),
+            "sapi_script": str(PROJECT_ROOT / "tts_sapi.ps1"),
+            "engine": self.render_settings.dialogue_tts_engine,
+            "voxcpm_model": "openbmb/VoxCPM2",
+            "voxcpm_device": "auto",
+            "voxcpm_local_files_only": True,
+        }, ensure_ascii=False), encoding="utf-8")
+        self.pending_design_tts = {
+            "plan": plan,
+            "materials": materials,
+            "replace": replace,
+            "before": before,
+            "design_dir": design_dir,
+            "settings": settings,
+            "warnings": list(warnings),
+            "generate_images": bool(generate_images),
+            "tts_material": tts_material,
+        }
+        self.design_tts_result = {}
+        runner = JsonLineProcess(self, "design-mandarin-tts")
+        runner.message.connect(self._design_tts_message)
+        runner.finished.connect(self._design_tts_finished)
+        self.design_tts_runner = runner
+        self.design_button.setEnabled(False)
+        self.generation_previous_monitor = self.monitor_display_stack.currentWidget()
+        engine_label = (
+            "VoxCPM2 Local"
+            if self.render_settings.dialogue_tts_engine == "voxcpm2_local"
+            else "Edge TTS"
+        )
+        self.generation_overlay.start(
+            f"{engine_label} · generating exact authored Mandarin speech"
+        )
+        self.statusBar().showMessage(
+            f"Generating exact authored Mandarin speech WAV with {engine_label}"
+        )
+        if not runner.start(
+            str(self.runtime.python),
+            [str(PROJECT_ROOT / "tts_service.py"), str(job_path)],
+        ):
+            raise RuntimeError("Mandarin TTS worker is still stopping")
+
+    def _design_tts_message(self, payload: dict) -> None:
+        if payload.get("progress"):
+            message = str(payload["progress"])
+            self.statusBar().showMessage(message)
+            self.generation_overlay.set_message(message)
+        if payload.get("completed") or payload.get("error"):
+            self.design_tts_result = payload
+
+    def _design_tts_finished(self, exit_code: int, log: str) -> None:
+        pending = self.pending_design_tts
+        result = self.design_tts_result
+        runner = self.design_tts_runner
+        self.design_tts_runner = None
+        self.design_tts_result = {}
+        self.pending_design_tts = None
+        if runner:
+            runner.deleteLater()
+        if not pending:
+            self.generation_overlay.stop()
+            self.design_button.setEnabled(True)
+            return
+        if exit_code or result.get("error"):
+            self.generation_overlay.stop()
+            self._restore_monitor_after_generation()
+            self.design_button.setEnabled(True)
+            QMessageBox.critical(
+                self,
+                "Mandarin TTS failed",
+                "Exact authored dialogue was detected, so Apply was stopped instead of using "
+                "a silent placeholder.\n\n"
+                + str(result.get("error") or log[-1000:] or f"worker exit {exit_code}"),
+            )
+            return
+        material = pending["tts_material"]
+        material["generated_by_tts"] = True
+        material["tts_transcript"] = list(result.get("transcript") or [])
+        sidecar = Path(material["local_path"]).with_suffix(
+            Path(material["local_path"]).suffix + ".request.json"
+        )
+        if sidecar.is_file():
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            metadata["tts_generation"] = {
+                "engine": result.get("engine", "Unknown TTS engine"),
+                "output_path": result.get("output_path", ""),
+                "transcript": material["tts_transcript"],
+            }
+            sidecar.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if pending["generate_images"]:
+            self._start_design_media_generation(
+                pending["plan"], pending["materials"], pending["replace"],
+                pending["before"], pending["design_dir"], pending["settings"],
+                initial_warnings=pending["warnings"],
+            )
+            return
+        self.generation_overlay.stop()
+        self.design_button.setEnabled(True)
+        self._commit_ai_design(
+            pending["plan"], pending["materials"], pending["replace"],
+            pending["before"], pending["design_dir"], pending["warnings"],
+        )
+        self._restore_monitor_after_generation()
+
     def _start_design_media_generation(
         self,
         plan: dict,
@@ -6697,6 +6974,7 @@ class DirectorCutStudio(QMainWindow):
         before: dict,
         design_dir: Path,
         settings: DesignAISettings,
+        initial_warnings: list[str] | None = None,
     ) -> None:
         if self.submit_runner and self.submit_runner.is_running():
             raise RuntimeError("A ComfyUI video generation job is already running")
@@ -6726,6 +7004,7 @@ class DirectorCutStudio(QMainWindow):
             "replace": replace,
             "before": before,
             "design_dir": design_dir,
+            "warnings": list(initial_warnings or []),
         }
         self.design_media_result = {}
         runner = JsonLineProcess(self, "design-media")
@@ -6755,7 +7034,8 @@ class DirectorCutStudio(QMainWindow):
         self.design_button.setEnabled(True)
         pending = self.pending_ai_design
         result = self.design_media_result
-        warnings = list(result.get("warnings") or [])
+        warnings = list((pending or {}).get("warnings") or [])
+        warnings.extend(result.get("warnings") or [])
         generated_paths = {
             str(Path(item["local_path"]).resolve())
             for item in result.get("outputs") or []
@@ -6790,6 +7070,7 @@ class DirectorCutStudio(QMainWindow):
             return
         if (
             (self.design_media_runner and self.design_media_runner.is_running())
+            or (self.design_tts_runner and self.design_tts_runner.is_running())
             or (self.submit_runner and self.submit_runner.is_running())
         ):
             QMessageBox.information(
@@ -6797,6 +7078,10 @@ class DirectorCutStudio(QMainWindow):
             )
             return
         try:
+            authored_requirement = str(plan.get("_authored_requirement", ""))
+            required_text_layers = deepcopy(
+                plan.get("_required_text_layers") or []
+            )
             generated_pipeline = bool(plan.get("_design_images_pre_generated", False))
             generated_references = [
                 dict(item) for item in plan.get("_generated_references") or []
@@ -6809,6 +7094,19 @@ class DirectorCutStudio(QMainWindow):
                 self.scan.counts,
                 existing_media=self._design_context().get("existing_media") or [],
                 repair_media_plan=True,
+                authored_requirement=authored_requirement,
+            )
+            plan = protect_explicit_timed_text_layers(
+                plan, authored_requirement
+            )
+            validated_required = validate_explicit_timed_text_contract(
+                authored_requirement, plan
+            )
+            plan["_required_text_layers"] = (
+                validated_required or required_text_layers
+            )
+            tts_required = self._ensure_authored_tts_request(
+                plan, authored_requirement
             )
             DESIGN_EXAMPLE_ROOT.mkdir(exist_ok=True)
             design_dir, materials = materialize_design_media(
@@ -6862,9 +7160,22 @@ class DirectorCutStudio(QMainWindow):
                 and bool(settings.image_checkpoint)
                 and any(item.get("media_type") == "image" for item in materials)
             )
-            if generate_images:
+            tts_material = next(
+                (
+                    item for item in materials
+                    if item.get("requirement_id") == "authored_speech_tts"
+                ),
+                None,
+            ) if tts_required else None
+            if tts_material:
+                self._start_design_tts_generation(
+                    plan, materials, replace, before, design_dir, settings,
+                    warnings, generate_images, tts_material,
+                )
+            elif generate_images:
                 self._start_design_media_generation(
-                    plan, materials, replace, before, design_dir, settings
+                    plan, materials, replace, before, design_dir, settings,
+                    initial_warnings=warnings,
                 )
             else:
                 self._commit_ai_design(
@@ -6878,7 +7189,92 @@ class DirectorCutStudio(QMainWindow):
                 self.design_media_runner.deleteLater()
                 self.design_media_runner = None
             self.pending_ai_design = None
+            self.pending_design_tts = None
             QMessageBox.critical(self, "Apply AI Design failed", str(exc))
+
+    def _ensure_authored_tts_request(
+        self,
+        plan: dict,
+        authored_requirement: str,
+    ) -> bool:
+        """Reserve one real Audio slot for exact authored speech when needed."""
+        speech_layers = [
+            item for item in plan.get("_required_text_layers") or plan.get("text_layers") or []
+            if str(item.get("role", "")) in {"dialogue", "voice_over", "lyrics"}
+            and str(item.get("content", "")).strip()
+        ]
+        if not speech_layers:
+            return False
+        explicit_audio_ids = {
+            f"A{match}"
+            for match in re.findall(r"@\s*A\s*(\d+)", authored_requirement, flags=re.I)
+        }
+        supplied_ids = {
+            str(item.get("media_id", "")).upper()
+            for item in plan.get("existing_media_uses") or []
+            if item.get("media_type") == "audio"
+        }
+        if explicit_audio_ids.intersection(supplied_ids):
+            return False
+
+        requests = list(plan.get("media_requests") or [])
+        if any(
+            item.get("requirement_id") == "authored_speech_tts"
+            for item in requests
+        ):
+            return True
+        empty_slots = sum(
+            asset.media_type == "audio" and not str(asset.local_path or "").strip()
+            for asset in self.scan.assets
+        ) if self.scan else 0
+        audio_requests = [item for item in requests if item.get("media_type") == "audio"]
+        if len(audio_requests) >= empty_slots:
+            replaceable = next(
+                (
+                    item for item in audio_requests
+                    if re.search(
+                        r"dialogue|voice|speech|narrat|monologue|对白|對白|旁白|台词|台詞",
+                        str(item.get("prompt", "")), flags=re.I,
+                    )
+                ),
+                None,
+            )
+            if replaceable is None:
+                raise ValueError(
+                    "Exact authored speech needs one empty Audio reference slot for Mandarin TTS, "
+                    "but all Audio slots are occupied or already reserved. Clear one A slot, or "
+                    "explicitly reference a real speech asset such as @A1 in the Design requirement."
+                )
+            requests.remove(replaceable)
+        transcript = "\n".join(
+            f"[{float(item['start_seconds']):.2f}-{float(item['end_seconds']):.2f}s] "
+            f"{item.get('speaker', 'S1')}: {item['content']}"
+            for item in speech_layers
+        )
+        tts_request = {
+            "requirement_id": "authored_speech_tts",
+            "media_type": "audio",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": float(plan["duration_seconds"]),
+            "track": "A1",
+            "subject_keywords": ["exact authored Mandarin speech", "lip sync"],
+            "prompt": (
+                "AUTHORED SPEECH TTS. Preserve this exact timed transcript and use it as the "
+                "lip-sync audio reference:\n" + transcript
+            ),
+        }
+        first_audio = next(
+            (
+                index for index, item in enumerate(requests)
+                if item.get("media_type") == "audio"
+            ),
+            len(requests),
+        )
+        requests.insert(first_audio, tts_request)
+        plan["media_requests"] = requests
+        return True
 
     def start_design_cleanup(self, job: dict) -> None:
         """Unload Design-only ComfyUI and LM Studio models after Apply."""
@@ -7429,6 +7825,9 @@ class DirectorCutStudio(QMainWindow):
             "timeline_clips": [asdict(clip) for clip in self.scan.timeline_clips],
             "tracks": [asdict(track) for track in self.tracks],
             "text_layers": [asdict(layer) for layer in self.text_layers],
+            "authored_text_requirements": deepcopy(
+                self.authored_text_requirements
+            ),
             "director_cues": [asdict(cue) for cue in self.director_cues],
             "smart_render": self.smart_render_manifest,
             "smart_render_manifests": self.smart_render_manifests,
@@ -7506,6 +7905,9 @@ class DirectorCutStudio(QMainWindow):
             self.text_layers = [
                 TextLayer(**row) for row in payload.get("text_layers", [])
             ]
+            self.authored_text_requirements = deepcopy(
+                payload.get("authored_text_requirements") or []
+            )
             self.timeline.set_text_layers(self.text_layers)
             self.director_cues = [
                 DirectorCue(**row) for row in payload.get("director_cues", [])
@@ -7693,6 +8095,7 @@ class DirectorCutStudio(QMainWindow):
         self.render_runtime_status.clear()
         self.tracks = default_timeline_tracks()
         self.text_layers = []
+        self.authored_text_requirements = []
         self.director_cues = []
         self.selected_asset = None
         self.selected_timeline_asset = None
@@ -10522,7 +10925,17 @@ class DirectorCutStudio(QMainWindow):
 
     def _handle_blip_payload(self, payload: dict) -> None:
         if payload.get("ready"):
-            self.statusBar().showMessage(f"BLIP recognition ready on {payload.get('device', '-')}")
+            if payload.get("fallback_from") == "cuda":
+                self.blip_cpu_mode = True
+                self.blip_cpu_fallback_attempted = True
+                self.statusBar().showMessage(
+                    "BLIP CUDA is incompatible with this GPU/Torch build; "
+                    "the same analysis is continuing on CPU"
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"BLIP recognition ready on {payload.get('device', '-')}"
+                )
             return
         if payload.get("fatal"):
             self.statusBar().showMessage(f"BLIP startup failed: {payload.get('error', 'unknown error')}")
@@ -10728,6 +11141,8 @@ class DirectorCutStudio(QMainWindow):
             self.submit_runner.stop()
         if self.design_media_runner:
             self.design_media_runner.stop()
+        if self.design_tts_runner:
+            self.design_tts_runner.stop()
         if self.design_cleanup_runner:
             self.design_cleanup_runner.stop()
         if self.generated_proxy_runner:
@@ -11004,8 +11419,8 @@ class DirectorCutStudio(QMainWindow):
         self._sync_timeline_clip_sources()
         if interactive:
             self._sync_prompt_panel_from_timeline()
-        spec = self._prompt_spec_with_director_cues(self.prompt_panel.spec())
-        if not spec.brief:
+        base_spec = self.prompt_panel.spec()
+        if not base_spec.brief:
             self.prompt_panel.output.clear()
             if interactive:
                 QMessageBox.information(self, "Brief required", "Add a creative brief before generating the H3 prompt.")
@@ -11022,6 +11437,10 @@ class DirectorCutStudio(QMainWindow):
                 )
             start, end = self.clip_start.value(), self.clip_end.value()
             _, assets = compile_active_workflow(self.scan, start, end)
+            spec = self._prompt_spec_with_director_cues(
+                base_spec,
+                supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(assets),
+            )
             if start > 1e-6 or end < self.scan.duration_seconds - 1e-6:
                 output = self._prompt_for_window(
                     start,
@@ -11061,9 +11480,13 @@ class DirectorCutStudio(QMainWindow):
         window_start: float | None = None,
         window_end: float | None = None,
         is_final_window: bool = True,
+        supplied_dialogue_audio_tag: str = "",
     ) -> PromptSpec:
         """Merge timeline-authored direction into the six-section H3 prompt input."""
         state = asdict(spec)
+        state["has_supplied_dialogue_audio"] = bool(
+            supplied_dialogue_audio_tag
+        )
         if window_start is not None and window_end is not None:
             # Do not let the visible all-timeline Shot/Dialogue fields leak into
             # an internal segment that has no matching cue of its own.
@@ -11199,14 +11622,44 @@ class DirectorCutStudio(QMainWindow):
                 for layer in layers:
                     if layer.content_role == "dialogue":
                         sync = "with accurate visible lip sync" if layer.lip_sync else "without required lip sync"
-                        parts.append(
-                            f'{layer.speaker} speaks in {layer.language}, {layer.delivery.lower()} delivery, {sync}: '
-                            f'<d>[{layer.language}] {layer.text}</d>'
-                        )
+                        if supplied_dialogue_audio_tag:
+                            parts.append(
+                                f'Use {supplied_dialogue_audio_tag} exactly as the supplied speech; '
+                                f'{layer.speaker} speaks in '
+                                f'{layer.language}, {layer.delivery.lower()} delivery, {sync}: '
+                                f'<d>[{layer.language}] {layer.text}</d>. Synchronize mouth motion '
+                                'and phoneme timing precisely to the supplied audio'
+                            )
+                        else:
+                            parts.append(
+                                f'{layer.speaker} speaks in {layer.language}, '
+                                f'{layer.delivery.lower()} delivery, {sync}. Generate this exact '
+                                f'audible {layer.language} dialogue in a natural native voice: '
+                                f'<d>[{layer.language}] {layer.text}</d>. Do not paraphrase, '
+                                'translate, omit or replace any word'
+                            )
                     elif layer.content_role == "voice_over":
-                        parts.append(f'Voice-over says exactly: <d>[Original] {layer.text}</d>')
+                        source = (
+                            f"Use {supplied_dialogue_audio_tag} exactly as the supplied speech"
+                            if supplied_dialogue_audio_tag
+                            else f"Generate an exact native {layer.language} voice-over"
+                        )
+                        parts.append(
+                            f'Voice-over says exactly: <d>[{layer.language}] {layer.text}</d>. '
+                            f'{source}. '
+                            'Do not paraphrase, translate or omit any word'
+                        )
                     elif layer.content_role == "lyrics":
-                        parts.append(f'Lyrics are synchronized exactly: <d>[Original] {layer.text}</d>')
+                        source = (
+                            f"Synchronize the exact lyrics to {supplied_dialogue_audio_tag}"
+                            if supplied_dialogue_audio_tag
+                            else f"Generate the exact {layer.language} lyrics audibly"
+                        )
+                        parts.append(
+                            f'Lyrics are synchronized exactly: <d>[{layer.language}] {layer.text}</d>. '
+                            f'{source}. '
+                            'Do not paraphrase, translate or omit any word'
+                        )
                 description = ". ".join(part.strip().rstrip(".") for part in parts if part.strip())
                 shots.append(description)
                 shot_ranges.append(
@@ -11306,6 +11759,25 @@ class DirectorCutStudio(QMainWindow):
             )
         return PromptSpec(**state)
 
+    @staticmethod
+    def _supplied_speech_audio_tag(assets: list[MediaAsset]) -> str:
+        """Return the exact active Audio tag, preferring generated authored TTS."""
+        valid: list[MediaAsset] = []
+        for asset in assets:
+            if asset.media_type != "audio" or not asset.enabled:
+                continue
+            path = Path(str(asset.local_path or ""))
+            if path.is_file() and path.stat().st_size > 44:
+                valid.append(asset)
+        preferred = next(
+            (
+                asset for asset in valid
+                if "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
+            ),
+            valid[0] if valid else None,
+        )
+        return preferred.tag if preferred else ""
+
     def _prompt_for_window(
         self,
         start: float,
@@ -11321,6 +11793,7 @@ class DirectorCutStudio(QMainWindow):
             window_start=start,
             window_end=end,
             is_final_window=is_final_window,
+            supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(assets),
         )
         if start is not None and end is not None:
             # A global creative brief describes the complete movie. Feeding it
@@ -11907,6 +12380,9 @@ class DirectorCutStudio(QMainWindow):
                 continuity_mode=segment.continuity_mode,
                 fingerprint_start=core_start,
             )
+            assets = self._prepare_windowed_tts_audio(
+                assets, core_start, core_end
+            )
             uploads = media_upload_manifest(assets)
             patch_media_upload_names(compiled, uploads)
             segment.fingerprint = fingerprint
@@ -11976,6 +12452,55 @@ class DirectorCutStudio(QMainWindow):
         job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         return job_path, len(segment_rows)
 
+    def _prepare_windowed_tts_audio(
+        self,
+        assets: list[MediaAsset],
+        start: float,
+        end: float,
+    ) -> list[MediaAsset]:
+        """Trim full-Timeline authored TTS to the exact hidden H3 window."""
+        clones = [deepcopy(asset) for asset in assets]
+        duration = max(0.01, end - start)
+        cache = CACHE_ROOT / "tts_windows"
+        cache.mkdir(parents=True, exist_ok=True)
+        for asset in clones:
+            if (
+                asset.media_type != "audio"
+                or "AI DESIGN AUTHORED SPEECH TTS" not in asset.recognition
+            ):
+                continue
+            source = Path(str(asset.local_path or ""))
+            if not source.is_file():
+                continue
+            source_key = (
+                f"{source.resolve()}|{source.stat().st_mtime_ns}|"
+                f"{start:.6f}|{end:.6f}|{asset.start_seconds:.6f}"
+            )
+            digest = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:20]
+            destination = cache / f"tts_{digest}_{start:.3f}-{end:.3f}.wav"
+            if not destination.is_file() or destination.stat().st_size <= 44:
+                source_offset = max(0.0, start - float(asset.start_seconds))
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                completed = subprocess.run(
+                    [
+                        str(self.runtime.ffmpeg), "-y", "-ss", f"{source_offset:.6f}",
+                        "-i", str(source), "-t", f"{duration:.6f}",
+                        "-af", f"apad=whole_dur={duration:.6f}",
+                        "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
+                        str(destination),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    creationflags=creation_flags,
+                    timeout=max(60, int(duration * 4)),
+                )
+                if completed.returncode or not destination.is_file():
+                    detail = completed.stderr.decode("utf-8", errors="replace")[-1000:]
+                    raise RuntimeError(f"Could not prepare segment TTS audio: {detail}")
+            asset.local_path = str(destination.resolve())
+            asset.filename = destination.name
+        return clones
+
     def _compiled_job(
         self,
         *,
@@ -12021,7 +12546,12 @@ class DirectorCutStudio(QMainWindow):
                 special_key = self.special_combo.currentData()
                 special = None if special_key == NONE_SPECIAL else self.profiles[special_key]
                 prompt = build_ref2va_prompt(
-                    self._prompt_spec_with_director_cues(self.prompt_panel.spec()),
+                    self._prompt_spec_with_director_cues(
+                        self.prompt_panel.spec(),
+                        supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
+                            prompt_sources
+                        ),
+                    ),
                     prompt_assets,
                     end - start,
                     self.profiles[DEFAULT_SKILL],
@@ -12029,7 +12559,7 @@ class DirectorCutStudio(QMainWindow):
                     source_assets=self.scan.assets,
                 )
             self.prompt_panel.output.setPlainText(prompt)
-            return compile_active_workflow(
+            compiled, compiled_assets = compile_active_workflow(
                 self.scan,
                 start,
                 end,
@@ -12039,6 +12569,9 @@ class DirectorCutStudio(QMainWindow):
                     seed=seed,
                     enable_rtx_vsr=enable_rtx_vsr,
                 ),
+            )
+            return compiled, self._prepare_windowed_tts_audio(
+                compiled_assets, start, end
             )
         finally:
             for asset, was_enabled in original_enabled:
@@ -12050,6 +12583,41 @@ class DirectorCutStudio(QMainWindow):
         self.accept_preview_button.setEnabled(False)
         self.reject_preview_button.setEnabled(False)
         self._start_generation("preview", 0.2, self.preview_seed, False)
+
+    def _validate_authored_text_before_run(self) -> bool:
+        """Block silent generation when Design-authored exact text was lost."""
+        if not self.authored_text_requirements:
+            return True
+        missing: list[dict] = []
+        for required in self.authored_text_requirements:
+            content = str(required.get("content", "")).strip()
+            role = str(required.get("role", ""))
+            start = float(required.get("start_seconds", -1.0))
+            end = float(required.get("end_seconds", -1.0))
+            if not any(
+                layer.content_role == role
+                and layer.text.strip() == content
+                and abs(layer.start_seconds - start) <= 0.01
+                and abs(layer.end_seconds - end) <= 0.01
+                for layer in self.text_layers
+            ):
+                missing.append(required)
+        if not missing:
+            return True
+        preview = "\n".join(
+            f"{item.get('start_seconds', 0):.2f}-{item.get('end_seconds', 0):.2f}s "
+            f"{item.get('role', 'text')}: {str(item.get('content', ''))[:90]}"
+            for item in missing[:4]
+        )
+        QMessageBox.critical(
+            self,
+            "Authored dialogue/text is missing",
+            "The original Design requirement contained exact timed Dialogue, Voice-over, "
+            "Lyrics or On-screen Text, but the matching Timeline layer is missing or changed.\n\n"
+            "Generation has been blocked so the Studio cannot silently produce a video without "
+            "the user's words. Restore the layer or Apply the Design again.\n\n" + preview,
+        )
+        return False
 
     def reject_pre_run_preview(self) -> None:
         self.preview_seed = self._new_seed(self.preview_seed)
@@ -12076,11 +12644,20 @@ class DirectorCutStudio(QMainWindow):
         seed: int,
         enable_rtx_vsr: bool,
     ) -> None:
+        if not self._validate_authored_text_before_run():
+            return
         if self.design_media_runner and self.design_media_runner.is_running():
             QMessageBox.information(
                 self,
                 "Design media running",
                 "Wait for the AI Design reference images to finish first.",
+            )
+            return
+        if self.design_tts_runner and self.design_tts_runner.is_running():
+            QMessageBox.information(
+                self,
+                "Mandarin TTS running",
+                "Wait for the exact authored speech WAV to finish first.",
             )
             return
         if self.submit_runner and self.submit_runner.is_running():
