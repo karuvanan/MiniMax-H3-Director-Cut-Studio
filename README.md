@@ -8,7 +8,7 @@
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
-- [示范输出影片（YouTube）](https://youtu.be/hALjq11lK_s)
+- [示范输出影片（YouTube）](https://www.youtube.com/@imbiplazaASUS/videos)
 - 下载源码及 runtime 后，从项目根目录执行 `run_h3_prompt_studio.bat`。
 
 源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
