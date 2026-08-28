@@ -13,6 +13,7 @@
 
 源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
 
+<img width="1280" height="720" alt="ezgif-4e995e5e3d7a85bb" src="https://github.com/user-attachments/assets/6d7a93cb-fef5-480f-b3ac-90eae04cca40" />
 
 <img width="1280" height="769" alt="MiniMax H3 Director Cut Studio" src="https://github.com/user-attachments/assets/ed7575ea-8868-4b54-8dd1-00a1810f1fcf" />
 
