@@ -42,6 +42,10 @@ class PromptSpec:
     music: str = ""
     shots: list[str] = field(default_factory=list)
     shot_ranges: list[dict] = field(default_factory=list)
+    # Timeline-authored Type clips remain independent from visual Shot prompts.
+    # The H3 compiler places these timed events in detailed_description without
+    # copying their exact wording into a Director Shot's action prose.
+    text_ranges: list[dict] = field(default_factory=list)
     dialogue: str = ""
     transition: str = ""
     ending: str = "Hold on the final image. Do not add another cut."
@@ -115,6 +119,36 @@ def build_structured_prompt(spec: PromptSpec) -> str:
         blocks.append(f"STORY AND CONTINUITY: {_sentence(spec.brief)}")
     if spec.must_keep.strip():
         blocks.append(f"MUST KEEP: {_sentence(spec.must_keep)}")
+
+    if spec.text_ranges:
+        rows = [
+            "TIMELINE TYPE / DIALOGUE TRACK: execute every independently timed clip exactly once; "
+            "never move its wording into Shot action prose."
+        ]
+        for item in sorted(
+            spec.text_ranges,
+            key=lambda row: (
+                float(row.get("start_seconds", 0.0)),
+                float(row.get("end_seconds", 0.0)),
+            ),
+        ):
+            start = float(item.get("start_seconds", 0.0))
+            end = float(item.get("end_seconds", start))
+            role = str(item.get("content_role", "on_screen_text"))
+            text = str(item.get("text", "")).strip()
+            track = str(item.get("track_id", "Type"))
+            if role == "on_screen_text":
+                rows.append(
+                    f'[{track} {start:.3f}-{end:.3f}s] Show exact text "{text}".'
+                )
+            else:
+                speaker = str(item.get("speaker", "S1"))
+                language = str(item.get("language", "Original"))
+                rows.append(
+                    f"[{track} {start:.3f}-{end:.3f}s] ({speaker}) "
+                    f"<d>[{language}] {text}</d>"
+                )
+        blocks.append("\n".join(rows))
 
     shots = spec.shots or [spec.brief.strip() or "Describe the intended shot action."]
     dialogue = _dialogue_by_cut(spec.dialogue)

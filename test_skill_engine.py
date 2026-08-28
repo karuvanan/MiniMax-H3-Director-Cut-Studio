@@ -35,6 +35,40 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("subject_definitions", self.profiles[DEFAULT_SKILL].h3_reference_guide)
         self.assertIn("Typography Rules", self.profiles[SPECIAL_SKILL].instruction)
 
+    def test_timed_dialogue_track_is_independent_and_emitted_once(self):
+        spec = PromptSpec(
+            brief="A woman speaks directly to camera.",
+            shots=["Medium close-up; she maintains eye contact."],
+            shot_ranges=[{
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+                "description": "Medium close-up; she maintains eye contact.",
+            }],
+            text_ranges=[{
+                "layer_id": "T1",
+                "track_id": "A4",
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+                "content_role": "dialogue",
+                "text": "你好，这句话不能改。",
+                "speaker": "S1",
+                "language": "Mandarin Chinese",
+                "delivery": "Natural",
+                "lip_sync": True,
+                "supplied_audio_tag": "",
+            }],
+        )
+        prompt = build_ref2va_prompt(
+            spec,
+            [],
+            3.0,
+            self.profiles[DEFAULT_SKILL],
+        )
+        self.assertIn("TIMELINE TYPE / DIALOGUE TRACK EVENTS", prompt)
+        self.assertIn("[Dialogue Track A4/T1", prompt)
+        self.assertEqual(prompt.count("你好，这句话不能改。"), 1)
+        self.assertIn("increasing speaking pace rather than editing words", prompt)
+
     def test_special_profile_metadata_comes_from_each_folder(self):
         profile = self.profiles["music-video-subtitle-generator"]
         self.assertEqual(profile.path.parent.name, "music-video-subtitle-generator")

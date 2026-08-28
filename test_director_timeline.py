@@ -242,21 +242,17 @@ class DirectorTimelineDragTests(unittest.TestCase):
         without_audio = window._prompt_spec_with_director_cues(
             window.prompt_panel.spec()
         )
-        self.assertIn("Generate this exact audible Mandarin Chinese dialogue", without_audio.shots[0])
-        self.assertNotIn("supplied speech", without_audio.shots[0])
+        self.assertEqual(without_audio.text_ranges[0]["supplied_audio_tag"], "")
+        self.assertNotIn(window.text_layers[0].text, without_audio.shots[0])
         self.assertIn("SHOT SOUND EXECUTION", without_audio.shots[0])
         self.assertIn("SHOT SPATIAL ACOUSTICS", without_audio.shots[0])
-        self.assertIn("Shot acoustic profile", without_audio.shots[0])
-        self.assertIn("live production sound captured on location", without_audio.shots[0])
-        self.assertIn("conversational timing", without_audio.shots[0])
         with_audio = window._prompt_spec_with_director_cues(
             window.prompt_panel.spec(), supplied_dialogue_audio_tag="<Audio 2>"
         )
-        self.assertIn("Use <Audio 2> exactly as the supplied speech", with_audio.shots[0])
-        self.assertIn("clean authored dialogue stem", with_audio.shots[0])
-        self.assertIn("spatialize the stem as live on-location production sound", with_audio.shots[0])
-        self.assertIn("Shot acoustic profile", with_audio.shots[0])
-        self.assertIn("never leave it as a dry studio/announcer voice", with_audio.shots[0])
+        self.assertEqual(
+            with_audio.text_ranges[0]["supplied_audio_tag"], "<Audio 2>"
+        )
+        self.assertNotIn(window.text_layers[0].text, with_audio.shots[0])
         window.project_dirty = False
         window.close()
 
@@ -2016,7 +2012,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
         self.assertIn("Hero Reveal", " ".join(spec.shots))
         self.assertIn("Whip Pan", spec.transition)
-        self.assertIn("GET READY", " ".join(spec.shots))
+        self.assertNotIn("GET READY", " ".join(spec.shots))
+        self.assertEqual(
+            [row["text"] for row in spec.text_ranges],
+            ["GET READY", "GET READY"],
+        )
         payload = window._project_payload()
         self.assertEqual(payload["version"], PROJECT_FORMAT_VERSION)
         self.assertEqual(len(payload["director_cues"]), 3)
@@ -2128,12 +2128,42 @@ class DirectorTimelineDragTests(unittest.TestCase):
         spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
         self.assertEqual(spec.shot_ranges[0]["start_seconds"], 0.0)
         self.assertEqual(spec.shot_ranges[0]["end_seconds"], 3.5)
-        self.assertIn("S2 speaks in Cantonese", spec.shot_ranges[0]["description"])
-        self.assertIn("accurate visible lip sync", spec.shot_ranges[0]["description"])
+        self.assertNotIn("Get ready", spec.shot_ranges[0]["description"])
+        self.assertEqual(spec.text_ranges[0]["text"], "Get ready")
+        self.assertEqual(spec.text_ranges[0]["speaker"], "S2")
+        self.assertEqual(spec.text_ranges[0]["language"], "Cantonese")
+        self.assertTrue(spec.text_ranges[0]["lip_sync"])
         dialog.role_combo.setCurrentIndex(dialog.role_combo.findData("voice_over"))
         self.assertTrue(all(widget.isHidden() for _label, widget in dialog.dialogue_rows))
         self.assertFalse(dialog.state()["lip_sync"])
         dialog.close()
+        window.project_dirty = False
+        window.close()
+
+    def test_dialogue_type_clip_repairs_from_visual_track_to_visible_audio_track(self):
+        window = DirectorCutStudio()
+        layer = TextLayer(
+            "T1", "这句话必须逐字说完。", 0.0, 3.0, "V3",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            delivery="Natural", lip_sync=True,
+        )
+        window.text_layers = [layer]
+        window._refresh_text_layers(layer)
+        self.app.processEvents()
+
+        self.assertEqual(layer.track_id, "A4")
+        dialogue_track = next(track for track in window.tracks if track.track_id == "A4")
+        self.assertEqual(dialogue_track.kind, "audio")
+        self.assertEqual(dialogue_track.name, "A4 Dialogue")
+        clip = next(
+            item for item in window.timeline.scene_obj.items()
+            if isinstance(item, TimelineTextClip) and item.layer is layer
+        )
+        self.assertIn("DIA", clip.label.text())
+        self.assertAlmostEqual(
+            clip.y(),
+            window.timeline._track_top(window.tracks.index(dialogue_track)) + 2,
+        )
         window.project_dirty = False
         window.close()
 
@@ -2178,7 +2208,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("@P3", brief)
         self.assertIn("@A1", brief)
         spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
-        self.assertIn("Voice-over says exactly", spec.shot_ranges[0]["description"])
+        self.assertNotIn(voiceover.text, spec.shot_ranges[0]["description"])
+        self.assertEqual(spec.text_ranges[0]["content_role"], "voice_over")
+        self.assertEqual(spec.text_ranges[0]["text"], voiceover.text)
         segment_prompt = window._prompt_for_window(
             8.0,
             12.0,
@@ -2188,7 +2220,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("AI-enriched media reference <Picture 1>", segment_prompt)
         self.assertNotIn("@P3", segment_prompt)
         self.assertNotIn("@A1", segment_prompt)
-        self.assertIn("螢光蟲同南十字座上下呼應", spec.shot_ranges[0]["description"])
+        # A Type/Dialogue clip is owned by the hidden Segment containing its
+        # start time; later overlapping windows must not replay the full line.
+        self.assertNotIn(voiceover.text, segment_prompt)
         window.project_dirty = False
         window.close()
 
@@ -2932,7 +2966,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
         self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 8)
+        self.assertEqual(job["render_policy_version"], 9)
         window.project_dirty = False
         window.close()
 
@@ -3159,7 +3193,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 8,
+            "render_policy_version": 9,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -3527,7 +3561,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 8,
+            "render_policy_version": 9,
             "segments": completed,
         }
         window._refresh_render_status_bar()

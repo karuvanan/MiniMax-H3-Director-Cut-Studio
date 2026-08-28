@@ -2,6 +2,22 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.6-alpha.1] - 2026-08-28
+
+### Changed
+
+- Rebuilt authored speech as visible Timeline Type clips instead of hidden text appended to visual Shot prompts. Dialogue, Voice-over and Lyrics now remain independently editable on `A4 Dialogue`, `A5 Voice-over` and `A6 Lyrics`; On-screen Text remains on a V track.
+- Changing a Type clip's Content Role automatically moves it to the matching visual/audio track. Loading an older project now repairs Dialogue clips previously mutated onto V tracks back to their correct A track.
+- H3 prompt compilation now emits one independent, time-coded `TIMELINE TYPE / DIALOGUE TRACK EVENTS` contract. Exact text is emitted only once and is no longer duplicated inside Shot Action prose, reducing Ori paraphrase, omission and repeated-line pressure.
+- Each hidden Segment receives only the Type/Dialogue events it owns. Editing the clip text, timing, Speaker, Language, Delivery or Lip Sync continues to invalidate the affected render range and regenerate the current Ori prompt automatically.
+- Smart Render policy version is now `9`, so cached Segments compiled with the former Shot-embedded dialogue policy are not reused.
+
+### Verification
+
+- Added regression coverage for old V-track Dialogue migration, visible `DIA` clips on `A4 Dialogue`, independent timed-dialogue prompt compilation and single-occurrence exact text.
+- The complete bundled test suite passed: `265` tests. All four Standard Pipeline Release Gates passed.
+- Director Project format remains version `17`; existing projects are migrated in memory and need no manual JSON edit.
+
 ## [0.2.6-alpha] - 2026-08-28
 
 ### Release

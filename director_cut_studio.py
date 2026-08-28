@@ -174,7 +174,7 @@ DIRECTOR_LANE_TYPES = ("shot", "transition", "marker")
 DIRECTOR_LANES_TOP = TIMELINE_RULER_HEIGHT + RENDER_STATUS_BAR_HEIGHT
 TIMELINE_TRACKS_TOP = DIRECTOR_LANES_TOP + DIRECTOR_LANE_HEIGHT * len(DIRECTOR_LANE_TYPES)
 TIMELINE_SNAP_SECONDS = 0.5
-SMART_RENDER_POLICY_VERSION = 8
+SMART_RENDER_POLICY_VERSION = 9
 CONTINUITY_MODE_LABELS = (
     "Auto", "Hard Cut", "Match Action", "Motion Reference", "Transition",
 )
@@ -855,6 +855,30 @@ class TextLayer:
         self.language = str(self.language).strip() or "English"
         self.delivery = str(self.delivery).strip() or "Natural"
         self.lip_sync = bool(self.lip_sync)
+
+
+def text_layer_track_kind(content_role: str) -> str:
+    """Map visible titles to V tracks and authored speech to A tracks."""
+    return "visual" if content_role == "on_screen_text" else "audio"
+
+
+def default_text_layer_track(content_role: str) -> str:
+    return {
+        "on_screen_text": "V4",
+        "dialogue": "A4",
+        "voice_over": "A5",
+        "lyrics": "A6",
+    }.get(content_role, "V4")
+
+
+def text_layer_track_name(track_id: str, content_role: str) -> str:
+    role_name = {
+        "on_screen_text": "Type",
+        "dialogue": "Dialogue",
+        "voice_over": "Voice-over",
+        "lyrics": "Lyrics",
+    }.get(content_role, "Type")
+    return f"{track_id} {role_name}"
 
 
 @dataclass(slots=True)
@@ -2008,8 +2032,14 @@ class TimelineTextClip(QGraphicsRectItem):
         width = max(42.0, (layer.end_seconds - layer.start_seconds) * self.pps)
         super().__init__(0, 0, width, clip_height)
         self.setPos(layer.start_seconds * self.pps, y)
-        self.setBrush(QColor("#a34f9e"))
-        self.setPen(QPen(QColor("#efb5ea"), 1))
+        fill, edge = {
+            "on_screen_text": ("#a34f9e", "#efb5ea"),
+            "dialogue": ("#167f77", "#7fe4d8"),
+            "voice_over": ("#9a6530", "#efbd78"),
+            "lyrics": ("#6d55a5", "#cbb8f5"),
+        }.get(layer.content_role, ("#a34f9e", "#efb5ea"))
+        self.setBrush(QColor(fill))
+        self.setPen(QPen(QColor(edge), 1))
         self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemSendsGeometryChanges)
         self.setFlag(QGraphicsItem.ItemIsMovable, not locked)
         self.setAcceptHoverEvents(True)
@@ -2374,14 +2404,23 @@ class TimelineView(QGraphicsView):
         )
         return index, track.track_id, self._track_top(index) + 2, max(12.0, track.height - 4)
 
-    def _resolve_text_track(self, scene_y: float) -> tuple[str, float, float]:
+    def _resolve_text_track(
+        self,
+        scene_y: float,
+        content_role: str = "on_screen_text",
+    ) -> tuple[str, float, float]:
+        wanted_kind = text_layer_track_kind(content_role)
         allowed = [
             (index, track)
             for index, track in enumerate(self.tracks)
-            if track.kind == "visual" and not track.locked
+            if track.kind == wanted_kind and not track.locked
         ]
         if not allowed:
-            allowed = [(index, track) for index, track in enumerate(self.tracks) if track.kind == "visual"]
+            allowed = [
+                (index, track)
+                for index, track in enumerate(self.tracks)
+                if track.kind == wanted_kind
+            ]
         index, track = min(
             allowed,
             key=lambda item: abs(self._track_top(item[0]) + item[1].height / 2 - scene_y),
@@ -2531,9 +2570,14 @@ class TimelineView(QGraphicsView):
                     clip.setOpacity(0.25)
                 self.scene_obj.addItem(clip)
         for layer in self.text_layers:
+            wanted_kind = text_layer_track_kind(layer.content_role)
             track = next(
-                (item for item in self.tracks if item.track_id == layer.track_id and item.kind == "visual"),
-                next(item for item in self.tracks if item.kind == "visual"),
+                (
+                    item
+                    for item in self.tracks
+                    if item.track_id == layer.track_id and item.kind == wanted_kind
+                ),
+                next(item for item in self.tracks if item.kind == wanted_kind),
             )
             index = self.tracks.index(track)
             layer.track_id = track.track_id
@@ -2541,7 +2585,9 @@ class TimelineView(QGraphicsView):
                 layer,
                 self.pps,
                 self._track_top(index) + 2,
-                self._resolve_text_track,
+                lambda scene_y, role=layer.content_role: self._resolve_text_track(
+                    scene_y, role
+                ),
                 self._set_interaction_active,
                 self.text_edit_committed.emit,
                 track.locked,
@@ -6406,7 +6452,7 @@ class DirectorCutStudio(QMainWindow):
             ("shot", "shot", "Shot", "Shot Tool · drag a time range on a visual track to create a structured Shot Block"),
             (
                 "type", "type", "Type",
-                "Type Tool · click any empty visual track to create text; clicking media uses the nearest empty V track",
+                "Type Tool · create an independent clip; On-screen Text uses V tracks, while Dialogue/Voice-over/Lyrics use dedicated A tracks",
             ),
             ("prompt", "prompt", "Prompt", "Prompt Tool · click a media clip to add a local director instruction"),
             ("transition", "transition", "Transition", "Transition Tool · add a transition preset at a cut point"),
@@ -6750,6 +6796,7 @@ class DirectorCutStudio(QMainWindow):
         ]
         self._sync_timeline_clip_sources()
         self.text_layers = [TextLayer(**values) for values in state.get("text_layers", [])]
+        self._normalize_text_layer_tracks()
         self.authored_text_requirements = deepcopy(
             state.get("authored_text_requirements") or []
         )
@@ -7093,15 +7140,15 @@ class DirectorCutStudio(QMainWindow):
             ))
         for index, item in enumerate(plan["text_layers"], 1):
             role = str(item.get("role", "on_screen_text"))
-            track_kind = "visual" if role == "on_screen_text" else "audio"
+            track_kind = text_layer_track_kind(role)
             requested_track = str(item.get("track", ""))
             if track_kind == "audio" and not requested_track.upper().startswith("A"):
-                requested_track = {
-                    "dialogue": "A4", "voice_over": "A5", "lyrics": "A6",
-                }.get(role, "A4")
+                requested_track = default_text_layer_track(role)
             elif track_kind == "visual" and not requested_track.upper().startswith("V"):
-                requested_track = "V4"
+                requested_track = default_text_layer_track(role)
             track = self._design_track(requested_track, track_kind)
+            if track.name == track.track_id or role != "on_screen_text":
+                track.name = text_layer_track_name(track.track_id, role)
             midpoint = (item["start_seconds"] + item["end_seconds"]) / 2
             shot_id = next(
                 (
@@ -8663,6 +8710,9 @@ class DirectorCutStudio(QMainWindow):
             self.text_layers = [
                 TextLayer(**row) for row in payload.get("text_layers", [])
             ]
+            if self._normalize_text_layer_tracks():
+                self.timeline.set_tracks(self.tracks)
+                self._rebuild_track_headers()
             self.authored_text_requirements = deepcopy(
                 payload.get("authored_text_requirements") or []
             )
@@ -10015,7 +10065,7 @@ class DirectorCutStudio(QMainWindow):
             label.set_selection_enabled(mode == "selection")
         messages = {
             "selection": "Selection Tool · move clips or drag text directly in Program Monitor",
-            "type": "Type Tool · click any empty V track; clicking media places text on the nearest empty V track",
+            "type": "Type Tool · Content Role automatically selects a V track or a dedicated Dialogue/Voice-over/Lyrics A track",
             "prompt": "Prompt Tool · click a clip to add or edit its director instruction",
             "hand": "Hand Tool · drag the Timeline horizontally or vertically to navigate",
             "razor": "Razor Tool · click media for a CUT boundary or split text/director blocks",
@@ -10183,7 +10233,37 @@ class DirectorCutStudio(QMainWindow):
         self._mark_render_states_dirty(state)
         self._mark_dirty()
 
+    def _normalize_text_layer_tracks(self) -> bool:
+        """Repair old projects and role edits without hiding speech on V tracks."""
+        track_model_changed = False
+        for layer in self.text_layers:
+            wanted_kind = text_layer_track_kind(layer.content_role)
+            current_track = next(
+                (
+                    track
+                    for track in self.tracks
+                    if track.track_id == layer.track_id
+                    and track.kind == wanted_kind
+                ),
+                None,
+            )
+            if current_track is None:
+                current_track = self._design_track(
+                    default_text_layer_track(layer.content_role), wanted_kind
+                )
+                layer.track_id = current_track.track_id
+                track_model_changed = True
+            wanted_name = text_layer_track_name(
+                current_track.track_id, layer.content_role
+            )
+            if current_track.name in {current_track.track_id, wanted_name}:
+                if current_track.name != wanted_name:
+                    current_track.name = wanted_name
+                    track_model_changed = True
+        return track_model_changed
+
     def _refresh_text_layers(self, _layer: TextLayer | None = None) -> None:
+        track_model_changed = self._normalize_text_layer_tracks()
         if not self.restoring_project:
             # Once the user edits a Timeline text layer, the Timeline becomes
             # the authored contract.  This keeps validation, Shot prompts and
@@ -10214,6 +10294,9 @@ class DirectorCutStudio(QMainWindow):
                     and self._authored_tts_asset() is not None
                 ):
                     self.timeline_tts_refresh_timer.start()
+        if track_model_changed:
+            self.timeline.set_tracks(self.tracks)
+            self._rebuild_track_headers()
         self.timeline.set_text_layers(self.text_layers)
         self._sync_prompt_panel_from_timeline(reconcile_brief=True)
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
@@ -12603,66 +12686,6 @@ class DirectorCutStudio(QMainWindow):
                         )
                     )
                 ]
-                overlays = [layer.text for layer in layers if layer.content_role == "on_screen_text"]
-                if overlays:
-                    exact = "; ".join(f'"{text}"' for text in overlays)
-                    parts.append(f"Show the exact on-screen text {exact}, preserving spelling")
-                for layer in layers:
-                    if layer.content_role == "dialogue":
-                        sync = "with accurate visible lip sync" if layer.lip_sync else "without required lip sync"
-                        acoustic_context = " ".join(
-                            (cue.environment_response or cue.detail or "the visible location").split()
-                        )[:320]
-                        if supplied_dialogue_audio_tag:
-                            parts.append(
-                                f'Use {supplied_dialogue_audio_tag} exactly as the supplied speech, treating '
-                                'it as the clean authored dialogue stem; '
-                                f'{layer.speaker} speaks in '
-                                f'{layer.language}, {layer.delivery.lower()} delivery, {sync}: '
-                                f'<d>[{layer.language}] {layer.text}</d>. Synchronize mouth motion '
-                                'and phoneme timing precisely to the supplied audio. Preserve every word, '
-                                'speaker identity and utterance timing, but spatialize the stem as live '
-                                f'on-location production sound for {acoustic_context}: match the visible '
-                                'camera distance, retain natural breath and conversational micro-pauses, '
-                                f'apply the Shot acoustic profile ({acoustic_profile}: {acoustic_direction}), '
-                                'retain low environmental bleed, and never leave '
-                                'it as a dry studio/announcer voice or generate a duplicate voice'
-                            )
-                        else:
-                            parts.append(
-                                f'{layer.speaker} speaks in {layer.language}, '
-                                f'{layer.delivery.lower()} delivery, {sync}. Generate this exact '
-                                f'audible {layer.language} dialogue as live production sound captured '
-                                f'on location for {acoustic_context}, in a natural native voice: '
-                                f'<d>[{layer.language}] {layer.text}</d>. Do not paraphrase, '
-                                'translate, omit or replace any word. Use organic conversational timing, '
-                                'natural breath and micro-pauses, restrained projection, matching camera '
-                                f'distance, and the Shot acoustic profile ({acoustic_profile}: '
-                                f'{acoustic_direction}) with low environmental bleed; never use '
-                                'a dry announcer, dubbing-booth or studio voice-over delivery'
-                            )
-                    elif layer.content_role == "voice_over":
-                        source = (
-                            f"Use {supplied_dialogue_audio_tag} exactly as the supplied speech"
-                            if supplied_dialogue_audio_tag
-                            else f"Generate an exact native {layer.language} voice-over"
-                        )
-                        parts.append(
-                            f'Voice-over says exactly: <d>[{layer.language}] {layer.text}</d>. '
-                            f'{source}. '
-                            'Do not paraphrase, translate or omit any word'
-                        )
-                    elif layer.content_role == "lyrics":
-                        source = (
-                            f"Synchronize the exact lyrics to {supplied_dialogue_audio_tag}"
-                            if supplied_dialogue_audio_tag
-                            else f"Generate the exact {layer.language} lyrics audibly"
-                        )
-                        parts.append(
-                            f'Lyrics are synchronized exactly: <d>[{layer.language}] {layer.text}</d>. '
-                            f'{source}. '
-                            'Do not paraphrase, translate or omit any word'
-                        )
                 description = ". ".join(part.strip().rstrip(".") for part in parts if part.strip())
                 shots.append(description)
                 shot_ranges.append(
@@ -12682,10 +12705,48 @@ class DirectorCutStudio(QMainWindow):
                 )
             state["shots"] = shots
             state["shot_ranges"] = shot_ranges
-            if self.prompt_panel.auto_sync.isChecked() and self.text_layers:
-                # Timeline layers are already expanded into each structured shot above.
-                # Keep the visible Dialogue field synchronized without emitting it twice.
-                state["dialogue"] = ""
+
+        # Type Tool content is a first-class Timeline track, never part of a
+        # visual Director Shot's prompt payload.  Keep exact wording in one
+        # place so editing a DIA/VO/LYR clip updates Ori without opening Shot.
+        state["text_ranges"] = [
+            {
+                "layer_id": layer.layer_id,
+                "track_id": layer.track_id,
+                "start_seconds": local_time(
+                    max(layer.start_seconds, window_start)
+                    if window_start is not None else layer.start_seconds
+                ),
+                "end_seconds": local_time(
+                    min(layer.end_seconds, window_end)
+                    if window_end is not None else layer.end_seconds
+                ),
+                "content_role": layer.content_role,
+                "text": layer.text,
+                "speaker": layer.speaker,
+                "language": layer.language,
+                "delivery": layer.delivery,
+                "lip_sync": layer.lip_sync,
+                "shot_id": layer.shot_id,
+                "supplied_audio_tag": supplied_dialogue_audio_tag,
+            }
+            for layer in sorted(
+                self.text_layers,
+                key=lambda item: (item.start_seconds, item.end_seconds, item.layer_id),
+            )
+            if layer.text.strip()
+            and (
+                window_start is None
+                or (
+                    layer.start_seconds >= window_start - 1e-6
+                    and layer.start_seconds < window_end - 1e-6
+                )
+            )
+        ]
+        if self.prompt_panel.auto_sync.isChecked() and self.text_layers:
+            # The visible Dialogue panel mirrors Type clips. The compiler emits
+            # only text_ranges, preventing duplicate or competing speech.
+            state["dialogue"] = ""
 
         transition_notes = [
             f"At {local_time(cue.start_seconds):.2f}s use {cue.preset}"

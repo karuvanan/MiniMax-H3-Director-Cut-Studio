@@ -2,7 +2,7 @@
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
-## v0.2.6-alpha 重点功能
+## v0.2.6-alpha.1 重点功能
 
 - **AI Director Design**：连接 Online GPT 或 LM Studio，把自然语言需求转换成可验证的 Director Design JSON；优先复用 Media Pool 素材，并按缺口调用 Z-Image 生成参考图，再以 BLIP 结果完成第二次视觉校准。
 - **可编辑长片生成**：Timeline 保持完整影片视图；超过 15 秒时自动按 Shot／原生窗口拆分、缓存、局部重算并组装 Master，跨段使用上一段最后 24 帧作为无声运动上下文。
@@ -13,7 +13,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.6-alpha`](VERSION)
+- 当前应用版本：[`v0.2.6-alpha.1`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -545,10 +545,10 @@ H3_DESIGN_IMAGE_CFG=1.0
 - AI Design 可按内容自动建立 V4/V5… 与 A4/A5… 编辑轨：画面／标题使用 V 轨，Dialogue、Voice-over、Lyrics 使用独立 A 轨。编辑轨最多 V16/A16；MiniMax H3 每个原生 15 秒任务仍遵守工作流的 9 Picture、3 Video、3 Audio 实体参考槽，并只选择该时间窗有关的素材。
 - Clip 支持速度、源入点/出点、淡入淡出与转场。
 - Selection Tool 可移动 clip 及 Program Monitor 文字；Hand Tool 用于平移 Timeline。
-- Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics；文字层可以放入任意空 V Track，不需要与原素材重叠。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
+- Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics。On-screen Text 使用独立 V Track；Dialogue、Voice-over 与 Lyrics 是可见、可拖拽与可修剪的独立 A Track Clip，默认分别放在 `A4 Dialogue`、`A5 Voice-over`、`A6 Lyrics`。修改 Content Role 会自动迁移到正确轨道；旧 Project 中被误放在 V Track 的 Dialogue 也会在载入时自动修复。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
 - Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Qwen 会从故事、Shot 与素材证据判断实际说话角色：女声分配 `S1`，男声分配 `S2`，并跨 Shot 保持一致；若用户明确写了 S1／S2 则以用户指定为准。逐字保护器只保护文字和时间，不会再把 Qwen 的合法 Speaker 选择覆盖回默认 S1。
 - Design Requirement 标题同一排提供三种对白模式按钮：`Ori` = MiniMax H3 Native Dialogue、`Vox` = VoxCPM2 Local、`Etts` = Edge TTS。默认 `Ori`；按钮选择会随 Apply 成为当前项目设置并写入 `.env`。回到 Timeline 后仍可在主页 Settings 改换，不必重新进入 Design。
-- `Ori` 不建立 authored WAV，H3 Prompt 会要求 MiniMax H3 根据最新 Text Layer 生成原语言对白与口型，并排除旧 authored-speech Audio。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 只使用项目 `models/VoxCPM2/` 的完整 snapshot、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
+- `Ori` 不建立 authored WAV，H3 Prompt 会从当前时间窗内的 `A4 Dialogue`／Type Clips 生成独立 `TIMELINE TYPE / DIALOGUE TRACK EVENTS`，每句只出现一次，按 Clip 的时间码、Speaker、Language、Delivery 和 Lip Sync 执行；逐字台词不再复制或混入 Shot Action Prompt。编辑 Dialogue Clip 会直接重新编译 Ori Prompt，并令对应 Segment 失效待重算。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 只使用项目 `models/VoxCPM2/` 的完整 snapshot、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
 - Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白期间环境声约降低 6 dB、配乐约降低 8 dB但不会静音；对白结束、转场或情绪节点会自然恢复。背景声音由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会复制、改写或再次朗读对白。
 - 每个 Shot 都会按照画面和已分析素材生成 `SHOT SPATIAL ACOUSTICS`：小房间／办公室使用短而较明亮的 `0.18–0.45s` 反射；普通室内使用中等扩散；大厅使用受控的 `0.9–1.8s` 长尾；走廊、楼梯间、洞穴使用有方向性的反射；车内使用极短软包空间反射；雨棚／摊位只保留附近屋顶、墙壁和柜台的 `0.12–0.32s` 短反射；户外则接近无混响、没有离散 Echo，并适度减少低中频饱满感。没有换地点的 Close-up／Cut 会继承上一 Shot 声场，真正换景时才平滑 crossfade。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。

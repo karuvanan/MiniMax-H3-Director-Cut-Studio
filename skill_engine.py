@@ -556,6 +556,81 @@ def build_ref2va_prompt(
             "The product body color, material, silhouette, functional details, negative space, "
             "and premium restrained motion remain consistent; every visible copy line stays on one line."
         )
+    if spec.text_ranges:
+        detailed_rows.append(
+            "TIMELINE TYPE / DIALOGUE TRACK EVENTS - these independently timed clips are "
+            "immutable authored payloads, not Shot-action prose. Execute each event exactly once "
+            "inside its stated interval. Never merge, paraphrase, translate, repeat, reorder, "
+            "replace or omit words. Visual actions, pauses, ambience and music must yield enough "
+            "time for the complete authored event."
+        )
+        for row in sorted(
+            spec.text_ranges,
+            key=lambda item: (
+                float(item.get("start_seconds", 0.0)),
+                float(item.get("end_seconds", 0.0)),
+                str(item.get("layer_id", "")),
+            ),
+        ):
+            start = float(row.get("start_seconds", 0.0))
+            end = max(start, float(row.get("end_seconds", start)))
+            role = str(row.get("content_role", "on_screen_text"))
+            text = str(row.get("text", "")).strip()
+            layer_id = str(row.get("layer_id", "Type"))
+            track_id = str(row.get("track_id", ""))
+            speaker = str(row.get("speaker", "S1")) or "S1"
+            language = str(row.get("language", "Original")) or "Original"
+            delivery = " ".join(str(row.get("delivery", "Natural")).split()) or "Natural"
+            supplied_audio = str(row.get("supplied_audio_tag", "")).strip()
+            label = f"{track_id}/{layer_id}" if track_id else layer_id
+            time_range = f"{_timecode(start)}-{_timecode(end)}"
+            if role == "on_screen_text":
+                detailed_rows.append(
+                    f'[Type Track {label} | {time_range}] Show the exact visible text "{text}" '
+                    "with authored spelling and punctuation for this interval only."
+                )
+                continue
+            if role == "voice_over":
+                source = (
+                    f"Use {supplied_audio} as the exact clean speech stem"
+                    if supplied_audio
+                    else "Generate the complete native-language performance"
+                )
+                detailed_rows.append(
+                    f"[Voice-over Track {label} | {time_range}] {speaker} says in an off-screen "
+                    f"voiceover with {delivery.lower()} delivery: <d>[{language}] {text}</d> "
+                    f"{source}; all visible lips remain closed."
+                )
+                continue
+            if role == "lyrics":
+                source = (
+                    f"Synchronize phonemes exactly to {supplied_audio}"
+                    if supplied_audio
+                    else "Generate every authored lyric in full"
+                )
+                detailed_rows.append(
+                    f"[Lyrics Track {label} | {time_range}] {speaker} sings with "
+                    f"{delivery.lower()} delivery: <d>[{language}] {text}</d> {source}."
+                )
+                continue
+            sync = (
+                "with accurate visible lip sync"
+                if bool(row.get("lip_sync", True))
+                else "without required visible lip sync"
+            )
+            source = (
+                f"Use {supplied_audio} exactly as the clean authored speech stem and do not generate a duplicate voice"
+                if supplied_audio
+                else (
+                    "Generate this native dialogue directly in H3; preserve the exact character sequence "
+                    "and complete it within the interval, increasing speaking pace rather than editing words"
+                )
+            )
+            detailed_rows.append(
+                f"[Dialogue Track {label} | {time_range}] The visible speaker ({speaker}) says "
+                f"exactly once in {language}, {delivery.lower()} delivery, {sync}: "
+                f"<d>[{language}] {text}</d> {source}."
+            )
     active_labels = ", ".join(
         [asset.tag for asset in unique_assets]
         + list(paired_audio_tags.values())
