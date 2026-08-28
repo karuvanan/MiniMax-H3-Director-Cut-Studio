@@ -2,9 +2,18 @@
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
+## v0.2.6-alpha 重点功能
+
+- **AI Director Design**：连接 Online GPT 或 LM Studio，把自然语言需求转换成可验证的 Director Design JSON；优先复用 Media Pool 素材，并按缺口调用 Z-Image 生成参考图，再以 BLIP 结果完成第二次视觉校准。
+- **可编辑长片生成**：Timeline 保持完整影片视图；超过 15 秒时自动按 Shot／原生窗口拆分、缓存、局部重算并组装 Master，跨段使用上一段最后 24 帧作为无声运动上下文。
+- **稳定动态 Mapping**：Media Pool 始终使用 `P/V/A` 稳定编号；每个 Segment 只把实际激活素材动态编译成 H3 的 `<Picture N> / <Video N> / <Audio N>`，并保护重复素材、跨段编辑和 continuity slot。
+- **逐字对白与三种声音模式**：支持 MiniMax H3 Native Dialogue、VoxCPM2 Local 和 Edge TTS；Timeline 修改台词、Speaker、时间或 Delivery 后会自动令旧 WAV 失效并重新生成。
+- **完整制作声音**：每个 Shot 自动规划现场对白、连续环境底噪、接触同步 Foley／SFX、受对白自动压低的配乐，以及根据可见空间变化的 Reverb／Echo。
+- **项目可恢复**：Preview／Run 自动输出 MP4、Director Project 与长片 manifest 到对应 `example` 工作文件夹；Open Project 可恢复 Timeline、Master、Program Monitor 与 Render Status。
+
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.5-alpha.9.2`](VERSION)
+- 当前应用版本：[`v0.2.6-alpha`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -109,13 +118,12 @@ Base URL:
 http://127.0.0.1:1234/v1
 
 Model ID:
-hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf
-
-GGUF filename:
-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf
+qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp
 ```
 
-若在 LM Studio 中启用该模型的视觉输入，还需要与它匹配的 projection 文件：
+这里的 Model ID 只是当前验证示例，不是硬编码要求。请在 Design 页面点击 `TEST CONNECTION`，从 LM Studio 实时返回的 `/v1/models` 清单选择任何能够执行 OpenAI-compatible Chat Completions／结构化 JSON 的文本模型。不要把 Windows 文件名或已经删除的完整 GGUF 路径当成永久 Model ID。
+
+若在 LM Studio 中启用所选模型的视觉输入，还需要与该模型匹配的 projection 文件，例如：
 
 ```text
 mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
@@ -124,6 +132,8 @@ mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
 当前 Design 流程会先用本地 BLIP 把生成图转成 caption，再把文字 caption 交给 LM Studio，因此 **mmproj 对现有纯文字请求不是硬性必需**；只有直接把图片提交给 LM Studio 的视觉模型模式才需要它。GGUF 由 LM Studio 管理，不要放入 ComfyUI 的模型目录。
 
 如果 LM Studio 位于其他电脑，请在 Design 设置或 `design_ai.env` 中改成对应的局域网地址和模型 ID。
+
+Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF 已删除、改量化版本或被 LM Studio 改成短 alias，会自动选择同系列可用模型并保存修复后的 ID。生成结束时只卸载 `/api/v1/models` 明确列在 `loaded_instances` 的实际实例；未加载／已删除模型直接视为已释放，不会重复产生 `model_not_found`，也不会误卸载其他模型。
 
 ## 推荐的模型目录结构
 
@@ -493,7 +503,7 @@ H3_BLIP_DEVICE=auto
 ```dotenv
 H3_DESIGN_PROVIDER="lm_studio"
 H3_DESIGN_LM_STUDIO_BASE_URL="http://127.0.0.1:1234/v1"
-H3_DESIGN_LM_STUDIO_MODEL="hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf"
+H3_DESIGN_LM_STUDIO_MODEL="qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp"
 H3_DESIGN_TIMEOUT=900
 H3_DESIGN_AUTO_SEMANTIC_ENRICHMENT=false
 H3_DESIGN_UNLOAD_LM_AFTER_SEMANTIC_ENRICHMENT=true
@@ -539,7 +549,8 @@ H3_DESIGN_IMAGE_CFG=1.0
 - Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Qwen 会从故事、Shot 与素材证据判断实际说话角色：女声分配 `S1`，男声分配 `S2`，并跨 Shot 保持一致；若用户明确写了 S1／S2 则以用户指定为准。逐字保护器只保护文字和时间，不会再把 Qwen 的合法 Speaker 选择覆盖回默认 S1。
 - Design Requirement 标题同一排提供三种对白模式按钮：`Ori` = MiniMax H3 Native Dialogue、`Vox` = VoxCPM2 Local、`Etts` = Edge TTS。默认 `Ori`；按钮选择会随 Apply 成为当前项目设置并写入 `.env`。回到 Timeline 后仍可在主页 Settings 改换，不必重新进入 Design。
 - `Ori` 不建立 authored WAV，H3 Prompt 会要求 MiniMax H3 根据最新 Text Layer 生成原语言对白与口型，并排除旧 authored-speech Audio。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 只使用项目 `models/VoxCPM2/` 的完整 snapshot、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
-- Design 会自动建立与场景相符的 diegetic ambience、环境底噪和接触拟音；H3 Prompt 会要求对白始终位于前景，并在说话时自动压低背景声与音乐。背景声由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会重复对白。
+- Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白期间环境声约降低 6 dB、配乐约降低 8 dB但不会静音；对白结束、转场或情绪节点会自然恢复。背景声音由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会复制、改写或再次朗读对白。
+- 每个 Shot 都会按照画面和已分析素材生成 `SHOT SPATIAL ACOUSTICS`：小房间／办公室使用短而较明亮的 `0.18–0.45s` 反射；普通室内使用中等扩散；大厅使用受控的 `0.9–1.8s` 长尾；走廊、楼梯间、洞穴使用有方向性的反射；车内使用极短软包空间反射；雨棚／摊位只保留附近屋顶、墙壁和柜台的 `0.12–0.32s` 短反射；户外则接近无混响、没有离散 Echo，并适度减少低中频饱满感。没有换地点的 Close-up／Cut 会继承上一 Shot 声场，真正换景时才平滑 crossfade。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、必须完成的 Core Action、必须保持的 Continuity State、Required Environment Response、可以省略的 Optional Flourish、Additional Direction 与 Shot Prompt Preset。
 - Design 与 Shot Tool 共用 H3 动作预算：每 5 秒最多三个必须完成的物理动作、两个必要接触后果和两个可选装饰。超出预算时优先把次要攻击、重复反击与纯装饰降级；最终 Prompt 明确要求先省略 Optional Flourish，不能因此延迟、削弱或重播 Core Action。Design Summary 会列出 `within / optional trimmed / priority compressed` 状态及压缩说明。
@@ -562,6 +573,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - 当 Shot Blocks 覆盖至少 80% Work Area 时，Shot 起点／终点成为优先切点；少于 3 秒的微小动作（例如 1 秒 bullet-time）会向后合并，通常形成约 3–6 秒 Render Units。若项目没有完整 Shot 结构，则继续使用稳定的 `0–15 / 14–29 / 28–43…` 规划。
 - Shot Render Unit 与稳定 seed 绑定。修改一秒动作时，只重新生成包含该时间的 Render Unit；continuity handle 内发生的修改不会令下一个已缓存 Shot 连锁失效。
 - 每段的 Shot、Dialogue、Marker 与 Ending 指令会过滤到该段，并从全局时间自动换算成段内 `0–15s` 时间。
+- 全局视觉阶段、Soundscape、Music、Constraints 与空间声学时间表同样会过滤到当前 Segment 并重设为段内时间；较早房间的 Reverb tail 不会泄漏到后续户外段。声音提示只参与该段 Prompt／fingerprint，不会修改 Picture／Video／Audio 动态编号、物理节点连接或 24 帧 continuity mapping。
 - 非第一段会把上一段最后 **24 帧（24 fps，正好 1 秒）**提取成无音频的隐藏 Video reference，只作为动作、人物位置、镜头方向、光线和环境的时间上下文；提示词明确禁止重播上一段动作。Hard Cut 会清空这项上下文。系统会优先使用空闲 Video slot；三个实体 Video slot 都占满时，只临时让出最低优先级的 Auto 参考，不会移除用户强制 Active 的素材。
 - ComfyUI 一次只执行一段，每段后请求 unload/free VRAM；单段失败会自动重试，已成功的段会写入 manifest，避免全部重来。
 - 未改变且 fingerprint 相同的段会直接复用缓存；编辑局部 Shot 或素材后，只重新生成受影响的内部段，再重新组装 Master。
@@ -674,6 +686,32 @@ http://YOUR_COMFYUI_HOST:8189/object_info/RTXVideoSuperResolution
 - 重新打开的项目会继续保存到当前 project folder，不会写回旧电脑的工作目录。
 
 升级后完全关闭并重新启动 Studio，再重新 Open Project 后执行 Preview／Run。无需重新拖入仍然存在于 project folder 的素材。
+
+### 删除或更换 LM Studio 模型后出现 `model_not_found`／无法 unload
+
+旧设置可能仍保存已经删除的完整 GGUF 路径，而新版 LM Studio 的 `/v1/models` 只公开较短的模型 alias；对未加载模型调用 `/api/v1/models/unload` 也会返回 `model_not_found`。
+
+`v0.2.6-alpha` 会在 Test Connection、Design 和 AI Semantic Enrichment 时自动处理：
+
+1. 实时读取 LM Studio 当前模型清单。
+2. 精确匹配现有 ID；旧量化文件不存在时优先选择同一模型 family／alias。
+3. 把实际可用 ID 保存回 `design_ai.env`。
+4. 生成结束后只卸载 LM Studio 明确报告为 loaded 的 instance ID。
+5. 模型已经卸载或删除时不再发送猜测的 unload 请求，也不会触碰其他已加载模型。
+
+建议更换模型后点击一次 `TEST CONNECTION`。即使没有点击，开始 Design 时仍会自动验证；如果 LM Studio 完全没有提供可用 Chat 模型，Studio 会保留清楚的连接／生成错误，而不会静默改用另一种 Provider。
+
+### 空间混响／Echo 怎样应用？会不会影响 Segment Mapping？
+
+空间声学在 H3 Prompt 编译时根据当前 Shot 的可见环境、BLIP／AI Enrich 证据和镜头距离自动建立，不是把同一个 FFmpeg Reverb 粗暴套到整条影片：
+
+- Dialogue、Foley 和 ambience 共用同一个可见空间，但各自保持正确距离与 direct/wet 比例。
+- 声学 Echo 只表示墙面、屋顶、洞穴等物理表面的反射，不允许生成第二次表演、重复字句或另一把声音。
+- 同一地点换 Close-up 不会改变空间；明确进入新地点才在边界 crossfade。
+- 旧项目的 `no artificial reverb tails` 自动提示会在重新编译时移除。
+- 已生成的 MP4 不会被原地修改；Open Project 后重新 Preview／Run 才会得到新声场。
+
+空间声学只改变受影响 Segment 的 Prompt 与 fingerprint，不会接触素材 Mapping。标准交叉测试已经验证：修改中间 Shot 的大厅声场为走廊后，只有中间 Segment 需要重算；全部 P/V/A slots、H3 节点输入、有效标签及前后 24 帧 continuity metadata 保持一致。
 
 ### RTX Video Super Resolution 失败
 
@@ -812,15 +850,15 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 1. 稀疏 Picture / Video / Audio 素材的稳定 `P/V/A` 编号、Segment 局部编号、Prompt 标签与实际 H3 节点输入完全一致。
 2. AI Design Apply 后移动、改轨、改时间或改 Clip Prompt，会立即重绑重叠 Shot、更新 Creative Brief / H3 Prompt，并在 Undo / Redo 后保持一致。
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
-4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。
+4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。该项同时交叉验证小房间／大厅／户外／走廊空间声学不会跨段泄漏，Shot-local 声学编辑不会改变任何 P/V/A mapping。
 
-当前完整验证结果：**250 tests passed**。
+当前完整验证结果：**263 tests passed**；四项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 250 tests
+Ran 263 tests
 OK
 ```

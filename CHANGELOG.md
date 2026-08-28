@@ -11,6 +11,12 @@ Every user-visible correction receives an application version and a dated entry 
 - The complete bundled test suite passed: `263` tests. All four Standard Pipeline Release Gates and all ten Timeline mapping-matrix regressions passed.
 - Director Project format remains version `17`; existing projects require no migration.
 
+### Documentation
+
+- Updated README highlights, LM Studio setup and `.env` examples to use the live model alias instead of a deleted quantized GGUF path.
+- Documented the three-layer Production Mix, visible-space Reverb/Echo profiles, acoustic inheritance across cuts, Segment-local sound schedules and their isolation from P/V/A mapping.
+- Added troubleshooting for LM Studio `model_not_found`, automatic model-family fallback/unload behavior, spatial-acoustics rerendering and the expanded `263`-test Release Gate.
+
 ## [0.2.5-alpha.9.6.1] - 2026-08-28
 
 ### Verification
