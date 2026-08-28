@@ -2,6 +2,103 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.2.6-alpha] - 2026-08-28
+
+### Release
+
+- Promoted the latest Director Cut Studio build to `v0.2.6-alpha`.
+- This alpha includes visible-scene-driven spatial acoustics, production ambience/Foley/music mixing, natural on-location dialogue treatment, safe LM Studio model replacement/unload handling, and the expanded Segment-mapping Release Gate.
+- The complete bundled test suite passed: `263` tests. All four Standard Pipeline Release Gates and all ten Timeline mapping-matrix regressions passed.
+- Director Project format remains version `17`; existing projects require no migration.
+
+## [0.2.5-alpha.9.6.1] - 2026-08-28
+
+### Verification
+
+- Expanded the mandatory fourth Release Gate with a spatial-audio/Segment-mapping cross-test covering three native windows with small-room, large-hall and open-exterior acoustic profiles.
+- Changing only the middle Shot from a large hall to a corridor changed only the middle Segment fingerprint. All request-local image/video/audio bindings, physical H3 reference inputs, effective tags and 24-frame continuity metadata remained byte-for-byte equivalent across the acoustic edit.
+- Verified that room profiles and their time ranges remain Segment-local: small-room, large-interior, open-exterior and corridor acoustics do not leak into adjacent native windows.
+- All four Standard Pipeline Release Gates passed, followed by all ten Timeline mapping-matrix regressions. The complete `263`-test suite from `0.2.5-alpha.9.6` remains valid because this patch adds verification coverage only and does not change production code.
+- Director Project format remains version `17`; no saved-project migration is required.
+
+## [0.2.5-alpha.9.6] - 2026-08-28
+
+### Added
+
+- Added deterministic, visible-scene-driven spatial acoustics for small reflective rooms, furnished rooms/offices, medium interiors, large halls, corridors/stairwells, caves/tunnels, vehicle cabins, covered semi-outdoor spaces and open exteriors.
+- Every generated Soundscape now contains a time-scoped `Spatial acoustics contract` with space-appropriate decay, early-reflection character and restrained wetness. Every Shot also receives its own `SHOT SPATIAL ACOUSTICS` execution rule for dialogue, Foley and ambience.
+- Acoustic spaces persist across close-up/cut changes when no location change is visible, then crossfade only when a later Shot explicitly enters a different space.
+
+### Changed
+
+- Small furnished rooms use close, brighter 0.18-0.45s reflections; large interiors use controlled 0.9-1.8s tails; corridors and caves receive directional returns rather than generic wash.
+- Open exteriors use nearly dry 0-0.15s acoustics, no discrete echo and slightly reduced low-mid/proximity fullness, allowing distance, wind and open-air diffusion to replace indoor body.
+- Covered stalls and awnings use only short 0.12-0.32s roof/counter/wall reflections while their open street-facing side remains free of an enclosed-room tail.
+- The obsolete auto-authored `no artificial reverb tails` phrase is removed from older Design soundscapes before recompilation. Physically plausible acoustic reflections are now explicitly distinguished from duplicated or repeated dialogue performances.
+- Time-local Segment audio planning now carries actual Shot start/end times, framing, camera angle and continuity evidence into the acoustic schedule.
+
+### Verification
+
+- Recompiled the reported `rainy_night_confession_20260828_095847_902149` sound design as one continuous `0.00-5.00s covered semi-outdoor space`; the former contradictory no-reverb direction is absent.
+- Added regressions for room-size profiles, outdoor de-fullness, covered-space reflections, acoustic location changes, same-location inheritance, legacy no-reverb cleanup and per-Shot/Release-Gate prompt presence.
+- The complete bundled test suite passed: `263` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
+## [0.2.5-alpha.9.5] - 2026-08-28
+
+### Fixed
+
+- LM Studio generation now validates a saved model ID against the live `/v1/models` catalogue. If the GGUF was deleted or replaced, Studio selects the closest available model family/alias and persists the repaired selection instead of repeatedly using the stale path.
+- Test Connection now replaces an unavailable editable model value with the resolved live model rather than silently retaining text that is absent from the discovered model list.
+- LM Studio cleanup now unloads only instance IDs explicitly reported in `loaded_instances`; an unloaded or deleted saved model is already considered released and no longer causes repeated `model_not_found` requests.
+- Saved full GGUF paths and LM Studio's shorter model aliases are matched safely during cleanup, while unrelated models with similar basenames remain isolated.
+- Media Pool AI Semantic Enrichment receives and persists the same resolved LM Studio model, so Design and background enrichment cannot drift onto different stale identifiers.
+
+### Verification
+
+- Verified against the configured live LM Studio server at `192.168.0.185:1234`: 28 models were discovered and the deleted/stale GGUF path resolved to `qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp`.
+- Added regressions for deleted models, unloaded catalogue entries, quantized-family fallback, full-path-to-alias cleanup and unrelated-model isolation.
+- The complete bundled test suite passed: `261` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
+## [0.2.5-alpha.9.4] - 2026-08-28
+
+### Added
+
+- Added a universal three-layer production-audio contract to every Design and Timeline render: continuous diegetic location ambience, exact-frame contact Foley/one-shot SFX, and foreground authored speech.
+- Added automatic story-aware non-diegetic music when the field is blank, plus a stable mix contract that keeps music audible between lines and transitions while ducking it beneath dialogue and important diegetic effects.
+- Every Shot now receives an executable sound instruction requiring continuous location tone and physically caused, perspective-correct Foley/SFX with natural decay.
+
+### Changed
+
+- Native H3 Dialogue is now directed as live on-location production sound with conversational timing, natural breath and micro-pauses, camera-distance perspective, subtle early reflections and low environmental bleed instead of a dry announcer or studio voice-over.
+- VoxCPM2 Voice Design now favors organic on-location film performance, restrained everyday projection and phrasing-driven emotion; Edge TTS applies a small delivery-aware rate/pitch adjustment instead of one fixed cadence.
+- VoxCPM2/Edge authored WAVs are now classified as clean dialogue stems rather than finished soundtracks. H3 preserves their exact wording, speaker identity, timing and phoneme rhythm while spatializing them and generating ambience, Foley/SFX and ducked music around them.
+- The Timeline TTS signature now includes the `on_location_production_v1` voice policy, so an older dry authored WAV is rebuilt automatically before Preview/Run.
+
+### Verification
+
+- Added regressions for sound/music contract idempotence, story-aware Foley and score selection, on-location VoxCPM instructions, native and supplied-dialogue spatialization, and authored-TTS stem retention semantics.
+- Expanded the mandatory fourth Release Gate to require the production-mix, music-mix and per-Shot sound contracts in every native Segment prompt.
+- The complete bundled test suite passed: `258` tests.
+- Director Project format remains version `17`; no saved-project migration is required.
+
+## [0.2.5-alpha.9.3] - 2026-08-28
+
+### Fixed
+
+- Hidden Segment prompts now filter project-global time-scoped visual style, reference rules, soundscape, music, constraints, technical rules and ending directions to the active render window, then rebase retained ranges onto the Segment's local clock.
+- Earlier and later phases are removed from the executable Segment prompt instead of being reinterpreted from local `00:00`; this prevents a later Shot from blending an earlier location, lighting state, ambience or music phase into its opening frames.
+- Segment prompts now state that the retained timed phase overrides incompatible untimed modifiers and that only subjects, locations, props, lighting states and actions present in the local Shots or active references may become visible.
+- Smart Render policy version is now `8`, invalidating cached Segments compiled with the older leaking prompt policy while leaving the saved Director Project schema unchanged.
+
+### Verification
+
+- Added deterministic parser regressions for English numeric ranges, clock timecodes, point events, partial-window clipping, year-range safety and removal of off-window phases.
+- Expanded the mandatory fourth Release Gate to verify that visual style, soundscape, music and constraint schedules never leak across native 15-second boundaries.
+- Recompiled the reported `ai_design_20260828_014726_319700` final 25-30s window: P6 remains the sole active image, physical node `154` remains request-local `<Picture 1>`, the previous 24 frames remain `<Video 1>`, and the cotton-field schedule is absent from the final Segment prompt.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.5-alpha.9.2] - 2026-08-27
 
 ### Fixed

@@ -244,10 +244,19 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.assertIn("Generate this exact audible Mandarin Chinese dialogue", without_audio.shots[0])
         self.assertNotIn("supplied speech", without_audio.shots[0])
+        self.assertIn("SHOT SOUND EXECUTION", without_audio.shots[0])
+        self.assertIn("SHOT SPATIAL ACOUSTICS", without_audio.shots[0])
+        self.assertIn("Shot acoustic profile", without_audio.shots[0])
+        self.assertIn("live production sound captured on location", without_audio.shots[0])
+        self.assertIn("conversational timing", without_audio.shots[0])
         with_audio = window._prompt_spec_with_director_cues(
             window.prompt_panel.spec(), supplied_dialogue_audio_tag="<Audio 2>"
         )
         self.assertIn("Use <Audio 2> exactly as the supplied speech", with_audio.shots[0])
+        self.assertIn("clean authored dialogue stem", with_audio.shots[0])
+        self.assertIn("spatialize the stem as live on-location production sound", with_audio.shots[0])
+        self.assertIn("Shot acoustic profile", with_audio.shots[0])
+        self.assertIn("never leave it as a dry studio/announcer voice", with_audio.shots[0])
         window.project_dirty = False
         window.close()
 
@@ -2923,7 +2932,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
         self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 7)
+        self.assertEqual(job["render_policy_version"], 8)
         window.project_dirty = False
         window.close()
 
@@ -3150,7 +3159,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 7,
+            "render_policy_version": 8,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -3518,7 +3527,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 7,
+            "render_policy_version": 8,
             "segments": completed,
         }
         window._refresh_render_status_bar()

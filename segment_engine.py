@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import re
 from typing import Any, Iterable, Mapping
 
 
@@ -20,6 +21,208 @@ DEFAULT_MIN_SHOT_SECONDS = 3.0
 TIMELINE_GRID_SECONDS = 0.5
 MAX_SEED = 2**63 - 1
 CONTINUITY_MODES = {"none", "hard_cut", "match_action", "motion_reference", "transition"}
+
+
+_TIME_TOKEN = r"(?:\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?|\d+(?:\.\d+)?)"
+_TIMED_TEXT_RANGE_RE = re.compile(
+    rf"""
+    (?P<open>[\[(]?)\s*
+    (?:(?:from|between)\s+)?
+    (?P<start>{_TIME_TOKEN})\s*
+    (?P<start_unit>hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s|\u79d2)?\s*
+    (?:-|\u2013|\u2014|to|through|until|and|\u81f3|\u5230)\s*
+    (?P<end>{_TIME_TOKEN})\s*
+    (?P<end_unit>hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s|\u79d2)?\s*
+    (?P<close>[\]\)]?)
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+_TIMED_TEXT_POINT_RE = re.compile(
+    rf"""
+    (?:(?:\bat\s+|@\s*)
+       (?P<time>{_TIME_TOKEN})\s*
+       (?P<unit>hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s|\u79d2)
+      |
+       (?P<time_cn>{_TIME_TOKEN})\s*(?P<unit_cn>\u79d2)(?:\u65f6|\u6642|\u5904|\u8655)?
+    )
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+_LEADING_PHASE_CONNECTOR_RE = re.compile(
+    r"^\s*(?:(?:and\s+)?(?:then|afterwards|subsequently)|"
+    r"(?:and\s+)?transition(?:s|ed|ing)?\s+to|"
+    r"(?:and\s+)?shift(?:s|ed|ing)?\s+to|followed\s+by|"
+    r"while|whereas|\u7136\u540e|\u7136\u5f8c|\u968f\u540e|\u96a8\u5f8c|\u4e4b\u540e|\u4e4b\u5f8c|\u8f6c\u4e3a|\u8f49\u70ba)\b\s*[:,\uff1a]?\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _time_token_seconds(token: str, unit: str = "") -> float:
+    """Parse common H3 prompt time tokens into seconds."""
+    value = token.strip()
+    if ":" in value:
+        parts = [float(part) for part in value.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60.0 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+        raise ValueError(f"Unsupported time token: {token}")
+    seconds = float(value)
+    normalized_unit = unit.strip().lower()
+    if normalized_unit in {"h", "hr", "hrs", "hour", "hours"}:
+        seconds *= 3600.0
+    elif normalized_unit in {"m", "min", "mins", "minute", "minutes"}:
+        seconds *= 60.0
+    return seconds
+
+
+def _is_prompt_time_range(match: re.Match[str]) -> bool:
+    """Reject bare year/number ranges while accepting normal timeline notation."""
+    raw = match.group(0)
+    return bool(
+        match.group("start_unit")
+        or match.group("end_unit")
+        or ":" in match.group("start")
+        or ":" in match.group("end")
+        or match.group("open")
+        or match.group("close")
+        or "\u79d2" in raw
+    )
+
+
+def _segment_local_timecode(seconds: float) -> str:
+    value = max(0.0, float(seconds))
+    hours = int(value // 3600)
+    minutes = int((value % 3600) // 60)
+    remainder = value % 60
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remainder:06.3f}"
+    return f"{minutes:02d}:{remainder:06.3f}"
+
+
+def scope_timed_prompt_text(
+    text: str,
+    window_start: float,
+    window_end: float,
+    *,
+    field_name: str = "direction",
+) -> str:
+    """Filter project-global timed prose and rebase it to one render segment.
+
+    Design presets often mix chronology into otherwise global fields, for
+    example ``daylight cotton fields (0-16s) transitioning to a night rubber
+    plantation (16-30s)``. Hidden H3 jobs use local timestamps, so passing that
+    sentence unchanged makes a 25-30s job look like a new 0-5s cotton-field
+    clip. This helper removes off-window phases, clips intersecting phases and
+    emits one authoritative segment-local schedule without knowing anything
+    about the story, language, location or media IDs.
+    """
+    source = str(text or "").strip()
+    if not source or window_end <= window_start:
+        return source
+
+    sentences = [
+        row.strip()
+        for row in re.split(r"[\r\n]+|(?<=[.!?;\u3002\uff01\uff1f\uff1b])", source)
+        if row.strip()
+    ]
+    output: list[str] = []
+    found_schedule = False
+    retained_schedule = False
+    for sentence in sentences:
+        matches = [
+            match for match in _TIMED_TEXT_RANGE_RE.finditer(sentence)
+            if _is_prompt_time_range(match)
+        ]
+        point_matches = [] if matches else list(_TIMED_TEXT_POINT_RE.finditer(sentence))
+        if not matches and not point_matches:
+            output.append(sentence)
+            continue
+
+        found_schedule = True
+        cursor = 0
+        retained_chunks: list[str] = []
+        last_match_retained = False
+        for match in matches:
+            chunk = sentence[cursor:match.end()]
+            cursor = match.end()
+            start_unit = match.group("start_unit") or match.group("end_unit") or ""
+            end_unit = match.group("end_unit") or match.group("start_unit") or ""
+            range_start = _time_token_seconds(match.group("start"), start_unit)
+            range_end = _time_token_seconds(match.group("end"), end_unit)
+            if range_end < range_start:
+                range_start, range_end = range_end, range_start
+            if not ranges_intersect(
+                range_start, range_end, float(window_start), float(window_end)
+            ):
+                last_match_retained = False
+                continue
+            local_start = max(range_start, window_start) - window_start
+            local_end = min(range_end, window_end) - window_start
+            local_range = (
+                "[segment-local "
+                + _segment_local_timecode(local_start)
+                + "\u2013"
+                + _segment_local_timecode(local_end)
+                + "]"
+            )
+            relative_start = match.start() - (match.end() - len(chunk))
+            relative_end = relative_start + len(match.group(0))
+            chunk = chunk[:relative_start] + local_range + chunk[relative_end:]
+            chunk = _LEADING_PHASE_CONNECTOR_RE.sub("", chunk).strip()
+            if chunk:
+                retained_chunks.append(chunk)
+                retained_schedule = True
+                last_match_retained = True
+        for match in point_matches:
+            chunk = sentence[cursor:match.end()]
+            cursor = match.end()
+            token = match.group("time") or match.group("time_cn") or "0"
+            unit = match.group("unit") or match.group("unit_cn") or ""
+            point = _time_token_seconds(token, unit)
+            if point < window_start - 1e-6 or point > window_end + 1e-6:
+                last_match_retained = False
+                continue
+            local_point = min(window_end - window_start, max(0.0, point - window_start))
+            local_tag = "at [segment-local " + _segment_local_timecode(local_point) + "]"
+            relative_start = match.start() - (match.end() - len(chunk))
+            relative_end = relative_start + len(match.group(0))
+            chunk = chunk[:relative_start] + local_tag + chunk[relative_end:]
+            chunk = _LEADING_PHASE_CONNECTOR_RE.sub("", chunk).strip()
+            if chunk:
+                retained_chunks.append(chunk)
+                retained_schedule = True
+                last_match_retained = True
+        if retained_chunks and last_match_retained:
+            retained_chunks[-1] = (retained_chunks[-1] + sentence[cursor:]).strip()
+        if retained_chunks:
+            output.extend(retained_chunks)
+
+    scoped = " ".join(row for row in output if row).strip()
+    if not found_schedule:
+        return scoped
+    duration = window_end - window_start
+    authority = (
+        f"SEGMENT-LOCAL {field_name.upper()} SCHEDULE (authoritative, "
+        f"00:00.000\u2013{_segment_local_timecode(duration)}): "
+    )
+    if retained_schedule:
+        return (
+            authority
+            + scoped
+            + " The retained timed phase overrides every untimed modifier in this field; apply "
+              "an untimed modifier only when it is compatible with that active phase."
+            + " Off-window earlier and later phases were removed; do not depict, replay, "
+              "foreshadow or blend any omitted phase into this segment."
+        ).strip()
+    if scoped:
+        return (
+            authority
+            + scoped
+            + " No time-scoped phase from this field is active in this segment; do not infer "
+              "one from an earlier or later phase."
+        ).strip()
+    return ""
 
 
 def snap_seconds(value: float, grid: float = TIMELINE_GRID_SECONDS) -> float:

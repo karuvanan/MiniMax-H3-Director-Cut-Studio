@@ -504,10 +504,21 @@ def build_ref2va_prompt(
         ranges = ", ".join(
             f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s" for item in instances
         )
-        retention_rows.append(
-            f"{asset.tag}: fully_copy - the assigned signal is reused during its "
-            f"{ranges} timeline range."
-        )
+        if "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition:
+            retention_rows.append(
+                f"{asset.tag}: authored_dialogue_stem - preserve every spoken word, speaker "
+                f"identity, timing and phoneme rhythm during its {ranges} timeline range. Treat "
+                "this as a clean foreground speech stem, not a finished full mix: spatialize it "
+                "into the visible location with camera-distance perspective, natural early "
+                "reflections and low environmental bleed, then generate clearly audible "
+                "diegetic ambience, synchronized Foley/SFX and ducked non-diegetic music around "
+                "it. Never duplicate, paraphrase, echo or replace the supplied voice."
+            )
+        else:
+            retention_rows.append(
+                f"{asset.tag}: fully_copy - the assigned signal is reused during its "
+                f"{ranges} timeline range."
+            )
     for asset in visual_assets:
         paired_audio_tag = paired_audio_tags.get(source_key(asset), "")
         if not paired_audio_tag:

@@ -380,6 +380,29 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("Soft tropical court ambience", prompt)
         self.assertIn("restrained fashion-electronic beat", prompt)
 
+    def test_authored_tts_is_a_dialogue_stem_not_the_finished_soundtrack(self):
+        speech = MediaAsset(
+            "101", "LoadAudio", "audio", "authored_dialogue.wav", "<Audio 1>",
+            "ref_audios.ref_audio_0", end_seconds=5.0,
+            recognition="AI DESIGN AUTHORED SPEECH TTS\nUsage: h3_reference",
+        )
+        prompt = build_ref2va_prompt(
+            PromptSpec(
+                brief="A woman speaks inside a busy station.",
+                shots=["She delivers the exact line to camera"],
+                audio="Station ambience, footsteps and luggage handling.",
+                music="Restrained suspense pulse.",
+            ),
+            [speech],
+            5.0,
+            self.profiles[DEFAULT_SKILL],
+        )
+        self.assertIn("authored_dialogue_stem", prompt)
+        self.assertIn("not a finished full mix", prompt)
+        self.assertIn("diegetic ambience", prompt)
+        self.assertIn("synchronized Foley/SFX", prompt)
+        self.assertIn("ducked non-diegetic music", prompt)
+
     def test_media_recognition_is_embedded_as_planning_guidance(self):
         asset = MediaAsset(
             "1",

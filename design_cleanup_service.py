@@ -6,6 +6,7 @@ import argparse
 import ipaddress
 import json
 from pathlib import Path
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,17 +57,33 @@ def lm_origin(base_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _lm_model_aliases(value: str) -> set[str]:
+    normalized = str(value or "").strip().casefold().replace("\\", "/")
+    normalized = re.sub(r"\.gguf$", "", normalized)
+    aliases = {normalized}
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) > 1:
+        parent = re.sub(r"(?:[-_.]gguf)$", "", parts[-2])
+        if parent != parts[-2]:
+            aliases.add(parent)
+    return {item for item in aliases if item}
+
+
 def unload_lm_studio(base_url: str, selected_model: str, timeout: float) -> list[str]:
     origin = lm_origin(base_url)
     catalog = request(origin + "/api/v1/models", timeout)
     selected = selected_model.strip().casefold()
+    selected_aliases = _lm_model_aliases(selected_model)
     instances: list[str] = []
     for model in catalog.get("models") or []:
         model_keys = {
             str(model.get("key", "")).casefold(),
             str(model.get("selected_variant", "")).casefold(),
         }
-        if selected and selected not in model_keys:
+        catalog_aliases: set[str] = set()
+        for key in model_keys:
+            catalog_aliases.update(_lm_model_aliases(key))
+        if selected and not selected_aliases.intersection(catalog_aliases):
             continue
         for instance in model.get("loaded_instances") or []:
             if isinstance(instance, str):
@@ -80,9 +97,10 @@ def unload_lm_studio(base_url: str, selected_model: str, timeout: float) -> list
                 )
             if instance_id:
                 instances.append(instance_id)
-    # Some LM Studio versions use the selected model key itself as the instance id.
-    if not instances and selected_model:
-        instances.append(selected_model)
+    # Never guess an instance id from the saved model name. The saved model may
+    # have been deleted or replaced since the previous Studio session, and an
+    # unloaded catalogue entry legitimately has no loaded_instances. Only IDs
+    # explicitly reported as loaded are safe unload targets.
     unloaded: list[str] = []
     errors: list[str] = []
     for instance_id in dict.fromkeys(instances):
@@ -94,6 +112,11 @@ def unload_lm_studio(base_url: str, selected_model: str, timeout: float) -> list
             )
             unloaded.append(instance_id)
         except Exception as exc:
+            detail = str(exc).casefold()
+            # A model can disappear between catalogue discovery and unload. In
+            # that race it is already in the desired state.
+            if "model_not_found" in detail or "is not loaded" in detail:
+                continue
             errors.append(f"{instance_id}: {exc}")
     if errors and not unloaded:
         raise RuntimeError("; ".join(errors))

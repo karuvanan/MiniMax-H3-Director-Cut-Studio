@@ -6,10 +6,11 @@ from unittest.mock import patch
 import wave
 
 from design_cleanup_service import cleanup, lm_origin, unload_lm_studio
-from design_ai_service import handle as handle_design_ai_job
+from design_ai_service import handle as handle_design_ai_job, select_available_model
 from design_engine import (
     DESIGN_JSON_SCHEMA,
     DesignDurationContractError,
+    automatic_background_music,
     automatic_background_soundscape,
     authored_text_layers_with_plan_assignments,
     build_design_system_prompt,
@@ -19,6 +20,8 @@ from design_engine import (
     normalize_shot_action_budget,
     normalize_design_plan,
     protect_explicit_timed_text_layers,
+    spatial_acoustics_profile,
+    spatial_acoustics_schedule,
     validate_explicit_timed_text_contract,
 )
 from design_media_service import generate as generate_design_media, image_workflow
@@ -236,6 +239,8 @@ class DesignEngineTests(unittest.TestCase):
         male = voxcpm_voice_control({"speaker": "S2"})
         self.assertIn("female voice", female)
         self.assertIn("male voice", male)
+        self.assertIn("natural on-location film dialogue", female)
+        self.assertIn("not narration", female)
         self.assertIn("克制而坚定", female)
 
     def test_unknown_tts_engine_is_rejected(self):
@@ -375,7 +380,114 @@ On-screen text: "EXACT TITLE"'''
             "shots": [],
         })
         self.assertIn("office room tone", soundscape)
-        self.assertIn("duck ambience and music", soundscape)
+        self.assertIn("Production mix contract", soundscape)
+        self.assertIn("three clearly audible layers", soundscape)
+        self.assertIn("live production audio", soundscape)
+        self.assertIn("Spatial acoustics contract", soundscape)
+        self.assertIn("small furnished room", soundscape)
+        music = automatic_background_music({
+            "creative_brief": "A tense police chase through city streets.",
+            "non_diegetic_music": "",
+            "shots": [],
+        })
+        self.assertIn("cinematic action score", music)
+        self.assertIn("Music mix contract", music)
+        self.assertIn("Duck it about 8 dB", music)
+
+    def test_automatic_sound_and_music_contracts_are_idempotent(self):
+        plan = {
+            "creative_brief": "A warrior runs through rain and strikes with a sword.",
+            "overall_soundscape": "Rain and distant thunder.",
+            "non_diegetic_music": "Low strings.",
+            "shots": [{
+                "subject_action": "The warrior runs, lands and strikes with a sword.",
+                "environment_response": "Rainwater splashes on impact.",
+            }],
+        }
+        first_sound = automatic_background_soundscape(plan)
+        second_sound = automatic_background_soundscape({
+            **plan, "overall_soundscape": first_sound,
+        })
+        self.assertEqual(first_sound, second_sound)
+        self.assertIn("footsteps, landings and surface contact", first_sound)
+        self.assertIn("weapon movement", first_sound)
+        first_music = automatic_background_music(plan)
+        second_music = automatic_background_music({
+            **plan, "non_diegetic_music": first_music,
+        })
+        self.assertEqual(first_music, second_music)
+
+    def test_spatial_acoustics_match_visible_space_and_change_on_shot_boundary(self):
+        small_name, small = spatial_acoustics_profile(
+            "A woman speaks in a small furnished living room."
+        )
+        hall_name, hall = spatial_acoustics_profile(
+            "The speaker crosses a vast station concourse and large hall."
+        )
+        exterior_name, exterior = spatial_acoustics_profile(
+            "A man speaks on an open outdoor street beside a field."
+        )
+        covered_name, covered = spatial_acoustics_profile(
+            "Two people stand beneath a rainy coffee stall awning."
+        )
+        self.assertEqual(small_name, "small furnished room")
+        self.assertIn("0.18-0.45s", small)
+        self.assertEqual(hall_name, "large interior")
+        self.assertIn("0.9-1.8s", hall)
+        self.assertEqual(exterior_name, "open exterior")
+        self.assertIn("almost no reverb", exterior)
+        self.assertIn("reduce low-mid body", exterior)
+        self.assertEqual(covered_name, "covered semi-outdoor space")
+        self.assertIn("no long enclosed-room tail", covered)
+
+        schedule = spatial_acoustics_schedule({
+            "shots": [
+                {
+                    "start_seconds": 0.0,
+                    "end_seconds": 2.5,
+                    "environment_response": "She speaks in a quiet office.",
+                },
+                {
+                    "start_seconds": 2.5,
+                    "end_seconds": 5.0,
+                    "environment_response": "She exits onto an open outdoor street.",
+                },
+            ]
+        })
+        self.assertIn("0.00-2.50s small furnished room", schedule)
+        self.assertIn("2.50-5.00s open exterior", schedule)
+
+        inherited = spatial_acoustics_schedule({
+            "shots": [
+                {
+                    "start_seconds": 0.0,
+                    "end_seconds": 4.5,
+                    "environment_response": "Rain strikes the coffee stall awning.",
+                },
+                {
+                    "start_seconds": 4.5,
+                    "end_seconds": 5.0,
+                    "environment_response": "They hold eye contact in close-up.",
+                },
+            ]
+        })
+        self.assertIn("0.00-5.00s covered semi-outdoor space", inherited)
+        self.assertNotIn("neutral visible location", inherited)
+
+    def test_old_no_reverb_auto_phrase_is_replaced_by_visible_space_contract(self):
+        soundscape = automatic_background_soundscape({
+            "overall_soundscape": (
+                "Rain and traffic; no artificial reverb tails or studio dryness on the voice."
+            ),
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "environment_response": "Rain strikes the coffee stall awning.",
+            }],
+        })
+        self.assertNotIn("no artificial reverb tails", soundscape.lower())
+        self.assertIn("covered semi-outdoor space", soundscape)
+        self.assertIn("Crossfade smoothly", soundscape)
 
     def test_design_ai_worker_releases_comfy_models_before_refinement(self):
         with patch("design_ai_service.request_json", return_value={}) as request:
@@ -429,6 +541,76 @@ On-screen text: "EXACT TITLE"'''
                 "http://127.0.0.1:1234/api/v1/models/unload",
                 {"instance_id": "selected/model.gguf:2"},
             ),
+        )
+
+    def test_cleanup_does_not_guess_deleted_or_unloaded_model_instance(self):
+        calls = []
+
+        def fake_request(url, timeout, payload=None):
+            calls.append((url, payload))
+            return {
+                "models": [
+                    {
+                        "key": "replacement/model-q4_k_m.gguf",
+                        "loaded_instances": [],
+                    }
+                ]
+            }
+
+        with patch("design_cleanup_service.request", side_effect=fake_request):
+            unloaded = unload_lm_studio(
+                "http://127.0.0.1:1234/v1", "deleted/model-q5_k_m.gguf", 10
+            )
+        self.assertEqual(unloaded, [])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].endswith("/api/v1/models"))
+
+    def test_cleanup_matches_saved_gguf_path_to_lm_studio_model_alias(self):
+        calls = []
+
+        def fake_request(url, timeout, payload=None):
+            calls.append((url, payload))
+            if url.endswith("/api/v1/models"):
+                return {
+                    "models": [
+                        {
+                            "key": "qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp",
+                            "loaded_instances": [{"id": "qwen3.8-alias:7"}],
+                        }
+                    ]
+                }
+            return {}
+
+        saved_path = (
+            "hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/"
+            "qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf"
+        )
+        with patch("design_cleanup_service.request", side_effect=fake_request):
+            unloaded = unload_lm_studio(
+                "http://127.0.0.1:1234/v1", saved_path, 10
+            )
+        self.assertEqual(unloaded, ["qwen3.8-alias:7"])
+        self.assertEqual(calls[-1][1], {"instance_id": "qwen3.8-alias:7"})
+
+    def test_deleted_quantized_lm_model_falls_back_to_same_family(self):
+        requested = (
+            "hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/"
+            "qwen3.8-27b-uncensored-hauhaucs-aggressive-q5_k_p.gguf"
+        )
+        replacement = (
+            "hauhaucs/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf/"
+            "qwen3.8-27b-uncensored-hauhaucs-aggressive-q4_k_p.gguf"
+        )
+        self.assertEqual(
+            select_available_model(requested, ["text-embedding-model", replacement]),
+            replacement,
+        )
+        self.assertEqual(
+            select_available_model(
+                requested,
+                ["unrelated-chat-model", "qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp"],
+            ),
+            "qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp",
         )
 
     def test_cleanup_requests_comfy_free_and_skips_lm_for_openai(self):

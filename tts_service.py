@@ -74,6 +74,7 @@ def synthesize_line(
     script: Path,
     ffmpeg: Path,
     speaker: str = "S1",
+    delivery: str = "Natural",
 ) -> None:
     edge_error = ""
     try:
@@ -85,7 +86,24 @@ def synthesize_line(
             if str(speaker).upper() == "S2"
             else "zh-CN-XiaoxiaoNeural"
         )
-        asyncio.run(edge_tts.Communicate(text, voice_name).save(str(encoded)))
+        performance = str(delivery or "").lower()
+        if any(word in performance for word in ("fast", "urgent", "excited", "angry", "快速", "急", "激动", "激動", "愤怒", "憤怒")):
+            rate, pitch = "+4%", "+2Hz"
+        elif any(word in performance for word in ("slow", "gentle", "sad", "soft", "缓慢", "緩慢", "温柔", "溫柔", "悲伤", "悲傷")):
+            rate, pitch = "-7%", "-2Hz"
+        else:
+            # A slightly relaxed pace is less announcer-like and leaves room
+            # for natural breath and location ambience in the H3 mix.
+            rate, pitch = "-3%", "+0Hz"
+        asyncio.run(
+            edge_tts.Communicate(
+                text,
+                voice_name,
+                rate=rate,
+                pitch=pitch,
+                volume="+0%",
+            ).save(str(encoded))
+        )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         converted = subprocess.run(
             [
@@ -154,7 +172,15 @@ def voxcpm_voice_control(layer: dict) -> str:
     )
     delivery = str(layer.get("delivery", "")).replace("(", "").replace(")", "")
     delivery = " ".join(delivery.split())[:160]
-    parts = [identity, "natural cinematic dialogue", "clear articulation", "moderate pace"]
+    parts = [
+        identity,
+        "natural on-location film dialogue",
+        "organic conversational rhythm",
+        "natural breathing and small micro-pauses between thought groups",
+        "restrained everyday projection",
+        "emotion carried through phrasing rather than exaggerated dubbing",
+        "not narration, not an announcer and not a studio-commercial read",
+    ]
     if delivery:
         parts.append(delivery)
     return ", ".join(parts)
@@ -354,6 +380,7 @@ class EdgeTTSSynthesizer:
             script=self.script,
             ffmpeg=self.ffmpeg,
             speaker=str(layer.get("speaker", "S1")),
+            delivery=str(layer.get("delivery", "Natural")),
         )
 
     def release(self) -> None:

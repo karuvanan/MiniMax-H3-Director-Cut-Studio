@@ -30,7 +30,7 @@ from comfy_submit_worker import (
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 7
+SMART_RENDER_POLICY_VERSION = 8
 
 
 def emit(payload: dict) -> None:

@@ -9,6 +9,7 @@ from segment_engine import (
     plan_shot_render_segments,
     rebase_timed_rows,
     reuse_cached_segments,
+    scope_timed_prompt_text,
 )
 
 
@@ -99,6 +100,46 @@ class SegmentEngineTests(unittest.TestCase):
             [(row["name"], row["start_seconds"], row["end_seconds"]) for row in rows],
             [("crossing", 0.0, 4.0), ("inside", 6.0, 8.0)],
         )
+
+    def test_timed_prompt_text_keeps_only_the_active_story_phase(self):
+        scoped = scope_timed_prompt_text(
+            "Bright Xinjiang cotton fields (0-16s) transitioning to cool "
+            "moonlit Nanyang rubber plantation (16-30s). Realistic cinema.",
+            25.0,
+            30.0,
+            field_name="visual style",
+        )
+        self.assertNotIn("Xinjiang", scoped)
+        self.assertNotIn("cotton", scoped)
+        self.assertIn("Nanyang rubber plantation", scoped)
+        self.assertIn("segment-local 00:00.000", scoped)
+        self.assertIn("00:05.000", scoped)
+        self.assertIn("Off-window earlier and later phases were removed", scoped)
+
+    def test_timed_prompt_text_clips_ranges_and_rebases_point_events(self):
+        scoped = scope_timed_prompt_text(
+            "Fog builds from 00:10 to 00:20. Cut to black at 18s. "
+            "The film was restored in 2020-2024.",
+            15.0,
+            19.0,
+            field_name="technical rule",
+        )
+        self.assertIn("segment-local 00:00.000", scoped)
+        self.assertIn("segment-local 00:03.000", scoped)
+        self.assertIn("2020-2024", scoped)
+        self.assertNotIn("00:10", scoped)
+        self.assertNotIn("00:20", scoped)
+
+    def test_timed_prompt_text_drops_an_off_window_point_without_story_keywords(self):
+        scoped = scope_timed_prompt_text(
+            "Maintain the same hero. Ensure the day-to-night change occurs at 16s.",
+            25.0,
+            30.0,
+            field_name="constraint",
+        )
+        self.assertIn("Maintain the same hero", scoped)
+        self.assertNotIn("day-to-night", scoped)
+        self.assertNotIn("16s", scoped)
 
     def test_cache_reuse_requires_matching_fingerprint(self):
         rows = plan_render_segments(0.0, 30.0)

@@ -88,6 +88,7 @@ from media_semantic_enrichment import (
 from design_engine import (
     DESIGN_JSON_SCHEMA,
     DesignDurationContractError,
+    automatic_background_music,
     automatic_background_soundscape,
     authored_text_layers_with_plan_assignments,
     build_design_system_prompt,
@@ -97,6 +98,7 @@ from design_engine import (
     normalize_shot_action_budget,
     normalize_design_plan,
     protect_explicit_timed_text_layers,
+    spatial_acoustics_profile,
     validate_explicit_timed_text_contract,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
@@ -140,6 +142,7 @@ from segment_engine import (
     plan_render_segments,
     plan_shot_render_segments,
     ranges_intersect,
+    scope_timed_prompt_text,
 )
 from workflow_engine import (
     MediaAsset,
@@ -171,7 +174,7 @@ DIRECTOR_LANE_TYPES = ("shot", "transition", "marker")
 DIRECTOR_LANES_TOP = TIMELINE_RULER_HEIGHT + RENDER_STATUS_BAR_HEIGHT
 TIMELINE_TRACKS_TOP = DIRECTOR_LANES_TOP + DIRECTOR_LANE_HEIGHT * len(DIRECTOR_LANE_TYPES)
 TIMELINE_SNAP_SECONDS = 0.5
-SMART_RENDER_POLICY_VERSION = 7
+SMART_RENDER_POLICY_VERSION = 8
 CONTINUITY_MODE_LABELS = (
     "Auto", "Hard Cut", "Match Action", "Motion Reference", "Transition",
 )
@@ -5170,6 +5173,15 @@ class DesignPageDialog(QDialog):
     def _service_message(self, payload: dict) -> None:
         if payload.get("ready"):
             return
+        resolved_model = str(payload.get("resolved_model", "")).strip()
+        if (
+            resolved_model
+            and self.provider_combo.currentData() == "lm_studio"
+            and self.model_combo.currentText().strip() != resolved_model
+        ):
+            self.model_combo.setCurrentText(resolved_model)
+            self.settings.lm_studio_model = resolved_model
+            save_design_settings(DESIGN_SETTINGS_ENV, self.settings)
         if payload.get("zimage_models") is not None:
             self._set_pipeline_busy(False)
             models = [str(item) for item in payload.get("zimage_models") or []]
@@ -5242,12 +5254,24 @@ class DesignPageDialog(QDialog):
             self._set_pipeline_busy(False)
             models = payload.get("models") or []
             current = self.model_combo.currentText().strip()
+            resolved = str(payload.get("resolved_model", "")).strip()
             self.model_combo.clear()
             self.model_combo.addItems(models)
-            if current:
+            if current in models:
                 self.model_combo.setCurrentText(current)
+            elif resolved in models:
+                self.model_combo.setCurrentText(resolved)
             elif models:
                 self.model_combo.setCurrentIndex(0)
+            selected = self.model_combo.currentText().strip()
+            if self.provider_combo.currentData() == "lm_studio" and selected:
+                self.settings.lm_studio_model = selected
+                save_design_settings(DESIGN_SETTINGS_ENV, self.settings)
+            if payload.get("model_replaced") and selected:
+                self.status_label.setText(
+                    f"Connected: saved model was unavailable; switched to {selected}"
+                )
+                return
             self.status_label.setText(f"Connected · {len(models)} model(s) discovered")
             return
         if payload.get("checkpoints") is not None:
@@ -7236,6 +7260,7 @@ class DirectorCutStudio(QMainWindow):
     def _timeline_tts_signature(self, layers: list[dict] | None = None) -> str:
         payload = {
             "engine": self.render_settings.dialogue_tts_engine,
+            "voice_policy": "on_location_production_v1",
             "duration_seconds": self.scan.duration_seconds if self.scan else 0.0,
             "text_layers": layers if layers is not None else self._speech_layers_for_tts(),
         }
@@ -7259,7 +7284,17 @@ class DirectorCutStudio(QMainWindow):
 
     def _ensure_timeline_tts_asset(self) -> MediaAsset | None:
         asset = self._authored_tts_asset()
-        if asset is not None or not self.scan:
+        authored_stem_prompt = (
+            "Use this exact authored Timeline speech as a clean foreground dialogue stem for "
+            "wording, speaker identity, timing and lip sync. Spatialize it as live on-location "
+            "production sound, then generate audible diegetic ambience, contact-synchronized "
+            "Foley/SFX and dialogue-ducked background music around it. Never treat this dry stem "
+            "as the complete soundtrack and never duplicate the voice."
+        )
+        if asset is not None:
+            asset.clip_prompt = authored_stem_prompt
+            return asset
+        if not self.scan:
             return asset
         asset = next(
             (
@@ -7289,9 +7324,7 @@ class DirectorCutStudio(QMainWindow):
         asset.activation_mode = "auto"
         asset.enabled = True
         asset.monitor_visible = True
-        asset.clip_prompt = (
-            "Use this exact authored Timeline speech for voice identity, wording and lip sync."
-        )
+        asset.clip_prompt = authored_stem_prompt
         asset.recognition = (
             "AI DESIGN AUTHORED SPEECH TTS\n"
             "Usage: h3_reference\n"
@@ -7600,6 +7633,7 @@ class DirectorCutStudio(QMainWindow):
         material["tts_transcript"] = list(result.get("transcript") or [])
         signature_payload = {
             "engine": self.render_settings.dialogue_tts_engine,
+            "voice_policy": "on_location_production_v1",
             "duration_seconds": float(pending["plan"].get("duration_seconds", 0.0)),
             "text_layers": [
                 {
@@ -7978,8 +8012,11 @@ class DirectorCutStudio(QMainWindow):
             "track": "A1",
             "subject_keywords": ["exact authored Mandarin speech", "lip sync"],
             "prompt": (
-                "AUTHORED SPEECH TTS. Preserve this exact timed transcript and use it as the "
-                "lip-sync audio reference:\n" + transcript
+                "AUTHORED SPEECH TTS CLEAN DIALOGUE STEM. Preserve this exact timed transcript, "
+                "speaker identity and phoneme rhythm for lip sync. This is not the complete "
+                "soundtrack: spatialize it as live on-location production dialogue and generate "
+                "audible diegetic ambience, exact contact Foley/SFX and dialogue-ducked background "
+                "music around it. Never duplicate the voice:\n" + transcript
             ),
         }
         first_audio = next(
@@ -9765,6 +9802,15 @@ class DirectorCutStudio(QMainWindow):
         try:
             if payload.get("error"):
                 raise RuntimeError(str(payload["error"]))
+            resolved_model = str(payload.get("resolved_model", "")).strip()
+            if job.get("provider") == "lm_studio" and resolved_model:
+                job["model"] = resolved_model
+                self.semantic_last_lm_request["model"] = resolved_model
+                settings = load_design_settings(DESIGN_SETTINGS_ENV)
+                if settings.lm_studio_model != resolved_model:
+                    settings.lm_studio_model = resolved_model
+                    save_design_settings(DESIGN_SETTINGS_ENV, settings)
+                    self.design_ai_settings = settings
             current_fingerprint = self._semantic_source_fingerprint(asset)
             if job["path"] != asset.local_path or current_fingerprint != job["fingerprint"]:
                 self.semantic_errors[asset.node_id] = (
@@ -12263,6 +12309,20 @@ class DirectorCutStudio(QMainWindow):
         })
         if soundscape != self.prompt_panel.soundscape.toPlainText().strip():
             self.prompt_panel.soundscape.setPlainText(soundscape)
+        music = automatic_background_music({
+            "non_diegetic_music": self.prompt_panel.music.toPlainText(),
+            "creative_brief": self.prompt_panel.brief.toPlainText(),
+            "shots": [
+                {
+                    "subject_action": cue.subject_action,
+                    "environment_response": cue.environment_response,
+                    "additional_direction": cue.detail,
+                }
+                for cue in self.director_cues if cue.cue_type == "shot"
+            ],
+        })
+        if music != self.prompt_panel.music.toPlainText().strip():
+            self.prompt_panel.music.setPlainText(music)
         base_spec = self.prompt_panel.spec()
         if not base_spec.brief:
             self.prompt_panel.output.clear()
@@ -12332,6 +12392,26 @@ class DirectorCutStudio(QMainWindow):
             supplied_dialogue_audio_tag
         )
         if window_start is not None and window_end is not None:
+            # Every hidden H3 request owns a local 0..duration clock. Design
+            # presets may contain project-global schedules in prose, so scope
+            # every non-Shot production field before it reaches the segment.
+            # This prevents an earlier visual/audio phase from being
+            # reinterpreted as the opening seconds of a later hidden job.
+            for field_name, label in (
+                ("style", "visual style"),
+                ("references", "reference rule"),
+                ("audio", "soundscape"),
+                ("music", "music"),
+                ("must_keep", "constraint"),
+                ("technical", "technical rule"),
+                ("ending", "ending"),
+            ):
+                state[field_name] = scope_timed_prompt_text(
+                    str(state.get(field_name, "")),
+                    window_start,
+                    window_end,
+                    field_name=label,
+                )
             # Do not let the visible all-timeline Shot/Dialogue fields leak into
             # an internal segment that has no matching cue of its own.
             state["shots"] = []
@@ -12355,6 +12435,37 @@ class DirectorCutStudio(QMainWindow):
                 )
             ]
 
+        audio_shots = [
+            {
+                "start_seconds": (
+                    max(0.0, cue.start_seconds - window_start)
+                    if window_start is not None else cue.start_seconds
+                ),
+                "end_seconds": (
+                    max(0.0, cue.end_seconds - window_start)
+                    if window_start is not None else cue.end_seconds
+                ),
+                "framing": cue.framing,
+                "camera_angle": cue.camera_angle,
+                "subject_action": cue.subject_action,
+                "environment_response": cue.environment_response,
+                "additional_direction": cue.detail,
+                "continuity_state": cue.continuity_state,
+            }
+            for cue in ordered
+            if cue.cue_type == "shot"
+        ]
+        state["audio"] = automatic_background_soundscape({
+            "overall_soundscape": state.get("audio", ""),
+            "creative_brief": state.get("brief", ""),
+            "shots": audio_shots,
+        })
+        state["music"] = automatic_background_music({
+            "non_diegetic_music": state.get("music", ""),
+            "creative_brief": state.get("brief", ""),
+            "shots": audio_shots,
+        })
+
         def local_time(seconds: float) -> float:
             if window_start is None:
                 return seconds
@@ -12368,6 +12479,9 @@ class DirectorCutStudio(QMainWindow):
         if shot_cues:
             shots: list[str] = []
             shot_ranges: list[dict] = []
+            inherited_acoustic = spatial_acoustics_profile(
+                str(state.get("brief", "")) + " " + str(state.get("audio", ""))
+            )
             for cue in shot_cues:
                 movement = (
                     f"Camera movement: {cue.camera_movement}, {cue.movement_speed.lower()} speed, "
@@ -12409,6 +12523,36 @@ class DirectorCutStudio(QMainWindow):
                             cue.h3_optional_flourish, cue.semantic_reference_directions
                         )
                     )
+                acoustic_profile, acoustic_direction = spatial_acoustics_profile(
+                    " ".join(
+                        str(value or "")
+                        for value in (
+                            cue.framing,
+                            cue.camera_angle,
+                            cue.subject_action,
+                            cue.environment_response,
+                            cue.detail,
+                            cue.continuity_state,
+                        )
+                    )
+                )
+                if acoustic_profile == "neutral visible location":
+                    acoustic_profile, acoustic_direction = inherited_acoustic
+                else:
+                    inherited_acoustic = (acoustic_profile, acoustic_direction)
+                parts.append(
+                    "SHOT SOUND EXECUTION - keep the location ambience continuously audible; "
+                    "give every visible footstep, cloth movement, handled prop, surface contact "
+                    "and stated environment response an exact-frame Foley/SFX transient with "
+                    "natural distance and decay. Never add a generic whoosh or impact without "
+                    "a visible physical cause, and never allow a silent gap unless the Shot "
+                    "explicitly calls for silence"
+                )
+                parts.append(
+                    f"SHOT SPATIAL ACOUSTICS - {acoustic_profile}: {acoustic_direction}. "
+                    "Apply the same visible-space perspective to dialogue, Foley and ambience, "
+                    "while keeping the direct sound and exact words intelligible"
+                )
                 if cue.detail:
                     parts.append(
                         canonicalize_cue_reference_ids(
@@ -12466,21 +12610,36 @@ class DirectorCutStudio(QMainWindow):
                 for layer in layers:
                     if layer.content_role == "dialogue":
                         sync = "with accurate visible lip sync" if layer.lip_sync else "without required lip sync"
+                        acoustic_context = " ".join(
+                            (cue.environment_response or cue.detail or "the visible location").split()
+                        )[:320]
                         if supplied_dialogue_audio_tag:
                             parts.append(
-                                f'Use {supplied_dialogue_audio_tag} exactly as the supplied speech; '
+                                f'Use {supplied_dialogue_audio_tag} exactly as the supplied speech, treating '
+                                'it as the clean authored dialogue stem; '
                                 f'{layer.speaker} speaks in '
                                 f'{layer.language}, {layer.delivery.lower()} delivery, {sync}: '
                                 f'<d>[{layer.language}] {layer.text}</d>. Synchronize mouth motion '
-                                'and phoneme timing precisely to the supplied audio'
+                                'and phoneme timing precisely to the supplied audio. Preserve every word, '
+                                'speaker identity and utterance timing, but spatialize the stem as live '
+                                f'on-location production sound for {acoustic_context}: match the visible '
+                                'camera distance, retain natural breath and conversational micro-pauses, '
+                                f'apply the Shot acoustic profile ({acoustic_profile}: {acoustic_direction}), '
+                                'retain low environmental bleed, and never leave '
+                                'it as a dry studio/announcer voice or generate a duplicate voice'
                             )
                         else:
                             parts.append(
                                 f'{layer.speaker} speaks in {layer.language}, '
                                 f'{layer.delivery.lower()} delivery, {sync}. Generate this exact '
-                                f'audible {layer.language} dialogue in a natural native voice: '
+                                f'audible {layer.language} dialogue as live production sound captured '
+                                f'on location for {acoustic_context}, in a natural native voice: '
                                 f'<d>[{layer.language}] {layer.text}</d>. Do not paraphrase, '
-                                'translate, omit or replace any word'
+                                'translate, omit or replace any word. Use organic conversational timing, '
+                                'natural breath and micro-pauses, restrained projection, matching camera '
+                                f'distance, and the Shot acoustic profile ({acoustic_profile}: '
+                                f'{acoustic_direction}) with low environmental bleed; never use '
+                                'a dry announcer, dubbing-booth or studio voice-over delivery'
                             )
                     elif layer.content_role == "voice_over":
                         source = (
@@ -12707,6 +12866,12 @@ class DirectorCutStudio(QMainWindow):
             brief_parts.append(
                 "Reference images define identity, props, geography and explicitly assigned visual "
                 "states. They are not instructions to replay a depicted pose or restart the story."
+            )
+            brief_parts.append(
+                "The visible scene may contain only subjects, locations, props, lighting states and "
+                "actions explicitly present in this segment's Shot blocks or active references. "
+                "A name or place that survives only inside a project-global modifier is inactive "
+                "continuity metadata; never introduce it into this segment."
             )
             local_roles = [
                 f"{asset.tag}: {' '.join(asset.clip_prompt.split())[:260]}"

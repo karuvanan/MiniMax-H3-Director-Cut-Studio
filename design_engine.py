@@ -413,34 +413,259 @@ def validate_explicit_timed_text_contract(requirement: str, plan: dict) -> list[
     return required
 
 
-def automatic_background_soundscape(plan: dict) -> str:
-    """Return a concise H3-ready ambience bed when the LM omitted one."""
-    existing = " ".join(str(plan.get("overall_soundscape", "")).split())
-    if existing:
-        base = existing
-    else:
-        evidence = " ".join(
-            str(value or "")
-            for value in (
-                plan.get("creative_brief"),
-                *(item.get("environment_response", "") for item in plan.get("shots") or []),
-                *(item.get("subject_action", "") for item in plan.get("shots") or []),
-            )
-        ).lower()
-        if any(word in evidence for word in ("office", "desk", "computer", "workspace")):
-            base = "Natural office room tone, restrained HVAC, subtle keyboard and desk foley."
-        elif any(word in evidence for word in ("city", "street", "traffic", "car", "road")):
-            base = "Natural city ambience, distant traffic, location room tone and synchronized movement foley."
-        elif any(word in evidence for word in ("forest", "mountain", "garden", "courtyard", "roof")):
-            base = "Natural outdoor ambience, wind through the environment, footsteps, cloth and contact-driven foley."
-        else:
-            base = "Natural location room tone with synchronized footsteps, cloth, object and environmental foley."
-    guard = (
-        " Keep authored speech in the foreground unchanged; duck ambience and music under every spoken line."
+_AUTO_SOUND_MIX_MARKER = "Production mix contract:"
+_AUTO_MUSIC_MIX_MARKER = "Music mix contract:"
+_SPATIAL_ACOUSTICS_MARKER = "Spatial acoustics contract:"
+
+
+def _audio_design_evidence(plan: dict) -> str:
+    shots = [item for item in plan.get("shots") or [] if isinstance(item, dict)]
+    return " ".join(
+        str(value or "")
+        for value in (
+            plan.get("creative_brief"),
+            *(item.get("environment_response", "") for item in shots),
+            *(item.get("subject_action", "") for item in shots),
+            *(item.get("additional_direction", "") for item in shots),
+        )
+    ).lower()
+
+
+def _without_generated_mix_contract(value: object, marker: str) -> str:
+    normalized = " ".join(str(value or "").split())
+    index = normalized.lower().find(marker.lower())
+    return normalized[:index].rstrip(" .") if index >= 0 else normalized.rstrip(" .")
+
+
+def _location_ambience(evidence: str) -> str:
+    if any(word in evidence for word in ("vehicle", "car", "taxi", "van", "bus", "train", "车", "車")):
+        return "Natural vehicle-cabin tone, engine and road vibration, exterior traffic filtered by the windows."
+    if any(word in evidence for word in ("cave", "tunnel", "地下", "洞穴", "山洞")):
+        return "Dark enclosed-space ambience with air movement, distant water and physically plausible cave reflections."
+    if any(word in evidence for word in ("office", "desk", "computer", "workspace", "办公室", "辦公室")):
+        return "Natural office room tone, restrained HVAC, distant activity and subtle desk presence."
+    if any(word in evidence for word in ("city", "street", "traffic", "road", "城市", "街", "公路")):
+        return "Natural city location tone with layered distant traffic, pedestrians and perspective-correct exterior activity."
+    if any(word in evidence for word in ("water", "pond", "river", "sea", "rain", "pool", "水", "雨", "池", "河", "海")):
+        return "Continuous outdoor location tone with wind, nearby water movement and natural distant environmental detail."
+    if any(word in evidence for word in ("forest", "mountain", "garden", "courtyard", "roof", "tree", "森林", "山", "庭院", "屋顶", "屋頂", "树", "樹")):
+        return "Natural outdoor ambience with wind through the environment, foliage movement and a stable distant location bed."
+    if any(word in evidence for word in ("room", "interior", "home", "hotel", "shop", "室内", "室內", "房间", "房間", "酒店")):
+        return "Natural interior room tone with subtle air movement, exterior bleed and room-size-appropriate reflections."
+    return "Natural location room tone with a continuous, perspective-correct environmental bed."
+
+
+def _foley_priorities(evidence: str) -> list[str]:
+    priorities: list[str] = []
+
+    def add(label: str, words: tuple[str, ...]) -> None:
+        if any(word in evidence for word in words) and label not in priorities:
+            priorities.append(label)
+
+    add("footsteps, landings and surface contact", ("walk", "run", "step", "jump", "land", "追", "跑", "走", "跳", "踏"))
+    add("cloth, costume and body-movement rustle", ("cloth", "cape", "coat", "dress", "robe", "衣", "披风", "披風", "裙"))
+    add("weapon movement, metallic contact and impact transients", ("sword", "spear", "knife", "dart", "weapon", "gun", "blade", "剑", "劍", "刀", "枪", "槍", "暗器"))
+    add("vehicle engine, tires, brakes and door contact", ("vehicle", "car", "taxi", "van", "drive", "车", "車", "驾驶", "駕駛"))
+    add("water splashes, droplets and surface disturbance", ("water", "pond", "river", "rain", "pool", "水", "雨", "池", "河"))
+    add("doors, latches and object handling", ("door", "handle", "open", "close", "门", "門", "开门", "開門"))
+    add("phone taps, handling and interface cues", ("phone", "smartphone", "手机", "手機"))
+    add("glass, bottle, can and liquid handling", ("glass", "bottle", "can", "drink", "pour", "杯", "瓶", "罐", "喝", "倒"))
+    add("fire, debris and pressure impacts", ("fire", "explosion", "debris", "spark", "火", "爆炸", "碎片", "火花"))
+    return priorities[:4]
+
+
+def spatial_acoustics_profile(evidence: object) -> tuple[str, str]:
+    """Infer a concise, executable acoustic space from visible-scene evidence."""
+    text = " ".join(str(evidence or "").lower().split())
+
+    def has(*words: str) -> bool:
+        return any(word in text for word in words)
+
+    if has("small reflective room", "bathroom", "washroom", "tile", "tiled", "浴室", "洗手间", "瓷砖"):
+        return (
+            "small reflective room",
+            "use bright short reflections, 0.35-0.65s decay and restrained 6-10% wetness; "
+            "control metallic flutter so consonants remain precise",
+        )
+    if has("cave", "tunnel", "cavern", "underground", "洞穴", "隧道", "地下"):
+        return (
+            "cave or tunnel",
+            "use sparse directional echoes and a dark 1.2-2.2s decay at 10-16% wetness; "
+            "keep the direct voice dominant and place each return behind the visible surfaces",
+        )
+    if has("car", "vehicle", "taxi", "van", "bus", "train cabin", "车内", "汽车", "的士"):
+        return (
+            "vehicle cabin",
+            "use very short 0.12-0.28s upholstered cabin reflections at 3-6% wetness, "
+            "with close low-level road and body-panel resonance but no audible echo repeat",
+        )
+    if has(
+        "large interior", "grand hall", "large hall", "ballroom", "auditorium", "warehouse", "hangar",
+        "cathedral", "station concourse", "大堂", "大厅", "礼堂", "仓库", "车站大厅",
+    ):
+        return (
+            "large interior",
+            "use a clear 20-45ms pre-delay, broad early reflections and a controlled 0.9-1.8s "
+            "tail at 10-16% wetness; reduce the tail beneath speech endings so words stay intelligible",
+        )
+    if has("corridor", "hallway", "stairwell", "passage", "走廊", "楼梯间", "通道"):
+        return (
+            "corridor or stairwell",
+            "use narrow directional early reflections and one restrained 0.6-1.1s return at "
+            "7-12% wetness; avoid rhythmic multi-tap echo on dialogue",
+        )
+    if has(
+        "small furnished room", "living room", "bedroom", "small room", "office", "hotel room", "apartment",
+        "客厅", "卧室", "小房间", "办公室", "酒店房间", "公寓",
+    ):
+        return (
+            "small furnished room",
+            "use close bright early reflections, a short 0.18-0.45s decay and subtle 4-8% "
+            "wetness; retain high-frequency room detail without making the voice hollow",
+        )
+    if has(
+        "medium furnished interior", "restaurant", "cafe interior", "coffee shop interior", "classroom", "shop interior",
+        "studio apartment", "餐厅", "咖啡店室内", "教室", "商店室内",
+    ):
+        return (
+            "medium furnished interior",
+            "use diffuse early reflections and a moderate 0.35-0.75s decay at 6-11% wetness; "
+            "keep foreground dialogue centered and clearly ahead of the room tail",
+        )
+    if has(
+        "covered semi-outdoor space", "awning", "covered stall", "coffee stall", "street stall", "pavilion", "veranda",
+        "covered platform", "雨棚", "摊位", "凉亭", "骑楼", "有盖站台",
+    ):
+        return (
+            "covered semi-outdoor space",
+            "use only short 0.12-0.32s early reflections from the nearby roof, counter and wall "
+            "at 3-6% wetness; keep the street-facing side open with no long enclosed-room tail",
+        )
+    if has(
+        "open exterior", "outdoor", "exterior", "street", "road", "courtyard", "rooftop", "field", "forest",
+        "mountain", "beach", "garden", "pond", "户外", "街道", "道路", "庭院", "屋顶",
+        "田野", "森林", "山", "海边", "花园", "池塘",
+    ):
+        return (
+            "open exterior",
+            "use almost no reverb (0-0.15s, 0-3% wetness), no discrete echo and no enclosed tail; "
+            "reduce low-mid body and proximity fullness slightly, preserving a thinner direct voice "
+            "with distance, wind and open-air diffusion",
+        )
+    return (
+        "neutral visible location",
+        "derive only subtle early reflections from visible nearby surfaces, keep the direct sound "
+        "dominant, and never invent a large enclosed acoustic space",
     )
-    if "authored speech" not in base.lower():
-        base = base.rstrip(". ") + "." + guard
-    return base.strip()
+
+
+def spatial_acoustics_schedule(plan: dict) -> str:
+    """Build a time-scoped acoustic schedule, collapsing adjacent equal spaces."""
+    shots = [item for item in plan.get("shots") or [] if isinstance(item, dict)]
+    if not shots:
+        profile, direction = spatial_acoustics_profile(_audio_design_evidence(plan))
+        return f"{profile}: {direction}."
+
+    rows: list[dict] = []
+    for shot in shots:
+        evidence = " ".join(
+            str(shot.get(field, "") or "")
+            for field in (
+                "framing", "camera_angle", "subject_action", "environment_response",
+                "additional_direction", "detail", "continuity_state",
+            )
+        )
+        profile, direction = spatial_acoustics_profile(evidence)
+        if profile == "neutral visible location" and rows:
+            profile = rows[-1]["profile"]
+            direction = rows[-1]["direction"]
+        start = float(shot.get("start_seconds", 0.0) or 0.0)
+        end = float(shot.get("end_seconds", start) or start)
+        if rows and rows[-1]["profile"] == profile and abs(rows[-1]["end"] - start) <= 0.05:
+            rows[-1]["end"] = end
+        else:
+            rows.append({
+                "start": start,
+                "end": end,
+                "profile": profile,
+                "direction": direction,
+            })
+    return " ".join(
+        f"{row['start']:.2f}-{row['end']:.2f}s {row['profile']}: {row['direction']}."
+        for row in rows
+    )
+
+
+def automatic_background_soundscape(plan: dict) -> str:
+    """Build an audible three-layer production mix for any Design/Timeline."""
+    evidence = _audio_design_evidence(plan)
+    base = _without_generated_mix_contract(
+        plan.get("overall_soundscape", ""), _AUTO_SOUND_MIX_MARKER
+    )
+    # Remove the obsolete auto-authored phrase used by early Design plans. It
+    # conflicts with the deterministic space profile below; explicit authored
+    # instructions such as "dry voice" or "no reverb" remain untouched.
+    base = re.sub(
+        r"(?i)\bno artificial reverb tails(?:\s+or\s+studio dryness on the voice)?\b[\s,;:.]*",
+        "",
+        base,
+    ).strip()
+    if not base:
+        base = _location_ambience(evidence).rstrip(".")
+    priorities = _foley_priorities(evidence)
+    spatial = spatial_acoustics_schedule(plan)
+    foley = (
+        " Prioritize exact-frame, contact-synchronized " + ", ".join(priorities) + "."
+        if priorities
+        else " Add exact-frame Foley only for visible footsteps, cloth, handled objects and physical contacts."
+    )
+    contract = (
+        f" {_AUTO_SOUND_MIX_MARKER} Maintain three clearly audible layers in every Shot: "
+        "a continuous diegetic location bed, close contact-synchronized Foley/one-shot SFX, "
+        "and foreground speech when authored."
+        + foley
+        + " On-screen dialogue sounds like live production audio captured in the visible space: "
+          "natural breath, conversational micro-pauses, matching camera distance, subtle early "
+          "reflections and low environmental bleed; never a dry announcer or studio voice-over. "
+        + f" {_SPATIAL_ACOUSTICS_MARKER} {spatial} Apply this profile separately to direct speech, "
+          "Foley and ambience according to their visible distance. Crossfade smoothly when the camera "
+          "moves between spaces; do not carry an earlier room tail into a later exterior Shot. Acoustic "
+          "echo means only physically plausible reflections, never a second performance or repeated words. "
+          "Reduce ambience and non-diegetic music by about 6 dB during speech but never mute them; "
+          "restore their level naturally between phrases. Keep ambience audible in silent gaps. "
+          "Do not duplicate, echo, paraphrase or mask authored words, and do not add generic impacts "
+          "without a visible cause."
+    )
+    return base.rstrip(". ") + "." + contract
+
+
+def automatic_background_music(plan: dict) -> str:
+    """Return a story-aware, always-audible but dialogue-safe music direction."""
+    evidence = _audio_design_evidence(plan)
+    base = _without_generated_mix_contract(
+        plan.get("non_diegetic_music", ""), _AUTO_MUSIC_MIX_MARKER
+    )
+    if not base:
+        if any(word in evidence for word in ("fight", "battle", "chase", "assassin", "wuxia", "武侠", "武俠", "刺杀", "刺殺", "追捕")):
+            base = "Tense cinematic action score with restrained percussion, low strings and short accents that follow major physical beats"
+        elif any(word in evidence for word in ("thriller", "kidnap", "police", "danger", "恐怖", "绑架", "綁架", "警方", "危险", "危險")):
+            base = "Low suspense pulse with sparse percussion and evolving dark tonal texture"
+        elif any(word in evidence for word in ("romance", "love", "emotional", "warm", "爱情", "愛情", "感动", "感動", "温暖", "溫暖")):
+            base = "Restrained warm piano and soft strings with an intimate emotional arc"
+        elif any(word in evidence for word in ("comedy", "funny", "playful", "幽默", "搞笑", "喜剧", "喜劇")):
+            base = "Light rhythmic pizzicato and restrained playful percussion"
+        elif any(word in evidence for word in ("product", "commercial", "advert", "品牌", "广告", "廣告", "产品", "產品")):
+            base = "Clean contemporary commercial pulse with minimal bass, crisp percussion and a polished final resolve"
+        else:
+            base = "Subtle cinematic underscore shaped to the story's emotional rise and final resolution"
+    contract = (
+        f" {_AUTO_MUSIC_MIX_MARKER} Keep the score clearly audible as a separate non-diegetic layer, "
+        "but subordinate to dialogue and important diegetic effects. Duck it about 8 dB under speech, "
+        "let it rise smoothly in dialogue gaps and transitions, and place only a few motivated accents "
+        "on major reveals, impacts or emotional turns. Preserve continuity across cuts, avoid wall-to-wall "
+        "maximum loudness, and use no vocals unless authored Lyrics explicitly require them."
+    )
+    return base.rstrip(". ") + "." + contract
 
 
 DESIGN_JSON_SCHEMA = {
@@ -1366,6 +1591,10 @@ def normalize_design_plan(
         **plan,
         "shots": source.get("shots") or [],
     })
+    plan["non_diegetic_music"] = automatic_background_music({
+        **plan,
+        "shots": source.get("shots") or [],
+    })
     budget_guardrail = (
         "Complete every Shot's core action before any optional flourish. Preserve the stated "
         "continuity state, exact subject count and identity, prop and weapon ownership, screen "
@@ -1823,9 +2052,18 @@ def build_design_system_prompt(context: dict) -> str:
         "reference-media evidence. Assign S1 to a female speaker and S2 to a male speaker, keep the assignment consistent across every "
         "Shot, and never use the narrator's gender when the visible character is speaking. If the user explicitly writes S1 or S2, "
         "preserve that explicit assignment. Put the intended emotion and pace in delivery without changing the authored words. "
-        "Always design a useful overall_soundscape containing diegetic location ambience and contact-synchronized foley. Keep dialogue "
-        "in the foreground, duck background ambience and non-diegetic music beneath speech, and never replace or echo authored dialogue "
-        "as part of the background sound. "
+        "Always design a useful overall_soundscape with three audible layers: continuous diegetic location ambience, exact-frame "
+        "contact-synchronized Foley/one-shot SFX, and foreground speech. On-screen Dialogue must sound like live production audio "
+        "captured in the visible location, with natural breath, conversational micro-pauses, camera-distance perspective, subtle room "
+        "or outdoor reflections and low environmental bleed; never request a dry announcer or studio voice-over performance. Infer a "
+        "time-scoped acoustic profile from every visible Shot: short bright decay for small furnished rooms, moderate diffuse decay for "
+        "ordinary interiors, longer controlled tails for large halls, directional returns for corridors/caves, very short roof/surface "
+        "reflections for covered semi-outdoor spaces, and almost no reverb with reduced low-mid fullness for open exteriors. Never carry "
+        "a previous room's tail across a location change. Keep "
+        "dialogue in the foreground, duck ambience beneath speech without muting it, and never replace or echo authored dialogue. "
+        "Always design a useful non_diegetic_music cue as a separate audible score layer. Specify its dramatic role and instrumentation, "
+        "duck it under speech, let it rise in dialogue gaps and transitions, and never leave it blank or use vocals unless authored Lyrics "
+        "explicitly require them. "
         "Always include a Final Hold marker before the final frame; cue timestamps must be earlier than duration_seconds. "
         "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
         "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. The Final Hold must resolve "

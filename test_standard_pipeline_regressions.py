@@ -300,22 +300,43 @@ class StandardPipelineRegressions(unittest.TestCase):
             DirectorCue(
                 "S1", "shot", 0.0, 15.0, "PHASE_ONE_UNIQUE",
                 subject_action="The hero launches the first attack and remains airborne at the boundary.",
+                environment_response="The action is inside a small furnished office with close walls.",
                 continuity_state="At 15 seconds the hero is airborne, moving screen-right.",
                 track_id="V1",
             ),
             DirectorCue(
                 "S2", "shot", 15.0, 30.0, "PHASE_TWO_UNIQUE",
                 subject_action="Begin with the hero still airborne, then land and pursue across the roof.",
+                environment_response="The action crosses a vast enclosed station concourse and large hall.",
                 continuity_state="At 30 seconds both fighters leave the roof toward the pond.",
                 track_id="V1",
             ),
             DirectorCue(
                 "S3", "shot", 30.0, 45.0, "PHASE_THREE_UNIQUE",
                 subject_action="Begin above the pond, complete the final pass and escape upward.",
+                environment_response="The finish occurs in an open exterior courtyard beside the pond.",
                 continuity_state="Finish after the final pass; do not restart an earlier attack.",
                 track_id="V1",
             ),
         ]
+        window.prompt_panel.style.setPlainText(
+            "EARLY_STYLE cotton daylight (0-15s). "
+            "MIDDLE_STYLE neon rain (15-30s). "
+            "LATE_STYLE moonlit courtyard (30-45s). TIMELESS_STYLE cinematic realism."
+        )
+        window.prompt_panel.soundscape.setPlainText(
+            "EARLY_SOUND market crowd (0-15s). "
+            "MIDDLE_SOUND rooftop rain (15-30s). "
+            "LATE_SOUND quiet wind (30-45s)."
+        )
+        window.prompt_panel.music.setPlainText(
+            "EARLY_MUSIC drums (0-15s). MIDDLE_MUSIC strings (15-30s). "
+            "LATE_MUSIC silence (30-45s)."
+        )
+        window.prompt_panel.constraints.setPlainText(
+            "Keep identity stable. EARLY_BOUNDARY_CHANGE occurs at 14s. "
+            "MIDDLE_BOUNDARY_CHANGE occurs at 22s. LATE_BOUNDARY_CHANGE occurs at 38s."
+        )
         window.clip_start.setValue(0.0)
         window.clip_end.setValue(45.0)
 
@@ -338,6 +359,40 @@ class StandardPipelineRegressions(unittest.TestCase):
             self.assertTrue(
                 all(unique not in prompt for other, prompt in enumerate(prompts) if other != index)
             )
+        for field_tokens in (
+            ("EARLY_STYLE", "MIDDLE_STYLE", "LATE_STYLE"),
+            ("EARLY_SOUND", "MIDDLE_SOUND", "LATE_SOUND"),
+            ("EARLY_MUSIC", "MIDDLE_MUSIC", "LATE_MUSIC"),
+            ("EARLY_BOUNDARY_CHANGE", "MIDDLE_BOUNDARY_CHANGE", "LATE_BOUNDARY_CHANGE"),
+        ):
+            for index, unique in enumerate(field_tokens):
+                self.assertIn(unique, prompts[index])
+                self.assertTrue(
+                    all(
+                        unique not in prompt
+                        for other, prompt in enumerate(prompts)
+                        if other != index
+                    ),
+                    msg=f"{unique} leaked across segment prompts",
+                )
+        self.assertTrue(all("SEGMENT-LOCAL VISUAL STYLE SCHEDULE" in prompt for prompt in prompts))
+        self.assertTrue(all("TIMELESS_STYLE" in prompt for prompt in prompts))
+        self.assertTrue(all("Production mix contract" in prompt for prompt in prompts))
+        self.assertTrue(all("Spatial acoustics contract" in prompt for prompt in prompts))
+        self.assertTrue(all("Music mix contract" in prompt for prompt in prompts))
+        self.assertTrue(all("SHOT SOUND EXECUTION" in prompt for prompt in prompts))
+        self.assertTrue(all("SHOT SPATIAL ACOUSTICS" in prompt for prompt in prompts))
+        acoustic_tokens = (
+            "small furnished room",
+            "large interior",
+            "open exterior",
+        )
+        for index, unique in enumerate(acoustic_tokens):
+            self.assertIn(unique, prompts[index])
+            self.assertTrue(
+                all(unique not in prompt for other, prompt in enumerate(prompts) if other != index),
+                msg=f"{unique} leaked across native acoustic schedules",
+            )
         for segment, active_video in zip(job["segments"][1:], (phase_two_video, phase_three_video)):
             continuity = segment["continuity"]
             h3 = self._h3_inputs(window, segment["workflow"])
@@ -353,6 +408,67 @@ class StandardPipelineRegressions(unittest.TestCase):
                 h3["ref_videos.ref_video_0"],
                 window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][active_video.binding],
             )
+
+        # A Shot-local acoustic edit must change only its own Segment prompt and
+        # fingerprint. It must never renumber P/V/A references or continuity.
+        reference_maps_before = [
+            {
+                key: value
+                for key, value in self._h3_inputs(window, segment["workflow"]).items()
+                if key.startswith(("ref_images.", "ref_videos.", "ref_audios."))
+            }
+            for segment in job["segments"]
+        ]
+        fingerprints_before = [segment["fingerprint"] for segment in job["segments"]]
+        continuity_before = [
+            {
+                key: value
+                for key, value in segment["continuity"].items()
+                if key in {"kind", "frame_count", "binding", "tag"}
+            }
+            for segment in job["segments"]
+        ]
+        window.director_cues[1].environment_response = (
+            "The same middle action now moves through a narrow enclosed corridor and stairwell."
+        )
+        edited_path, edited_count = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=4300,
+            enable_rtx_vsr=False,
+        )
+        edited = json.loads(edited_path.read_text(encoding="utf-8"))
+        self.assertEqual(edited_count, 3)
+        reference_maps_after = [
+            {
+                key: value
+                for key, value in self._h3_inputs(window, segment["workflow"]).items()
+                if key.startswith(("ref_images.", "ref_videos.", "ref_audios."))
+            }
+            for segment in edited["segments"]
+        ]
+        continuity_after = [
+            {
+                key: value
+                for key, value in segment["continuity"].items()
+                if key in {"kind", "frame_count", "binding", "tag"}
+            }
+            for segment in edited["segments"]
+        ]
+        fingerprints_after = [segment["fingerprint"] for segment in edited["segments"]]
+        self.assertEqual(reference_maps_after, reference_maps_before)
+        self.assertEqual(continuity_after, continuity_before)
+        self.assertEqual(
+            [
+                index
+                for index, (before, after) in enumerate(
+                    zip(fingerprints_before, fingerprints_after)
+                )
+                if before != after
+            ],
+            [1],
+        )
+        edited_prompts = [self._prompt(row["workflow"]) for row in edited["segments"]]
+        self.assertIn("corridor or stairwell", edited_prompts[1])
+        self.assertNotIn("corridor or stairwell", edited_prompts[0] + edited_prompts[2])
 
 
 if __name__ == "__main__":

@@ -79,6 +79,78 @@ def response_text(payload: dict) -> str:
     raise RuntimeError("The model response did not contain text output")
 
 
+def _model_family(value: str) -> str:
+    """Return a stable family key after removing a GGUF quantization suffix."""
+    text = str(value or "").strip().casefold().replace("\\", "/")
+    text = re.sub(r"\.gguf$", "", text)
+    text = re.sub(
+        r"[-_.](?:q\d+(?:[_-][a-z0-9]+)*|f16|f32|bf16|iq\d+(?:[_-][a-z0-9]+)*)$",
+        "",
+        text,
+    )
+    return text
+
+
+def _model_aliases(value: str) -> set[str]:
+    normalized = str(value or "").strip().casefold().replace("\\", "/")
+    aliases = {_model_family(normalized)}
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) > 1:
+        parent = re.sub(r"(?:[-_.]gguf)$", "", parts[-2])
+        if parent != parts[-2]:
+            aliases.add(_model_family(parent))
+    return {item for item in aliases if item}
+
+
+def select_available_model(requested: str, models: list[str]) -> str:
+    """Resolve a deleted LM Studio model to the closest available chat model."""
+    available = [str(item).strip() for item in models if str(item).strip()]
+    if not available:
+        return ""
+    requested_key = str(requested or "").strip().casefold()
+    exact = next((item for item in available if item.casefold() == requested_key), "")
+    if exact:
+        return exact
+
+    requested_aliases = _model_aliases(requested)
+    same_family = [
+        item for item in available if requested_aliases.intersection(_model_aliases(item))
+    ]
+    if same_family:
+        return same_family[0]
+
+    requested_parent = requested_key.rsplit("/", 1)[0] if "/" in requested_key else ""
+    if requested_parent:
+        same_parent = [
+            item
+            for item in available
+            if item.casefold().rsplit("/", 1)[0] == requested_parent
+        ]
+        if same_parent:
+            return same_parent[0]
+
+    excluded = ("embed", "rerank", "clip", "vision", "whisper", "tts")
+    chat_models = [
+        item
+        for item in available
+        if not any(token in item.casefold() for token in excluded)
+    ]
+    return (chat_models or available)[0]
+
+
+def available_openai_models(base_url: str, api_key: str, timeout: float) -> list[str]:
+    payload = request_json(
+        endpoint(base_url, "models"),
+        api_key=api_key,
+        timeout=timeout,
+    )
+    return [
+        str(item.get("id", "")).strip()
+        for item in payload.get("data") or []
+        if isinstance(item, dict) and str(item.get("id", "")).strip()
+    ]
+
+
 def generate(job: dict) -> dict:
     provider = str(job.get("provider", "openai")).lower()
     base_url = str(job.get("base_url", ""))
@@ -121,6 +193,11 @@ def generate(job: dict) -> dict:
             },
         )
     else:
+        models = available_openai_models(base_url, api_key, min(timeout, 30.0))
+        # Older OpenAI-compatible local servers may return no model catalogue
+        # even though chat/completions works. Keep the authored model in that
+        # compatibility case; when a catalogue exists, stale IDs are repaired.
+        model = select_available_model(model, models) or model
         chat_payload = {
             "model": model,
             "messages": [
@@ -159,7 +236,7 @@ def generate(job: dict) -> dict:
                 timeout=timeout,
                 payload=chat_payload,
             )
-    return {"response": payload, "text": response_text(payload)}
+    return {"response": payload, "text": response_text(payload), "resolved_model": model}
 
 
 def handle(job: dict) -> dict:
@@ -196,13 +273,19 @@ def handle(job: dict) -> dict:
         )
         return {"comfy_unloaded": True}
     if action == "test":
-        payload = request_json(
-            endpoint(str(job.get("base_url", "")), "models"),
-            api_key=str(job.get("api_key", "")),
-            timeout=float(job.get("timeout", 20)),
+        models = available_openai_models(
+            str(job.get("base_url", "")),
+            str(job.get("api_key", "")),
+            float(job.get("timeout", 20)),
         )
-        models = [str(item.get("id", "")) for item in payload.get("data") or [] if item.get("id")]
-        return {"connected": True, "models": models[:100]}
+        requested = str(job.get("model", "")).strip()
+        return {
+            "connected": True,
+            "models": models[:100],
+            "resolved_model": select_available_model(requested, models),
+            "model_replaced": bool(requested)
+            and requested.casefold() not in {item.casefold() for item in models},
+        }
     if action == "generate":
         return {"generated": True, **generate(job)}
     if action == "unload_lm":
