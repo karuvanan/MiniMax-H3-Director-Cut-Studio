@@ -149,11 +149,13 @@ from workflow_engine import (
     WorkflowScan,
     assign_local_media,
     compile_active_workflow,
+    create_virtual_media_asset,
     effective_reference_assets,
     load_workflow,
     media_upload_manifest,
     patch_media_upload_names,
     stable_reference_id,
+    validate_portable_media_manifest,
 )
 
 
@@ -165,7 +167,7 @@ DESIGN_EXAMPLE_ROOT = PROJECT_ROOT / "example"
 Z_IMAGE_WORKFLOW = PROJECT_ROOT / "Z-Image_Text2Image_for_webui_t2i_api.json"
 PROMPT_PRESET_ENV_ROOT = PROJECT_ROOT / "preset_env"
 MIME_SLOT = "application/x-h3-media-slot"
-MEDIA_CARD_TARGET_WIDTH = 112
+MEDIA_POOL_COLUMNS = 3
 MEDIA_CARD_MIN_WIDTH = 80
 TIMELINE_RULER_HEIGHT = 20
 RENDER_STATUS_BAR_HEIGHT = 6
@@ -174,7 +176,7 @@ DIRECTOR_LANE_TYPES = ("shot", "transition", "marker")
 DIRECTOR_LANES_TOP = TIMELINE_RULER_HEIGHT + RENDER_STATUS_BAR_HEIGHT
 TIMELINE_TRACKS_TOP = DIRECTOR_LANES_TOP + DIRECTOR_LANE_HEIGHT * len(DIRECTOR_LANE_TYPES)
 TIMELINE_SNAP_SECONDS = 0.5
-SMART_RENDER_POLICY_VERSION = 9
+SMART_RENDER_POLICY_VERSION = 11
 CONTINUITY_MODE_LABELS = (
     "Auto", "Hard Cut", "Match Action", "Motion Reference", "Transition",
 )
@@ -6063,9 +6065,33 @@ class DirectorCutStudio(QMainWindow):
         media_page = QWidget()
         media_layout = QVBoxLayout(media_page)
         media_layout.setContentsMargins(5, 5, 5, 5)
-        self.media_header = QLabel("MEDIA POOL · waiting for API")
-        self.media_header.setStyleSheet("font-weight:700; color:#bfc4ca; padding:5px;")
-        media_layout.addWidget(self.media_header)
+        media_header_row = QHBoxLayout()
+        media_header_row.setSpacing(3)
+        self.media_header = QLabel("VIRTUAL MEDIA POOL · waiting for API")
+        self.media_header.setStyleSheet(
+            "font-size:10px; font-weight:700; color:#bfc4ca; padding:1px;"
+        )
+        self.media_header.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.media_header.setMinimumWidth(0)
+        self.media_header.setToolTip(
+            "Unlimited logical Media Pool. The compact header shows logical "
+            "Image/Video/Audio totals and per-Segment physical H3 capacity."
+        )
+        media_header_row.addWidget(self.media_header, 1)
+        self.add_media_buttons: dict[str, QPushButton] = {}
+        for label, kind in (("+I", "image"), ("+V", "video"), ("+A", "audio")):
+            button = QPushButton(label)
+            button.setFixedSize(30, 22)
+            button.setToolTip(
+                f"Add {kind.upper()} to the unlimited Virtual Media Pool. "
+                "H3 physical slots are assigned per Segment."
+            )
+            button.clicked.connect(
+                lambda _checked=False, media_type=kind: self.add_virtual_media(media_type)
+            )
+            self.add_media_buttons[kind] = button
+            media_header_row.addWidget(button)
+        media_layout.addLayout(media_header_row)
         self.media_scroll = QScrollArea()
         self.media_scroll.setWidgetResizable(True)
         self.media_scroll.viewport().installEventFilter(self)
@@ -6650,7 +6676,11 @@ class DirectorCutStudio(QMainWindow):
                     "analysis_status": "ready" if analysis_ready else "pending",
                     "timeline_uses": timeline_uses,
                 })
-        total_capacity = (
+        # Logical assets are not globally capped.  Keep a high schema guard for
+        # malformed plans; the real 9/3/3 rule is enforced independently for
+        # every compiled Segment.
+        total_capacity = {"image": 10000, "video": 10000, "audio": 10000}
+        physical_segment_capacity = (
             dict(scan.counts) if scan else {"image": 9, "video": 3, "audio": 3}
         )
         free_capacity = {
@@ -6673,6 +6703,7 @@ class DirectorCutStudio(QMainWindow):
             "aspect_ratio": self.aspect_ratio_combo.currentData(),
             "available_tracks": [track.track_id for track in self.tracks],
             "media_capacity": total_capacity,
+            "physical_segment_capacity": physical_segment_capacity,
             "loaded_media_counts": loaded_counts,
             "available_new_media_capacity": free_capacity,
             "existing_media": media,
@@ -6715,7 +6746,7 @@ class DirectorCutStudio(QMainWindow):
         dialog = DesignPageDialog(
             self.runtime,
             self._design_context(),
-            self.scan.counts,
+            self._design_context()["media_capacity"],
             self,
             context_provider=self._design_context,
         )
@@ -6758,7 +6789,14 @@ class DirectorCutStudio(QMainWindow):
             # Timeline scene while the Track Header still shows V3/V2/V1.
             "tracks": [asdict(track) for track in self.tracks],
             "assets": {asset.node_id: asdict(asset) for asset in self.scan.assets},
-            "timeline_clips": [asdict(clip) for clip in self.scan.timeline_clips],
+            "timeline_clips": [
+                {
+                    key: value
+                    for key, value in asdict(clip).items()
+                    if not key.startswith("request_")
+                }
+                for clip in self.scan.timeline_clips
+            ],
             "text_layers": [asdict(layer) for layer in self.text_layers],
             "authored_text_requirements": deepcopy(
                 self.authored_text_requirements
@@ -6783,6 +6821,21 @@ class DirectorCutStudio(QMainWindow):
             if node_id in self.scan.nodes:
                 self.scan.nodes[node_id].setdefault("inputs", {})["value"] = value
         asset_states = state.get("assets", {})
+        self.scan.assets[:] = [
+            asset for asset in self.scan.assets
+            if not asset.is_virtual or asset.node_id in asset_states
+        ]
+        existing_ids = {asset.node_id for asset in self.scan.assets}
+        for node_id, values in asset_states.items():
+            if node_id in existing_ids or not bool(values.get("is_virtual")):
+                continue
+            created = create_virtual_media_asset(
+                self.scan,
+                str(values.get("media_type", "")),
+                reference_id=str(values.get("reference_id", "")),
+                node_id=str(node_id),
+            )
+            existing_ids.add(created.node_id)
         for asset in self.scan.assets:
             values = asset_states.get(asset.node_id)
             if not values:
@@ -6790,7 +6843,8 @@ class DirectorCutStudio(QMainWindow):
             for name, value in values.items():
                 setattr(asset, name, value)
             input_name = {"image": "image", "video": "file", "audio": "audio"}[asset.media_type]
-            self.scan.nodes[asset.node_id].setdefault("inputs", {})[input_name] = asset.filename
+            if asset.node_id in self.scan.nodes:
+                self.scan.nodes[asset.node_id].setdefault("inputs", {})[input_name] = asset.filename
         self.scan.timeline_clips = [
             MediaAsset(**values) for values in state.get("timeline_clips", [])
         ]
@@ -6828,6 +6882,7 @@ class DirectorCutStudio(QMainWindow):
         self._rebuild_track_headers()
         self.timeline.set_text_layers(self.text_layers)
         self.timeline.set_director_cues(self.director_cues)
+        self._rebuild_media_cards()
         for asset in self.scan.assets:
             card = self.cards.get(asset.node_id)
             if not card:
@@ -7052,11 +7107,12 @@ class DirectorCutStudio(QMainWindow):
                         asset for asset in candidates if asset is not preferred
                     ]
             if not candidates:
-                warnings.append(
-                    f"No empty {request['media_type']} slot for missing requirement "
-                    f"{request.get('requirement_id') or request.get('local_path')}"
+                virtual = create_virtual_media_asset(
+                    self.scan, str(request["media_type"])
                 )
-                continue
+                self._append_media_card(virtual)
+                assets_by_media_id[stable_reference_id(virtual).upper()] = virtual
+                candidates = [virtual]
             asset = candidates[0]
             used_nodes.add(asset.node_id)
             assign_local_media(self.scan, asset, request["local_path"])
@@ -7095,6 +7151,8 @@ class DirectorCutStudio(QMainWindow):
             preview_path = Path(request.get("preview_path", ""))
             if preview_path.is_file():
                 self.preview_paths[asset.node_id] = preview_path
+
+        self._refresh_virtual_media_header()
 
         for index, shot in enumerate(plan["shots"], 1):
             track = self._design_track(shot.get("track", ""), "visual")
@@ -7351,7 +7409,9 @@ class DirectorCutStudio(QMainWindow):
             None,
         )
         if asset is None:
-            return None
+            asset = create_virtual_media_asset(self.scan, "audio")
+            self._append_media_card(asset)
+            self._refresh_virtual_media_header()
         output_root = (
             self.example_work_dir
             if self.example_work_dir is not None
@@ -7877,7 +7937,7 @@ class DirectorCutStudio(QMainWindow):
             ]
             plan = normalize_design_plan(
                 plan,
-                self.scan.counts,
+                self._design_context()["media_capacity"],
                 existing_media=self._design_context().get("existing_media") or [],
                 repair_media_plan=True,
                 authored_requirement=authored_requirement,
@@ -7894,6 +7954,7 @@ class DirectorCutStudio(QMainWindow):
             tts_required = self._ensure_authored_tts_request(
                 plan, authored_requirement
             )
+            self._validate_design_segment_capacity(plan)
             if (
                 tts_required
                 and self.render_settings.dialogue_tts_engine == "voxcpm2_local"
@@ -7983,6 +8044,49 @@ class DirectorCutStudio(QMainWindow):
             self.pending_ai_design = None
             self.pending_design_tts = None
             QMessageBox.critical(self, "Apply AI Design failed", str(exc))
+
+    def _validate_design_segment_capacity(self, plan: dict) -> None:
+        """Fail before generation when one time range cannot fit H3 9/3/3."""
+        if not self.scan:
+            return
+        duration = float(plan.get("duration_seconds", self.scan.duration_seconds))
+        rows: list[tuple[str, str, float, float]] = []
+        for index, item in enumerate(plan.get("existing_media_uses") or [], 1):
+            media_type = str(item.get("media_type", "")).lower()
+            identity = str(item.get("media_id") or f"existing-{index}").upper()
+            rows.append((
+                media_type,
+                identity,
+                float(item.get("start_seconds", 0.0)),
+                float(item.get("end_seconds", duration)),
+            ))
+        for index, item in enumerate(plan.get("media_requests") or [], 1):
+            media_type = str(item.get("media_type", "")).lower()
+            identity = "REQUEST:" + str(item.get("requirement_id") or index)
+            rows.append((
+                media_type,
+                identity,
+                float(item.get("start_seconds", 0.0)),
+                float(item.get("end_seconds", duration)),
+            ))
+        boundaries = sorted({0.0, duration, *[value for row in rows for value in row[2:]]})
+        for left, right in zip(boundaries, boundaries[1:]):
+            if right <= left:
+                continue
+            midpoint = (left + right) / 2.0
+            for media_type, limit in self.scan.counts.items():
+                active_ids = {
+                    identity
+                    for kind, identity, start, end in rows
+                    if kind == media_type and start <= midpoint < end
+                }
+                if len(active_ids) > limit:
+                    raise ValueError(
+                        f"Design interval {left:.2f}-{right:.2f}s needs "
+                        f"{len(active_ids)} unique {media_type} references, but one H3 "
+                        f"Segment has only {limit} physical slots. Split or shorten the "
+                        "references; the Virtual Media Pool itself remains unlimited."
+                    )
 
     def _ensure_authored_tts_request(
         self,
@@ -8314,13 +8418,7 @@ class DirectorCutStudio(QMainWindow):
         spacing = self.media_grid.horizontalSpacing()
         margins = self.media_grid.contentsMargins()
         available = max(1, viewport_width - margins.left() - margins.right())
-        columns = max(
-            1,
-            min(
-                len(self.media_card_order),
-                (available + spacing) // (MEDIA_CARD_TARGET_WIDTH + spacing),
-            ),
-        )
+        columns = max(1, min(len(self.media_card_order), MEDIA_POOL_COLUMNS))
         card_width = max(
             MEDIA_CARD_MIN_WIDTH,
             (available - max(0, columns - 1) * spacing) // columns,
@@ -8337,6 +8435,62 @@ class DirectorCutStudio(QMainWindow):
         for column in range(columns):
             self.media_grid.setColumnStretch(column, 1)
         self._media_grid_columns = columns
+
+    def _append_media_card(self, asset: MediaAsset) -> MediaCard:
+        card = MediaCard(asset)
+        card.selected.connect(self.select_asset)
+        card.file_dropped.connect(self.load_asset_file)
+        self.cards[asset.node_id] = card
+        self.media_card_order.append(card)
+        QTimer.singleShot(0, self._reflow_media_pool)
+        return card
+
+    def _rebuild_media_cards(self) -> None:
+        self.cards.clear()
+        self.media_card_order.clear()
+        while self.media_grid.count():
+            item = self.media_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if self.scan:
+            for asset in self.scan.assets:
+                self._append_media_card(asset)
+        self._refresh_virtual_media_header()
+
+    def _refresh_virtual_media_header(self) -> None:
+        if not self.scan:
+            self.media_header.setText("VIRTUAL MEDIA POOL · waiting for API")
+            return
+        logical = self.scan.logical_counts
+        capacity = self.scan.counts
+        self.media_header.setText(
+            "VIRTUAL MEDIA POOL · "
+            f"{logical['image']}I · {logical['video']}V · {logical['audio']}A "
+            f"· SEG {capacity['image']}/{capacity['video']}/{capacity['audio']}"
+        )
+
+    def add_virtual_media(self, media_type: str) -> None:
+        if not self.scan:
+            QMessageBox.information(self, "Virtual Media Pool", "Load the H3 API workflow first.")
+            return
+        filters = {
+            "image": "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
+            "video": "Videos (*.mp4 *.mov *.mkv *.webm *.avi)",
+            "audio": "Audio (*.wav *.mp3 *.flac *.m4a *.aac *.ogg)",
+        }
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Add virtual {media_type}",
+            str(self.example_work_dir or PROJECT_ROOT),
+            filters.get(media_type, "All media (*.*)"),
+        )
+        if not filename:
+            return
+        asset = create_virtual_media_asset(self.scan, media_type)
+        self._append_media_card(asset)
+        self._refresh_virtual_media_header()
+        self.load_asset_file(asset, filename)
+        self._mark_dirty()
 
     def _connect_dirty_signals(self) -> None:
         for name in (
@@ -8585,6 +8739,14 @@ class DirectorCutStudio(QMainWindow):
         assets = {}
         for asset in self.scan.assets:
             assets[asset.node_id] = {
+                "node_id": asset.node_id,
+                "class_type": asset.class_type,
+                "media_type": asset.media_type,
+                "tag": asset.tag,
+                "binding": asset.binding,
+                "paired_audio_binding": asset.paired_audio_binding,
+                "reference_id": stable_reference_id(asset),
+                "is_virtual": asset.is_virtual,
                 "filename": asset.filename,
                 "local_path": asset.local_path,
                 "recognition": asset.recognition,
@@ -8722,6 +8884,24 @@ class DirectorCutStudio(QMainWindow):
             ]
             self.timeline.set_director_cues(self.director_cues)
             asset_map = {asset.node_id: asset for asset in self.scan.assets}  # type: ignore[union-attr]
+            # Project v18+ persists logical P10/A4/V4 sources.  Recreate those
+            # cards before resolving files or Timeline clip instances.
+            for node_id, saved in payload.get("assets", {}).items():
+                if node_id in asset_map or not isinstance(saved, dict):
+                    continue
+                if not bool(saved.get("is_virtual")):
+                    continue
+                media_type = str(saved.get("media_type", "")).lower()
+                reference_id = str(saved.get("reference_id", "")).upper()
+                virtual = create_virtual_media_asset(
+                    self.scan,  # type: ignore[arg-type]
+                    media_type,
+                    reference_id=reference_id,
+                    node_id=str(node_id),
+                )
+                asset_map[virtual.node_id] = virtual
+                self._append_media_card(virtual)
+            self._refresh_virtual_media_header()
             raw_saved_work_dir = str(payload.get("example_work_dir") or "").strip()
             saved_media_root = Path(raw_saved_work_dir) if raw_saved_work_dir else None
             for node_id, saved in payload.get("assets", {}).items():
@@ -8734,6 +8914,8 @@ class DirectorCutStudio(QMainWindow):
                 if resolved_media is not None:
                     assign_local_media(self.scan, asset, resolved_media)  # type: ignore[arg-type]
                 for name in (
+                    "reference_id",
+                    "is_virtual",
                     "recognition",
                     "semantic_enrichment",
                     "semantic_enrichment_source_hash",
@@ -8938,16 +9120,10 @@ class DirectorCutStudio(QMainWindow):
             item = self.media_grid.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for index, asset in enumerate(scan.assets):
-            card = MediaCard(asset)
-            card.selected.connect(self.select_asset)
-            card.file_dropped.connect(self.load_asset_file)
-            self.cards[asset.node_id] = card
-            self.media_card_order.append(card)
+        for asset in scan.assets:
+            self._append_media_card(asset)
         counts = scan.counts
-        self.media_header.setText(
-            f"MEDIA POOL · {counts['image']} IMAGE · {counts['video']} VIDEO · {counts['audio']} AUDIO · MAX 15"
-        )
+        self._refresh_virtual_media_header()
         self.clip_start.setRange(0, scan.duration_seconds)
         self.clip_end.setRange(0.01, scan.duration_seconds)
         self.clip_start.setValue(0)
@@ -8965,7 +9141,10 @@ class DirectorCutStudio(QMainWindow):
             f"LoadImage: {counts['image']} / 9\nLoadVideo + GetVideoComponents: {counts['video']} / 3\n"
             f"LoadAudio: {counts['audio']} / 3\n\n" + "\n".join(scan.warnings)
         )
-        self.statusBar().showMessage(f"Loaded {path.name}: 15 media slots discovered")
+        self.statusBar().showMessage(
+            f"Loaded {path.name}: virtual pool ready; per-Segment H3 capacity "
+            f"{counts['image']} image / {counts['video']} video / {counts['audio']} audio"
+        )
         QTimer.singleShot(0, self._reflow_media_pool)
         self.undo_stack.clear()
         self.project_path = None
@@ -10010,6 +10189,7 @@ class DirectorCutStudio(QMainWindow):
             "semantic_enrichment_source_hash", "semantic_enrichment_model",
             "semantic_enrichment_updated_at", "source_duration_seconds", "state",
             "binding", "paired_audio_binding", "tag", "class_type", "media_type",
+            "reference_id", "is_virtual",
         )
         sources = {item.node_id: item for item in self.scan.assets}
         for clip in self.scan.timeline_clips:
@@ -13089,13 +13269,14 @@ class DirectorCutStudio(QMainWindow):
         if mode not in {"motion_reference", "transition"}:
             return {}
         active_ids = {
-            asset.source_node_id or asset.node_id for asset in active_assets
+            str(asset.request_loader_node_id or asset.source_node_id or asset.node_id)
+            for asset in active_assets
         }
         h3_id = self.scan.h3_node_ids[0]
         h3_inputs = (self.scan.nodes.get(h3_id, {}).get("inputs") or {})
         candidates = [
             asset
-            for asset in self.scan.assets
+            for asset in self.scan.physical_assets("video")
             if (
                 asset.media_type == media_type
                 and asset.node_id not in active_ids
@@ -13115,7 +13296,7 @@ class DirectorCutStudio(QMainWindow):
         # this exact binding index to calculate H3's effective ordinal.
         asset = min(candidates, key=binding_index)
         active_video_sources = {
-            (item.source_node_id or item.node_id, item.binding)
+            stable_reference_id(item)
             for item in active_assets
             if item.media_type == "video"
         }
@@ -13175,14 +13356,14 @@ class DirectorCutStudio(QMainWindow):
             # boundary than a tightly timed action clip.
             timed_specificity = 1 if duration < MAX_NATIVE_SECONDS - 1e-6 else 0
             prompted = 1 if asset.clip_prompt.strip() else 0
-            match = re.search(r"_(\d+)$", asset.binding)
+            match = re.search(r"_(\d+)$", asset.request_binding or asset.binding)
             binding_index = int(match.group(1)) if match else 10_000
             return timed_specificity + prompted, -duration, -binding_index
 
         released = min(candidates, key=release_score)
-        released_source = released.source_node_id or released.node_id
-        for asset in active_assets:
-            if (asset.source_node_id or asset.node_id) == released_source:
+        released_source = stable_reference_id(released)
+        for asset in self.scan.timeline_assets() if self.scan else []:
+            if stable_reference_id(asset) == released_source:
                 asset.enabled = False
         return released
 
@@ -13375,6 +13556,11 @@ class DirectorCutStudio(QMainWindow):
                     seed=seed,
                     enable_rtx_vsr=enable_rtx_vsr,
                 ),
+                preserve_loader_node_ids=(
+                    {str(continuity.get("loader_node_id"))}
+                    if continuity and continuity.get("loader_node_id")
+                    else None
+                ),
             )
             fingerprint_workflow = compiled
             fingerprint_assets = assets
@@ -13397,6 +13583,11 @@ class DirectorCutStudio(QMainWindow):
                         megapixels=megapixels,
                         seed=seed,
                         enable_rtx_vsr=enable_rtx_vsr,
+                    ),
+                    preserve_loader_node_ids=(
+                        {str(continuity.get("loader_node_id"))}
+                        if continuity and continuity.get("loader_node_id")
+                        else None
                     ),
                 )
             fingerprint = content_fingerprint(
@@ -13467,11 +13658,10 @@ class DirectorCutStudio(QMainWindow):
             )
             segment_rows.append(row)
 
-        # ComfyUI validates loader widgets even when their H3 input is
-        # disconnected for this Segment. Point every physical loader at the
-        # collision-safe name uploaded for the complete render job. This does
-        # not reactivate any H3 reference; it only removes stale-basename
-        # warnings from orphan loader validation after reopening a project.
+        # Every Segment retains only its active media loaders plus the one
+        # optional runtime continuity loader. Patch retained loaders from the
+        # complete collision-safe upload set; inactive cross-computer widgets
+        # have already been removed by compile_active_workflow.
         unique_media = list({
             (row["loader_node_id"], row["upload_name"]): row
             for row in all_media
@@ -13798,6 +13988,23 @@ class DirectorCutStudio(QMainWindow):
                     seed=seed,
                     enable_rtx_vsr=enable_rtx_vsr,
                 )
+                smart_job = json.loads(job_path.read_text(encoding="utf-8"))
+                smart_media = [
+                    item for item in (smart_job.get("media") or [])
+                    if isinstance(item, dict)
+                ]
+                for segment in smart_job.get("segments") or []:
+                    continuity = segment.get("continuity") or {}
+                    runtime_ids = (
+                        {str(continuity.get("loader_node_id"))}
+                        if continuity.get("loader_node_id")
+                        else set()
+                    )
+                    validate_portable_media_manifest(
+                        segment.get("workflow") or {},
+                        smart_media,
+                        runtime_loader_node_ids=runtime_ids,
+                    )
             else:
                 # Native-length projects deliberately retain the original one-job path.
                 compiled, assets = self._compiled_job(
@@ -13807,6 +14014,7 @@ class DirectorCutStudio(QMainWindow):
                 )
                 media = media_upload_manifest(assets)
                 patch_media_upload_names(compiled, media)
+                validate_portable_media_manifest(compiled, media)
                 job_path = CACHE_ROOT / "comfy_submit_job.json"
                 job = {
                     "action": "queue",

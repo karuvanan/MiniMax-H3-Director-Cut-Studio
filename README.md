@@ -2,18 +2,19 @@
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
-## v0.2.6-alpha.1 重点功能
+## v0.3.0-alpha.4 重点功能
 
+- **无限 Virtual Media Pool + Segment 动态装载**：项目可使用 `P10+ / V4+ / A4+`，不再受工作流实体 Loader 总数限制。每个 Segment 只选择自己时间范围内需要的逻辑素材，自动装入 H3 的 9 Image／3 Video／3 Audio 实体插槽，再生成该段专属 `<Picture N> / <Video N> / <Audio N>`。局部重算、重复素材、跨段移动、24 帧 continuity 和项目重载都保持同一永久 `P/V/A` 身份。
 - **AI Director Design**：连接 Online GPT 或 LM Studio，把自然语言需求转换成可验证的 Director Design JSON；优先复用 Media Pool 素材，并按缺口调用 Z-Image 生成参考图，再以 BLIP 结果完成第二次视觉校准。
 - **可编辑长片生成**：Timeline 保持完整影片视图；超过 15 秒时自动按 Shot／原生窗口拆分、缓存、局部重算并组装 Master，跨段使用上一段最后 24 帧作为无声运动上下文。
-- **稳定动态 Mapping**：Media Pool 始终使用 `P/V/A` 稳定编号；每个 Segment 只把实际激活素材动态编译成 H3 的 `<Picture N> / <Video N> / <Audio N>`，并保护重复素材、跨段编辑和 continuity slot。
+- **稳定动态 Mapping**：逻辑素材编号与 ComfyUI 实体 Loader 完全分离；P10 可以在一个 Segment 临时装入第一个实体 Picture Loader，但提示词解码和工程文件中仍永远是 P10，不会误变成 P1。
 - **逐字对白与三种声音模式**：支持 MiniMax H3 Native Dialogue、VoxCPM2 Local 和 Edge TTS；Timeline 修改台词、Speaker、时间或 Delivery 后会自动令旧 WAV 失效并重新生成。
 - **完整制作声音**：每个 Shot 自动规划现场对白、连续环境底噪、接触同步 Foley／SFX、受对白自动压低的配乐，以及根据可见空间变化的 Reverb／Echo。
 - **项目可恢复**：Preview／Run 自动输出 MP4、Director Project 与长片 manifest 到对应 `example` 工作文件夹；Open Project 可恢复 Timeline、Master、Program Monitor 与 Render Status。
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.2.6-alpha.1`](VERSION)
+- 当前应用版本：[`v0.3.0-alpha.4`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -30,7 +31,7 @@
 
 <img width="1474" height="2080" alt="Design workspace" src="https://github.com/user-attachments/assets/345e1d79-455f-4836-bffb-8e138aa20ee4" />
 
-默认主工作流支持最多 **9 张图片、3 段参考视频和 3 段独立音频**：
+默认主工作流提供每个 Segment 的实体执行容量：**9 张图片、3 段参考视频和 3 段独立音频**。这不是整个项目的 Media Pool 上限；v0.3.0-alpha.4 的 Virtual Media Pool 可保存不限数量的逻辑素材，并在生成时按 Segment 自动换入这些实体插槽：
 
 ```text
 video_minimax_h3_r2v_9image_3audio_3video_api.json
@@ -526,7 +527,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 5. Z-Image 工作流执行 `VRAM_Debug → RAMCleanup → VRAMCleanup`，程序随后请求 ComfyUI unload/free。
 6. LM Studio 根据原计划与 BLIP 结果完成最终 Director Design JSON。
 
-若 LM Studio 把空的 P1–P9 错写成现有素材，Studio 会把它自动修复成 Z-Image 请求，并优先放回原本的物理 Picture 栏位，不再阻止 Apply。若视觉 Shot 的图片请求为零或明显不足，Studio 会按约每 5 秒一个有效视觉状态自动补足，最多每个 Shot 一张且不会超过可用 Picture 容量；每张 Z-Image 遇到暂时性 ComfyUI 错误时会自动重试一次。
+若 LM Studio 把空的 P1–P9 错写成现有素材，Studio 会把它自动修复成 Z-Image 请求，不再阻止 Apply。若视觉 Shot 的图片请求为零或明显不足，Studio 会按约每 5 秒一个有效视觉状态自动补足，最多每个 Shot 一张；整个项目可以继续产生 P10+，但任一 Segment 同时激活的图片仍不可超过 9 张。每张 Z-Image 遇到暂时性 ComfyUI 错误时会自动重试一次。
 7. LM Studio 再次自动 unload。
 8. 点击 `Apply to H3 Workspace` 后关闭 thumbnail 视窗，把素材、时间范围、Shot、主题文字和提示词带回 H3 工作台。
 
@@ -534,21 +535,21 @@ H3_DESIGN_IMAGE_CFG=1.0
 
 ## Director Cut 工作区
 
-- Media Pool 会随面板宽度自动重排，素材使用 `P1 / V1 / A1` 简称。
+- Virtual Media Pool 固定每行显示三个素材卡片；调整面板宽度时三张卡片会同步缩放，不会自动增加为四列或更多列。紧凑标题栏以 `+I / +V / +A` 添加素材，完整说明可从 hover tooltip 查看。素材使用永久 `P1 / V1 / A1` 简称，并可继续加入 `P10+ / V4+ / A4+`；Design 缺少空卡时也会自动建立新的逻辑素材。
 - Recognition 检查器分为 `RAW ANALYSIS` 与 `AI SEMANTIC` 两页。后者可手动执行，也可开启 `AUTO AI SEMANTIC ENRICHMENT`，并复用 Design 当前选择的 LM Studio／Online GPT 服务与模型。
 - Media Pool 或 Timeline 素材执行 AI Enrich 时，对应 Media Pool 卡片会显示半透明 processing overlay；分析在后台执行，不会冻结主界面。
 - 只有拖入 Timeline 的素材才会连接并激活到 H3 workflow。
-- 同一个 Media Pool Source 可以重复拖入 Timeline。每次重复使用都是独立 Clip Instance，可分别调整时间、轨道、速度、Source In/Out、淡入淡出、转场及 Clip Prompt；它们仍共享同一份识别/AI Enrich 结果，而且只占用一个实体 H3 Picture／Video／Audio reference slot。
+- 同一个 Media Pool Source 可以重复拖入 Timeline。每次重复使用都是独立 Clip Instance，可分别调整时间、轨道、速度、Source In/Out、淡入淡出、转场及 Clip Prompt；它们仍共享同一份识别/AI Enrich 结果，而且在同一 Segment 内只装入一次实体 H3 Picture／Video／Audio reference slot。
 - Studio 与 Design 内统一使用不会改变的素材编号 `@P1 / @V1 / @A1`。每个生成 Segment 提交前，编译器才按该段实际激活的素材转换成 MiniMax H3 所需的 `<Picture N> / <Video N> / <Audio N>`；旧项目中的 angle-bracket 编号会按原始 Media Pool 编号安全迁移，未激活引用不会误指向别的素材。
 - Clip、Shot、Marker 与编辑范围仍以 `0.5s` 为一格执行 snap；播放头和 Program Monitor 播放滑杆不 snap，可按毫秒连续拖动。滑杆使用按下位置作为相对拖动锚点，不会在开始向左或向右时突然跳到端点；拖动期间画面 seek 会轻量 debounce，释放后精确落在所选时间。
 - 支持动态增加/删除 V 与 A 轨、多层视频合成、Opacity、Blend Mode、Mute、Solo、Volume、Pan、锁定和轨道高度。
-- AI Design 可按内容自动建立 V4/V5… 与 A4/A5… 编辑轨：画面／标题使用 V 轨，Dialogue、Voice-over、Lyrics 使用独立 A 轨。编辑轨最多 V16/A16；MiniMax H3 每个原生 15 秒任务仍遵守工作流的 9 Picture、3 Video、3 Audio 实体参考槽，并只选择该时间窗有关的素材。
+- AI Design 可按内容自动建立 V4/V5… 与 A4/A5… 编辑轨：画面／标题使用 V 轨，Dialogue、Voice-over、Lyrics 使用独立 A 轨。编辑轨最多 V16/A16；逻辑素材库没有 9/3/3 的项目总量上限，只有每个实际生成 Segment 仍遵守 9 Picture、3 Video、3 Audio 实体参考槽。
 - Clip 支持速度、源入点/出点、淡入淡出与转场。
 - Selection Tool 可移动 clip 及 Program Monitor 文字；Hand Tool 用于平移 Timeline。
 - Type Tool 支持 On-screen Text、Dialogue、Voice-over 与 Lyrics。On-screen Text 使用独立 V Track；Dialogue、Voice-over 与 Lyrics 是可见、可拖拽与可修剪的独立 A Track Clip，默认分别放在 `A4 Dialogue`、`A5 Voice-over`、`A6 Lyrics`。修改 Content Role 会自动迁移到正确轨道；旧 Project 中被误放在 V Track 的 Dialogue 也会在载入时自动修复。Dialogue 另有 Speaker、Language、Delivery、Lip Sync 和所属 Shot。
 - Design 输入中的带时间码 `对白／普通话对白／旁白／Lyrics／On-screen Text` 会在送入 LM Studio 前由确定性解析器建立逐字 `text_layers`；LM 第一次规划和 BLIP Refinement 都不能删除、改写或翻译这些内容。Qwen 会从故事、Shot 与素材证据判断实际说话角色：女声分配 `S1`，男声分配 `S2`，并跨 Shot 保持一致；若用户明确写了 S1／S2 则以用户指定为准。逐字保护器只保护文字和时间，不会再把 Qwen 的合法 Speaker 选择覆盖回默认 S1。
 - Design Requirement 标题同一排提供三种对白模式按钮：`Ori` = MiniMax H3 Native Dialogue、`Vox` = VoxCPM2 Local、`Etts` = Edge TTS。默认 `Ori`；按钮选择会随 Apply 成为当前项目设置并写入 `.env`。回到 Timeline 后仍可在主页 Settings 改换，不必重新进入 Design。
-- `Ori` 不建立 authored WAV，H3 Prompt 会从当前时间窗内的 `A4 Dialogue`／Type Clips 生成独立 `TIMELINE TYPE / DIALOGUE TRACK EVENTS`，每句只出现一次，按 Clip 的时间码、Speaker、Language、Delivery 和 Lip Sync 执行；逐字台词不再复制或混入 Shot Action Prompt。编辑 Dialogue Clip 会直接重新编译 Ori Prompt，并令对应 Segment 失效待重算。切换到 `Vox`／`Etts` 后，Preview／Run 会自动寻找空的实体 Audio slot、建立或重建 WAV、放回 Timeline 并逐音素同步；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 只使用项目 `models/VoxCPM2/` 的完整 snapshot、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
+- `Ori` 不建立 authored WAV，H3 Prompt 会从当前时间窗内的 `A4 Dialogue`／Type Clips 生成独立 `TIMELINE TYPE / DIALOGUE TRACK EVENTS`，每句只出现一次，按 Clip 的时间码、Speaker、Language、Delivery 和 Lip Sync 执行；逐字台词不再复制或混入 Shot Action Prompt。编辑 Dialogue Clip 会直接重新编译 Ori Prompt，并令对应 Segment 失效待重算。切换到 `Vox`／`Etts` 后，Preview／Run 会建立或重建逻辑 Audio 素材（必要时自动成为 A4+），放回 Timeline 并在当前 Segment 动态装入实体 Audio slot；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 只使用项目 `models/VoxCPM2/` 的完整 snapshot、按 Speaker 保持确定性 Voice Design，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会转用 Edge。Timeline 中修改对白、Speaker、时间或 Delivery 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
 - Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白期间环境声约降低 6 dB、配乐约降低 8 dB但不会静音；对白结束、转场或情绪节点会自然恢复。背景声音由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会复制、改写或再次朗读对白。
 - 每个 Shot 都会按照画面和已分析素材生成 `SHOT SPATIAL ACOUSTICS`：小房间／办公室使用短而较明亮的 `0.18–0.45s` 反射；普通室内使用中等扩散；大厅使用受控的 `0.9–1.8s` 长尾；走廊、楼梯间、洞穴使用有方向性的反射；车内使用极短软包空间反射；雨棚／摊位只保留附近屋顶、墙壁和柜台的 `0.12–0.32s` 短反射；户外则接近无混响、没有离散 Echo，并适度减少低中频饱满感。没有换地点的 Close-up／Cut 会继承上一 Shot 声场，真正换景时才平滑 crossfade。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
@@ -845,20 +846,21 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 .\ai_libraries_common\python_env\python.exe -m unittest -v test_standard_pipeline_regressions.py
 ```
 
-这四项标准测试固定检查：
+这五项标准测试固定检查：
 
-1. 稀疏 Picture / Video / Audio 素材的稳定 `P/V/A` 编号、Segment 局部编号、Prompt 标签与实际 H3 节点输入完全一致。
+1. 稀疏 Picture / Video / Audio 素材的稳定 `P/V/A` 编号、Segment 局部编号、Prompt 标签与实际 H3 节点输入完全一致；同时模拟项目由旧电脑盘符搬到新电脑，固定检查 PNG/WEBP 照片、WAV/其他音频及 MP4/其他视频会从当前 Project/Example folder 重新解析、重新上传并重写 Loader。
 2. AI Design Apply 后移动、改轨、改时间或改 Clip Prompt，会立即重绑重叠 Shot、更新 Creative Brief / H3 Prompt，并在 Undo / Redo 后保持一致。
 3. Picture / Video 只能落在 V Track，Audio 只能落在 A Track；错误的 Design track 请求及旧项目错误 lane 会被自动修正。
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。该项同时交叉验证小房间／大厅／户外／走廊空间声学不会跨段泄漏，Shot-local 声学编辑不会改变任何 P/V/A mapping。
+5. 后台找不到素材保护：普通 Preview/Run 与 Smart Render 都必须在上传、查询 `/object_info` 或提交 `/prompt` 之前拦截本机缺失的图片、声音和视频；当前 Segment 未使用的旧电脑 Loader（包括 Ori 模式遗留 authored WAV）必须从编译后的 workflow 移除，不能只在 ComfyUI 后台留下 `[Errno 2]` 警告。
 
-当前完整验证结果：**263 tests passed**；四项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
+当前完整验证结果：**269 tests passed**；五项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 263 tests
+Ran 269 tests
 OK
 ```

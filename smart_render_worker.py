@@ -26,11 +26,12 @@ from comfy_submit_worker import (
     upload_file,
     wait_for_history,
 )
+from workflow_engine import validate_portable_media_manifest
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 9
+SMART_RENDER_POLICY_VERSION = 11
 
 
 def emit(payload: dict) -> None:
@@ -300,6 +301,22 @@ def preflight_smart_render(job: dict) -> dict:
         raise FileNotFoundError(
             "Reference media is missing before ComfyUI upload. Re-link the "
             "Media Pool source or reopen the portable project folder:\n" + preview
+        )
+
+    manifest_rows = [
+        item for item in (job.get("media") or []) if isinstance(item, dict)
+    ]
+    for segment in segments:
+        continuity = segment.get("continuity") or {}
+        runtime_ids = (
+            {str(continuity.get("loader_node_id"))}
+            if continuity.get("loader_node_id")
+            else set()
+        )
+        validate_portable_media_manifest(
+            segment.get("workflow") or {},
+            manifest_rows,
+            runtime_loader_node_ids=runtime_ids,
         )
 
     output_parent = Path(job["master_output"]).parent

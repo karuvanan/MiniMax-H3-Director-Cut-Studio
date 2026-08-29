@@ -5,6 +5,7 @@ import unittest
 from workflow_engine import (
     assign_local_media,
     compile_active_workflow,
+    create_virtual_media_asset,
     effective_reference_assets,
     load_workflow,
     media_upload_manifest,
@@ -254,19 +255,21 @@ class WorkflowEngineTests(unittest.TestCase):
 
         compiled_workflow, compiled_assets = compile_active_workflow(scan, 20.0, 25.0)
         inputs = compiled_workflow[scan.h3_node_ids[0]]["inputs"]
-        self.assertEqual(inputs["ref_images.ref_image_0"], [pictures[3].node_id, 0])
-        self.assertEqual(inputs["ref_images.ref_image_1"], [pictures[6].node_id, 0])
+        # Stable P4/P7 identities are dynamically loaded into the first two
+        # physical image templates for this Segment.
+        self.assertEqual(inputs["ref_images.ref_image_0"], [pictures[0].node_id, 0])
+        self.assertEqual(inputs["ref_images.ref_image_1"], [pictures[1].node_id, 0])
         self.assertEqual(
             inputs["ref_videos.ref_video_0"],
-            scan.nodes[scan.h3_node_ids[0]]["inputs"][videos[1].binding],
+            scan.nodes[scan.h3_node_ids[0]]["inputs"][videos[0].binding],
         )
         self.assertEqual(
             inputs["ref_video_audios.ref_video_audio_0"],
-            scan.nodes[scan.h3_node_ids[0]]["inputs"][videos[1].paired_audio_binding],
+            scan.nodes[scan.h3_node_ids[0]]["inputs"][videos[0].paired_audio_binding],
         )
         self.assertEqual(
             inputs["ref_audios.ref_audio_0"],
-            scan.nodes[scan.h3_node_ids[0]]["inputs"][audios[2].binding],
+            scan.nodes[scan.h3_node_ids[0]]["inputs"][audios[0].binding],
         )
         self.assertNotIn("ref_images.ref_image_2", inputs)
         self.assertNotIn("ref_videos.ref_video_1", inputs)
@@ -287,6 +290,46 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertIn("[P1 reference is inactive in this segment]", compiled_prompt)
         self.assertIn("[V1 reference is inactive in this segment]", compiled_prompt)
         self.assertIn("[A1 reference is inactive in this segment]", compiled_prompt)
+
+    def test_virtual_pool_p10_v4_a4_are_loaded_per_segment(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        scan.duration_seconds = 30.0
+        p10 = create_virtual_media_asset(scan, "image")
+        v4 = create_virtual_media_asset(scan, "video")
+        a4 = create_virtual_media_asset(scan, "audio")
+        self.assertEqual((stable_reference_id(p10), stable_reference_id(v4), stable_reference_id(a4)), ("P10", "V4", "A4"))
+        self.assertEqual(scan.counts, {"image": 9, "video": 3, "audio": 3})
+        self.assertEqual(scan.logical_counts, {"image": 10, "video": 4, "audio": 4})
+
+        for asset in (p10, v4, a4):
+            asset.timeline_placed = True
+            asset.start_seconds = 15.0
+            asset.end_seconds = 30.0
+        compiled, active = compile_active_workflow(scan, 15.0, 30.0)
+        inputs = compiled[scan.h3_node_ids[0]]["inputs"]
+        self.assertIn("ref_images.ref_image_0", inputs)
+        self.assertIn("ref_videos.ref_video_0", inputs)
+        self.assertIn("ref_audios.ref_audio_0", inputs)
+        self.assertEqual({stable_reference_id(asset) for asset in active}, {"P10", "V4", "A4"})
+        effective, _ = effective_reference_assets(active)
+        prompt = remap_reference_tokens("Use @P10, @V4 and @A4.", scan.assets, effective)
+        self.assertIn("<Picture 1>", prompt)
+        self.assertIn("<Video 1>", prompt)
+        # V4 carries paired audio as Audio 1, so A4 is Audio 2.
+        self.assertIn("<Audio 2>", prompt)
+
+    def test_virtual_pool_rejects_more_than_nine_overlapping_images(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        p10 = create_virtual_media_asset(scan, "image")
+        for asset in [*pictures, p10]:
+            asset.timeline_placed = True
+            asset.start_seconds = 0.0
+            asset.end_seconds = 5.0
+        with self.assertRaisesRegex(ValueError, "supports only 9 physical image slots"):
+            compile_active_workflow(scan, 0.0, 5.0)
 
     def test_same_basename_uploads_receive_distinct_loader_names(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"

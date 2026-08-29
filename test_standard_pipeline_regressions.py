@@ -2,7 +2,7 @@
 
 Run this file before generating a new project whenever Timeline, Design,
 reference mapping, track handling or long-render continuity code changes.
-The four tests intentionally describe user-visible invariants instead of
+The five tests intentionally describe user-visible invariants instead of
 individual helper implementations.
 """
 
@@ -11,27 +11,38 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
+import comfy_submit_worker
 from design_engine import normalize_design_plan
 from director_cut_studio import (
     DirectorCue,
     DirectorCutStudio,
     media_shortcut,
+    resolve_project_media_path,
     timeline_state,
 )
 from test_design_engine import sample_design
 from runtime_paths import PROJECT_ROOT
-from workflow_engine import assign_local_media
+import smart_render_worker
+from workflow_engine import (
+    assign_local_media,
+    create_virtual_media_asset,
+    media_upload_manifest,
+    patch_media_upload_names,
+    validate_portable_media_manifest,
+)
 
 
 class StandardPipelineRegressions(unittest.TestCase):
-    """The small, mandatory release gate for the four highest-risk flows."""
+    """The small, mandatory release gate for the five highest-risk flows."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -64,18 +75,68 @@ class StandardPipelineRegressions(unittest.TestCase):
         window.close()
 
     def test_01_sparse_picture_video_audio_mapping_matches_executable_slots(self):
-        """Stable P/V/A IDs must compile to the exact request-local H3 slots."""
+        """P/V/A mapping and copied image/audio/video files must stay executable."""
 
         window = DirectorCutStudio()
         self.addCleanup(self._close, window)
+        portable_root = (
+            PROJECT_ROOT / ".director_cache" / "standard_release_gate_media"
+        )
+        portable_root.mkdir(parents=True, exist_ok=True)
         window._set_design_duration(30.0)
         pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
         videos = [asset for asset in window.scan.assets if asset.media_type == "video"]
         audios = [asset for asset in window.scan.assets if asset.media_type == "audio"]
+        p10 = create_virtual_media_asset(window.scan, "image")
+        v4 = create_virtual_media_asset(window.scan, "video")
+        a4 = create_virtual_media_asset(window.scan, "audio")
+        local_files = {
+            pictures[3].node_id: portable_root / "copied_subject.png",
+            pictures[6].node_id: portable_root / "copied_location.webp",
+            videos[1].node_id: portable_root / "copied_motion.mp4",
+            audios[2].node_id: portable_root / "copied_dialogue.wav",
+            p10.node_id: portable_root / "virtual_p10.png",
+            v4.node_id: portable_root / "virtual_v4.mp4",
+            a4.node_id: portable_root / "virtual_a4.wav",
+        }
+        for fixture in local_files.values():
+            self.addCleanup(fixture.unlink, missing_ok=True)
+        Image.new("RGB", (16, 16), (22, 44, 66)).save(
+            local_files[pictures[3].node_id]
+        )
+        Image.new("RGB", (16, 16), (66, 44, 22)).save(
+            local_files[pictures[6].node_id]
+        )
+        Image.new("RGB", (16, 16), (22, 66, 44)).save(local_files[p10.node_id])
+        local_files[videos[1].node_id].write_bytes(b"portable-video-fixture")
+        local_files[audios[2].node_id].write_bytes(b"portable-audio-fixture")
+        local_files[v4.node_id].write_bytes(b"virtual-video-fixture")
+        local_files[a4.node_id].write_bytes(b"virtual-audio-fixture")
+        for asset in (pictures[3], pictures[6], videos[1], audios[2], p10, v4, a4):
+            assign_local_media(window.scan, asset, local_files[asset.node_id])
+
+        # Simulate a project copied from an unavailable drive.  All supported
+        # media types must resolve beside the moved project by basename rather
+        # than retaining the former machine's absolute path.
+        moved_project = portable_root / "director_project.h3director.json"
+        old_root = Path("Z:/old-computer/example/portable_project")
+        for asset in (pictures[3], pictures[6], videos[1], audios[2], p10, v4, a4):
+            resolved = resolve_project_media_path(
+                moved_project,
+                {
+                    "filename": local_files[asset.node_id].name,
+                    "local_path": str(old_root / local_files[asset.node_id].name),
+                },
+                old_root,
+            )
+            self.assertEqual(resolved, local_files[asset.node_id].resolve())
         p4 = self._place(pictures[3], 0.0, 15.0, "V1", "Opening identity @P4.")
         p7 = self._place(pictures[6], 15.0, 30.0, "V2", "Later location @P7.")
         v2 = self._place(videos[1], 15.0, 30.0, "V3", "Follow @V2 motion.")
         a3 = self._place(audios[2], 15.0, 30.0, "A2", "Use @A3 sound.")
+        self._place(p10, 20.0, 30.0, "V1", "Virtual later reference @P10.")
+        self._place(v4, 20.0, 30.0, "V2", "Virtual motion @V4.")
+        self._place(a4, 20.0, 30.0, "A1", "Virtual sound @A4.")
 
         first, first_assets = window._compiled_window_job(
             0.0, 15.0, megapixels=0.2, seed=4101,
@@ -89,30 +150,59 @@ class StandardPipelineRegressions(unittest.TestCase):
         )[:2]
 
         self.assertEqual(first_assets, [p4])
-        self.assertEqual({media_shortcut(asset) for asset in second_assets}, {"P7", "V2", "A3"})
+        self.assertEqual(
+            {media_shortcut(asset) for asset in second_assets},
+            {"P7", "P10", "V2", "V4", "A3", "A4"},
+        )
         first_h3 = self._h3_inputs(window, first)
         second_h3 = self._h3_inputs(window, second)
-        self.assertEqual(first_h3["ref_images.ref_image_0"], [p4.node_id, 0])
-        self.assertEqual(second_h3["ref_images.ref_image_0"], [p7.node_id, 0])
+        self.assertEqual(first_h3["ref_images.ref_image_0"], [pictures[0].node_id, 0])
+        self.assertEqual(second_h3["ref_images.ref_image_0"], [pictures[0].node_id, 0])
+        self.assertEqual(second_h3["ref_images.ref_image_1"], [pictures[1].node_id, 0])
         self.assertEqual(
             second_h3["ref_videos.ref_video_0"],
-            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][v2.binding],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][videos[0].binding],
         )
         self.assertEqual(
             second_h3["ref_audios.ref_audio_0"],
-            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][a3.binding],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][audios[0].binding],
         )
-        self.assertNotIn("ref_images.ref_image_1", second_h3)
-        self.assertNotIn("ref_videos.ref_video_1", second_h3)
-        self.assertNotIn("ref_audios.ref_audio_1", second_h3)
+        self.assertIn("ref_videos.ref_video_1", second_h3)
+        self.assertIn("ref_audios.ref_audio_1", second_h3)
         first_prompt, second_prompt = self._prompt(first), self._prompt(second)
         self.assertIn("<Picture 1>", first_prompt)
         self.assertIn("<Picture 1>", second_prompt)
+        self.assertIn("<Picture 2>", second_prompt)
         self.assertIn("<Video 1>", second_prompt)
-        self.assertIn("<Audio 2>", second_prompt)
+        self.assertIn("<Video 2>", second_prompt)
+        self.assertIn("<Audio 3>", second_prompt)
+        self.assertIn("<Audio 4>", second_prompt)
         self.assertNotIn("@P", first_prompt + second_prompt)
         self.assertNotIn("@V", first_prompt + second_prompt)
         self.assertNotIn("@A", first_prompt + second_prompt)
+
+        first_uploads = media_upload_manifest(first_assets)
+        second_uploads = media_upload_manifest(second_assets)
+        patch_media_upload_names(first, first_uploads)
+        patch_media_upload_names(second, second_uploads)
+        validate_portable_media_manifest(first, first_uploads)
+        validate_portable_media_manifest(second, second_uploads)
+
+        # Ori/native dialogue and every other inactive pool slot must not carry
+        # a stale WAV/image/video widget into the compiled ComfyUI request.
+        stale_audio = audios[0]
+        window.scan.nodes[stale_audio.node_id]["inputs"]["audio"] = (
+            r"Z:\old-computer\ComfyUI\input\authored_timeline_dialogue_30.00s.wav"
+        )
+        stale_audio.local_path = ""
+        stale_audio.timeline_placed = False
+        native_workflow = window._compiled_window_job(
+            0.0, 15.0, megapixels=0.2, seed=4103,
+            enable_rtx_vsr=False, is_final_window=False,
+            continuity_mode="none",
+        )[0]
+        self.assertNotIn(stale_audio.node_id, native_workflow)
+        self.assertNotIn("old-computer", json.dumps(native_workflow))
 
     def test_02_design_apply_then_media_move_reconciles_shots_and_prompt(self):
         """A post-Design clip edit must immediately become Timeline truth."""
@@ -291,6 +381,21 @@ class StandardPipelineRegressions(unittest.TestCase):
             asset.timeline_placed = False
         pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
         videos = [asset for asset in window.scan.assets if asset.media_type == "video"]
+        media_root = (
+            PROJECT_ROOT / ".director_cache" / "standard_release_gate_segments"
+        )
+        media_root.mkdir(parents=True, exist_ok=True)
+        for index, asset in enumerate(
+            (pictures[3], pictures[6], pictures[8], videos[1], videos[2]), 1
+        ):
+            suffix = ".mp4" if asset.media_type == "video" else ".png"
+            fixture = media_root / f"{asset.media_type}_{index}{suffix}"
+            if asset.media_type == "image":
+                Image.new("RGB", (16, 16), (index * 20, 30, 40)).save(fixture)
+            else:
+                fixture.write_bytes(b"portable-segment-video")
+            self.addCleanup(fixture.unlink, missing_ok=True)
+            assign_local_media(window.scan, asset, fixture)
         self._place(pictures[3], 0.0, 15.0, "V1", "Phase one identity @P4.")
         self._place(pictures[6], 15.0, 30.0, "V1", "Phase two location @P7.")
         self._place(pictures[8], 30.0, 45.0, "V1", "Phase three finish @P9.")
@@ -406,7 +511,7 @@ class StandardPipelineRegressions(unittest.TestCase):
             self.assertNotIn("ref_videos.ref_video_1", h3)
             self.assertEqual(
                 h3["ref_videos.ref_video_0"],
-                window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][active_video.binding],
+                window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][videos[0].binding],
             )
 
         # A Shot-local acoustic edit must change only its own Segment prompt and
@@ -469,6 +574,129 @@ class StandardPipelineRegressions(unittest.TestCase):
         edited_prompts = [self._prompt(row["workflow"]) for row in edited["segments"]]
         self.assertIn("corridor or stairwell", edited_prompts[1])
         self.assertNotIn("corridor or stairwell", edited_prompts[0] + edited_prompts[2])
+
+    def test_05_backend_rejects_missing_or_stale_media_before_comfyui_queue(self):
+        """No missing cross-computer media or inactive Loader may reach Queue."""
+
+        gate_root = PROJECT_ROOT / ".director_cache" / "standard_release_gate_backend"
+        gate_root.mkdir(parents=True, exist_ok=True)
+
+        # Compiling a Segment must prune every inactive physical Loader even if
+        # a reopened project still contains an absolute path from another PC.
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        stale_assets = {
+            media_type: next(
+                asset
+                for asset in window.scan.assets
+                if asset.media_type == media_type and not asset.is_virtual
+            )
+            for media_type in ("image", "audio", "video")
+        }
+        old_paths = {
+            "image": r"Z:\old-computer\ComfyUI\input\missing_subject.png",
+            "audio": r"Z:\old-computer\ComfyUI\input\missing_dialogue.wav",
+            "video": r"Z:\old-computer\ComfyUI\input\missing_motion.mp4",
+        }
+        loader_inputs = {"image": "image", "audio": "audio", "video": "file"}
+        for media_type, asset in stale_assets.items():
+            asset.local_path = ""
+            asset.timeline_placed = False
+            asset.timeline_track_id = ""
+            loader_input = loader_inputs[media_type]
+            window.scan.nodes[asset.node_id]["inputs"][loader_input] = old_paths[media_type]
+        compiled = window._compiled_window_job(
+            0.0, 5.0, megapixels=0.2, seed=4501,
+            enable_rtx_vsr=False, is_final_window=True,
+            continuity_mode="none",
+        )[0]
+        compiled_json = json.dumps(compiled, ensure_ascii=False)
+        self.assertNotIn("old-computer", compiled_json)
+        for asset in stale_assets.values():
+            self.assertNotIn(asset.node_id, compiled)
+
+        # PNG/WEBP, WAV/audio and MP4/video must all fail in the ordinary
+        # Preview/Run worker before upload or /prompt can be contacted.
+        loader_cases = (
+            ("LoadImage", "image", "image", ".png"),
+            ("LoadAudio", "audio", "audio", ".wav"),
+            ("LoadVideo", "video", "file", ".mp4"),
+        )
+        for class_type, media_type, loader_input, suffix in loader_cases:
+            missing = gate_root / f"missing_{media_type}{suffix}"
+            missing.unlink(missing_ok=True)
+            upload_name = f"h3ref_{media_type}_999_missing{suffix}"
+            workflow = {
+                "999": {
+                    "class_type": class_type,
+                    "inputs": {loader_input: upload_name},
+                }
+            }
+            manifest = [{
+                "path": str(missing),
+                "loader_node_id": "999",
+                "loader_input": loader_input,
+                "upload_name": upload_name,
+            }]
+
+            # Keep a direct contract assertion so an error-message or worker
+            # refactor cannot silently weaken the shared validator.
+            with self.subTest(worker="manifest", media_type=media_type):
+                with self.assertRaisesRegex(
+                    FileNotFoundError, "missing on this computer"
+                ):
+                    validate_portable_media_manifest(workflow, manifest)
+
+            ordinary_job_path = gate_root / f"ordinary_missing_{media_type}.json"
+            ordinary_job_path.write_text(
+                json.dumps({
+                    "server": "http://127.0.0.1:8188",
+                    "http_timeout": 1,
+                    "wait_for_completion": False,
+                    "workflow": workflow,
+                    "media": manifest,
+                }),
+                encoding="utf-8",
+            )
+            self.addCleanup(ordinary_job_path.unlink, missing_ok=True)
+            with self.subTest(worker="preview_run", media_type=media_type):
+                with (
+                    patch.object(comfy_submit_worker, "upload_file") as upload_mock,
+                    patch.object(comfy_submit_worker, "_request_json") as request_mock,
+                    patch.object(sys, "argv", ["comfy_submit_worker.py", str(ordinary_job_path)]),
+                ):
+                    with self.assertRaises(FileNotFoundError):
+                        comfy_submit_worker.main()
+                    upload_mock.assert_not_called()
+                    request_mock.assert_not_called()
+
+            # Smart Render must stop during preflight, before object_info,
+            # upload or any Segment queue operation can start.
+            smart_job = {
+                "server": "http://127.0.0.1:8188",
+                "http_timeout": 1,
+                "ffmpeg": str(Path(smart_render_worker.__file__).resolve()),
+                "ffprobe": str(Path(smart_render_worker.__file__).resolve()),
+                "master_output": str(gate_root / f"missing_{media_type}_master.mp4"),
+                "media": manifest,
+                "segments": [
+                    {
+                        "index": index,
+                        "start_seconds": float(index * 5),
+                        "end_seconds": float((index + 1) * 5),
+                        "workflow": workflow,
+                        "continuity": {},
+                    }
+                    for index in range(2)
+                ],
+            }
+            with self.subTest(worker="smart_render", media_type=media_type):
+                with patch.object(smart_render_worker, "_request_json") as request_mock:
+                    with self.assertRaisesRegex(
+                        FileNotFoundError, "missing before ComfyUI upload"
+                    ):
+                        smart_render_worker.preflight_smart_render(smart_job)
+                    request_mock.assert_not_called()
 
 
 if __name__ == "__main__":

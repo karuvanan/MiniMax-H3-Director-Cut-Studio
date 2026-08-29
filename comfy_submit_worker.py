@@ -14,6 +14,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from workflow_engine import validate_portable_media_manifest
+
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -170,6 +172,10 @@ def main() -> int:
     if job.get("action") == "test_connection":
         print(json.dumps(test_connection(server, http_timeout), ensure_ascii=False), flush=True)
         return 0
+    validate_portable_media_manifest(
+        job.get("workflow") or {},
+        [item for item in (job.get("media") or []) if isinstance(item, dict)],
+    )
     uploaded: list[dict] = []
     seen_uploads: set[tuple[str, str]] = set()
     for item in job.get("media", []):

@@ -61,6 +61,15 @@ class MediaAsset:
     # physical ComfyUI loader/reference slot.
     clip_id: str = ""
     source_node_id: str = ""
+    # Permanent editor identity (P1/P10, V1/V4, A1/A4).  It is deliberately
+    # independent from the finite ComfyUI loader selected for one request.
+    reference_id: str = ""
+    is_virtual: bool = False
+    # Request-local physical allocation.  These fields are populated only on
+    # the clones returned by compile_active_workflow().
+    request_loader_node_id: str = field(default="", compare=False, repr=False)
+    request_binding: str = field(default="", compare=False, repr=False)
+    request_paired_audio_binding: str = field(default="", compare=False, repr=False)
 
     def overlaps(self, clip_start: float, clip_end: float) -> bool:
         """Return whether this reference participates in the current generation clip."""
@@ -69,7 +78,7 @@ class MediaAsset:
             or not self.timeline_placed
             or self.activation_mode == "bypass"
             or self.state != "active"
-            or self.binding == "unassigned"
+            or (not self.is_virtual and self.binding == "unassigned")
         ):
             return False
         if self.activation_mode == "active":
@@ -89,10 +98,24 @@ class WorkflowScan:
 
     @property
     def counts(self) -> dict[str, int]:
+        """Return physical H3 execution capacity, not logical pool size."""
+        return {
+            kind: sum(asset.media_type == kind and not asset.is_virtual for asset in self.assets)
+            for kind in ("image", "video", "audio")
+        }
+
+    @property
+    def logical_counts(self) -> dict[str, int]:
         return {
             kind: sum(asset.media_type == kind for asset in self.assets)
             for kind in ("image", "video", "audio")
         }
+
+    def physical_assets(self, media_type: str = "") -> list[MediaAsset]:
+        return [
+            asset for asset in self.assets
+            if not asset.is_virtual and (not media_type or asset.media_type == media_type)
+        ]
 
     def active_assets(self, clip_start: float, clip_end: float) -> list[MediaAsset]:
         return [asset for asset in self.timeline_assets() if asset.overlaps(clip_start, clip_end)]
@@ -309,6 +332,65 @@ def _discover_assets(scan: WorkflowScan) -> None:
 
     order = {"image": 0, "video": 1, "audio": 2}
     scan.assets.sort(key=lambda item: (order.get(item.media_type, 9), item.tag, int(item.node_id) if item.node_id.isdigit() else item.node_id))
+    for asset in scan.assets:
+        asset.reference_id = stable_reference_id(asset)
+
+
+def create_virtual_media_asset(
+    scan: WorkflowScan,
+    media_type: str,
+    *,
+    reference_id: str = "",
+    node_id: str = "",
+) -> MediaAsset:
+    """Create an unlimited logical Media Pool source.
+
+    Virtual assets never add nodes to ``scan.nodes``.  A physical LoadImage,
+    LoadVideo or LoadAudio template is assigned only while a Segment request
+    is compiled.
+    """
+    media_type = str(media_type).strip().lower()
+    prefixes = {"image": "P", "video": "V", "audio": "A"}
+    classes = {"image": "LoadImage", "video": "LoadVideo", "audio": "LoadAudio"}
+    labels = {"image": "Picture", "video": "Video", "audio": "Audio"}
+    if media_type not in prefixes:
+        raise ValueError(f"Unsupported virtual media type: {media_type}")
+    prefix = prefixes[media_type]
+    used_numbers = []
+    for asset in scan.assets:
+        stable_id = stable_reference_id(asset)
+        match = re.fullmatch(rf"{prefix}(\d+)", stable_id, flags=re.IGNORECASE)
+        if match:
+            used_numbers.append(int(match.group(1)))
+    if not reference_id:
+        reference_id = f"{prefix}{max(used_numbers, default=0) + 1}"
+    reference_id = reference_id.upper()
+    if any(stable_reference_id(item).upper() == reference_id for item in scan.assets):
+        raise ValueError(f"Duplicate Media Pool reference ID: {reference_id}")
+    number_match = re.fullmatch(rf"{prefix}(\d+)", reference_id)
+    if not number_match:
+        raise ValueError(f"Invalid {media_type} reference ID: {reference_id}")
+    number = int(number_match.group(1))
+    if not node_id:
+        node_id = f"virtual-{media_type}-{number}"
+        suffix = 2
+        while any(item.node_id == node_id for item in scan.assets):
+            node_id = f"virtual-{media_type}-{number}-{suffix}"
+            suffix += 1
+    asset = MediaAsset(
+        node_id=node_id,
+        class_type=classes[media_type],
+        media_type=media_type,
+        filename="",
+        tag=f"<{labels[media_type]} {number}>",
+        binding="virtual",
+        paired_audio_binding="virtual" if media_type == "video" else "",
+        reference_id=reference_id,
+        is_virtual=True,
+        end_seconds=scan.duration_seconds,
+    )
+    scan.assets.append(asset)
+    return asset
 
 
 def _add_warnings(scan: WorkflowScan) -> None:
@@ -481,12 +563,13 @@ def compile_active_workflow(
     clip_end: float | None = None,
     prompt: str | None = None,
     generation: dict[str, Any] | None = None,
+    preserve_loader_node_ids: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[MediaAsset]]:
     """Compile a copy containing only references relevant to a generation time window.
 
-    The source workflow is never mutated. Inactive loader nodes may remain in the
-    JSON, but their H3 reference connections are removed, so ComfyUI will not
-    execute them as part of the output graph.
+    The source workflow is never mutated. Inactive H3 connections and their
+    physical media loaders are removed from the request copy, preventing stale
+    filenames from a previous computer from reaching ComfyUI validation.
     """
     if clip_end is None:
         clip_end = scan.duration_seconds
@@ -494,18 +577,144 @@ def compile_active_workflow(
         raise ValueError("生成时间窗必须满足 0 ≤ 开始时间 < 结束时间。")
 
     compiled = deepcopy(scan.nodes)
-    active_assets = scan.active_assets(clip_start, clip_end)
-    active_bindings: set[str] = set()
-    for asset in active_assets:
-        active_bindings.add(asset.binding)
-        if asset.paired_audio_binding:
-            active_bindings.add(asset.paired_audio_binding)
+    active_source_assets = scan.active_assets(clip_start, clip_end)
+    # Preserve the editor objects in the return value for Timeline selection,
+    # Undo/Redo and repeated-use compatibility. Request allocation metadata is
+    # transient and excluded from equality/serialization semantics.
+    active_assets = list(active_source_assets)
+    preserved_loader_ids = {
+        str(value) for value in (preserve_loader_node_ids or set()) if str(value)
+    }
 
+    def binding_index(asset: MediaAsset) -> int:
+        match = re.search(r"_(\d+)$", asset.binding)
+        return int(match.group(1)) if match else 10_000
+
+    physical_by_type = {
+        kind: sorted(
+            (
+                asset for asset in scan.physical_assets(kind)
+                if asset.binding != "unassigned"
+                and str(asset.node_id) not in preserved_loader_ids
+            ),
+            key=binding_index,
+        )
+        for kind in ("image", "video", "audio")
+    }
+
+    def logical_key(asset: MediaAsset) -> tuple[str, str]:
+        stable_id = stable_reference_id(asset)
+        fallback = str(asset.source_node_id or asset.node_id)
+        return asset.media_type, stable_id if "?" not in stable_id else fallback
+
+    representatives: dict[tuple[str, str], MediaAsset] = {}
+    for asset in active_assets:
+        representatives.setdefault(logical_key(asset), asset)
+
+    allocated: dict[tuple[str, str], MediaAsset] = {}
+    for kind in ("image", "video", "audio"):
+        logical_rows = [
+            (key, asset) for key, asset in representatives.items() if key[0] == kind
+        ]
+
+        def logical_number(row: tuple[tuple[str, str], MediaAsset]) -> tuple[int, str]:
+            match = re.search(r"(\d+)$", stable_reference_id(row[1]))
+            return (int(match.group(1)) if match else 10_000, row[0][1])
+
+        logical_rows.sort(key=logical_number)
+        templates = physical_by_type[kind]
+        if len(logical_rows) > len(templates):
+            ids = ", ".join(stable_reference_id(row[1]) for row in logical_rows)
+            raise ValueError(
+                f"Segment {clip_start:.2f}-{clip_end:.2f}s uses {len(logical_rows)} "
+                f"unique {kind} references ({ids}), but H3 supports only "
+                f"{len(templates)} physical {kind} slots in one request. "
+                "Shorten/split the Segment or move references so fewer overlap."
+            )
+        for (key, source), template in zip(logical_rows, templates):
+            source.request_loader_node_id = template.node_id
+            source.request_binding = template.binding
+            source.request_paired_audio_binding = (
+                template.paired_audio_binding
+                if kind == "video" and source.paired_audio_binding
+                else ""
+            )
+            allocated[key] = source
+
+    for asset in active_assets:
+        request = allocated[logical_key(asset)]
+        asset.request_loader_node_id = request.request_loader_node_id
+        asset.request_binding = request.request_binding
+        asset.request_paired_audio_binding = request.request_paired_audio_binding
+
+    # Rebuild every H3 reference list exclusively from this Segment's dynamic
+    # allocation.  The permanent P/A/V number never leaks into physical slots.
     for h3_id in scan.h3_node_ids:
         inputs = compiled[h3_id].setdefault("inputs", {})
+        source_inputs = (scan.nodes.get(h3_id, {}).get("inputs") or {})
         for input_name in list(inputs):
-            if input_name.startswith(REFERENCE_INPUT_PREFIXES) and input_name not in active_bindings:
+            if input_name.startswith(REFERENCE_INPUT_PREFIXES):
                 inputs.pop(input_name)
+        for request in allocated.values():
+            if request.request_binding in source_inputs:
+                inputs[request.request_binding] = deepcopy(source_inputs[request.request_binding])
+            if (
+                request.request_paired_audio_binding
+                and request.request_paired_audio_binding in source_inputs
+            ):
+                inputs[request.request_paired_audio_binding] = deepcopy(
+                    source_inputs[request.request_paired_audio_binding]
+                )
+
+    # Fill the allocated physical loader widgets from the logical source.  The
+    # collision-safe upload pass replaces this basename before submission.
+    allocated_loader_ids: set[str] = set()
+    for request in allocated.values():
+        loader_id = str(request.request_loader_node_id)
+        allocated_loader_ids.add(loader_id)
+        loader = compiled.get(loader_id)
+        if not isinstance(loader, dict):
+            raise KeyError(f"Missing physical loader template {loader_id}")
+        field_name = MEDIA_LOADERS.get(
+            str(loader.get("class_type", "")), (request.media_type, "file")
+        )[1]
+        loader.setdefault("inputs", {})[field_name] = request.filename
+
+    # API-format workflows keep every Media Pool loader in the JSON.  After a
+    # project is copied to another computer those inactive widgets can still
+    # contain a filename from the previous ComfyUI input folder.  Some custom
+    # nodes validate those orphan widgets even though H3 no longer consumes
+    # them, producing misleading "No such file or directory" warnings (and,
+    # for authored TTS, potentially reconnecting stale speech).  Keep only the
+    # physical loaders used by this request.  A hidden continuity loader may
+    # be explicitly preserved because the Smart Render worker fills it with
+    # the preceding segment's freshly extracted 24-frame tail at runtime.
+    active_loader_ids = set(allocated_loader_ids)
+    active_loader_ids.update(preserved_loader_ids)
+    inactive_loader_ids = {
+        str(asset.node_id)
+        for asset in scan.physical_assets()
+        if asset.class_type in MEDIA_LOADERS and str(asset.node_id) not in active_loader_ids
+    }
+    for node_id in inactive_loader_ids:
+        compiled.pop(node_id, None)
+
+    # LoadVideo is normally consumed through GetVideoComponents.  Remove the
+    # now-orphan component node too, otherwise ComfyUI can reject its missing
+    # required input even when both H3 video/audio bindings were disconnected.
+    orphan_components: set[str] = set()
+    for node_id, node in compiled.items():
+        if node.get("class_type") != "GetVideoComponents":
+            continue
+        video_input = (node.get("inputs") or {}).get("video")
+        if (
+            isinstance(video_input, list)
+            and len(video_input) == 2
+            and str(video_input[0]) in inactive_loader_ids
+        ):
+            orphan_components.add(str(node_id))
+    for node_id in orphan_components:
+        compiled.pop(node_id, None)
 
     # Prompt ordinals are request-local, so the executable graph must use the
     # same contiguous ordering.  Asset objects deliberately retain their
@@ -554,7 +763,7 @@ def effective_reference_assets(
     clones = [deepcopy(asset) for asset in assets]
 
     def binding_index(asset: MediaAsset) -> int:
-        match = re.search(r"_(\d+)$", asset.binding)
+        match = re.search(r"_(\d+)$", asset.request_binding or asset.binding)
         return int(match.group(1)) if match else 10_000
 
     extra_tag = ""
@@ -564,7 +773,7 @@ def effective_reference_assets(
         for asset in clones:
             if asset.media_type != kind:
                 continue
-            key = (asset.source_node_id or asset.node_id, asset.binding)
+            key = _reference_source_key(asset)[1:]
             groups.setdefault(key, []).append(asset)
         return [
             (binding_index(group[0]), group)
@@ -614,6 +823,8 @@ def stable_reference_id(asset: MediaAsset) -> str:
     it cannot be used as an editor identity.  The physical H3 binding remains
     stable and is also shared by repeated Timeline Clip Instances.
     """
+    if asset.reference_id:
+        return str(asset.reference_id).upper()
     prefixes = {"image": "P", "video": "V", "audio": "A"}
     prefix = prefixes.get(asset.media_type, "M")
     binding_patterns = {
@@ -629,10 +840,14 @@ def stable_reference_id(asset: MediaAsset) -> str:
 
 
 def _reference_source_key(asset: MediaAsset) -> tuple[str, str, str]:
+    stable_id = stable_reference_id(asset)
+    logical_id = (
+        stable_id if "?" not in stable_id else asset.source_node_id or asset.node_id
+    )
     return (
         asset.media_type,
-        asset.source_node_id or asset.node_id,
-        asset.binding,
+        logical_id,
+        logical_id,
     )
 
 
@@ -654,7 +869,10 @@ def paired_audio_reference_tags(
         groups.setdefault(_reference_source_key(asset), asset)
 
     def binding_index(asset: MediaAsset) -> int:
-        match = re.search(r"_(\d+)$", asset.paired_audio_binding)
+        match = re.search(
+            r"_(\d+)$",
+            asset.request_paired_audio_binding or asset.paired_audio_binding,
+        )
         return int(match.group(1)) if match else 10_000
 
     return {
@@ -758,16 +976,18 @@ def media_upload_manifest(assets: list[MediaAsset]) -> list[dict[str, str]]:
         if not local_path:
             continue
         source_node_id = str(asset.source_node_id or asset.node_id)
-        key = (asset.media_type, source_node_id)
+        logical_id = stable_reference_id(asset)
+        key = (asset.media_type, logical_id if "?" not in logical_id else source_node_id)
         if key in rows:
             continue
+        loader_node_id = str(asset.request_loader_node_id or source_node_id)
         basename = Path(local_path).name
-        safe_node = re.sub(r"[^A-Za-z0-9_-]+", "_", source_node_id).strip("_") or "node"
+        safe_node = re.sub(r"[^A-Za-z0-9_-]+", "_", logical_id).strip("_") or "node"
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", basename).strip("_") or "media"
         upload_name = f"h3ref_{asset.media_type}_{safe_node}_{safe_name}"
         rows[key] = {
             "path": local_path,
-            "loader_node_id": source_node_id,
+            "loader_node_id": loader_node_id,
             "loader_input": loader_inputs.get(asset.media_type, "file"),
             "upload_name": upload_name,
         }
@@ -786,6 +1006,77 @@ def patch_media_upload_names(
         if not isinstance(node, dict) or not upload_name or not loader_input:
             continue
         node.setdefault("inputs", {})[loader_input] = upload_name
+
+
+def validate_portable_media_manifest(
+    workflow: dict[str, dict[str, Any]],
+    uploads: list[dict[str, str]],
+    *,
+    runtime_loader_node_ids: set[str] | None = None,
+) -> None:
+    """Reject stale/missing cross-computer media before ComfyUI is queued.
+
+    Every remaining image, audio or video loader must be backed by a real local
+    file and must already point at the deterministic upload name.  Runtime
+    continuity loaders are the sole exception: the Smart Render worker creates
+    and uploads their 24-frame video immediately before the segment is queued.
+    """
+    runtime_ids = {
+        str(value) for value in (runtime_loader_node_ids or set()) if str(value)
+    }
+    rows: dict[tuple[str, str], dict[str, str]] = {}
+    missing_paths: list[str] = []
+    for row in uploads:
+        loader_id = str(row.get("loader_node_id", "")).strip()
+        loader_input = str(row.get("loader_input", "")).strip()
+        path_text = str(row.get("path", "")).strip()
+        upload_name = str(row.get("upload_name", "")).strip()
+        if not loader_id or not loader_input or not path_text or not upload_name:
+            raise ValueError("A media upload manifest row is incomplete.")
+        if Path(upload_name).name != upload_name:
+            raise ValueError(
+                f"Unsafe ComfyUI upload name for media loader {loader_id}: {upload_name}"
+            )
+        path = Path(path_text)
+        if not path.is_file():
+            missing_paths.append(path_text)
+        rows[(loader_id, loader_input)] = row
+    if missing_paths:
+        raise FileNotFoundError(
+            "Reference media is missing on this computer before ComfyUI upload. "
+            "Re-link the Media Pool source or copy the complete project/example folder:\n"
+            + "\n".join(missing_paths[:12])
+        )
+
+    unbacked: list[str] = []
+    stale: list[str] = []
+    for node_id, node in workflow.items():
+        class_type = str(node.get("class_type", ""))
+        loader = MEDIA_LOADERS.get(class_type)
+        if loader is None or str(node_id) in runtime_ids:
+            continue
+        media_type, loader_input = loader
+        row = rows.get((str(node_id), loader_input))
+        if row is None:
+            value = str((node.get("inputs") or {}).get(loader_input, "")).strip()
+            unbacked.append(
+                f"{media_type} loader {node_id} ({value or 'empty filename'})"
+            )
+            continue
+        expected = str(row["upload_name"])
+        actual = str((node.get("inputs") or {}).get(loader_input, "")).strip()
+        if actual != expected:
+            stale.append(f"loader {node_id}: {actual or '<empty>'} -> {expected}")
+    if unbacked:
+        raise FileNotFoundError(
+            "Compiled workflow still contains media loaders that have no local "
+            "upload on this computer:\n" + "\n".join(unbacked[:12])
+        )
+    if stale:
+        raise ValueError(
+            "Compiled workflow contains stale media filenames instead of the "
+            "current upload names:\n" + "\n".join(stale[:12])
+        )
 
 
 def timed_reference_rules(assets: list[MediaAsset]) -> tuple[str, str]:
@@ -821,15 +1112,16 @@ def assign_local_media(scan: WorkflowScan, asset: MediaAsset, path: str | Path) 
         asset.semantic_enrichment_model = ""
         asset.semantic_enrichment_updated_at = ""
     node = scan.nodes.get(asset.node_id)
-    if node is None:
+    if node is not None:
+        field_name = MEDIA_LOADERS.get(asset.class_type, (asset.media_type, "file"))[1]
+        if asset.media_type == "image":
+            field_name = "image"
+        elif asset.media_type == "audio":
+            field_name = "audio"
+        elif asset.media_type == "video":
+            field_name = "file"
+        node.setdefault("inputs", {})[field_name] = local_path.name
+    elif not asset.is_virtual:
         raise KeyError(f"Unknown media node: {asset.node_id}")
-    field_name = MEDIA_LOADERS.get(asset.class_type, (asset.media_type, "file"))[1]
-    if asset.media_type == "image":
-        field_name = "image"
-    elif asset.media_type == "audio":
-        field_name = "audio"
-    elif asset.media_type == "video":
-        field_name = "file"
-    node.setdefault("inputs", {})[field_name] = local_path.name
     asset.local_path = str(local_path)
     asset.filename = local_path.name

@@ -2,6 +2,95 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.0-alpha.4] - 2026-08-29
+
+### Changed
+
+- Restored the compact legacy Media Pool header proportions while retaining Virtual Media Pool support.
+- Reduced the header typography and padding, compacted logical/Segment totals, and replaced `+ IMAGE / + VIDEO / + AUDIO` with same-row `+I / +V / +A` buttons. Full descriptions remain available through hover tooltips.
+
+### Verification
+
+- Added UI assertions for the compact labels, fixed 30px controls and reduced header typography together with the fixed three-column material grid.
+- All `94` Timeline/UI tests and all five Standard Pipeline Release Gates pass.
+- Project format remains `18` and Smart Render policy remains `11`.
+
+## [0.3.0-alpha.3] - 2026-08-29
+
+### Changed
+
+- Media Pool now uses exactly three material cards per complete row. Resizing the panel changes card width without silently increasing the grid to four or more columns.
+
+### Verification
+
+- Updated the Media Pool UI regression to require columns `0, 1, 2` at default, narrow and wide panel sizes.
+- All `94` Timeline/UI tests and all five Standard Pipeline Release Gates pass.
+- Project format remains `18` and Smart Render policy remains `11`.
+
+## [0.3.0-alpha.2] - 2026-08-29
+
+### Changed
+
+- Media Pool now opens in a three-column layout by default, using larger cards for easier visual identification.
+- Responsive reflow remains enabled: a narrow panel can use two columns, while widening the panel continues to add columns automatically.
+
+### Verification
+
+- Added a UI regression assertion for the default three-column layout while retaining narrow- and wide-panel reflow coverage.
+- All `94` Timeline/UI tests and all five Standard Pipeline Release Gates pass.
+- Project format remains `18` and Smart Render policy remains `11`.
+
+## [0.3.0-alpha.1] - 2026-08-29
+
+### Added
+
+- Promoted cross-computer missing-media protection into the independent fifth mandatory Standard Pipeline Release Gate.
+- Gate 5 now verifies PNG/WEBP pictures, WAV/other audio and MP4/other video across both ordinary Preview/Run and Smart Render. A missing local source must stop before upload, `/object_info` or `/prompt`, and inactive LoadImage/LoadAudio/LoadVideo nodes containing stale paths from another computer must be absent from the compiled Segment workflow.
+
+### Verification
+
+- All five mandatory Standard Pipeline Release Gates pass.
+- All `14` bundled test modules pass independently: `269 tests` total. The Program Monitor Qt Multimedia smoke test also passes when rerun directly.
+- Project format remains `18` and Smart Render policy remains `11`; this patch adds release verification and documentation without changing saved-project compatibility or render-cache semantics.
+
+## [0.3.0-alpha] - 2026-08-29
+
+### Added
+
+- Introduced the unlimited Virtual Media Pool. Projects may now own stable `P10+`, `V4+` and `A4+` logical sources while the existing ComfyUI workflow remains the per-Segment execution backend with 9 image, 3 video and 3 audio loader templates.
+- Added `+ IMAGE`, `+ VIDEO` and `+ AUDIO` controls to the Media Pool. AI Director Design and authored TTS also create a new logical source automatically when every original workflow card is occupied.
+- Added deterministic Segment allocation: active logical sources are sorted by permanent `P/V/A` identity, assigned to free physical loaders, uploaded under collision-safe names and compiled into request-local H3 ordinals. Permanent Media Pool IDs never change when a physical loader changes.
+- Added pre-generation capacity validation. The project library is unlimited, but a time interval that exceeds the current workflow's physical 9/3/3 Segment capacity is rejected with the exact interval and media type before Z-Image/TTS/H3 work begins.
+
+### Changed
+
+- Design planning no longer treats empty workflow Loader cards as a project-wide generation ceiling. Long designs can create different reference sets for later Segments, and the Design prompt now distinguishes unlimited logical media from per-Segment physical capacity.
+- Smart Render continuity reserves its 24-frame motion loader after dynamic allocation and, when necessary, releases only one eligible automatic video reference for that request. User references and the hidden continuity video cannot collide.
+- Director Project format is now `18`, persisting logical source type, permanent reference ID and virtual-source status. Existing format-17 projects remain loadable; v0.3 projects containing P10+/V4+/A4+ require this or a later Studio version.
+- Smart Render policy version is now `11`, invalidating Segment caches compiled with physical-loader-owned media identity.
+
+### Verification
+
+- Expanded Standard Pipeline Release Gate 1 to compile and validate P10, V4 and A4 together with sparse legacy P7/V2/A3 references, including copied-file rebasing, upload manifests and physical Loader alignment.
+- Added virtual-pool regressions for per-Segment P10/V4/A4 remapping, more-than-nine overlapping-image rejection, repeated logical sources and format-18 project save/reload.
+- All four mandatory Standard Pipeline Release Gates pass. The complete bundled suite passes `268` tests.
+
+## [0.2.6-alpha.2] - 2026-08-28
+
+### Fixed
+
+- Removed inactive image, audio and video loader branches from every compiled H3 request, so an old computer's ComfyUI `input` filename can no longer leak into a reopened project's Preview/Run. This specifically fixes stale `authored_timeline_dialogue_*.wav` warnings when Ori / MiniMax H3 Native Dialogue is selected.
+- Added a universal pre-Queue portability check for every retained `LoadImage`, `LoadAudio` and `LoadVideo`: each must resolve to a real local file, appear in the upload manifest and use the current deterministic upload name. Missing copied media is reported before ComfyUI generation instead of surfacing later as a background `[Errno 2]` warning.
+- Preserved Smart Render's dedicated runtime video loader for the preceding silent 24-frame continuity tail while removing all other inactive loaders. Continuity injection therefore remains compatible with the stricter portability rules.
+- Smart Render policy version is now `10`; old compiled Segment cache entries cannot bypass the new loader policy.
+
+### Verification
+
+- Expanded the first mandatory Standard Pipeline Release Gate to simulate a project copied from an unavailable old drive and verify local rebasing, upload rewriting and missing-file rejection for pictures, WAV/audio and MP4/video.
+- Added an explicit Ori regression proving an old absolute `authored_timeline_dialogue_30.00s.wav` path and its loader are absent from the compiled request.
+- All four Standard Pipeline Release Gates pass. The complete bundled suite passes `265` tests, including all long-render mapping, repeated-media, packed-shot, local-Segment edit and 24-frame continuity regressions.
+- Director Project format remains version `17`; no saved-project migration is required.
+
 ## [0.2.6-alpha.1] - 2026-08-28
 
 ### Changed

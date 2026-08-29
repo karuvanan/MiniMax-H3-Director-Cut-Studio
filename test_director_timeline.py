@@ -47,7 +47,7 @@ from prompt_presets import (
     TRANSITION_STYLE_PRESETS,
     VISUAL_STYLE_PRESETS,
 )
-from workflow_engine import assign_local_media
+from workflow_engine import MEDIA_LOADERS, assign_local_media, create_virtual_media_asset
 from test_design_engine import sample_design
 from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
@@ -865,6 +865,40 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_project_roundtrip_restores_virtual_p10_source_and_timeline_use(self):
+        root = PROJECT_ROOT / ".director_cache" / "virtual_pool_project_test"
+        root.mkdir(parents=True, exist_ok=True)
+        media_path = root / "p10.png"
+        project_path = root / "virtual.h3director.json"
+        Image.new("RGB", (32, 32), (21, 44, 88)).save(media_path)
+        self.addCleanup(lambda: media_path.unlink(missing_ok=True))
+        self.addCleanup(lambda: project_path.unlink(missing_ok=True))
+
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        p10 = create_virtual_media_asset(window.scan, "image")
+        window._append_media_card(p10)
+        assign_local_media(window.scan, p10, media_path)
+        self._place(p10, 20.0, 25.0, "V1", "Use @P10 as the later scene.")
+        payload = window._project_payload()
+        project_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        window.project_dirty = False
+        window.close()
+
+        restored = DirectorCutStudio()
+        with patch.object(restored, "queue_media_preparation"):
+            restored.load_project_path(project_path)
+        recovered = next(
+            asset for asset in restored.scan.assets if media_shortcut(asset) == "P10"
+        )
+        self.assertTrue(recovered.is_virtual)
+        self.assertEqual(recovered.local_path, str(media_path.resolve()))
+        self.assertTrue(recovered.timeline_placed)
+        self.assertEqual((recovered.start_seconds, recovered.end_seconds), (20.0, 25.0))
+        self.assertIn(recovered.node_id, restored.cards)
+        restored.project_dirty = False
+        restored.close()
+
     def test_design_context_does_not_inject_stale_media_semantic_enrichment(self):
         window = DirectorCutStudio()
         media_root = PROJECT_ROOT / ".director_cache" / "media_semantic_ui_tests"
@@ -1359,13 +1393,23 @@ class DirectorTimelineDragTests(unittest.TestCase):
     def test_media_pool_reflows_and_cards_resize_with_panel(self):
         window = DirectorCutStudio()
         window.show()
+        self.app.processEvents()
+        window._reflow_media_pool()
+        self.assertEqual(window._media_grid_columns, 3)
+        self.assertEqual(
+            [window.add_media_buttons[kind].text() for kind in ("image", "video", "audio")],
+            ["+I", "+V", "+A"],
+        )
+        self.assertTrue(all(button.width() == 30 for button in window.add_media_buttons.values()))
+        self.assertLessEqual(window.media_header.font().pointSizeF(), 10.0)
+
         window.media_scroll.setFixedWidth(255)
         self.app.processEvents()
         window._reflow_media_pool()
         narrow_positions = [window.media_grid.getItemPosition(index) for index in range(5)]
         narrow_width = window.media_card_order[0].width()
-        self.assertEqual([position[1] for position in narrow_positions[:2]], [0, 1])
-        self.assertEqual(narrow_positions[2][0], 1)
+        self.assertEqual([position[1] for position in narrow_positions[:3]], [0, 1, 2])
+        self.assertEqual(narrow_positions[3][0], 1)
         shortcuts = {
             card.asset.media_type: card.tag.text()
             for card in window.media_card_order
@@ -1381,7 +1425,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window._reflow_media_pool()
         wide_positions = [window.media_grid.getItemPosition(index) for index in range(8)]
         wide_width = window.media_card_order[0].width()
-        self.assertGreaterEqual(max(position[1] for position in wide_positions), 7)
+        self.assertEqual(max(position[1] for position in wide_positions), 2)
         self.assertNotEqual(narrow_width, wide_width)
         window.project_dirty = False
         window.close()
@@ -2353,23 +2397,21 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("<Audio 2>", prompt)
         h3_inputs = compiled[window.scan.h3_node_ids[0]]["inputs"]
         self.assertEqual(
-            h3_inputs["ref_images.ref_image_0"], [pictures[3].node_id, 0]
-        )
-        self.assertNotEqual(
             h3_inputs["ref_images.ref_image_0"], [pictures[0].node_id, 0]
         )
+        self.assertNotEqual(h3_inputs["ref_images.ref_image_0"], [pictures[3].node_id, 0])
         self.assertEqual(
             h3_inputs["ref_videos.ref_video_0"],
-            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][videos[1].binding],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][videos[0].binding],
         )
         self.assertEqual(
             h3_inputs["ref_video_audios.ref_video_audio_0"],
             window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"]
-            [videos[1].paired_audio_binding],
+            [videos[0].paired_audio_binding],
         )
         self.assertEqual(
             h3_inputs["ref_audios.ref_audio_0"],
-            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][audios[2].binding],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][audios[0].binding],
         )
         window.project_dirty = False
         window.close()
@@ -2487,12 +2529,18 @@ class DirectorTimelineDragTests(unittest.TestCase):
         uploads_by_node = {
             row["loader_node_id"]: row for row in job["media"]
         }
-        # Every physical loader is patched in every Segment because ComfyUI
-        # validates orphan loader widgets too. H3 activation remains scoped by
-        # the compacted reference connections tested above.
+        # Every loader retained by a Segment must be backed by the current
+        # local upload. Inactive loaders are removed completely so an old
+        # computer's image/audio/video filename cannot be validated by ComfyUI.
         for segment in job["segments"]:
-            for node_id, upload in uploads_by_node.items():
-                node = segment["workflow"][node_id]
+            continuity_loader = str(
+                (segment.get("continuity") or {}).get("loader_node_id", "")
+            )
+            for node_id, node in segment["workflow"].items():
+                loader = MEDIA_LOADERS.get(str(node.get("class_type", "")))
+                if loader is None or node_id == continuity_loader:
+                    continue
+                upload = uploads_by_node[node_id]
                 self.assertEqual(
                     node["inputs"][upload["loader_input"]],
                     upload["upload_name"],
@@ -2516,7 +2564,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(active, [picture])
         self.assertIn("<Picture 1>", prompt)
         self.assertNotIn("<Picture 2>", prompt)
-        self.assertEqual(h3["ref_images.ref_image_0"], [picture.node_id, 0])
+        physical = [a for a in window.scan.assets if a.media_type == "image"][0]
+        self.assertEqual(h3["ref_images.ref_image_0"], [physical.node_id, 0])
         self.assertNotIn("ref_images.ref_image_1", h3)
         window.project_dirty = False
         window.close()
@@ -2544,8 +2593,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("[Shot 2 | 00:02.000-00:06.000]", prompt)
         self.assertIn("<Picture 1>", prompt)
         self.assertIn("<Picture 2>", prompt)
-        self.assertEqual(h3["ref_images.ref_image_0"], [first.node_id, 0])
-        self.assertEqual(h3["ref_images.ref_image_1"], [second.node_id, 0])
+        self.assertEqual(h3["ref_images.ref_image_0"], [pictures[0].node_id, 0])
+        self.assertEqual(h3["ref_images.ref_image_1"], [pictures[1].node_id, 0])
         window.project_dirty = False
         window.close()
 
@@ -2578,11 +2627,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn("First half", self._workflow_prompt(second_job["workflow"]))
         self.assertEqual(
             self._h3_inputs(window, first_job["workflow"])["ref_images.ref_image_0"],
-            [first.node_id, 0],
+            [pictures[0].node_id, 0],
         )
         self.assertEqual(
             self._h3_inputs(window, second_job["workflow"])["ref_images.ref_image_0"],
-            [second.node_id, 0],
+            [pictures[0].node_id, 0],
         )
         window.project_dirty = False
         window.close()
@@ -2612,7 +2661,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn("ref_videos.ref_video_1", h3)
         self.assertEqual(
             h3["ref_videos.ref_video_0"],
-            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][video.binding],
+            window.scan.nodes[window.scan.h3_node_ids[0]]["inputs"][videos[0].binding],
         )
         window.project_dirty = False
         window.close()
@@ -2655,7 +2704,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
 
         self.assertIn("<Picture 4>", prompt)
         self.assertIn("single water-step", prompt)
-        self.assertEqual(h3["ref_images.ref_image_3"], [water.node_id, 0])
+        self.assertEqual(h3["ref_images.ref_image_3"], [pictures[3].node_id, 0])
         self.assertNotIn("ref_images.ref_image_4", h3)
         self.assertEqual(third["continuity"]["tag"], "<Video 1>")
         self.assertEqual(
@@ -2789,14 +2838,15 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(active_before, [picture])
         self.assertEqual(active_deleted, [])
         self.assertEqual(active_readded, [picture])
+        physical = [a for a in window.scan.assets if a.media_type == "image"][0]
         self.assertEqual(
             self._h3_inputs(window, before)["ref_images.ref_image_0"],
-            [picture.node_id, 0],
+            [physical.node_id, 0],
         )
         self.assertNotIn("ref_images.ref_image_0", self._h3_inputs(window, deleted))
         self.assertEqual(
             self._h3_inputs(window, readded)["ref_images.ref_image_0"],
-            [picture.node_id, 0],
+            [physical.node_id, 0],
         )
         self.assertIn("<Picture 1>", self._workflow_prompt(readded))
         window.project_dirty = False
@@ -2897,9 +2947,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 [key for key in h3 if key.startswith("ref_images.ref_image_")],
                 ["ref_images.ref_image_0"],
             )
-            self.assertEqual(
-                h3["ref_images.ref_image_0"], [picture.node_id, 0]
-            )
+            physical = [a for a in window.scan.assets if a.media_type == "image"][0]
+            self.assertEqual(h3["ref_images.ref_image_0"], [physical.node_id, 0])
         self.assertIn("Opening occurrence", self._workflow_prompt(first["workflow"]))
         self.assertNotIn("Closing occurrence", self._workflow_prompt(first["workflow"]))
         self.assertIn("Closing occurrence", self._workflow_prompt(second["workflow"]))
@@ -2966,7 +3015,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
         self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 9)
+        self.assertEqual(job["render_policy_version"], 11)
         window.project_dirty = False
         window.close()
 
@@ -3193,7 +3242,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 9,
+            "render_policy_version": 11,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -3561,7 +3610,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 9,
+            "render_policy_version": 11,
             "segments": completed,
         }
         window._refresh_render_status_bar()

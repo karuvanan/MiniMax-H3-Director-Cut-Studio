@@ -432,7 +432,13 @@ def build_ref2va_prompt(
         )
 
     def source_key(asset: MediaAsset) -> tuple[str, str, str]:
-        return (asset.media_type, asset.source_node_id or asset.node_id, asset.binding)
+        stable_id = stable_reference_id(asset)
+        logical_id = (
+            stable_id
+            if "?" not in stable_id
+            else asset.source_node_id or asset.node_id
+        )
+        return (asset.media_type, logical_id, logical_id)
 
     grouped: dict[tuple[str, str, str], list[MediaAsset]] = {}
     for asset in assets:
