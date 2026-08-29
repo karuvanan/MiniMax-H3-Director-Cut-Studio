@@ -857,13 +857,13 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。该项同时交叉验证小房间／大厅／户外／走廊空间声学不会跨段泄漏，Shot-local 声学编辑不会改变任何 P/V/A mapping。
 5. 后台找不到素材保护：普通 Preview/Run 与 Smart Render 都必须在上传、查询 `/object_info` 或提交 `/prompt` 之前拦截本机缺失的图片、声音和视频；当前 Segment 未使用的旧电脑 Loader（包括 Ori 模式遗留 authored WAV）必须从编译后的 workflow 移除，不能只在 ComfyUI 后台留下 `[Errno 2]` 警告。
 
-当前完整验证结果：**275 tests passed**；五项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
+当前完整验证结果：**276 tests passed**；五项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 275 tests
+Ran 276 tests
 OK
 ```

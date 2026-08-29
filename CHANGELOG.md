@@ -10,11 +10,12 @@ Every user-visible correction receives an application version and a dated entry 
 - Added the full Chinese mirror `SKILL.cn.md` and retained the upstream MIT notice in `THIRD_PARTY_LICENSE.txt`.
 - Added `SPECIAL SKILL CREATOR` beside the Default and Special selectors. It can create or edit English/Chinese Special Skill files, choose `Default + Special` or Standalone binding, validate metadata and instructions, then reload and apply the saved Skill without restarting Studio.
 - Added automatic storage, binding, bilingual-content, attribution and toolbar regressions for the new Skill workflow.
+- Added a two-round Design regression proving that loaded P1–P3 remain stable, first-round generated images occupy P4–P6, an explicit second-round `@P4` is reused, and three further generated images occupy P7–P9 without renumbering.
 
 ### Verification
 
 - The adapted Skill passes the bundled `skill-creator` validator.
-- All `275` bundled tests pass, including the new Skill storage/binding/bilingual-attribution checks and Creator toolbar assertion. All five Standard Pipeline Release Gates pass.
+- All `276` bundled tests pass, including the new Skill storage/binding/bilingual-attribution checks, Creator toolbar assertion and two-round Media Pool allocation regression. All five Standard Pipeline Release Gates pass.
 - Project format remains `18` and Smart Render policy remains `11`.
 
 ## [0.3.0-alpha.4] - 2026-08-29

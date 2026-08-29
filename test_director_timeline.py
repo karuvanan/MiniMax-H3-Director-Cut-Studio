@@ -1129,6 +1129,98 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_two_design_rounds_reuse_p4_and_fill_p4_through_p9_without_renumbering(self):
+        window = DirectorCutStudio()
+        media_root = PROJECT_ROOT / ".director_cache" / "two_round_design_media_test"
+        media_root.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for number in range(1, 10):
+            path = media_root / f"round_media_p{number}.png"
+            Image.new("RGB", (32, 32), (number * 17, 40, 90)).save(path)
+            paths.append(path)
+            self.addCleanup(lambda target=path: target.unlink(missing_ok=True))
+
+        pictures = sorted(
+            (asset for asset in window.scan.assets if asset.media_type == "image"),
+            key=lambda asset: int(media_shortcut(asset)[1:]),
+        )
+        for asset, path in zip(pictures[:3], paths[:3]):
+            assign_local_media(window.scan, asset, str(path.resolve()))
+
+        base_plan = normalize_design_plan(sample_design(), window._design_context()["media_capacity"])
+        base_plan["existing_media_uses"] = []
+
+        def generated_material(path, requirement_id, start, end):
+            return {
+                "requirement_id": requirement_id,
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": start,
+                "end_seconds": end,
+                "track": "V1",
+                "subject_keywords": [requirement_id],
+                "prompt": f"One frozen story instant for {requirement_id}.",
+                "local_path": str(path.resolve()),
+                "preview_path": str(path.resolve()),
+                "generated_by_comfyui": True,
+            }
+
+        first_materials = [
+            generated_material(paths[3], "round1_p4", 0.0, 4.0),
+            generated_material(paths[4], "round1_p5", 4.0, 8.0),
+            generated_material(paths[5], "round1_p6", 8.0, 12.0),
+        ]
+        self.assertEqual(
+            window._apply_ai_design_direct(base_plan, first_materials, replace=True),
+            [],
+        )
+        first_loaded = {
+            media_shortcut(asset)
+            for asset in window.scan.assets
+            if asset.media_type == "image" and str(asset.local_path or "").strip()
+        }
+        self.assertEqual(first_loaded, {f"P{number}" for number in range(1, 7)})
+
+        second_plan = deepcopy(base_plan)
+        second_plan["existing_media_uses"] = [{
+            "requirement_id": "reuse_p4",
+            "media_id": "P4",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "track": "V1",
+            "subject_keywords": ["p4 identity"],
+            "instruction": "Preserve @P4 exactly in the opening Shot.",
+        }]
+        second_materials = [
+            generated_material(paths[6], "round2_p7", 0.0, 4.0),
+            generated_material(paths[7], "round2_p8", 4.0, 8.0),
+            generated_material(paths[8], "round2_p9", 8.0, 12.0),
+        ]
+        self.assertEqual(
+            window._apply_ai_design_direct(second_plan, second_materials, replace=True),
+            [],
+        )
+        loaded_by_path = {
+            Path(str(asset.local_path)).name: media_shortcut(asset)
+            for asset in window.scan.assets
+            if asset.media_type == "image" and str(asset.local_path or "").strip()
+        }
+        self.assertEqual(loaded_by_path[paths[3].name], "P4")
+        self.assertEqual(loaded_by_path[paths[6].name], "P7")
+        self.assertEqual(loaded_by_path[paths[7].name], "P8")
+        self.assertEqual(loaded_by_path[paths[8].name], "P9")
+        second_context_ids = {
+            row["media_id"] for row in window._design_context()["existing_media"]
+            if row["type"] == "image"
+        }
+        self.assertEqual(second_context_ids, {f"P{number}" for number in range(1, 10)})
+        window.project_dirty = False
+        window.close()
+
     def test_lm_planned_image_count_drives_z_image_material_jobs(self):
         window = DirectorCutStudio()
         with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
