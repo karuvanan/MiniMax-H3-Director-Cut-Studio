@@ -47,6 +47,37 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertIn("hero.png", visual)
         self.assertIn("line.wav", audio)
 
+    def test_i2v_keyframes_stay_active_and_receive_the_compiled_prompt(self):
+        payload = {
+            "1": {"class_type": "LoadImage", "inputs": {"image": "first.png"}},
+            "2": {"class_type": "LoadImage", "inputs": {"image": "last.png"}},
+            "9": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {
+                    "first_frame": ["1", 0],
+                    "last_frame": ["2", 0],
+                    "prompt": "old prompt",
+                },
+            },
+        }
+
+        scan = scan_workflow_data(payload)
+        self.assertEqual(scan.h3_node_ids, ["9"])
+        self.assertEqual(
+            {asset.binding for asset in scan.active_assets(0.0, 5.0)},
+            {"first_frame", "last_frame"},
+        )
+
+        compiled, active = compile_active_workflow(
+            scan, 0.0, 5.0, prompt="new prompt"
+        )
+        self.assertEqual(
+            {asset.binding for asset in active}, {"first_frame", "last_frame"}
+        )
+        self.assertEqual(compiled["9"]["inputs"]["prompt"], "new prompt")
+        self.assertIn("first_frame", compiled["9"]["inputs"])
+        self.assertIn("last_frame", compiled["9"]["inputs"])
+
     def test_warns_when_bypassed_nodes_were_removed(self):
         payload = {
             "1": {"class_type": "LoadImage", "inputs": {"image": "hero.png"}},

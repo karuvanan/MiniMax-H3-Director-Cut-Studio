@@ -164,6 +164,11 @@ from workflow_engine import (
     stable_reference_id,
     validate_portable_media_manifest,
 )
+from toyxyz_prompt_client import (
+    DEFAULT_ENHANCE_MODEL as TOYXYZ_DEFAULT_MODEL,
+    DEFAULT_IMAGE_MODEL as TOYXYZ_DEFAULT_IMAGE_MODEL,
+    build_project_data as toyxyz_build_project_data,
+)
 
 
 LATEST_WORKFLOW = PROJECT_ROOT / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
@@ -184,6 +189,15 @@ DIRECTOR_LANES_TOP = TIMELINE_RULER_HEIGHT + RENDER_STATUS_BAR_HEIGHT
 TIMELINE_TRACKS_TOP = DIRECTOR_LANES_TOP + DIRECTOR_LANE_HEIGHT * len(DIRECTOR_LANE_TYPES)
 TIMELINE_SNAP_SECONDS = 0.5
 SMART_RENDER_POLICY_VERSION = 11
+
+# H3 mode -> provider routing.  The first Studio node fixes provider by mode:
+# FL2VA/I2VA/L2VA go to fal, Ref2VA stays on local ComfyUI.
+H3_MODES = ("Ref2VA", "FL2VA", "I2VA", "L2VA", "T2VA")
+FAL_MODES = {"FL2VA", "I2VA", "L2VA", "T2VA"}
+FAL_ENDPOINT = "minimax/h3-max/image-to-video"
+FAL_RESOLUTION = "768P"
+
+
 CONTINUITY_MODE_LABELS = (
     "Auto", "Hard Cut", "Match Action", "Motion Reference", "Transition",
 )
@@ -5825,6 +5839,9 @@ class DirectorCutStudio(QMainWindow):
         self.worker_watchdog.timeout.connect(self._watch_worker_health)
         self.worker_watchdog.start()
         self.submit_runner: JsonLineProcess | None = None
+        self.prompt_runner: JsonLineProcess | None = None
+        self._toyxyz_enhanced_prompt: str = ""
+        self._toyxyz_prompt_error: str = ""
         self.submit_result: dict = {}
         self.submit_request_kind = "final"
         self.design_media_runner: JsonLineProcess | None = None
@@ -5849,6 +5866,7 @@ class DirectorCutStudio(QMainWindow):
         self.smart_render_manifests: dict[str, dict] = {}
         self.render_dirty_segment_ids: set[str] = set()
         self.render_runtime_status: dict[str, str] = {}
+        self.render_history: list[dict] = []
         self.generated_output_path: Path | None = None
         self.generated_playback_path: Path | None = None
         self.generated_output_locked = False
@@ -5991,6 +6009,28 @@ class DirectorCutStudio(QMainWindow):
         self.aspect_ratio_combo.currentIndexChanged.connect(self._aspect_ratio_changed)
         generation_bar.addWidget(self.aspect_ratio_combo)
         generation_bar.addSeparator()
+        generation_bar.addWidget(QLabel("MODE"))
+        self.h3_mode_combo = QComboBox()
+        for mode in H3_MODES:
+            self.h3_mode_combo.addItem(mode, mode)
+        self.h3_mode_combo.setCurrentIndex(0)
+        self.h3_mode_combo.setToolTip(
+            "H3 mode selects the generation mode. Provider routing defaults to fal for FL2VA/I2VA/L2VA/T2VA and ComfyUI for Ref2VA; override with the PROVIDER dropdown."
+        )
+        self.h3_mode_combo.currentIndexChanged.connect(self._h3_mode_changed)
+        generation_bar.addWidget(self.h3_mode_combo)
+        generation_bar.addWidget(QLabel("VIA"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("Auto", "auto")
+        self.provider_combo.addItem("fal", "fal")
+        self.provider_combo.addItem("ComfyUI", "comfyui")
+        self.provider_combo.setCurrentIndex(0)
+        self.provider_combo.setToolTip(
+            "Override the render provider. Auto follows the mode default (fal for FL2VA/I2VA/L2VA/T2VA, ComfyUI for Ref2VA). Select ComfyUI to submit FL2VA/I2VA to a local ComfyUI workflow instead of fal."
+        )
+        self.provider_combo.currentIndexChanged.connect(self._h3_mode_changed)
+        generation_bar.addWidget(self.provider_combo)
+        generation_bar.addSeparator()
         export = QPushButton("EXPORT ACTIVE API")
         export.clicked.connect(self.export_active_api)
         generation_bar.addWidget(export)
@@ -6023,6 +6063,22 @@ class DirectorCutStudio(QMainWindow):
 
     def _aspect_ratio_changed(self, *_args) -> None:
         self.render_settings.aspect_ratio = str(self.aspect_ratio_combo.currentData())
+        self.preview_ready = False
+        self.accept_preview_button.setEnabled(False)
+        self._mark_dirty()
+
+    def _is_fal_mode(self) -> bool:
+        provider = str(self.provider_combo.currentData()) if hasattr(self, "provider_combo") else "auto"
+        if provider == "fal":
+            return True
+        if provider == "comfyui":
+            return False
+        return str(self.h3_mode_combo.currentData()) in FAL_MODES
+
+    def _h3_mode_changed(self, *_args) -> None:
+        fal = self._is_fal_mode()
+        self.server_url.setEnabled(not fal)
+        self.test_connection_button.setEnabled(not fal)
         self.preview_ready = False
         self.accept_preview_button.setEnabled(False)
         self._mark_dirty()
@@ -8460,6 +8516,7 @@ class DirectorCutStudio(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
         self._clear_generated_output()
+        self.render_history = []
         self.prompt_panel.clear_fields()
         self.special_combo.setCurrentIndex(0)
         if LATEST_WORKFLOW.exists():
@@ -9029,6 +9086,8 @@ class DirectorCutStudio(QMainWindow):
             "special_skill": self.special_combo.currentData(),
             "prompt_auto_sync": self.prompt_panel.auto_sync.isChecked(),
             "server_url": self.server_url.text().strip(),
+            "h3_mode": str(self.h3_mode_combo.currentData()),
+            "provider": str(self.provider_combo.currentData()) if hasattr(self, "provider_combo") else "auto",
             "render_settings": asdict(self.render_settings),
             "prompt": prompt,
             "assets": assets,
@@ -9051,6 +9110,7 @@ class DirectorCutStudio(QMainWindow):
                 if self.generated_output_path and self.generated_output_path.is_file()
                 else ""
             ),
+            "render_history": list(self.render_history),
         }
 
     def save_project(self) -> bool:
@@ -9232,6 +9292,13 @@ class DirectorCutStudio(QMainWindow):
             ratio_index = self.aspect_ratio_combo.findData(self.render_settings.aspect_ratio)
             self.aspect_ratio_combo.setCurrentIndex(max(0, ratio_index))
             self._sync_settings_ui()
+            saved_mode = str(payload.get("h3_mode", "Ref2VA"))
+            mode_index = self.h3_mode_combo.findData(saved_mode)
+            self.h3_mode_combo.setCurrentIndex(max(0, mode_index))
+            if hasattr(self, "provider_combo"):
+                saved_provider = str(payload.get("provider", "auto"))
+                provider_index = self.provider_combo.findData(saved_provider)
+                self.provider_combo.setCurrentIndex(max(0, provider_index))
             work_area = payload.get("work_area", [0.0, self.scan.duration_seconds])  # type: ignore[union-attr]
             self.clip_start.setValue(float(work_area[0]))
             self.clip_end.setValue(float(work_area[1]))
@@ -9257,6 +9324,7 @@ class DirectorCutStudio(QMainWindow):
                 str(value) for value in payload.get("render_dirty_segment_ids", [])
             }
             self.render_runtime_status.clear()
+            self.render_history = list(payload.get("render_history") or [])
             self._refresh_render_status_bar()
             # Continue saving beside the project that was actually opened, not
             # into a stale example_work_dir from another machine or drive.
@@ -12804,8 +12872,23 @@ class DirectorCutStudio(QMainWindow):
         if not self.scan:
             return
         self._sync_timeline_clip_sources()
+        # Interactive (button click): launch the toyxyz LLM prompt enhancer.
+        # This works for all H3 modes, including i2v/FL2VA workflows.
         if interactive:
             self._sync_prompt_panel_from_timeline()
+            self._generate_prompt_via_toyxyz()
+            return
+        # Non-interactive (auto-sync timer): use the deterministic template
+        # filler for a quick preview.  The user clicks Generate Prompt to
+        # get the full LLM-enhanced version via toyxyz.
+        # MiniMaxH3ImageToVideo (FL2VA/I2VA) workflows carry the full prompt
+        # directly in the H3 node.  Do not overwrite it with a ref2va template.
+        is_i2v_workflow = any(
+            self.scan.nodes[nid].get("class_type") == "MiniMaxH3ImageToVideo"
+            for nid in self.scan.h3_node_ids
+        )
+        if is_i2v_workflow:
+            return
         soundscape = automatic_background_soundscape({
             "overall_soundscape": self.prompt_panel.soundscape.toPlainText(),
             "creative_brief": self.prompt_panel.brief.toPlainText(),
@@ -12836,8 +12919,6 @@ class DirectorCutStudio(QMainWindow):
         base_spec = self.prompt_panel.spec()
         if not base_spec.brief:
             self.prompt_panel.output.clear()
-            if interactive:
-                QMessageBox.information(self, "Brief required", "Add a creative brief before generating the H3 prompt.")
             return
         timeline_assets = self.scan.timeline_assets()
         original_enabled = [(asset, asset.enabled) for asset in timeline_assets]
@@ -12879,13 +12960,134 @@ class DirectorCutStudio(QMainWindow):
                 f"H3 prompt auto-generated with {len(assets)} active references"
             )
         except Exception as exc:
-            if interactive:
-                QMessageBox.critical(self, "Prompt error", str(exc))
-            else:
-                self.statusBar().showMessage(f"Automatic prompt generation paused: {exc}")
+            self.statusBar().showMessage(f"Automatic prompt generation paused: {exc}")
         finally:
             for asset, was_enabled in original_enabled:
                 asset.enabled = was_enabled
+
+    def _collect_toyxyz_reference_assets(self) -> list[dict]:
+        """Collect reference assets for the toyxyz project_data.
+
+        Uses all scan assets with a local_path, not just compile_active_workflow
+        results, because ref2va reference images are not timeline-placed clips.
+        """
+        refs: list[dict] = []
+        for asset in self.scan.assets:
+            if asset.media_type not in ("image", "video"):
+                continue
+            if not asset.local_path:
+                continue
+            refs.append({
+                "local_path": asset.local_path,
+                "binding": asset.binding,
+                "media_type": asset.media_type,
+                "strength": "normal",
+            })
+        return refs
+
+    def _build_toyxyz_shots(self) -> list[dict]:
+        """Build the shots list for toyxyz project_data from Studio state."""
+        duration = self.clip_end.value() - self.clip_start.value()
+        brief = self.prompt_panel.brief.toPlainText().strip()
+        shots_text = self.prompt_panel.shots.toPlainText().strip()
+        shot_lines = split_shots(shots_text) if shots_text else []
+        if not shot_lines:
+            return [{
+                "duration": duration,
+                "visual_action": brief,
+                "presets": {},
+            }]
+        per_shot = duration / len(shot_lines)
+        return [
+            {
+                "duration": per_shot,
+                "visual_action": shot_text,
+                "presets": {},
+            }
+            for shot_text in shot_lines
+        ]
+
+    def _generate_prompt_via_toyxyz(self) -> None:
+        """Launch the toyxyz prompt enhancer as a subprocess."""
+        if self.prompt_runner and self.prompt_runner.is_running():
+            QMessageBox.information(self, "Prompt generation running", "Wait for the current prompt generation to finish.")
+            return
+        prompt_server = self.render_settings.prompt_comfyui_url
+        if not prompt_server:
+            QMessageBox.critical(self, "No prompt server", "Set H3_PROMPT_COMFYUI_URL in .env to the local ComfyUI running the toyxyz MinimaxH3Prompter node.")
+            return
+        mode = str(self.h3_mode_combo.currentData())
+        duration = self.clip_end.value() - self.clip_start.value()
+        brief = self.prompt_panel.brief.toPlainText().strip()
+        if not brief:
+            QMessageBox.information(self, "Brief required", "Add a creative brief before generating the H3 prompt.")
+            return
+        constraints = self.prompt_panel.constraints.toPlainText().strip()
+        dialogue = self.prompt_panel.dialogue.toPlainText().strip()
+        verbatim = dialogue
+        shots = self._build_toyxyz_shots()
+        reference_assets = self._collect_toyxyz_reference_assets()
+        project_data = toyxyz_build_project_data(
+            mode=mode,
+            duration=duration,
+            user_request=brief,
+            shots=shots,
+            constraints=constraints,
+            verbatim_content=verbatim,
+        )
+        job = {
+            "server": prompt_server,
+            "project_data": project_data,
+            "model": TOYXYZ_DEFAULT_MODEL,
+            "image_model": TOYXYZ_DEFAULT_IMAGE_MODEL,
+            "reference_images": reference_assets,
+        }
+        job_path = CACHE_ROOT / "toyxyz_prompt_job.json"
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        runner = JsonLineProcess(self, "toyxyz_prompt")
+        runner.message.connect(self._toyxyz_prompt_message)
+        runner.finished.connect(self._toyxyz_prompt_finished)
+        self.prompt_runner = runner
+        python = sys.executable
+        script = str(PROJECT_ROOT / "toyxyz_prompt_worker.py")
+        if not runner.start(python, [script, str(job_path)]):
+            QMessageBox.critical(self, "Prompt worker failed", "Could not start the toyxyz prompt worker subprocess.")
+            self.prompt_runner = None
+            return
+        self.statusBar().showMessage("Generating H3 prompt via toyxyz (Qwen3.8 LLM)...")
+        self.prompt_panel.output.setPlainText("")
+        self._toyxyz_enhanced_prompt = ""
+        self._toyxyz_prompt_error = ""
+
+    def _toyxyz_prompt_message(self, payload: dict) -> None:
+        if payload.get("progress"):
+            self.statusBar().showMessage(f"Prompt: {payload['progress']}")
+        elif payload.get("completed"):
+            self._toyxyz_enhanced_prompt = payload.get("enhanced_prompt", "")
+        elif payload.get("error"):
+            self._toyxyz_enhanced_prompt = ""
+            self._toyxyz_prompt_error = payload.get("error", "unknown error")
+
+    def _toyxyz_prompt_finished(self, exit_code: int, log: str) -> None:
+        if self.prompt_runner:
+            self.prompt_runner.deleteLater()
+        self.prompt_runner = None
+        if exit_code != 0:
+            error = getattr(self, "_toyxyz_prompt_error", "") or "Prompt generation failed"
+            QMessageBox.critical(self, "Prompt generation failed", error)
+            self.statusBar().showMessage(f"Prompt generation failed: {error}")
+            return
+        enhanced_prompt = self._toyxyz_enhanced_prompt
+        if enhanced_prompt:
+            self.prompt_panel.output.setPlainText(enhanced_prompt)
+            self.statusBar().showMessage("H3 prompt generated via toyxyz (Qwen3.8 LLM)")
+        else:
+            error = getattr(self, "_toyxyz_prompt_error", "")
+            if not error:
+                error = "The toyxyz worker returned no prompt."
+            QMessageBox.critical(self, "Prompt generation failed", error)
+            self.statusBar().showMessage("Prompt generation returned empty result")
 
     def _prompt_spec_with_director_cues(
         self,
@@ -14047,33 +14249,45 @@ class DirectorCutStudio(QMainWindow):
                     asset, audio_solo=audio_solo
                 )
             _, prompt_sources = compile_active_workflow(self.scan, start, end)
-            is_partial_window = (
-                start > 1e-6 or end < self.scan.duration_seconds - 1e-6
+            # MiniMaxH3ImageToVideo (FL2VA/I2VA) workflows carry the prompt
+            # directly in the H3 node.  Use the prompt panel text as-is
+            # instead of building a Ref2VA reference prompt.
+            is_i2v_workflow = any(
+                self.scan.nodes[nid].get("class_type") == "MiniMaxH3ImageToVideo"
+                for nid in self.scan.h3_node_ids
             )
-            if is_partial_window:
-                prompt = self._prompt_for_window(
-                    start,
-                    end,
-                    prompt_sources,
-                    is_final_window=end >= self.scan.duration_seconds - 1e-6,
-                )
+            if is_i2v_workflow:
+                prompt = self.prompt_panel.output.toPlainText().strip()
+                if not prompt:
+                    raise ValueError("Enter an H3 prompt before submitting to ComfyUI.")
             else:
-                prompt_assets, _ = effective_reference_assets(prompt_sources)
-                special_key = self.special_combo.currentData()
-                special = None if special_key == NONE_SPECIAL else self.profiles[special_key]
-                prompt = build_ref2va_prompt(
-                    self._prompt_spec_with_director_cues(
-                        self.prompt_panel.spec(),
-                        supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
-                            prompt_sources
-                        ),
-                    ),
-                    prompt_assets,
-                    end - start,
-                    self.profiles[DEFAULT_SKILL],
-                    special,
-                    source_assets=self.scan.assets,
+                is_partial_window = (
+                    start > 1e-6 or end < self.scan.duration_seconds - 1e-6
                 )
+                if is_partial_window:
+                    prompt = self._prompt_for_window(
+                        start,
+                        end,
+                        prompt_sources,
+                        is_final_window=end >= self.scan.duration_seconds - 1e-6,
+                    )
+                else:
+                    prompt_assets, _ = effective_reference_assets(prompt_sources)
+                    special_key = self.special_combo.currentData()
+                    special = None if special_key == NONE_SPECIAL else self.profiles[special_key]
+                    prompt = build_ref2va_prompt(
+                        self._prompt_spec_with_director_cues(
+                            self.prompt_panel.spec(),
+                            supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
+                                prompt_sources
+                            ),
+                        ),
+                        prompt_assets,
+                        end - start,
+                        self.profiles[DEFAULT_SKILL],
+                        special,
+                        source_assets=self.scan.assets,
+                    )
             self.prompt_panel.output.setPlainText(prompt)
             compiled, compiled_assets = compile_active_workflow(
                 self.scan,
@@ -14153,6 +14367,82 @@ class DirectorCutStudio(QMainWindow):
             self.settings_rtx_vsr.isChecked(),
         )
 
+    def _build_fal_job(
+        self,
+        *,
+        request_kind: str,
+        megapixels: float,
+        seed: int,
+        duration: float,
+    ) -> Path:
+        """Build a fal FL2VA job JSON and return its path.
+
+        fal does not use a ComfyUI workflow.  The job carries the final text
+        prompt, optional first/last keyframe paths, duration, resolution, and
+        seed.  Keyframes are extracted from the active image references that
+        carry first-frame and last-frame bindings.
+        """
+        prompt = self.prompt_panel.output.toPlainText().strip()
+        if not prompt:
+            raise ValueError("Generate or enter an H3 prompt before submitting to fal.")
+        # Snap duration to the 17k+5 grid at 24fps: 124 frames for 5s.
+        frame_grid_duration = round(duration * 24) / 24
+        first_frame_path = ""
+        last_frame_path = ""
+        if self.scan:
+            # fal FL2VA does not use the ComfyUI workflow or timeline.
+            # Scan all image assets that have a local file, regardless of
+            # timeline placement or activation mode.
+            loaded_images = [
+                asset
+                for asset in self.scan.assets
+                if asset.media_type == "image" and asset.local_path
+            ]
+            # Prefer explicit "first"/"last"/"end" bindings when present;
+            # otherwise fall back to lowest/highest ref_image index.
+            def _binding_index(asset: MediaAsset) -> int:
+                m = re.search(r"ref_image_(\d+)", asset.binding)
+                return int(m.group(1)) if m else 9999
+
+            explicit_first = next(
+                (a for a in loaded_images if "first" in a.binding.lower()), None
+            )
+            explicit_last = next(
+                (
+                    a
+                    for a in loaded_images
+                    if "last" in a.binding.lower() or "end" in a.binding.lower()
+                ),
+                None,
+            )
+            if explicit_first:
+                first_frame_path = explicit_first.local_path
+            elif loaded_images:
+                first_frame_path = min(loaded_images, key=_binding_index).local_path
+            if explicit_last:
+                last_frame_path = explicit_last.local_path
+            elif len(loaded_images) > 1:
+                last_frame_path = max(loaded_images, key=_binding_index).local_path
+        job = {
+            "endpoint": FAL_ENDPOINT,
+            "prompt": prompt,
+            "first_frame_path": first_frame_path,
+            "last_frame_path": last_frame_path,
+            "duration": int(max(1, round(frame_grid_duration))),
+            "resolution": FAL_RESOLUTION,
+            "seed": seed,
+            "prompt_expansion_mode": "disabled",
+            "enable_safety_checker": False,
+            "download_dir": str(
+                CACHE_ROOT / "generated_outputs" / request_kind / str(seed)
+            ),
+            "request_kind": request_kind,
+            "megapixels": megapixels,
+        }
+        job_path = CACHE_ROOT / "fal_submit_job.json"
+        job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        return job_path
+
     def _start_generation(
         self,
         request_kind: str,
@@ -14221,79 +14511,97 @@ class DirectorCutStudio(QMainWindow):
         if self.submit_runner and self.submit_runner.is_running():
             QMessageBox.information(self, "Generation running", "The current ComfyUI job is still running.")
             return
+        is_fal = self._is_fal_mode()
+        if is_fal and not os.environ.get("FAL_KEY"):
+            QMessageBox.critical(
+                self,
+                "FAL_KEY not set",
+                "Launch with run_h3_prompt_studio.sh so FAL_KEY is retrieved with pass-get FAL_API_KEY.",
+            )
+            return
         is_smart_render = False
         segment_count = 1
+        worker_script = "comfy_submit_worker.py"
         try:
             self._read_settings_ui()
             self.generate_prompt(interactive=False)
             duration = self.clip_end.value() - self.clip_start.value()
-            is_smart_render = duration > MAX_NATIVE_SECONDS + 1e-6
-            if is_smart_render:
-                job_path, segment_count = self._build_smart_render_job(
+            if is_fal:
+                job_path = self._build_fal_job(
                     request_kind=request_kind,
                     megapixels=megapixels,
                     seed=seed,
-                    enable_rtx_vsr=enable_rtx_vsr,
+                    duration=duration,
                 )
-                smart_job = json.loads(job_path.read_text(encoding="utf-8"))
-                smart_media = [
-                    item for item in (smart_job.get("media") or [])
-                    if isinstance(item, dict)
-                ]
-                for segment in smart_job.get("segments") or []:
-                    continuity = segment.get("continuity") or {}
-                    runtime_ids = (
-                        {str(continuity.get("loader_node_id"))}
-                        if continuity.get("loader_node_id")
-                        else set()
-                    )
-                    validate_portable_media_manifest(
-                        segment.get("workflow") or {},
-                        smart_media,
-                        runtime_loader_node_ids=runtime_ids,
-                    )
+                worker_script = "fal_submit_worker.py"
             else:
-                # Native-length projects deliberately retain the original one-job path.
-                compiled, assets = self._compiled_job(
-                    megapixels=megapixels,
-                    seed=seed,
-                    enable_rtx_vsr=enable_rtx_vsr,
-                )
-                media = media_upload_manifest(assets)
-                patch_media_upload_names(compiled, media)
-                validate_portable_media_manifest(compiled, media)
-                job_path = CACHE_ROOT / "comfy_submit_job.json"
-                job = {
-                    "action": "queue",
-                    "server": self.server_url.text().strip(),
-                    "workflow": compiled,
-                    "media": media,
-                    "wait_for_completion": True,
-                    "history_poll_interval": self.render_settings.history_poll_interval,
-                    "generation_timeout": self.render_settings.generation_timeout,
-                    "http_timeout": self.render_settings.http_request_timeout,
-                    "download_dir": str(
-                        CACHE_ROOT / "generated_outputs" / request_kind / str(seed)
-                    ),
-                    "request_kind": request_kind,
-                    "seed": seed,
-                    "megapixels": megapixels,
-                    "target_duration_seconds": duration,
-                    "progress_shots": self._progress_shot_rows(
-                        self.clip_start.value(), self.clip_end.value()
-                    ),
-                }
-                job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+                is_smart_render = duration > MAX_NATIVE_SECONDS + 1e-6
+                if is_smart_render:
+                    job_path, segment_count = self._build_smart_render_job(
+                        request_kind=request_kind,
+                        megapixels=megapixels,
+                        seed=seed,
+                        enable_rtx_vsr=enable_rtx_vsr,
+                    )
+                    worker_script = "smart_render_worker.py"
+                    smart_job = json.loads(job_path.read_text(encoding="utf-8"))
+                    smart_media = [
+                        item for item in (smart_job.get("media") or [])
+                        if isinstance(item, dict)
+                    ]
+                    for segment in smart_job.get("segments") or []:
+                        continuity = segment.get("continuity") or {}
+                        runtime_ids = (
+                            {str(continuity.get("loader_node_id"))}
+                            if continuity.get("loader_node_id")
+                            else set()
+                        )
+                        validate_portable_media_manifest(
+                            segment.get("workflow") or {},
+                            smart_media,
+                            runtime_loader_node_ids=runtime_ids,
+                        )
+                else:
+                    compiled, assets = self._compiled_job(
+                        megapixels=megapixels,
+                        seed=seed,
+                        enable_rtx_vsr=enable_rtx_vsr,
+                    )
+                    media = media_upload_manifest(assets)
+                    patch_media_upload_names(compiled, media)
+                    validate_portable_media_manifest(compiled, media)
+                    job_path = CACHE_ROOT / "comfy_submit_job.json"
+                    job = {
+                        "action": "queue",
+                        "server": self.server_url.text().strip(),
+                        "workflow": compiled,
+                        "media": media,
+                        "wait_for_completion": True,
+                        "history_poll_interval": self.render_settings.history_poll_interval,
+                        "generation_timeout": self.render_settings.generation_timeout,
+                        "http_timeout": self.render_settings.http_request_timeout,
+                        "download_dir": str(
+                            CACHE_ROOT / "generated_outputs" / request_kind / str(seed)
+                        ),
+                        "request_kind": request_kind,
+                        "seed": seed,
+                        "megapixels": megapixels,
+                        "target_duration_seconds": duration,
+                        "progress_shots": self._progress_shot_rows(
+                            self.clip_start.value(), self.clip_end.value()
+                        ),
+                    }
+                    job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             QMessageBox.critical(self, "Queue error", str(exc))
             return
-        runner = JsonLineProcess(self, "comfy-submit")
+        runner = JsonLineProcess(self, "submit")
         runner.message.connect(self._generation_message)
         runner.finished.connect(self._generation_finished)
         self.submit_runner = runner
         self.submit_result = {}
         self.submit_request_kind = request_kind
-        if not is_smart_render:
+        if not is_smart_render and not is_fal:
             for segment in self._planned_render_segments():
                 self.render_runtime_status[segment.segment_id] = "running"
             self._refresh_render_status_bar()
@@ -14302,6 +14610,7 @@ class DirectorCutStudio(QMainWindow):
         self.accept_preview_button.setEnabled(False)
         self.reject_preview_button.setEnabled(False)
         self.queue_button.setText("GENERATING…")
+        provider_label = "fal" if is_fal else "ComfyUI"
         label = {
             "preview": "0.2MP preview without upscaling",
             "accepted": "accepted 1.0MP render",
@@ -14314,7 +14623,7 @@ class DirectorCutStudio(QMainWindow):
             f"Submitting {label} · seed {seed} · output → {example_folder}"
         )
         self.generation_previous_monitor = self.monitor_display_stack.currentWidget()
-        self.generation_overlay.start(f"ComfyUI running · {label}")
+        self.generation_overlay.start(f"{provider_label} running · {label}")
         try:
             try:
                 progress_job = json.loads(job_path.read_text(encoding="utf-8"))
@@ -14333,21 +14642,18 @@ class DirectorCutStudio(QMainWindow):
                 total_weight_seconds=total_weight,
                 active_shots=(
                     [str(row.get("shot_id", "")) for row in progress_rows]
-                    if not is_smart_render else []
+                    if not is_smart_render and not is_fal else []
                 ),
             )
             started = runner.start(
                 str(self.runtime.python),
                 [
-                    str(
-                        PROJECT_ROOT
-                        / ("smart_render_worker.py" if is_smart_render else "comfy_submit_worker.py")
-                    ),
+                    str(PROJECT_ROOT / worker_script),
                     str(job_path),
                 ],
             )
             if not started:
-                raise RuntimeError("ComfyUI worker is still stopping")
+                raise RuntimeError(f"{provider_label} worker is still stopping")
         except Exception as exc:
             self.generation_overlay.stop()
             self._restore_monitor_after_generation()
@@ -14360,7 +14666,7 @@ class DirectorCutStudio(QMainWindow):
                     self.render_runtime_status.pop(segment_id, None)
             self._refresh_render_status_bar()
             runner.deleteLater()
-            QMessageBox.critical(self, "ComfyUI worker failed", str(exc))
+            QMessageBox.critical(self, f"{provider_label} worker failed", str(exc))
 
     def _generation_message(self, payload: dict) -> None:
         if payload.get("progress"):
@@ -14491,6 +14797,34 @@ class DirectorCutStudio(QMainWindow):
                 for segment_id, status in list(self.render_runtime_status.items()):
                     if status == "running":
                         self.render_runtime_status.pop(segment_id, None)
+            # Capture full provenance for this render.
+            record = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "request_kind": kind,
+                "provider": result.get("provider", "ComfyUI"),
+                "endpoint": result.get("endpoint", ""),
+                "prompt_id": prompt_id,
+                "seed": seed,
+                "megapixels": result.get("megapixels"),
+                "outputs": [
+                    {k: v for k, v in o.items() if k != "local_path"}
+                    | {"local_path": str(o.get("local_path", ""))}
+                    for o in outputs
+                ],
+                "fal_request_id": result.get("fal_request_id", ""),
+                "inference_seconds": next(
+                    (o.get("inference_seconds") for o in outputs if o.get("inference_seconds")),
+                    None,
+                ),
+                "wall_clock_seconds": next(
+                    (o.get("wall_clock_seconds") for o in outputs if o.get("wall_clock_seconds")),
+                    None,
+                ),
+                "h3_mode": str(self.h3_mode_combo.currentData()),
+                "provider_selection": str(self.provider_combo.currentData()) if hasattr(self, "provider_combo") else "auto",
+            }
+            self.render_history.append(record)
+            self._mark_dirty()
             self._refresh_render_status_bar()
             project_copy = None
             if shown:
@@ -14531,9 +14865,10 @@ class DirectorCutStudio(QMainWindow):
                     )
                 else:
                     self.statusBar().showMessage(f"Generation completed · prompt_id {prompt_id}")
+                provider_name = result.get("provider", "ComfyUI")
                 QMessageBox.information(
                     self,
-                    "ComfyUI generation completed",
+                    f"{provider_name} generation completed",
                     (
                         "Master video assembled from "
                         f"{len((result.get('manifest') or {}).get('segments') or [])} hidden segments.\n"
@@ -14552,8 +14887,8 @@ class DirectorCutStudio(QMainWindow):
             self._refresh_render_status_bar()
             if self.submit_request_kind == "preview" and self.preview_seed is not None:
                 self.reject_preview_button.setEnabled(True)
-            error = result.get("error") or log[-1200:] or "Unknown ComfyUI error"
-            QMessageBox.critical(self, "ComfyUI generation failed", str(error))
+            error = result.get("error") or log[-1200:] or "Unknown generation error"
+            QMessageBox.critical(self, "Generation failed", str(error))
         if self.submit_runner:
             self.submit_runner.deleteLater()
         self.submit_runner = None

@@ -8,6 +8,7 @@ from pathlib import Path
 
 ENV_KEYS = {
     "server_url": "H3_COMFYUI_URL",
+    "prompt_comfyui_url": "H3_PROMPT_COMFYUI_URL",
     "aspect_ratio": "H3_ASPECT_RATIO",
     "megapixels": "H3_MEGAPIXELS",
     "sampling_steps": "H3_SAMPLING_STEPS",
@@ -24,6 +25,7 @@ ENV_KEYS = {
 @dataclass(slots=True)
 class RenderSettings:
     server_url: str = "http://192.168.0.185:8189"
+    prompt_comfyui_url: str = "http://127.0.0.1:8188"
     aspect_ratio: str = "16:9"
     megapixels: float = 1.0
     sampling_steps: int = 8
@@ -58,6 +60,7 @@ class RenderSettings:
 
         return cls(
             server_url=str(merged["server_url"]).strip() or defaults["server_url"],
+            prompt_comfyui_url=str(merged["prompt_comfyui_url"]).strip() or defaults["prompt_comfyui_url"],
             aspect_ratio=str(merged["aspect_ratio"]),
             megapixels=min(16.0, max(0.1, number("megapixels", float))),
             sampling_steps=max(1, number("sampling_steps", int)),

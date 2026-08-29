@@ -147,14 +147,23 @@ def scan_workflow_data(payload: Any, path: str | Path = "workflow.json") -> Work
     h3_ids = [
         node_id
         for node_id, node in nodes.items()
-        if node.get("class_type") == "MiniMaxH3ReferenceToVideo"
+        if node.get("class_type") in ("MiniMaxH3ReferenceToVideo", "MiniMaxH3ImageToVideo")
     ]
     scan = WorkflowScan(
         workflow_path.resolve(), nodes, h3_ids, duration_seconds=_find_duration(nodes)
     )
     _discover_assets(scan)
+    # MiniMaxH3ImageToVideo keyframes (first_frame/last_frame) are always
+    # active regardless of timeline placement, since they are the generation
+    # inputs, not optional references.
+    is_i2v = any(
+        nodes[nid].get("class_type") == "MiniMaxH3ImageToVideo" for nid in h3_ids
+    )
     for asset in scan.assets:
         asset.end_seconds = scan.duration_seconds
+        if is_i2v and asset.media_type == "image":
+            asset.timeline_placed = True
+            asset.activation_mode = "active"
     _add_warnings(scan)
     return scan
 
@@ -265,6 +274,8 @@ def _find_upstream_loader(
 
 def _binding_details(input_name: str) -> tuple[str, str, int] | None:
     patterns = (
+        (r"^first_frame$", "image", "First Frame"),
+        (r"^last_frame$", "image", "Last Frame"),
         (r"^ref_images\.ref_image_(\d+)$", "image", "Picture"),
         (r"^ref_videos\.ref_video_(\d+)$", "video", "Video"),
         (r"^ref_audios\.ref_audio_(\d+)$", "audio", "Audio"),
@@ -273,7 +284,8 @@ def _binding_details(input_name: str) -> tuple[str, str, int] | None:
     for pattern, media_type, label in patterns:
         match = re.match(pattern, input_name)
         if match:
-            return media_type, label, int(match.group(1))
+            index = int(match.group(1)) if match.groups() else 0
+            return media_type, label, index
     return None
 
 
@@ -281,19 +293,18 @@ def _discover_assets(scan: WorkflowScan) -> None:
     assigned_node_ids: set[str] = set()
     for h3_id in scan.h3_node_ids:
         inputs = scan.nodes[h3_id].get("inputs") or {}
-        binding_items = [
-            (input_name, value, _binding_details(input_name))
-            for input_name, value in inputs.items()
-            if _binding_details(input_name)
-        ]
+        binding_items: list[tuple[str, Any, tuple[str, str, int]]] = []
+        for input_name, value in inputs.items():
+            details = _binding_details(input_name)
+            if details:
+                binding_items.append((input_name, value, details))
         # Discover video frames before their paired soundtrack so both bindings
         # are represented by a single timeline asset.
         priority = {"image": 0, "video": 1, "video_audio": 2, "audio": 3}
         binding_items.sort(key=lambda item: priority[item[2][0]])
         for input_name, value, details in binding_items:
-            details = _binding_details(input_name)
             connection = _connection(value)
-            if not details or not connection:
+            if not connection:
                 continue
             binding_type, label, zero_index = details
             wanted_type = "video" if binding_type == "video_audio" else binding_type
@@ -395,7 +406,7 @@ def create_virtual_media_asset(
 
 def _add_warnings(scan: WorkflowScan) -> None:
     if not scan.h3_node_ids:
-        scan.warnings.append("没有检测到 MiniMaxH3ReferenceToVideo 节点。")
+        scan.warnings.append("没有检测到 MiniMaxH3ReferenceToVideo 或 MiniMaxH3ImageToVideo 节点。")
     counts = scan.counts
     if counts["video"] == 0:
         scan.warnings.append(
@@ -733,6 +744,12 @@ def compile_active_workflow(
         for node in compiled.values():
             if node.get("class_type") == "PrimitiveStringMultiline":
                 (node.setdefault("inputs", {}))["value"] = prompt
+                break
+        # MiniMaxH3ImageToVideo stores the prompt directly in its inputs,
+        # not in a separate PrimitiveStringMultiline node.
+        for node in compiled.values():
+            if node.get("class_type") == "MiniMaxH3ImageToVideo":
+                (node.setdefault("inputs", {}))["prompt"] = prompt
                 break
     if generation:
         apply_generation_parameters(compiled, **generation)
