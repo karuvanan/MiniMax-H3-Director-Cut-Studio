@@ -2,7 +2,7 @@
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
-## v0.3.0-alpha.4 重点功能
+## v0.3.0-alpha.5 重点功能
 
 - **无限 Virtual Media Pool + Segment 动态装载**：项目可使用 `P10+ / V4+ / A4+`，不再受工作流实体 Loader 总数限制。每个 Segment 只选择自己时间范围内需要的逻辑素材，自动装入 H3 的 9 Image／3 Video／3 Audio 实体插槽，再生成该段专属 `<Picture N> / <Video N> / <Audio N>`。局部重算、重复素材、跨段移动、24 帧 continuity 和项目重载都保持同一永久 `P/V/A` 身份。
 - **AI Director Design**：连接 Online GPT 或 LM Studio，把自然语言需求转换成可验证的 Director Design JSON；优先复用 Media Pool 素材，并按缺口调用 Z-Image 生成参考图，再以 BLIP 结果完成第二次视觉校准。
@@ -14,7 +14,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.3.0-alpha.4`](VERSION)
+- 当前应用版本：[`v0.3.0-alpha.5`](VERSION)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
@@ -31,7 +31,7 @@
 
 <img width="1474" height="2080" alt="Design workspace" src="https://github.com/user-attachments/assets/345e1d79-455f-4836-bffb-8e138aa20ee4" />
 
-默认主工作流提供每个 Segment 的实体执行容量：**9 张图片、3 段参考视频和 3 段独立音频**。这不是整个项目的 Media Pool 上限；v0.3.0-alpha.4 的 Virtual Media Pool 可保存不限数量的逻辑素材，并在生成时按 Segment 自动换入这些实体插槽：
+默认主工作流提供每个 Segment 的实体执行容量：**9 张图片、3 段参考视频和 3 段独立音频**。这不是整个项目的 Media Pool 上限；v0.3.0-alpha.5 的 Virtual Media Pool 可保存不限数量的逻辑素材，并在生成时按 Segment 自动换入这些实体插槽：
 
 ```text
 video_minimax_h3_r2v_9image_3audio_3video_api.json
@@ -613,6 +613,9 @@ skill special/
 - Default 固定为 `h3-prompt-writing`，负责 MiniMax H3 官方 Ref2VA 结构。
 - Special 提供场景/风格规则；选择 `None` 时只应用 Default。
 - 一般 Special 采用 `Default + Special`；在 `SKILL.md` 写入 `<!-- h3-studio-binding: standalone -->` 的 Special 会独立送入 Design，不会同时注入 `h3-prompt-writing`。
+- 顶部工具栏的 `SPECIAL SKILL CREATOR` 与 Default / Special 选择器位于同一排。它可以新建或编辑 Special Skill、选择 `Default + Special` 或 Standalone 绑定、维护英文 `SKILL.md` 与可选中文 `SKILL.cn.md`，并在 `SAVE + APPLY` 后立即刷新及选中该 Skill。Folder/key 只允许小写英文字母、数字及单连字符；Default Skill 名称受保护，不能覆盖。
+- `short-drama-h3-director` 是适配 Studio 的短剧 Special Skill，默认采用 `Default + Special`。它把短剧冲突、人物因果、伏笔反转、集尾钩子及竖屏构图转换为完整时间范围的 Shot Blocks，同时逐字保护 `text_layers`，优先复用 `existing_media_uses`，仅为缺失证据建立 `media_requests`，并遵守每 5 秒动作预算、环境因果、声音层与 Final Hold 规则。英文主文件、中文对照版及第三方许可证均位于 `skill special/short-drama-h3-director/`。
+- 该短剧 Skill 参考并重新设计自 MIT 授权的 [POUND0423/AI-drama-pound](https://github.com/POUND0423/AI-drama-pound)。上游侧重剧本创作；Studio 版本另外加入 H3 Director Design JSON、Timeline、素材映射、对白、音景和可执行 Shot 预算规则。
 - `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它会先诊断并自动改写不适合 H3 的武侠输入，再建立物理连续、武器因果、每 5 秒动作预算、15 秒无重播边界、人物／武器／空间／消耗品账本、写实轻功、碎片式镜头和环境同步。输入修正会自动重新分配缺失或不均匀的 Shot 时间，压缩同镜多招，把气劲捷径、无支点飞行、长时间 Bullet-time、完整 360 度环绕及多个竞争镜头运动改写成可执行的接触、动量和镜头重构，并在输出前以零预算警告为目标再次编译。最新版亦包含断刀内圈贴身流、链索张力轴心、凌空双刀掠食流、“一秒生死”距离判定、肢体／刀身几何／累积伤势锁定，以及单一冻结动作参考图规则。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。旧版《一叶杀》V2 保留于 `example/one_leaf_kill_45s_design_requirement.txt`；推荐的长枪将军对双短剑刺客 V3 同时提供可贴入 Design 的 `example/one_leaf_kill_45s_design_requirement_v3.txt` 与可直接 Load JSON 的 `example/one_leaf_kill_45s_design_plan_v3.json`。
 
 Preset 分别保存于独立文件，均支持选择、新增、修改、删除及 `SAVE + APPLY`：
@@ -854,13 +857,13 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 4. `0–15 / 15–30 / 30–45s` 原生边界不会重叠生成或重播前段动作；后段只使用无声 24 帧运动上下文，而且不会覆盖当前 Segment 的 Video reference slot。该项同时交叉验证小房间／大厅／户外／走廊空间声学不会跨段泄漏，Shot-local 声学编辑不会改变任何 P/V/A mapping。
 5. 后台找不到素材保护：普通 Preview/Run 与 Smart Render 都必须在上传、查询 `/object_info` 或提交 `/prompt` 之前拦截本机缺失的图片、声音和视频；当前 Segment 未使用的旧电脑 Loader（包括 Ori 模式遗留 authored WAV）必须从编译后的 workflow 移除，不能只在 ComfyUI 后台留下 `[Errno 2]` 警告。
 
-当前完整验证结果：**269 tests passed**；五项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
+当前完整验证结果：**275 tests passed**；五项 Standard Pipeline Release Gate 与十项 Timeline Mapping Matrix 均通过。
 
 ```powershell
 .\ai_libraries_common\python_env\python.exe -m unittest discover -v
 ```
 
 ```text
-Ran 269 tests
+Ran 275 tests
 OK
 ```

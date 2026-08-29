@@ -25,6 +25,7 @@ from director_cut_studio import (
     JsonLineProcess,
     MIME_SLOT,
     PrecisionScrubSlider,
+    SpecialSkillCreatorDialog,
     TimelineClip,
     TimelineCueItem,
     TimelineTextClip,
@@ -140,6 +141,17 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn("not bound", window.default_skill_label.text().lower())
         self.assertEqual(window.special_skill_label.text(), "+ Special")
         window.special_combo.setCurrentIndex(0)
+
+        creator_button = window.findChild(QPushButton, "specialSkillCreatorButton")
+        self.assertIsNotNone(creator_button)
+        self.assertIs(
+            creator_button.parentWidget(),
+            window.default_skill_combo.parentWidget(),
+        )
+        self.assertIs(
+            creator_button.parentWidget(),
+            window.special_combo.parentWidget(),
+        )
 
         payload = sample_design()
         payload["media_requests"] = payload["media_requests"][:1]

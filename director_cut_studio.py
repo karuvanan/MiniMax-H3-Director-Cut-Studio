@@ -135,6 +135,13 @@ from skill_engine import (
     build_ref2va_prompt,
     load_skill_profiles,
 )
+from special_skill_store import (
+    DEFAULT_SPECIAL_SKILL_BODY,
+    SpecialSkillDocument,
+    load_special_skill_document,
+    render_special_skill,
+    save_special_skill_document,
+)
 from segment_engine import (
     MAX_NATIVE_SECONDS,
     content_fingerprint,
@@ -3131,6 +3138,209 @@ class PromptPresetDialog(QDialog):
             self.accept()
 
 
+class SpecialSkillCreatorDialog(QDialog):
+    """Create or edit Studio-native Special Skills without leaving the app."""
+
+    NEW_SKILL = "__new_special_skill__"
+
+    def __init__(self, special_root: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.special_root = Path(special_root)
+        self.saved_key = ""
+        self.editing_key = ""
+        self.setWindowTitle("Special Skill Creator")
+        self.resize(980, 760)
+        self.setMinimumSize(760, 560)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Create a scene-specific H3 planning skill. Default + Special keeps the "
+            "official MiniMax H3 prompt structure; Standalone intentionally replaces it."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#aeb9c3;")
+        layout.addWidget(intro)
+
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("SPECIAL SKILL"))
+        self.skill_selector = QComboBox()
+        self.skill_selector.setObjectName("specialSkillCreatorSelector")
+        self.skill_selector.setMinimumWidth(320)
+        self.skill_selector.currentIndexChanged.connect(self._select_skill)
+        selector_row.addWidget(self.skill_selector, 1)
+        self.new_button = QPushButton("+ NEW")
+        self.new_button.clicked.connect(self._new_skill)
+        selector_row.addWidget(self.new_button)
+        layout.addLayout(selector_row)
+
+        metadata = QGridLayout()
+        metadata.addWidget(QLabel("Folder / key"), 0, 0)
+        self.key_edit = QLineEdit()
+        self.key_edit.setObjectName("specialSkillKeyEdit")
+        self.key_edit.setPlaceholderText("example: cinematic-food-commercial")
+        metadata.addWidget(self.key_edit, 0, 1)
+        metadata.addWidget(QLabel("Binding"), 0, 2)
+        self.binding_combo = QComboBox()
+        self.binding_combo.setObjectName("specialSkillBindingCombo")
+        self.binding_combo.addItem("Default + Special (Recommended)", False)
+        self.binding_combo.addItem("Standalone Special", True)
+        metadata.addWidget(self.binding_combo, 0, 3)
+        metadata.addWidget(QLabel("Description"), 1, 0)
+        self.description_edit = QLineEdit()
+        self.description_edit.setObjectName("specialSkillDescriptionEdit")
+        self.description_edit.setPlaceholderText(
+            "What this Skill does and when Design should use it"
+        )
+        metadata.addWidget(self.description_edit, 1, 1, 1, 3)
+        metadata.setColumnStretch(1, 2)
+        metadata.setColumnStretch(3, 1)
+        layout.addLayout(metadata)
+
+        editors = QSplitter(Qt.Horizontal)
+        english_panel = QWidget()
+        english_layout = QVBoxLayout(english_panel)
+        english_layout.setContentsMargins(0, 0, 0, 0)
+        english_layout.addWidget(QLabel("SKILL.md · English instructions used by Studio"))
+        self.english_edit = QPlainTextEdit()
+        self.english_edit.setObjectName("specialSkillEnglishEdit")
+        self.english_edit.setPlaceholderText("Markdown instruction body (frontmatter is automatic)")
+        english_layout.addWidget(self.english_edit, 1)
+        editors.addWidget(english_panel)
+
+        chinese_panel = QWidget()
+        chinese_layout = QVBoxLayout(chinese_panel)
+        chinese_layout.setContentsMargins(0, 0, 0, 0)
+        chinese_layout.addWidget(QLabel("SKILL.cn.md · 中文对照版本（可选）"))
+        self.chinese_edit = QPlainTextEdit()
+        self.chinese_edit.setObjectName("specialSkillChineseEdit")
+        self.chinese_edit.setPlaceholderText("中文说明；留空则不建立中文版本")
+        chinese_layout.addWidget(self.chinese_edit, 1)
+        editors.addWidget(chinese_panel)
+        editors.setSizes([520, 420])
+        layout.addWidget(editors, 1)
+
+        self.path_label = QLabel()
+        self.path_label.setWordWrap(True)
+        self.path_label.setStyleSheet("color:#7f8993;")
+        layout.addWidget(self.path_label)
+
+        actions = QHBoxLayout()
+        validate_button = QPushButton("VALIDATE")
+        validate_button.clicked.connect(self._validate)
+        close_button = QPushButton("CLOSE")
+        close_button.clicked.connect(self.reject)
+        save_button = QPushButton("SAVE + APPLY")
+        save_button.setObjectName("saveSpecialSkillButton")
+        save_button.setStyleSheet("background:#087f96; font-weight:700;")
+        save_button.clicked.connect(self._save_and_apply)
+        actions.addWidget(validate_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+
+        self._reload_selector()
+
+    def _available_skill_folders(self) -> list[Path]:
+        if not self.special_root.is_dir():
+            return []
+        return sorted(
+            (
+                folder for folder in self.special_root.iterdir()
+                if folder.is_dir() and (folder / "SKILL.md").is_file()
+            ),
+            key=lambda folder: folder.name.casefold(),
+        )
+
+    def _reload_selector(self, selected_key: str = "") -> None:
+        self.skill_selector.blockSignals(True)
+        self.skill_selector.clear()
+        self.skill_selector.addItem("Create new Special Skill", self.NEW_SKILL)
+        selected_index = 0
+        for folder in self._available_skill_folders():
+            self.skill_selector.addItem(folder.name, folder.name)
+            if selected_key == folder.name:
+                selected_index = self.skill_selector.count() - 1
+        self.skill_selector.blockSignals(False)
+        self.skill_selector.setCurrentIndex(selected_index)
+        self._select_skill(selected_index)
+
+    def _new_skill(self) -> None:
+        self.skill_selector.setCurrentIndex(0)
+        self._load_new_document()
+
+    def _load_new_document(self) -> None:
+        self.editing_key = ""
+        self.key_edit.setEnabled(True)
+        self.key_edit.clear()
+        self.description_edit.clear()
+        self.binding_combo.setCurrentIndex(0)
+        self.english_edit.setPlainText(DEFAULT_SPECIAL_SKILL_BODY)
+        self.chinese_edit.clear()
+        self.path_label.setText(
+            f"New folder will be saved under: {self.special_root.resolve()}"
+        )
+        self.key_edit.setFocus()
+
+    def _select_skill(self, _index: int) -> None:
+        key = str(self.skill_selector.currentData() or "")
+        if not key or key == self.NEW_SKILL:
+            self._load_new_document()
+            return
+        try:
+            document = load_special_skill_document(self.special_root / key)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Special Skill not loaded", str(exc))
+            self._load_new_document()
+            return
+        self.editing_key = key
+        self.key_edit.setEnabled(False)
+        self.key_edit.setText(document.key)
+        self.description_edit.setText(document.description)
+        self.binding_combo.setCurrentIndex(1 if document.standalone else 0)
+        self.english_edit.setPlainText(document.body)
+        self.chinese_edit.setPlainText(document.chinese_body)
+        self.path_label.setText(str(document.path or (self.special_root / key / "SKILL.md")))
+
+    def _document(self) -> SpecialSkillDocument:
+        return SpecialSkillDocument(
+            key=self.key_edit.text().strip(),
+            description=self.description_edit.text().strip(),
+            body=self.english_edit.toPlainText().strip(),
+            chinese_body=self.chinese_edit.toPlainText().strip(),
+            standalone=bool(self.binding_combo.currentData()),
+        )
+
+    def _validate(self) -> bool:
+        try:
+            document = self._document()
+            render_special_skill(document)
+            if document.chinese_body:
+                render_special_skill(document, chinese=True)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Special Skill", str(exc))
+            return False
+        QMessageBox.information(
+            self,
+            "Special Skill valid",
+            "The Skill metadata, binding mode and instruction files are valid.",
+        )
+        return True
+
+    def _save_and_apply(self) -> None:
+        try:
+            document = save_special_skill_document(
+                self.special_root,
+                self._document(),
+                editing_key=self.editing_key,
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Special Skill not saved", str(exc))
+            return
+        self.saved_key = document.key
+        self.accept()
+
+
 class PromptPanel(QWidget):
     generate_requested = Signal()
     sync_requested = Signal()
@@ -5745,6 +5955,13 @@ class DirectorCutStudio(QMainWindow):
                 self.special_combo.addItem(profile.display_name, key)
         self.special_combo.setMinimumWidth(240)
         bar.addWidget(self.special_combo)
+        self.special_skill_creator_button = QPushButton("SPECIAL SKILL CREATOR")
+        self.special_skill_creator_button.setObjectName("specialSkillCreatorButton")
+        self.special_skill_creator_button.setToolTip(
+            "Create or edit a Studio Special Skill, its Chinese version and binding mode"
+        )
+        self.special_skill_creator_button.clicked.connect(self.open_special_skill_creator)
+        bar.addWidget(self.special_skill_creator_button)
         generation_bar = QToolBar("Generation Controls")
         generation_bar.setMovable(False)
         self.addToolBarBreak()
@@ -8526,6 +8743,36 @@ class DirectorCutStudio(QMainWindow):
             else self.profiles[DEFAULT_SKILL].display_name,
         )
         self.special_skill_label.setText("Standalone Special" if standalone else "+ Special")
+
+    def open_special_skill_creator(self) -> None:
+        dialog = SpecialSkillCreatorDialog(PROJECT_ROOT / "skill special", self)
+        current_key = str(self.special_combo.currentData() or "")
+        if current_key and current_key != NONE_SPECIAL:
+            index = dialog.skill_selector.findData(current_key)
+            if index >= 0:
+                dialog.skill_selector.setCurrentIndex(index)
+        if dialog.exec() != QDialog.Accepted or not dialog.saved_key:
+            return
+        self._reload_skill_profiles(dialog.saved_key)
+
+    def _reload_skill_profiles(self, selected_special: str = NONE_SPECIAL) -> None:
+        self.profiles = load_skill_profiles(PROJECT_ROOT)
+        self.default_skill_combo.setItemText(
+            0, self.profiles[DEFAULT_SKILL].display_name
+        )
+        self.special_combo.blockSignals(True)
+        self.special_combo.clear()
+        self.special_combo.addItem("None", NONE_SPECIAL)
+        for key, profile in sorted(self.profiles.items()):
+            if profile.special:
+                self.special_combo.addItem(profile.display_name, key)
+        selected_index = self.special_combo.findData(selected_special)
+        self.special_combo.setCurrentIndex(max(0, selected_index))
+        self.special_combo.blockSignals(False)
+        self._refresh_skill_binding_display()
+        self._mark_dirty()
+        self._mark_all_render_segments_dirty()
+        self.schedule_prompt_generation()
 
     def _mark_dirty(self, *_args) -> None:
         if self.restoring_project:

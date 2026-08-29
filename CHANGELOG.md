@@ -2,6 +2,21 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.0-alpha.5] - 2026-08-29
+
+### Added
+
+- Added `short-drama-h3-director`, a Studio-native adaptation of the MIT-licensed `POUND0423/AI-drama-pound` short-drama screenwriting workflow. The new Default-bound Special Skill adds causal conflict, planted reversals, character/prop continuity, exact authored `text_layers`, vertical composition, executable Shot budgets, reference-media planning, location sound and episode-hook validation for H3 Director Design JSON.
+- Added the full Chinese mirror `SKILL.cn.md` and retained the upstream MIT notice in `THIRD_PARTY_LICENSE.txt`.
+- Added `SPECIAL SKILL CREATOR` beside the Default and Special selectors. It can create or edit English/Chinese Special Skill files, choose `Default + Special` or Standalone binding, validate metadata and instructions, then reload and apply the saved Skill without restarting Studio.
+- Added automatic storage, binding, bilingual-content, attribution and toolbar regressions for the new Skill workflow.
+
+### Verification
+
+- The adapted Skill passes the bundled `skill-creator` validator.
+- All `275` bundled tests pass, including the new Skill storage/binding/bilingual-attribution checks and Creator toolbar assertion. All five Standard Pipeline Release Gates pass.
+- Project format remains `18` and Smart Render policy remains `11`.
+
 ## [0.3.0-alpha.4] - 2026-08-29
 
 ### Changed

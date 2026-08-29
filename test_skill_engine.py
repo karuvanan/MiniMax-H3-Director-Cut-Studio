@@ -93,6 +93,33 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("Feral collapse", system)
         self.assertIn(self.profiles[DEFAULT_SKILL].h3_reference_guide, system)
 
+    def test_short_drama_special_is_default_bound_and_production_ready(self):
+        profile = self.profiles["short-drama-h3-director"]
+        self.assertTrue(profile.special)
+        self.assertFalse(profile.standalone)
+        system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
+        self.assertIn("DEFAULT H3 SKILL", system)
+        self.assertIn("SPECIAL SCENE SKILL (short-drama-h3-director)", system)
+        for phrase in (
+            "Preserve Authored Speech Verbatim",
+            "text_layers",
+            "existing_media_uses",
+            "media_requests",
+            "three must-complete physical beats",
+            "episode hook",
+            "one frozen instant",
+        ):
+            self.assertIn(phrase, system)
+
+    def test_short_drama_special_has_chinese_mirror_and_upstream_license(self):
+        folder = self.profiles["short-drama-h3-director"].path.parent
+        chinese = (folder / "SKILL.cn.md").read_text(encoding="utf-8-sig")
+        license_text = (folder / "THIRD_PARTY_LICENSE.txt").read_text(encoding="utf-8-sig")
+        for phrase in ("短剧", "逐字", "text_layers", "existing_media_uses", "media_requests"):
+            self.assertIn(phrase, chinese)
+        self.assertIn("MIT License", license_text)
+        self.assertIn("POUND0423/AI-drama-pound", license_text)
+
     def test_wuxia_english_and_chinese_skills_share_asymmetry_guardrails(self):
         profile = self.profiles["wuxia-blade-film"]
         english = profile.instruction
