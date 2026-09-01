@@ -53,6 +53,9 @@ class PromptSpec:
     technical: str = ""
     transition_ranges: list[dict] = field(default_factory=list)
     has_supplied_dialogue_audio: bool = False
+    # Prompt-only H3 native soundtrack direction.  These rows never create an
+    # external audio node or alter the generated H3 soundtrack.
+    native_audio_ranges: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -148,6 +151,24 @@ def build_structured_prompt(spec: PromptSpec) -> str:
                     f"[{track} {start:.3f}-{end:.3f}s] ({speaker}) "
                     f"<d>[{language}] {text}</d>"
                 )
+        blocks.append("\n".join(rows))
+
+    if spec.native_audio_ranges:
+        rows = [
+            "NATIVE H3 AUDIO DIRECTIONS: generate these sounds natively with each picture interval; "
+            "do not treat them as post-production effects."
+        ]
+        for item in sorted(
+            spec.native_audio_ranges,
+            key=lambda row: float(row.get("start_seconds", 0.0)),
+        ):
+            start = float(item.get("start_seconds", 0.0))
+            end = float(item.get("end_seconds", start))
+            rows.append(
+                f"[{start:.3f}-{end:.3f}s] {str(item.get('native_audio_direction', '')).strip()} "
+                f"{str(item.get('environment_continuity', '')).strip()} "
+                f"{str(item.get('audio_reference_intent', '')).strip()}"
+            )
         blocks.append("\n".join(rows))
 
     shots = spec.shots or [spec.brief.strip() or "Describe the intended shot action."]

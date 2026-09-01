@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 from comfy_submit_worker import (
     _direct_urlopen,
@@ -31,7 +32,8 @@ from workflow_engine import validate_portable_media_manifest
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 11
+SMART_RENDER_POLICY_VERSION = 16
+AUDIO_JOIN_FADE_SECONDS = 0.04
 
 
 def emit(payload: dict) -> None:
@@ -265,10 +267,48 @@ def _primary_video(outputs: list[dict]) -> Path | None:
 
 
 def _write_manifest(path: Path, payload: dict) -> None:
+    payload = dict(payload)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def classify_generation_error(error: object) -> str:
+    """Classify retry/failure evidence without weakening output quality."""
+    text = str(error or "").casefold()
+    if any(
+        marker in text
+        for marker in (
+            "out of memory",
+            "oom",
+            "cuda oom",
+            "allocation on device",
+            "not enough memory",
+            "memory allocation",
+        )
+    ):
+        return "oom"
+    if any(marker in text for marker in ("timed out", "timeout")):
+        return "timeout"
+    if any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "connection refused",
+            "remote end closed",
+            "temporarily unavailable",
+            "urlopen error",
+        )
+    ):
+        return "transport"
+    if any(
+        marker in text
+        for marker in ("no such file", "missing media", "produced no downloadable video")
+    ):
+        return "media"
+    return "unknown"
 
 
 def preflight_smart_render(job: dict) -> dict:
@@ -373,6 +413,13 @@ def _patch_continuity(workflow: dict, continuity: dict, uploaded_name: str) -> N
             + "; refusing to overwrite an active Timeline reference."
         )
     h3_inputs[binding] = connection
+    # The preceding tail exists strictly as visual motion context.  Even a
+    # loader capable of exposing synchronized sound must never feed old audio
+    # into the next H3 segment, where it can duplicate dialogue or create an
+    # audible tail.
+    if bool(continuity.get("visual_only", False)):
+        _canonicalize_reference_input_order(h3_node)
+        return
     paired = str(continuity.get("paired_audio_binding", ""))
     paired_connection = continuity.get("paired_audio_connection")
     if paired and isinstance(paired_connection, list):
@@ -537,9 +584,19 @@ def build_assembly_command(
         )
         concat_inputs.append(f"[v{index}]")
         if include_audio:
+            audio_filters = [
+                f"[{index}:a]atrim=start={trim:.6f}:end={trim_end:.6f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+            fade = min(AUDIO_JOIN_FADE_SECONDS, core_duration / 4.0)
+            if index > 0 and fade > 0.0:
+                audio_filters.append(f"afade=t=in:st=0:d={fade:.6f}")
+            if index < len(segments) - 1 and fade > 0.0:
+                audio_filters.append(
+                    f"afade=t=out:st={max(0.0, core_duration - fade):.6f}:d={fade:.6f}"
+                )
             filters.append(
-                f"[{index}:a]atrim=start={trim:.6f}:end={trim_end:.6f},"
-                f"asetpts=PTS-STARTPTS[a{index}]"
+                ",".join(audio_filters) + f"[a{index}]"
             )
             concat_inputs.append(f"[a{index}]")
     filters.append(
@@ -585,7 +642,7 @@ def assemble_master(job: dict, segments: list[dict]) -> Path:
 def queue_segment(job: dict, segment: dict, workflow: dict, uploaded: list[dict]) -> dict:
     server = job["server"].rstrip("/")
     http_timeout = max(1, int(job.get("http_timeout", 30)))
-    attempts = max(1, int(job.get("segment_attempts", 2)))
+    attempts = max(1, min(5, int(job.get("segment_attempts", 3))))
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -634,17 +691,58 @@ def queue_segment(job: dict, segment: dict, workflow: dict, uploaded: list[dict]
                 "history_status": history.get("status", {}),
                 "uploaded": uploaded,
                 "error": "",
+                "attempts_used": attempt,
+                "failure_class": "",
             }
         except Exception as exc:
             last_error = exc
+            failure_class = classify_generation_error(exc)
             emit({
                 "progress": f"Segment {segment['index'] + 1} attempt {attempt}/{attempts} failed: {exc}",
                 "segment_index": segment["index"],
+                "failure_class": failure_class,
+                "attempt": attempt,
+                "attempts": attempts,
             })
-            emit({"progress": release_comfy_memory(server, http_timeout)})
+            released = release_comfy_memory(server, http_timeout)
+            emit({
+                "progress": (
+                    f"{released} · retry class {failure_class}"
+                    if attempt < attempts
+                    else f"{released} · retry budget exhausted"
+                ),
+                "failure_class": failure_class,
+            })
             if attempt < attempts:
-                time.sleep(1.0)
+                # OOM often needs a little longer for ComfyUI/PyTorch to return
+                # released allocations to the driver. Never lower megapixels
+                # or silently change the accepted quality contract.
+                time.sleep(2.0 if failure_class == "oom" else 1.0)
     raise RuntimeError(str(last_error or "Unknown segment generation error"))
+
+
+def uploaded_media_for_workflow(workflow: dict, uploaded: list[dict]) -> list[dict]:
+    """Return only uploads actually referenced by this Segment workflow.
+
+    Files may be uploaded once for the whole job, but the manifest is a
+    mapping audit.  Recording the global upload union on every Segment made
+    inactive Pictures appear active and concealed reference-slot leaks.
+    """
+    referenced: set[str] = set()
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+        for value in inputs.values():
+            if isinstance(value, str):
+                referenced.add(value.replace("\\", "/").rsplit("/", 1)[-1])
+    return [
+        row for row in uploaded
+        if str(row.get("upload_name") or row.get("file") or "")
+        .replace("\\", "/").rsplit("/", 1)[-1] in referenced
+    ]
 
 
 def main() -> int:
@@ -759,12 +857,23 @@ def main() -> int:
             )
         })
         try:
-            result = queue_segment(job, segment, workflow, uploaded)
+            result = queue_segment(
+                job,
+                segment,
+                workflow,
+                uploaded_media_for_workflow(workflow, uploaded),
+            )
         except Exception as exc:
+            failure_class = classify_generation_error(exc)
             failed = {
                 key: value for key, value in segment.items() if key != "workflow"
             }
-            failed.update(status="failed", error=str(exc))
+            failed.update(
+                status="failed",
+                error=str(exc),
+                failure_class=failure_class,
+                retry_budget=max(1, min(5, int(job.get("segment_attempts", 3)))),
+            )
             manifest = {
                 "format": "h3-smart-render-manifest",
                 "version": 1,
@@ -786,6 +895,7 @@ def main() -> int:
                     "segment_id": segment["segment_id"],
                     "status": "failed",
                     "error": str(exc),
+                    "failure_class": failure_class,
                 },
                 "partial_manifest": manifest,
                 "render_progress": build_render_progress(
@@ -847,6 +957,9 @@ def main() -> int:
         "segments": completed,
     }
     _write_manifest(manifest_path, final_manifest)
+    # The full workflow-bearing job can be large. Keep it only for interrupted
+    # recovery; a successful final manifest is the compact durable record.
+    Path(args.job).unlink(missing_ok=True)
     emit({
         "smart_render": True,
         "queued": {"prompt_id": "smart-render-master"},

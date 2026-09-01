@@ -20,6 +20,8 @@ class DesignAISettings:
     timeout: int = 900
     auto_semantic_enrichment: bool = False
     unload_lm_after_semantic_enrichment: bool = True
+    dialogue_language: str = "auto"
+    subtitles_enabled: bool = False
     generate_comfy_images: bool = True
     image_checkpoint: str = "z_image_turbo_bf16.safetensors"
     image_width: int = 1024
@@ -41,6 +43,8 @@ KEYS = {
     "H3_DESIGN_TIMEOUT": "timeout",
     "H3_DESIGN_AUTO_SEMANTIC_ENRICHMENT": "auto_semantic_enrichment",
     "H3_DESIGN_UNLOAD_LM_AFTER_SEMANTIC_ENRICHMENT": "unload_lm_after_semantic_enrichment",
+    "H3_DESIGN_DIALOGUE_LANGUAGE": "dialogue_language",
+    "H3_DESIGN_SUBTITLES_ENABLED": "subtitles_enabled",
     "H3_DESIGN_GENERATE_COMFY_IMAGES": "generate_comfy_images",
     "H3_DESIGN_IMAGE_CHECKPOINT": "image_checkpoint",
     "H3_DESIGN_IMAGE_WIDTH": "image_width",
@@ -81,11 +85,17 @@ def load_design_settings(path: str | Path) -> DesignAISettings:
             "auto_semantic_enrichment",
             "unload_lm_after_semantic_enrichment",
             "generate_comfy_images",
+            "subtitles_enabled",
         }:
             value = value if isinstance(value, bool) else str(value).lower() in {"1", "true", "yes", "on"}
         setattr(settings, field, value)
     if settings.provider not in {"openai", "lm_studio"}:
         settings.provider = "openai"
+    if settings.dialogue_language not in {
+        "auto", "Arabic", "Chinese", "English", "French", "German", "Italian",
+        "Japanese", "Korean", "Portuguese", "Russian", "Spanish",
+    }:
+        settings.dialogue_language = "auto"
     settings.timeout = max(10, settings.timeout)
     settings.image_width = max(256, min(2048, settings.image_width // 8 * 8))
     settings.image_height = max(256, min(2048, settings.image_height // 8 * 8))

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from difflib import SequenceMatcher
+import re
 import subprocess
 
 import numpy as np
@@ -190,3 +192,82 @@ def audio_analysis_summary(result: dict) -> str:
         f"\nVAD voice ratio: {vad.get('voice_ratio', 0) * 100:.1f}%"
         f"\nVoice-active ranges: {segment_text}"
     )
+
+
+def ambient_presence(
+    samples: np.ndarray,
+    vad_segments: list[list[float]] | None = None,
+    sample_rate: int = SAMPLE_RATE,
+) -> dict:
+    """Estimate whether unchanged generated audio contains a non-speech bed.
+
+    This is analysis only.  No denoising, gain, filtering, or resynthesis is
+    performed.  The result is deliberately conservative because quiet rooms
+    may have a very low but still valid location bed.
+    """
+    if not len(samples):
+        return {"present": False, "nonvoice_rms": 0.0, "overall_rms": 0.0}
+    overall_rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
+    mask = np.ones(len(samples), dtype=bool)
+    for start, end in vad_segments or []:
+        left = max(0, min(len(mask), int(float(start) * sample_rate)))
+        right = max(left, min(len(mask), int(float(end) * sample_rate)))
+        mask[left:right] = False
+    nonvoice = samples[mask]
+    nonvoice_rms = (
+        float(np.sqrt(np.mean(nonvoice * nonvoice) + 1e-12))
+        if len(nonvoice) >= sample_rate // 10 else 0.0
+    )
+    return {
+        "present": bool(nonvoice_rms >= 0.00045 or overall_rms >= 0.0025),
+        "nonvoice_rms": round(nonvoice_rms, 7),
+        "overall_rms": round(overall_rms, 7),
+    }
+
+
+def _normalized_words(value: object) -> str:
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", str(value or "").lower())
+
+
+def evaluate_native_audio_qc(
+    expected_dialogue: list[str],
+    transcript: str,
+    vad: dict,
+    ambient: dict,
+) -> dict:
+    """Evaluate H3's untouched generated soundtrack against Timeline intent."""
+    expected = [_normalized_words(item) for item in expected_dialogue if _normalized_words(item)]
+    heard = _normalized_words(re.sub(r"\[[^\]]+\]", "", transcript or ""))
+    missing: list[str] = []
+    for raw, normalized in zip(
+        [item for item in expected_dialogue if _normalized_words(item)], expected,
+    ):
+        if normalized not in heard and SequenceMatcher(None, normalized, heard).ratio() < 0.55:
+            missing.append(raw)
+    if expected:
+        authorized_text = "".join(expected)
+        similarity = SequenceMatcher(None, authorized_text, heard).ratio() if heard else 0.0
+        extra_dialogue = bool(heard and authorized_text not in heard and similarity < 0.52 and len(heard) > len(authorized_text) * 1.12)
+    else:
+        extra_dialogue = bool(heard or float(vad.get("voice_ratio", 0.0) or 0.0) > 0.025)
+    ambience_missing = not bool(ambient.get("present", False))
+    warnings: list[str] = []
+    if missing:
+        warnings.append(f"missing or materially changed authored line(s): {len(missing)}")
+    if extra_dialogue:
+        warnings.append("unauthorized extra dialogue may be present")
+    if ambience_missing:
+        warnings.append("continuous environment sound may be missing")
+    status = "PASS" if not warnings else "WARNING"
+    return {
+        "status": status,
+        "target_dialogue_present": not missing,
+        "unauthorized_extra_dialogue": extra_dialogue,
+        "environment_sound_missing": ambience_missing,
+        "missing_dialogue": missing,
+        "message": (
+            "Native Audio QC PASS · exact dialogue/voice authorization and environment bed look consistent."
+            if not warnings
+            else "Native Audio QC WARNING · " + "; ".join(warnings) + ". Regenerate if the audible result confirms this."
+        ),
+    }

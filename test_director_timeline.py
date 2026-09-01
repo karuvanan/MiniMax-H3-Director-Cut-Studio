@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 from copy import deepcopy
 from pathlib import Path
 import time
@@ -8,11 +9,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QWheelEvent
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QTimer
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QPixmap, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGraphicsView, QPushButton, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QAbstractItemView, QDialog, QGraphicsView, QListView,
+    QPushButton, QToolButton, QWidget,
+)
 
 from PIL import Image
 
@@ -23,9 +27,12 @@ from director_cut_studio import (
     DirectorCue,
     DirectorCueDialog,
     JsonLineProcess,
+    MediaCard,
     MIME_SLOT,
     PrecisionScrubSlider,
     SpecialSkillCreatorDialog,
+    SmartCutDialog,
+    StoryboardEditorDialog,
     TimelineClip,
     TimelineCueItem,
     TimelineTextClip,
@@ -35,7 +42,12 @@ from director_cut_studio import (
     resolve_project_media_path,
     snap_timeline_range,
     snap_timeline_seconds,
+    strip_untracked_visible_text_directions,
     timeline_state,
+)
+from project_integrity import (
+    rebase_project_media_paths,
+    rebase_project_workspace_metadata,
 )
 from runtime_paths import PROJECT_ROOT
 from design_engine import normalize_design_plan
@@ -48,7 +60,9 @@ from prompt_presets import (
     TRANSITION_STYLE_PRESETS,
     VISUAL_STYLE_PRESETS,
 )
-from workflow_engine import MEDIA_LOADERS, assign_local_media, create_virtual_media_asset
+from workflow_engine import (
+    MEDIA_LOADERS, MediaAsset, assign_local_media, create_virtual_media_asset,
+)
 from test_design_engine import sample_design
 from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
@@ -119,8 +133,40 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "uncertain_inferences": ["A possible intent remains unconfirmed."],
         }
 
+    def test_over_budget_dialogue_clip_is_marked_red_on_timeline(self):
+        layer = TextLayer(
+            "T-risk",
+            "我必须在两秒里面完整说明这个过长而且绝对不可以删改换序的关键句子。",
+            0.0,
+            2.0,
+            "A4",
+            content_role="dialogue",
+            language="Chinese",
+            delivery="Natural and emotionally controlled",
+        )
+        clip = TimelineTextClip(
+            layer,
+            100.0,
+            0.0,
+            lambda *_args: (0, "A4", 0.0, 20.0),
+            lambda *_args: None,
+            lambda *_args: None,
+            False,
+            20.0,
+            10.0,
+        )
+        self.assertEqual(clip.pen().color().name().lower(), "#ff4b55")
+        self.assertEqual(clip.brush().color().name().lower(), "#8f1d25")
+        self.assertTrue(clip.label.text().startswith("! DIA"))
+
     def test_ai_design_button_applies_timeline_and_is_undoable(self):
         window = DirectorCutStudio()
+        design_workspace = (
+            PROJECT_ROOT / ".director_cache" / "alpha1_design_workspace_test"
+        )
+        if design_workspace.is_dir():
+            shutil.rmtree(design_workspace)
+        window.example_work_dir = design_workspace
         window.show()
         self.app.processEvents()
         design_button = window.findChild(QPushButton, "designButton")
@@ -170,13 +216,22 @@ class DirectorTimelineDragTests(unittest.TestCase):
             patch(
                 "director_cut_studio.materialize_design_media",
                 return_value=(placeholder.parent, [material]),
-            ),
+            ) as materialize,
             patch(
                 "director_cut_studio.load_design_settings",
                 return_value=DesignAISettings(generate_comfy_images=False),
             ),
         ):
             window.apply_ai_design(payload, True)
+
+        call = materialize.call_args
+        design_revision = Path(call.kwargs["design_dir"])
+        media_revision = Path(call.kwargs["media_dir"])
+        audio_revision = Path(call.kwargs["audio_dir"])
+        self.assertEqual(design_revision.name, "R0001")
+        self.assertEqual(media_revision.name, "R0001")
+        self.assertEqual(audio_revision.name, "R0001")
+        self.assertEqual(design_revision.parents[2], window.example_work_dir)
 
         asset = next(item for item in window.scan.assets if item.media_type == "image")
         self.assertEqual(window.scan.duration_seconds, 12.0)
@@ -195,6 +250,40 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(window.scan.duration_seconds, 12.0)
         self.assertTrue(asset.timeline_placed)
         placeholder.unlink(missing_ok=True)
+        window.project_dirty = False
+        window.close()
+
+    def test_work_area_end_can_extend_timeline_beyond_default_twelve_seconds(self):
+        window = DirectorCutStudio()
+        self.assertEqual(window.scan.duration_seconds, 12.0)
+        self.assertGreater(window.clip_end.maximum(), window.scan.duration_seconds)
+
+        window.clip_end.setValue(120.0)
+        self.app.processEvents()
+
+        self.assertEqual(window.clip_end.value(), 120.0)
+        self.assertEqual(window.scan.duration_seconds, 120.0)
+        duration_values = [
+            (node.get("inputs") or {}).get("value")
+            for node in window.scan.nodes.values()
+            if node.get("class_type") == "PrimitiveFloat"
+            and "duration" in str((node.get("_meta") or {}).get("title", "")).lower()
+        ]
+        self.assertTrue(duration_values)
+        self.assertTrue(all(float(value) == 120.0 for value in duration_values))
+
+        # Reducing Work Area End is only a range selection; it must not trim
+        # or destroy the now-extended Timeline.
+        window.clip_end.setValue(45.0)
+        self.app.processEvents()
+        self.assertEqual(window.clip_end.value(), 45.0)
+        self.assertEqual(window.scan.duration_seconds, 120.0)
+
+        window.clip_start.setValue(40.0)
+        window.clip_end.setValue(20.0)
+        self.app.processEvents()
+        self.assertEqual(window.clip_end.value(), 40.5)
+        self.assertEqual(window.scan.duration_seconds, 120.0)
         window.project_dirty = False
         window.close()
 
@@ -239,6 +328,38 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_authored_tts_full_audio_slots_defers_without_destroying_text_layers(self):
+        window = DirectorCutStudio()
+        window.render_settings.dialogue_tts_engine = "edge_tts"
+        for index, asset in enumerate(
+            [item for item in window.scan.assets if item.media_type == "audio"], 1
+        ):
+            asset.local_path = f"C:/virtual/already_loaded_{index}.wav"
+        plan = normalize_design_plan(sample_design(), window.scan.counts)
+        plan["media_requests"] = [{
+            "requirement_id": "music_bed",
+            "media_type": "audio",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": plan["duration_seconds"],
+            "track": "A1",
+            "subject_keywords": ["music"],
+            "prompt": "Low suspense music bed.",
+        }]
+        plan["_required_text_layers"] = [{
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "content": "必须保留的对白。",
+            "role": "dialogue",
+            "speaker": "S1",
+        }]
+        self.assertFalse(window._ensure_authored_tts_request(plan, "普通话对白"))
+        self.assertIn("all three physical Audio slots", plan["_tts_deferred_reason"])
+        self.assertEqual(plan["_required_text_layers"][0]["content"], "必须保留的对白。")
+        window.project_dirty = False
+        window.close()
+
     def test_dialogue_prompt_names_supplied_audio_only_when_present(self):
         window = DirectorCutStudio()
         window.director_cues = [DirectorCue(
@@ -256,8 +377,10 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.assertEqual(without_audio.text_ranges[0]["supplied_audio_tag"], "")
         self.assertNotIn(window.text_layers[0].text, without_audio.shots[0])
-        self.assertIn("SHOT SOUND EXECUTION", without_audio.shots[0])
-        self.assertIn("SHOT SPATIAL ACOUSTICS", without_audio.shots[0])
+        self.assertIn("NATIVE AUDIO DIRECTION", without_audio.shots[0])
+        self.assertIn("diegetic sound", without_audio.shots[0])
+        self.assertIn("ENVIRONMENT CONTINUITY", without_audio.shots[0])
+        self.assertEqual(len(without_audio.native_audio_ranges), 1)
         with_audio = window._prompt_spec_with_director_cues(
             window.prompt_panel.spec(), supplied_dialogue_audio_tag="<Audio 2>"
         )
@@ -267,6 +390,466 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn(window.text_layers[0].text, with_audio.shots[0])
         window.project_dirty = False
         window.close()
+
+    def test_native_audio_user_override_survives_automatic_prompt_refresh(self):
+        window = DirectorCutStudio()
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 5.0, "Interview", track_id="V1",
+            subject_action="A woman speaks in an office.",
+            native_audio_direction="Custom quiet office perspective.",
+            native_audio_direction_user_edited=True,
+        )
+        window.director_cues = [cue]
+        spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        self.assertEqual(cue.native_audio_direction, "Custom quiet office perspective.")
+        self.assertIn("Custom quiet office perspective", spec.shots[0])
+        self.assertTrue(cue.environment_continuity)
+        window.project_dirty = False
+        window.close()
+
+    def test_h3_visible_text_is_a_timeline_only_whitelist(self):
+        window = DirectorCutStudio()
+        window.director_cues = [DirectorCue(
+            "S1", "shot", 0.0, 5.0, "Interview", track_id="V1",
+            subject_action=(
+                "The woman speaks. Text appears on the monitor: 'LEAKED WORDS'. "
+                "The monitor keeps its cold glow."
+            ),
+        )]
+        window.prompt_panel.constraints.setPlainText(
+            "Keep identity stable. Ensure the 'old answer' is text-only on screen."
+        )
+        window.text_layers = [TextLayer(
+            "T1", "这句只能被听见。", 0.0, 5.0, "A4",
+            content_role="voice_over", language="Mandarin Chinese",
+        )]
+        locked = window._prompt_spec_with_director_cues(
+            window.prompt_panel.spec()
+        )
+        self.assertIn("VISIBLE TEXT LOCK", locked.technical)
+        self.assertIn("never convert them into pixels", locked.technical)
+        self.assertNotIn("old answer", locked.technical)
+        self.assertNotIn("LEAKED WORDS", " ".join(locked.shots))
+        self.assertEqual(
+            strip_untracked_visible_text_directions(
+                "Hold the light at 0.25 intensity. Render no title on screen."
+            ),
+            "Hold the light at 0.25 intensity.",
+        )
+        prompt = window._prompt_for_window(0.0, 5.0, [], is_final_window=True)
+        self.assertIn("SPEECH WHITELIST WITH VOCAL-SILENCE GAPS", prompt)
+        self.assertIn("Every interval outside those windows is strict vocal silence", prompt)
+        window.text_layers.append(TextLayer(
+            "T2", "唯一允许的字幕", 1.0, 3.0, "V4",
+            content_role="on_screen_text", language="Chinese",
+        ))
+        whitelisted = window._prompt_spec_with_director_cues(
+            window.prompt_panel.spec()
+        )
+        self.assertIn("VISIBLE TEXT WHITELIST", whitelisted.technical)
+        self.assertIn("唯一允许的字幕", whitelisted.technical)
+        self.assertNotIn("old answer", whitelisted.technical)
+        window.project_dirty = False
+        window.close()
+
+    def test_generated_plan_title_outranks_chinese_command_for_workspace_name(self):
+        window = DirectorCutStudio()
+        plan = sample_design()
+        plan["title"] = "Sam Altman's Manual Email"
+        requirement = (
+            "帮我生成45秒视频，加上中文对白，普通话，加入合适旁白，"
+            "总结以下内容如下\n八月二十三日，播客上线了新对谈。"
+        )
+        self.assertEqual(
+            window._preferred_workspace_display_name(plan, requirement),
+            "Sam Altman's Manual Email",
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_storyboard_shot_delete_ripples_media_speech_and_is_undoable(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(20.0)
+        window.storyboard_target_duration_seconds = 10.0
+        window.storyboard_target_spin.setValue(10.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 5.0, "Opening", track_id="V1"),
+            DirectorCue("S2", "shot", 5.0, 10.0, "Remove me", track_id="V1"),
+            DirectorCue("S3", "shot", 10.0, 20.0, "Ending", track_id="V1"),
+            DirectorCue("M1", "marker", 19.0, 19.5, "Final Hold"),
+        ]
+        window.text_layers = [
+            TextLayer("T1", "keep opening", 0.0, 4.5, "A4", content_role="voice_over"),
+            TextLayer("T2", "remove middle", 5.0, 9.5, "A4", content_role="voice_over"),
+            TextLayer("T3", "keep ending", 10.0, 19.0, "A4", content_role="voice_over"),
+        ]
+        image = next(item for item in window.scan.assets if item.media_type == "image")
+        image.timeline_placed = True
+        image.timeline_track_id = "V1"
+        image.start_seconds = 0.0
+        image.end_seconds = 20.0
+        audio = next(item for item in window.scan.assets if item.media_type == "audio")
+        audio.timeline_placed = True
+        audio.timeline_track_id = "A1"
+        audio.start_seconds = 0.0
+        audio.end_seconds = 20.0
+        audio.source_duration_seconds = 20.0
+        window.timeline.set_director_cues(window.director_cues)
+        window.timeline.set_text_layers(window.text_layers)
+        window.manual_ripple_action.setChecked(True)
+        window.remove_director_cue(window.director_cues[1])
+
+        self.assertEqual(window.scan.duration_seconds, 15.0)
+        shots = [cue for cue in window.director_cues if cue.cue_type == "shot"]
+        self.assertEqual([(cue.start_seconds, cue.end_seconds) for cue in shots], [(0.0, 5.0), (5.0, 15.0)])
+        self.assertEqual([layer.text for layer in window.text_layers], ["keep opening", "keep ending"])
+        self.assertEqual(window.text_layers[-1].start_seconds, 5.0)
+        self.assertEqual(image.end_seconds, 15.0)
+        audio_parts = [
+            item for item in window.scan.timeline_assets()
+            if item.media_type == "audio" and item.timeline_placed
+        ]
+        self.assertEqual(
+            sorted((item.start_seconds, item.end_seconds) for item in audio_parts),
+            [(0.0, 5.0), (5.0, 15.0)],
+        )
+        self.assertEqual(window._project_payload()["storyboard_target_duration_seconds"], 10.0)
+        window.undo_stack.undo()
+        self.assertEqual(window.scan.duration_seconds, 20.0)
+        self.assertEqual(len([cue for cue in window.director_cues if cue.cue_type == "shot"]), 3)
+        self.assertEqual(len(window.text_layers), 3)
+        window.project_dirty = False
+        window.close()
+
+    def test_smart_cut_dialog_reviews_plan_without_touching_timeline(self):
+        rows = [
+            {
+                "cue_id": "S1", "start_seconds": 0.0, "end_seconds": 5.0,
+                "preset": "Opening Hook", "subject_action": "Woman sees an alert.",
+                "speech_duration": 3.0, "speech_count": 1, "explicit_speech": True,
+                "media_ids": ["P1"],
+            },
+            {
+                "cue_id": "S2", "start_seconds": 5.0, "end_seconds": 10.0,
+                "preset": "Reaction", "optional_flourish": "Long repeated pause.",
+                "speech_duration": 0.0, "speech_count": 0, "media_ids": ["P1"],
+            },
+            {
+                "cue_id": "S3", "start_seconds": 10.0, "end_seconds": 15.0,
+                "preset": "Final Hook", "subject_action": "Duplicate looks back.",
+                "speech_duration": 2.5, "speech_count": 1, "explicit_speech": True,
+                "media_ids": ["P2"],
+            },
+        ]
+        dialog = SmartCutDialog(rows, 12.0, "balanced")
+        self.assertEqual(dialog.table.rowCount(), 3)
+        self.assertEqual(dialog.plan["edited_duration"], 12.0)
+        self.assertTrue(dialog.plan["on_target"])
+        self.assertEqual(dialog.mode_combo.currentData(), "balanced")
+        first = dialog.plan["decisions"][0]
+        self.assertTrue(first["protected"])
+        dialog.table.setCurrentCell(0, 0)
+        self.app.processEvents()
+        self.assertEqual(dialog.action_combo.findData("remove"), -1)
+        before = deepcopy(dialog.plan)
+        dialog.reject()
+        self.assertEqual(dialog.result_plan(), before)
+
+    def test_smart_cut_apply_protects_speech_is_undoable_and_marks_local_segments(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(15.0)
+        window.storyboard_target_duration_seconds = 12.0
+        window.storyboard_target_spin.setValue(12.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 5.0, "Opening Hook", subject_action="Woman sees alert."),
+            DirectorCue("S2", "shot", 5.0, 10.0, "Reaction", optional_flourish="Long pause."),
+            DirectorCue("S3", "shot", 10.0, 15.0, "Final Hook", subject_action="Duplicate turns."),
+        ]
+        window.text_layers = [
+            TextLayer("T1", "Who is that?", 0.5, 3.5, "A4", content_role="dialogue", shot_id="S1"),
+            TextLayer("T2", "I am real.", 11.0, 13.5, "A4", content_role="dialogue", shot_id="S3"),
+        ]
+        rows = window._smart_cut_shot_inputs()
+        plan = __import__("smart_cut_engine").plan_smart_cut(rows, 12.0, mode="balanced")
+        window._apply_smart_cut_plan(plan)
+        self.assertEqual(window.scan.duration_seconds, 12.0)
+        self.assertEqual(len(window.text_layers), 2)
+        self.assertEqual(window.smart_cut_last_plan["format"], "h3-smart-cut-plan")
+        self.assertTrue(window.render_dirty_segment_ids)
+        self.assertEqual(window._project_payload()["smart_cut_last_plan"]["mode"], "balanced")
+        window.undo_stack.undo()
+        self.assertEqual(window.scan.duration_seconds, 15.0)
+        self.assertEqual(len(window.text_layers), 2)
+        window.project_dirty = False
+        window.close()
+
+    def test_smart_cut_menu_keeps_original_manual_ripple_mode(self):
+        window = DirectorCutStudio()
+        self.assertEqual(window.storyboard_trim_button.popupMode(), QToolButton.MenuButtonPopup)
+        self.assertIn("SMART CUT", window.storyboard_trim_button.toolTip().upper())
+        self.assertFalse(window.storyboard_trim_active)
+        window._set_design_duration(20.0)
+        window.storyboard_target_duration_seconds = 10.0
+        window.manual_ripple_action.setChecked(True)
+        self.assertTrue(window.storyboard_trim_active)
+        window.manual_ripple_action.setChecked(False)
+        self.assertFalse(window.storyboard_trim_active)
+        parsed = window._json_object_from_model_text('```json\n{"shots": []}\n```')
+        self.assertEqual(parsed, {"shots": []})
+        window.project_dirty = False
+        window.close()
+
+    def test_smart_cut_semantic_refine_remembers_resolved_model_for_unload(self):
+        window = DirectorCutStudio()
+        rows = [{
+            "cue_id": "S1", "start_seconds": 0.0, "end_seconds": 5.0,
+            "preset": "Opening Hook", "subject_action": "Woman sees an alert.",
+            "speech_duration": 0.0, "speech_count": 0, "media_ids": ["P1"],
+        }]
+        dialog = SmartCutDialog(rows, 5.0, "balanced")
+        window.smart_cut_dialog = dialog
+        window.smart_cut_job_id = "smart-cut-test"
+        window.smart_cut_active_request = {
+            "provider": "lm_studio",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "deleted-model.gguf",
+            "timeout": 60,
+        }
+        window._handle_smart_cut_payload({
+            "job": "smart-cut-test",
+            "resolved_model": "replacement-model.gguf",
+            "text": json.dumps({"shots": [{
+                "shot_id": "S1", "story_role": "hook", "importance_delta": 0,
+                "redundancy_with": "", "protect": True, "reason": "opening hook",
+            }]}),
+        })
+        self.assertEqual(window.smart_cut_active_request["model"], "replacement-model.gguf")
+        self.assertTrue(dialog.plan["lm_semantics_applied"])
+        window.smart_cut_dialog = None
+        dialog.close()
+        window.project_dirty = False
+        window.close()
+
+    def test_existing_expanded_project_recovers_story_target_from_design_revision(self):
+        root = PROJECT_ROOT / ".director_cache" / "storyboard_target_recovery_test"
+        if root.is_dir():
+            shutil.rmtree(root)
+        plan_path = root / "design" / "revisions" / "R0001" / "design_plan.json"
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text(json.dumps({
+            "duration_seconds": 107.5,
+            "_speech_timing_base_duration": 45.0,
+        }), encoding="utf-8")
+        self.assertEqual(
+            DirectorCutStudio._storyboard_target_from_workspace(root, 107.5),
+            45.0,
+        )
+        shutil.rmtree(root)
+
+    def test_storyboard_editor_cards_update_duration_and_support_add_delete_reorder(self):
+        shots = [
+            DirectorCue("S1", "shot", 0.0, 5.0, "Opening", subject_action="Open"),
+            DirectorCue("S2", "shot", 5.0, 10.0, "Reveal", subject_action="Reveal"),
+        ]
+        dialogue = [TextLayer(
+            "T1", "Exact dialogue", 0.0, 4.0, "A4",
+            content_role="dialogue", shot_id="S1",
+        )]
+        dialog = StoryboardEditorDialog(shots, dialogue, [], 10.0, 8.0)
+        dialog.show()
+        dialog.resize(1450, 850)
+        self.app.processEvents()
+        self.assertEqual(dialog.block_list.count(), 2)
+        self.assertEqual(dialog.block_list.viewMode(), QListView.IconMode)
+        self.assertEqual(
+            dialog.block_list.dragDropMode(), QAbstractItemView.InternalMove
+        )
+        self.assertTrue(dialog.block_list.dragEnabled())
+        self.assertTrue(dialog.block_list.acceptDrops())
+        self.assertTrue(dialog.block_list.hasMouseTracking())
+        self.assertEqual(
+            type(dialog.block_list.itemDelegate()).__name__,
+            "StoryboardCardDelegate",
+        )
+        source = QPixmap(120, 70)
+        source.fill(Qt.white)
+        lifted = dialog.block_list._drag_ghost(source)
+        self.assertEqual(lifted.width(), 152)
+        self.assertEqual(lifted.height(), 102)
+        self.assertEqual(dialog.block_list.visual_columns, 3)
+        self.assertFalse(dialog.block_list.item(0).icon().isNull())
+        self.assertEqual(set(dialog.view_actions), set(dialog.block_list.DISPLAY_MODES))
+        self.assertEqual(dialog.view_button.text(), "VIEW · LARGE ICONS")
+        dialog._set_view_mode("extra_large_icons")
+        self.assertEqual(dialog.block_list.viewMode(), QListView.IconMode)
+        self.assertEqual(dialog.block_list.visual_columns, 2)
+        dialog._set_view_mode("medium_icons")
+        self.assertEqual(dialog.block_list.visual_columns, 4)
+        dialog._set_view_mode("small_icons")
+        self.assertEqual(dialog.block_list.visual_columns, 5)
+        dialog._set_view_mode("list")
+        self.assertEqual(dialog.block_list.viewMode(), QListView.ListMode)
+        dialog._set_view_mode("details")
+        self.assertEqual(dialog.block_list.viewMode(), QListView.ListMode)
+        dialog._set_view_mode("tiles")
+        self.assertEqual(dialog.block_list.viewMode(), QListView.IconMode)
+        self.assertEqual(dialog.block_list.visual_columns, 2)
+        dialog._set_view_mode("content")
+        self.assertEqual(dialog.block_list.viewMode(), QListView.ListMode)
+        dialog._set_view_mode("large_icons")
+        self.assertEqual(dialog.block_list.visual_columns, 3)
+        dialog.block_list.setCurrentRow(0)
+        self.app.processEvents()
+        self.assertFalse(dialog.move_left_button.isEnabled())
+        self.assertTrue(dialog.move_right_button.isEnabled())
+        dialog.move_right_button.click()
+        self.app.processEvents()
+        self.assertIsNotNone(dialog.block_list._drop_animation)
+        self.assertEqual(dialog.block_list._drop_animation.duration(), 260)
+        self.assertEqual(
+            [dialog.block_list.item(index).data(Qt.UserRole)["cue_id"] for index in range(2)],
+            ["S2", "S1"],
+        )
+        self.assertTrue(dialog.move_left_button.isEnabled())
+        self.assertFalse(dialog.move_right_button.isEnabled())
+        dialog.move_left_button.click()
+        self.app.processEvents()
+        self.assertEqual(
+            [dialog.block_list.item(index).data(Qt.UserRole)["cue_id"] for index in range(2)],
+            ["S1", "S2"],
+        )
+        self.assertIn("ORIGINAL  10.0s", dialog.original_label.text())
+        self.assertIn("EDITED  10.0s", dialog.current_label.text())
+        dialog.duration_spin.setValue(4.0)
+        self.app.processEvents()
+        self.assertIn("EDITED  9.0s", dialog.current_label.text())
+        dialog._add_shot()
+        self.assertEqual(dialog.block_list.count(), 3)
+        self.assertIn("EDITED  14.0s", dialog.current_label.text())
+        new_item = dialog.block_list.takeItem(1)
+        dialog.block_list.insertItem(0, new_item)
+        dialog._refresh_all_cards()
+        self.assertTrue(dialog.block_list.item(0).data(Qt.UserRole)["is_new"])
+        dialog.block_list.setCurrentRow(0)
+        dialog._delete_shot()
+        self.assertEqual(dialog.block_list.count(), 2)
+        dialog.findChild(QPushButton, "storyboardApply").click()
+        self.assertEqual(dialog.result(), QDialog.Accepted)
+
+    def test_storyboard_view_mode_persists_in_workspace_and_project_payload(self):
+        window = DirectorCutStudio()
+        window.storyboard_view_mode = "tiles"
+        state = window._design_workspace_state()
+        self.assertEqual(state["storyboard_view_mode"], "tiles")
+        window.storyboard_view_mode = "large_icons"
+        window._restore_design_workspace_state(state)
+        self.assertEqual(window.storyboard_view_mode, "tiles")
+        payload = window._project_payload()
+        self.assertEqual(payload["storyboard_view_mode"], "tiles")
+        window.project_dirty = False
+        window.close()
+
+    def test_storyboard_apply_reorders_shots_removes_dependencies_and_is_undoable(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(15.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 5.0, "Opening", subject_action="A"),
+            DirectorCue("S2", "shot", 5.0, 10.0, "Remove", subject_action="B"),
+            DirectorCue("S3", "shot", 10.0, 15.0, "Ending", subject_action="C"),
+        ]
+        window.text_layers = [
+            TextLayer("T1", "opening", 0.5, 4.5, "A4", content_role="voice_over", shot_id="S1"),
+            TextLayer("T2", "remove", 5.5, 9.5, "A4", content_role="voice_over", shot_id="S2"),
+            TextLayer("T3", "ending", 10.5, 14.5, "A4", content_role="voice_over", shot_id="S3"),
+        ]
+        image = next(item for item in window.scan.assets if item.media_type == "image")
+        image.timeline_placed = True
+        image.timeline_track_id = "V1"
+        image.start_seconds = 0.0
+        image.end_seconds = 15.0
+        entries = [
+            {"cue_id": "S3", "duration": 5.0, "preset": "Ending first", "subject_action": "C"},
+            {"cue_id": "S1", "duration": 4.0, "preset": "Opening second", "subject_action": "A"},
+            {"cue_id": "story-new-test", "is_new": True, "duration": 3.0,
+             "preset": "New final beat", "subject_action": "Hold"},
+        ]
+        window._apply_storyboard_entries(entries, 12.0)
+        shots = sorted(
+            (cue for cue in window.director_cues if cue.cue_type == "shot"),
+            key=lambda cue: cue.start_seconds,
+        )
+        self.assertEqual(window.scan.duration_seconds, 12.0)
+        self.assertEqual([cue.cue_id for cue in shots[:2]], ["S3", "S1"])
+        self.assertEqual([(cue.start_seconds, cue.end_seconds) for cue in shots],
+                         [(0.0, 5.0), (5.0, 9.0), (9.0, 12.0)])
+        self.assertEqual([layer.text for layer in window.text_layers], ["opening", "ending"])
+        by_text = {layer.text: layer for layer in window.text_layers}
+        self.assertEqual(by_text["ending"].shot_id, "S3")
+        self.assertEqual(by_text["opening"].shot_id, "S1")
+        placed_images = [
+            item for item in window.scan.timeline_assets()
+            if item.media_type == "image" and item.timeline_placed
+        ]
+        self.assertEqual(
+            sorted((item.start_seconds, item.end_seconds) for item in placed_images),
+            [(0.0, 5.0), (5.0, 9.0)],
+        )
+        window.undo_stack.undo()
+        self.assertEqual(window.scan.duration_seconds, 15.0)
+        self.assertEqual(len([cue for cue in window.director_cues if cue.cue_type == "shot"]), 3)
+        self.assertEqual(len(window.text_layers), 3)
+        window.project_dirty = False
+        window.close()
+
+    def test_storyboard_uses_exact_shot_picture_and_live_drag_placeholder_reorders(self):
+        cache = PROJECT_ROOT / ".director_cache" / "storyboard_exact_picture_test"
+        if cache.is_dir():
+            shutil.rmtree(cache)
+        cache.mkdir(parents=True)
+        p1_path = cache / "p1.png"
+        p5_path = cache / "p5.png"
+        Image.new("RGB", (320, 180), (20, 40, 80)).save(p1_path)
+        Image.new("RGB", (320, 180), (180, 80, 30)).save(p5_path)
+        shots = [
+            DirectorCue("S1", "shot", 0.0, 5.0, "Opening"),
+            DirectorCue("S2", "shot", 5.0, 11.5, "Typing"),
+            DirectorCue("S3", "shot", 11.5, 18.5, "Reaction"),
+        ]
+        p1 = MediaAsset("137", "LoadImage", "image", p1_path.name,
+                        reference_id="P1", local_path=str(p1_path),
+                        timeline_placed=True, start_seconds=0.0, end_seconds=18.5,
+                        timeline_track_id="V1")
+        p5 = MediaAsset("500", "LoadImage", "image", p5_path.name,
+                        reference_id="P5", local_path=str(p5_path),
+                        timeline_placed=True, start_seconds=5.0, end_seconds=11.5,
+                        timeline_track_id="V3")
+        dialog = StoryboardEditorDialog(shots, [], [p1, p5], 18.5, 18.5)
+        dialog.show()
+        self.app.processEvents()
+        second = dialog.block_list.item(1).data(Qt.UserRole)
+        self.assertEqual(second["preview_ref"], "P5")
+        self.assertEqual(Path(second["preview_path"]), p5_path)
+
+        first_item = dialog.block_list.item(0)
+        dialog.block_list._drag_item = first_item
+        dialog.block_list._drag_original_row = 0
+        dialog.block_list._move_drag_placeholder(2)
+        self.app.processEvents()
+        order = [
+            dialog.block_list.item(index).data(Qt.UserRole)["cue_id"]
+            for index in range(dialog.block_list.count())
+        ]
+        self.assertEqual(order, ["S2", "S3", "S1"])
+        self.assertEqual(dialog.block_list.currentItem(), first_item)
+        self.assertIsNotNone(dialog.block_list._reflow_animation)
+        self.assertEqual(dialog.block_list._reflow_animation.duration(), 190)
+        dialog.block_list._animate_drop_settle(first_item)
+        self.assertEqual(dialog.block_list._drop_item, first_item)
+        self.assertEqual(dialog.block_list._drop_animation.duration(), 260)
+        dialog.block_list._drag_item = None
+        dialog.block_list.order_changed.emit()
+        dialog.close()
+        shutil.rmtree(cache)
 
     def test_design_page_fits_screen_scrolls_and_uses_compact_checkpoint_controls(self):
         window = DirectorCutStudio()
@@ -280,6 +863,39 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 dialog.height(), QApplication.primaryScreen().availableGeometry().height()
             )
             self.assertTrue(dialog.image_checkpoint_combo.isEditable())
+            self.assertEqual(dialog.dialogue_language_combo.count(), 12)
+            self.assertEqual(dialog.dialogue_language_combo.itemData(0), "auto")
+            self.assertEqual(
+                [
+                    dialog.dialogue_language_combo.itemData(index)
+                    for index in range(1, dialog.dialogue_language_combo.count())
+                ],
+                [
+                    "Arabic", "Chinese", "English", "French", "German", "Italian",
+                    "Japanese", "Korean", "Portuguese", "Russian", "Spanish",
+                ],
+            )
+            dialog.requirement_edit.setPlainText(
+                "\u8bf7\u521b\u4f5c\u90fd\u5e02\u60ac\u7591\u77ed\u5267\uff0c\u52a0\u4e0a\u5408\u9002\u5bf9\u767d\u3002"
+            )
+            dialog.dialogue_language_combo.setCurrentIndex(0)
+            self.assertEqual(
+                dialog._selected_design_context()["dialogue_language"],
+                "Chinese",
+            )
+            self.assertFalse(dialog.subtitles_button.isChecked())
+            self.assertEqual(dialog.subtitles_button.text(), "SUB OFF")
+            self.assertEqual(dialog.music_mode_combo.currentData(), "auto")
+            self.assertEqual(dialog.music_mode_combo.count(), 3)
+            off_index = dialog.music_mode_combo.findData("off")
+            dialog.music_mode_combo.setCurrentIndex(off_index)
+            self.assertEqual(dialog._selected_design_context()["music_mode"], "off")
+            english_index = dialog.dialogue_language_combo.findData("English")
+            dialog.dialogue_language_combo.setCurrentIndex(english_index)
+            self.assertEqual(
+                dialog._selected_design_context()["dialogue_language"],
+                "English",
+            )
             self.assertTrue(
                 any(
                     button.text() == "LOAD JSON"
@@ -307,6 +923,133 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 dialog.design_scroll.viewport(), dialog.apply_button.rect().center()
             )
             self.assertTrue(dialog.design_scroll.viewport().rect().contains(center))
+            dialog.close()
+        window.project_dirty = False
+        window.close()
+
+    def test_design_page_allows_generic_missing_dialogue_with_timeline_warning(self):
+        window = DirectorCutStudio()
+        with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
+            dialog = DesignPageDialog(
+                window.runtime,
+                window._design_context(),
+                window.scan.counts,
+                window,
+                context_provider=window._design_context,
+            )
+        plan = sample_design()
+        plan["text_layers"] = []
+        plan["media_requests"] = []
+        dialog.pending_requirement = "Create a suspense scene with suitable Mandarin dialogue."
+        dialog.requirement_edit.setPlainText(dialog.pending_requirement)
+        dialog.json_edit.setPlainText(json.dumps(plan, ensure_ascii=False))
+        self.assertTrue(dialog.validate_json())
+        self.assertTrue(dialog.apply_button.isEnabled())
+        self.assertEqual(dialog.validated_plan["_missing_speech_roles"], ["dialogue"])
+        self.assertIn("TIMELINE REMINDER", dialog.summary_edit.toPlainText())
+        self.assertTrue(any(
+            item["preset"].startswith("⚠ ADD EDITABLE DIALOGUE")
+            for item in dialog.validated_plan["markers"]
+        ))
+        dialog.close()
+        window.project_dirty = False
+        window.close()
+
+    def test_design_apply_preflight_stays_open_until_commit_and_reports_failure_inline(self):
+        window = DirectorCutStudio()
+        with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
+            dialog = DesignPageDialog(
+                window.runtime, window._design_context(), window.scan.counts, window
+            )
+        dialog.json_edit.setPlainText(json.dumps(sample_design(), ensure_ascii=False))
+        self.assertTrue(dialog.validate_json())
+        emitted = []
+        dialog.apply_requested.connect(
+            lambda plan, replace: emitted.append((plan, replace))
+        )
+        dialog.apply_design()
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(dialog.apply_in_progress)
+        self.assertEqual(dialog.result(), QDialog.Rejected)
+
+        dialog.mark_apply_failed("FFmpeg executable is unavailable")
+        self.assertFalse(dialog.apply_in_progress)
+        self.assertTrue(dialog.apply_button.isEnabled())
+        self.assertIn("HARD BLOCK", dialog.summary_edit.toPlainText())
+        self.assertIn("FFmpeg executable", dialog.summary_edit.toPlainText())
+
+        dialog.mark_apply_succeeded(["Recovered after retry"])
+        self.assertEqual(dialog.result(), QDialog.Accepted)
+        window.project_dirty = False
+        window.close()
+
+    def test_missing_voxcpm_model_is_warning_not_apply_block(self):
+        window = DirectorCutStudio()
+        context = window._design_context()
+        context["dialogue_tts_engine"] = "voxcpm2_local"
+        with (
+            patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True),
+            patch("director_cut_studio.voxcpm_model_missing", return_value=["model.bin"]),
+        ):
+            dialog = DesignPageDialog(
+                window.runtime, context, window.scan.counts, window
+            )
+            plan = sample_design()
+            plan["text_layers"] = [{
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+                "track": "A4",
+                "content": "这是逐字对白。",
+                "role": "dialogue",
+                "speaker": "S1",
+                "language": "Chinese",
+                "delivery": "Natural",
+                "lip_sync": True,
+                "explicit_user_requested": True,
+            }]
+            dialog.json_edit.setPlainText(json.dumps(plan, ensure_ascii=False))
+            self.assertTrue(dialog.validate_json())
+            self.assertTrue(dialog.apply_button.isEnabled())
+            self.assertIn("VoxCPM2 model is missing", dialog.summary_edit.toPlainText())
+            dialog.close()
+        window.project_dirty = False
+        window.close()
+
+    def test_missing_qwen3_tts_model_is_warning_not_apply_block(self):
+        window = DirectorCutStudio()
+        context = window._design_context()
+        context["dialogue_tts_engine"] = "qwen3_tts_local"
+        with (
+            patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True),
+            patch("director_cut_studio.qwen3_tts_runtime_missing", return_value=[]),
+            patch(
+                "director_cut_studio.qwen3_tts_model_missing",
+                return_value=["model.safetensors"],
+            ),
+        ):
+            dialog = DesignPageDialog(
+                window.runtime, context, window.scan.counts, window
+            )
+            plan = sample_design()
+            plan["text_layers"] = [{
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+                "track": "A4",
+                "content": "这是逐字对白。",
+                "role": "dialogue",
+                "speaker": "S1",
+                "language": "Chinese",
+                "delivery": "Natural",
+                "lip_sync": True,
+                "explicit_user_requested": True,
+            }]
+            dialog.json_edit.setPlainText(json.dumps(plan, ensure_ascii=False))
+            self.assertTrue(dialog.validate_json())
+            self.assertTrue(dialog.apply_button.isEnabled())
+            self.assertIn(
+                "Qwen3-TTS runtime/model is missing",
+                dialog.summary_edit.toPlainText(),
+            )
             dialog.close()
         window.project_dirty = False
         window.close()
@@ -349,6 +1092,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.assertIn("Decide how many reference images are genuinely useful", payload["user_prompt"])
         self.assertIn("do not force one image per Shot", payload["user_prompt"])
+        self.assertIn(
+            "MANDATORY DIALOGUE LANGUAGE CONTRACT: The selected language is English",
+            payload["user_prompt"],
+        )
+        self.assertIn("dialogue_language", payload["system_prompt"])
         self.assertEqual(dialog.pipeline_stage, "lm_plan")
 
         dialog.planned_plan = sample_design()
@@ -818,6 +1566,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window = DirectorCutStudio()
         media_root = PROJECT_ROOT / ".director_cache" / "media_replacement_tests"
         media_root.mkdir(parents=True, exist_ok=True)
+        window.example_work_dir = media_root / "workspace"
         old_path = media_root / "old_reference.png"
         new_path = media_root / "new_reference.png"
         Image.new("RGB", (64, 64), (66, 22, 18)).save(old_path)
@@ -837,7 +1586,10 @@ class DirectorTimelineDragTests(unittest.TestCase):
         with patch.object(window, "queue_media_preparation") as prepare:
             window.load_asset_file(picture, str(new_path))
 
-        self.assertEqual(picture.local_path, str(new_path.resolve()))
+        imported = Path(picture.local_path)
+        self.assertTrue(imported.is_file())
+        self.assertEqual(imported.parent, window.example_work_dir / "media" / "imported")
+        self.assertEqual(imported.read_bytes(), new_path.read_bytes())
         self.assertEqual(picture.clip_prompt, "")
         self.assertTrue(picture.timeline_placed)
         self.assertEqual((picture.start_seconds, picture.end_seconds), (3.0, 7.0))
@@ -910,6 +1662,101 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn(recovered.node_id, restored.cards)
         restored.project_dirty = False
         restored.close()
+
+    def test_old_project_load_accepts_auto_repaired_speech_timing_metadata(self):
+        root = PROJECT_ROOT / ".director_cache" / "speech_timing_metadata_load_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        project_path = root / "speech_timing.h3director.json"
+
+        source = DirectorCutStudio()
+        payload = source._project_payload()
+        payload["timeline_duration_seconds"] = 2.0
+        payload["work_area"] = [0.0, 2.0]
+        payload["director_cues"] = [{
+            "cue_id": "S1", "cue_type": "shot", "start_seconds": 0.0,
+            "end_seconds": 2.0, "preset": "Final speech",
+        }]
+        payload["text_layers"] = [{
+            "layer_id": "T1", "text": "这是结尾不能被项目终点切断的完整普通话旁白。",
+            "start_seconds": 0.0, "end_seconds": 2.0, "track_id": "A5",
+            "content_role": "voice_over", "speaker": "S1",
+            "language": "Mandarin Chinese", "delivery": "Natural",
+            "lip_sync": False, "shot_id": "S1",
+        }]
+        project_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        source.project_dirty = False
+        source.close()
+
+        restored = DirectorCutStudio()
+        with patch.object(restored, "queue_media_preparation"):
+            restored.load_project_path(project_path)
+        self.assertEqual(len(restored.text_layers), 1)
+        self.assertTrue(restored.text_layers[0].speech_timing_auto_adjusted)
+        self.assertGreater(restored.text_layers[0].end_seconds, 2.0)
+        self.assertGreater(
+            restored.scan.duration_seconds, restored.text_layers[0].end_seconds
+        )
+        self.assertTrue(restored.project_dirty)
+        restored.project_dirty = False
+        restored.close()
+
+    def test_run_preflight_repairs_final_speech_tail_and_cjk_language(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(70.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 60.0, "Story"),
+            DirectorCue("S2", "shot", 60.0, 70.0, "Final"),
+        ]
+        window.text_layers = [TextLayer(
+            "T1", "我以为我会哭。但我的心跳很稳。原来真正贵的不是那笔钱，是第一次拒绝。",
+            60.0, 70.0, "A5", content_role="voice_over", speaker="S2",
+            language="English", lip_sync=False, shot_id="S2",
+        )]
+        repairs = window._reconcile_speech_timing_before_run()
+        self.assertTrue(repairs)
+        self.assertEqual(window.text_layers[0].language, "Mandarin Chinese")
+        self.assertGreater(window.scan.duration_seconds, window.text_layers[0].end_seconds)
+        self.assertGreaterEqual(
+            window.scan.duration_seconds - window.text_layers[0].end_seconds, 1.5
+        )
+        self.assertEqual(window.clip_end.value(), window.scan.duration_seconds)
+        window.project_dirty = False
+        window.close()
+
+    def test_native_dialogue_prompt_locks_s1_female_and_s2_male_faces(self):
+        window = DirectorCutStudio()
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        male, female = pictures[:2]
+        male.clip_prompt = "Primary identity: exactly one adult man in a dark suit."
+        female.clip_prompt = "Secondary identity: exactly one adult woman in a white dress."
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 5.0, "Two-person dialogue")
+        ]
+        window.text_layers = [
+            TextLayer(
+                "T1", "请告诉我答案。", 0.0, 2.0, "A4",
+                content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+                shot_id="S1",
+            ),
+            TextLayer(
+                "T2", "我现在回答。", 2.5, 5.0, "A4",
+                content_role="dialogue", speaker="S2", language="Mandarin Chinese",
+                shot_id="S1",
+            ),
+        ]
+        prompt = window._prompt_for_window(
+            0.0, 5.0, [male, female], is_final_window=True
+        )
+        self.assertIn("SPEAKER-TO-FACE IDENTITY LOCK", prompt)
+        self.assertIn(f"S1 always means the female voice/character defined by {female.tag}", prompt)
+        self.assertIn(f"S2 always means the male voice/character defined by {male.tag}", prompt)
+        self.assertIn("only the assigned speaker moves lips", prompt)
+        window.project_dirty = False
+        window.close()
 
     def test_design_context_does_not_inject_stale_media_semantic_enrichment(self):
         window = DirectorCutStudio()
@@ -1456,6 +2303,172 @@ class DirectorTimelineDragTests(unittest.TestCase):
             media.unlink(missing_ok=True)
             nested.rmdir()
             root.rmdir()
+
+    def test_canonical_project_json_finds_media_in_workspace_sibling_tree(self):
+        root = PROJECT_ROOT / ".director_cache" / "portable_workspace_sibling_test"
+        project_dir = root / "project"
+        media_dir = root / "media" / "generated_references" / "R0001"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        project = project_dir / "director_project.h3director.json"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        media = media_dir / "generated_identity.png"
+        media.write_bytes(b"portable-generated-reference")
+        saved = {
+            "filename": media.name,
+            "local_path": "D:/old-computer/example/story/media/generated_references/R0001/"
+            + media.name,
+        }
+        try:
+            resolved = resolve_project_media_path(
+                project, saved, Path("D:/old-computer/example/story")
+            )
+            self.assertEqual(resolved, media.resolve())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_clean_project_export_rebases_old_media_to_workspace_sibling(self):
+        root = PROJECT_ROOT / ".director_cache" / "clean_project_rebase_test"
+        project = root / "project" / "director_project.clean.h3director.json"
+        media_dir = root / "media" / "generated_references" / "R0001"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        media = media_dir / "generated_scene.png"
+        media.write_bytes(b"portable-generated-scene")
+        payload = {
+            "assets": {
+                "137": {
+                    "media_type": "image",
+                    "filename": media.name,
+                    "local_path": "D:/old-computer/example/story/media/" + media.name,
+                }
+            }
+        }
+        try:
+            rebase_project_workspace_metadata(payload, project)
+            report = rebase_project_media_paths(payload, project)
+            self.assertEqual(Path(payload["workspace_root"]), root.resolve())
+            self.assertEqual(Path(payload["example_work_dir"]), root.resolve())
+            self.assertEqual(
+                Path(payload["assets"]["137"]["local_path"]), media.resolve()
+            )
+            self.assertTrue(any("media loader 137" in row for row in report))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_media_card_z_image_menu_is_picture_only_and_keeps_source_object(self):
+        picture = MediaAsset(
+            node_id="153", class_type="LoadImage", media_type="image",
+            tag="<Picture 5>", binding="ref_images.ref_image_4",
+            filename="p5.png", reference_id="P5",
+            clip_prompt="Exactly one man and one woman.",
+        )
+        audio = MediaAsset(
+            node_id="144", class_type="LoadAudio", media_type="audio",
+            tag="<Audio 1>", binding="ref_audios.ref_audio_0",
+            filename="a1.wav", reference_id="A1", clip_prompt="Dialogue.",
+        )
+        picture_card = MediaCard(picture)
+        audio_card = MediaCard(audio)
+        received = []
+        picture_card.z_image_regeneration_requested.connect(received.append)
+        picture_action = picture_card.create_context_menu().actions()[0]
+        audio_action = audio_card.create_context_menu().actions()[0]
+        self.assertTrue(picture_action.isEnabled())
+        self.assertFalse(audio_action.isEnabled())
+        picture_action.trigger()
+        self.assertEqual(received, [picture])
+        picture_card.deleteLater()
+        audio_card.deleteLater()
+
+    def test_local_picture_displays_before_async_media_preparation(self):
+        root = PROJECT_ROOT / ".director_cache" / "immediate_picture_preview_test"
+        root.mkdir(parents=True, exist_ok=True)
+        image_path = root / "p1_local.png"
+        Image.new("RGB", (96, 64), (240, 180, 20)).save(image_path)
+        window = DirectorCutStudio()
+        picture = next(
+            asset for asset in window.scan.assets if asset.media_type == "image"
+        )
+        card = window.cards[picture.node_id]
+        self.assertIsNone(card.preview_pixmap)
+
+        assign_local_media(window.scan, picture, image_path)
+        self.assertTrue(window._show_immediate_image_preview(picture))
+
+        self.assertIn(picture.node_id, window.preview_paths)
+        self.assertEqual(window.preview_paths[picture.node_id], image_path.resolve())
+        self.assertIsNotNone(card.preview_pixmap)
+        self.assertFalse(card.preview_pixmap.isNull())
+        window.project_dirty = False
+        window.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+    def test_z_image_regeneration_preserves_p_mapping_prompt_and_dirty_range(self):
+        root = PROJECT_ROOT / ".director_cache" / "z_image_regeneration_test"
+        root.mkdir(parents=True, exist_ok=True)
+        old_image = root / "p5_old.png"
+        new_image = root / "p5_regenerated.png"
+        Image.new("RGB", (32, 32), (20, 30, 40)).save(old_image)
+        Image.new("RGB", (32, 32), (40, 30, 20)).save(new_image)
+        window = DirectorCutStudio()
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        p5 = pictures[4]
+        assign_local_media(window.scan, p5, old_image)
+        p5.timeline_placed = True
+        p5.timeline_track_id = "V2"
+        p5.start_seconds = 2.0
+        p5.end_seconds = 8.0
+        p5.clip_prompt = (
+            "A rear medium shot of exactly one man and exactly one woman at a window. "
+            "EXACT SUBJECT COUNT LOCK: exactly two unique visible people and no one else."
+        )
+        sidecar = old_image.with_suffix(old_image.suffix + ".request.json")
+        sidecar.write_text(json.dumps({
+            "requirement_id": "req_window_pair",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 2.0,
+            "end_seconds": 8.0,
+            "track": "V2",
+            "subject_keywords": ["man", "woman", "window"],
+            "prompt": p5.clip_prompt,
+            "identity_anchor_requirement_id": "req_man_identity",
+            "preferred_media_id": "P5",
+        }), encoding="utf-8")
+        request = window._z_image_regeneration_request(p5)
+        self.assertEqual(request["preferred_media_id"], "P5")
+        self.assertEqual(request["identity_anchor_requirement_id"], "req_man_identity")
+        self.assertIn("EXACT SUBJECT COUNT LOCK", request["prompt"])
+        self.assertIn("REGENERATION CONTRACT FOR P5", request["prompt"])
+        original_node = p5.node_id
+        original_prompt = p5.clip_prompt
+        window.pending_media_regeneration = {"asset": p5}
+        window.media_regeneration_result = {
+            "completed": True,
+            "outputs": [{
+                "generated": True,
+                "local_path": str(new_image.resolve()),
+            }],
+        }
+        try:
+            with (
+                patch.object(window, "queue_media_preparation") as prepare,
+                patch.object(window, "schedule_prompt_generation"),
+                patch.object(window, "render_timeline_at"),
+            ):
+                window._media_regeneration_finished(0, "")
+            self.assertEqual(p5.node_id, original_node)
+            self.assertEqual(p5.reference_id, "P5")
+            self.assertEqual(p5.local_path, str(new_image.resolve()))
+            self.assertEqual(p5.clip_prompt, original_prompt)
+            prepare.assert_called_once_with(
+                p5, auto_analyze=True, preserve_recognition=True
+            )
+            self.assertTrue(window.render_dirty_segment_ids)
+        finally:
+            window.project_dirty = False
+            window.close()
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_timeline_uses_half_second_snap_grid(self):
         self.assertEqual(snap_timeline_seconds(0.24), 0.0)
@@ -2171,6 +3184,30 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_missing_speech_reminder_is_red_and_never_reaches_h3_prompt(self):
+        window = DirectorCutStudio()
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 3.0, "Suspense close-up", track_id="V1"),
+            DirectorCue(
+                "M1", "marker", 0.0, 0.5,
+                "⚠ ADD EDITABLE DIALOGUE",
+                "Use the Type Tool to add or confirm the spoken line before Preview/Run.",
+            ),
+        ]
+        window._refresh_director_cues()
+        QTest.qWait(20)
+        reminder_item = next(
+            item for item in window.timeline.scene_obj.items()
+            if isinstance(item, TimelineCueItem)
+            and item.cue.preset.startswith("⚠ ADD EDITABLE ")
+        )
+        self.assertEqual(reminder_item.brush().color().name(), "#c43d4b")
+        spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        self.assertNotIn("ADD EDITABLE", spec.technical)
+        self.assertNotIn("Type Tool", spec.technical)
+        window.project_dirty = False
+        window.close()
+
     def test_shot_tool_drags_visual_range_and_shot_dialog_is_structured(self):
         window = DirectorCutStudio()
         window.resize(1400, 900)
@@ -2444,6 +3481,89 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_h3_native_audio_prompt_reaches_workflow_without_effect_or_tts_nodes(self):
+        window = DirectorCutStudio()
+        window.render_settings.dialogue_tts_engine = "h3_native"
+        window.render_settings.music_mode = "off"
+        window.director_cues = [DirectorCue(
+            "S1", "shot", 0.0, 5.0, "Office close-up", track_id="V1",
+            framing="Close-up",
+            subject_action="A woman speaks quietly in a furnished office while typing.",
+            environment_response="The keyboard clicks exactly with her visible fingers.",
+        )]
+        window.text_layers = [TextLayer(
+            "T1", "这是现场里的原声对白。", 0.0, 5.0, "A4",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            shot_id="S1",
+        )]
+        compiled, _active = window._compiled_job(
+            megapixels=0.2, seed=42, enable_rtx_vsr=False
+        )
+        prompt = self._workflow_prompt(compiled)
+        self.assertIn("NATIVE H3 AUDIO EXECUTION CONTRACT", prompt)
+        self.assertIn("diegetic sound", prompt)
+        self.assertIn("<d>[Mandarin Chinese] 这是现场里的原声对白。</d>", prompt)
+        self.assertIn("non_diegetic_music:\nN/A", prompt)
+        prohibited = (
+            "tts", "voice separation", "aecho", "afir", "equalizer",
+            "convolution", "reverbnode", "audiomix", "amix",
+        )
+        class_names = " ".join(
+            str(node.get("class_type", "")).lower()
+            for node in compiled.values()
+        )
+        for name in prohibited:
+            self.assertNotIn(name, class_names)
+        window.project_dirty = False
+        window.close()
+
+    def test_music_mode_controls_the_actual_segment_h3_prompt(self):
+        window = DirectorCutStudio()
+        window.prompt_panel.brief.setPlainText(
+            "A tense police chase reaches an emotional reveal."
+        )
+        window.director_cues = [DirectorCue(
+            "S1", "shot", 0.0, 5.0, "Street chase", track_id="V1",
+            subject_action="A detective runs through a wet city street.",
+            environment_response="Footsteps strike puddles.",
+        )]
+
+        window.render_settings.music_mode = "auto"
+        window.prompt_panel.music.clear()
+        compiled, _ = window._compiled_job(
+            megapixels=0.2, seed=43, enable_rtx_vsr=False
+        )
+        auto_prompt = self._workflow_prompt(compiled)
+        self.assertIn("non_diegetic_music:", auto_prompt)
+        self.assertIn("cinematic action score", auto_prompt)
+        self.assertNotIn("non_diegetic_music:\nN/A", auto_prompt)
+
+        window.render_settings.music_mode = "timeline"
+        window.prompt_panel.music.setPlainText("Restrained low strings.")
+        compiled, _ = window._compiled_job(
+            megapixels=0.2, seed=44, enable_rtx_vsr=False
+        )
+        timeline_silent_prompt = self._workflow_prompt(compiled)
+        self.assertIn("non_diegetic_music:\nN/A", timeline_silent_prompt)
+
+        window.director_cues.append(DirectorCue(
+            "M1", "marker", 0.0, 0.5, "Music Cue",
+            "Begin the restrained low strings.",
+        ))
+        compiled, _ = window._compiled_job(
+            megapixels=0.2, seed=45, enable_rtx_vsr=False
+        )
+        timeline_music_prompt = self._workflow_prompt(compiled)
+        self.assertIn("non_diegetic_music:\nRestrained low strings", timeline_music_prompt)
+        self.assertTrue(window._timeline_music_requested_for_range(15.0, 30.0))
+        window.director_cues.append(DirectorCue(
+            "M2", "marker", 10.0, 10.5, "Music Cue",
+            "Stop music and return to diegetic ambience only.",
+        ))
+        self.assertFalse(window._timeline_music_requested_for_range(10.5, 30.0))
+        window.project_dirty = False
+        window.close()
+
     def test_active_api_export_rebuilds_dynamic_mapping_before_compile(self):
         window = DirectorCutStudio()
         window.prompt_panel.brief.setPlainText("Use the current Timeline references.")
@@ -2630,9 +3750,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn("@P", first_prompt + second_prompt)
         self.assertNotIn("@V", first_prompt + second_prompt)
         self.assertNotIn("@A", first_prompt + second_prompt)
-        uploads_by_node = {
-            row["loader_node_id"]: row for row in job["media"]
-        }
+        uploads_by_node: dict[str, list[dict]] = {}
+        for row in job["media"]:
+            uploads_by_node.setdefault(str(row["loader_node_id"]), []).append(row)
         # Every loader retained by a Segment must be backed by the current
         # local upload. Inactive loaders are removed completely so an old
         # computer's image/audio/video filename cannot be validated by ComfyUI.
@@ -2644,10 +3764,14 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 loader = MEDIA_LOADERS.get(str(node.get("class_type", "")))
                 if loader is None or node_id == continuity_loader:
                     continue
-                upload = uploads_by_node[node_id]
-                self.assertEqual(
-                    node["inputs"][upload["loader_input"]],
-                    upload["upload_name"],
+                candidates = uploads_by_node[node_id]
+                self.assertTrue(
+                    any(
+                        node["inputs"].get(upload["loader_input"])
+                        == upload["upload_name"]
+                        for upload in candidates
+                    ),
+                    msg=f"Segment-local loader {node_id} was overwritten by the global media union",
                 )
         window.project_dirty = False
         window.close()
@@ -3119,7 +4243,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
         self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 11)
+        self.assertEqual(job["render_policy_version"], 16)
         window.project_dirty = False
         window.close()
 
@@ -3346,7 +4470,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 11,
+            "render_policy_version": 16,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -3370,6 +4494,256 @@ class DirectorTimelineDragTests(unittest.TestCase):
         folder.rmdir()
         window.project_dirty = False
         window.close()
+
+    def test_alpha2_extending_45_to_120_preserves_approved_front_segments(self):
+        window = DirectorCutStudio()
+        window.prompt_panel.brief.setPlainText(
+            "A continuous urban mystery with stable characters and locations."
+        )
+        window.prompt_panel.ending.setPlainText(
+            "Only the actual final segment holds on the unresolved clue."
+        )
+        window._set_design_duration(45.0)
+        first_path, _ = window._build_smart_render_job(
+            request_kind="final", megapixels=1.0, seed=86420,
+            enable_rtx_vsr=False,
+        )
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        folder = PROJECT_ROOT / ".director_cache" / "alpha2_extend_reuse_test"
+        if folder.is_dir():
+            shutil.rmtree(folder)
+        folder.mkdir(parents=True)
+        cached_rows = []
+        for row in first["segments"]:
+            output = folder / f"{row['segment_id']}.mp4"
+            output.write_bytes(b"approved")
+            cached_rows.append({
+                **{key: value for key, value in row.items() if key != "workflow"},
+                "status": "complete",
+                "output_path": str(output),
+            })
+        window.smart_render_manifests["production"] = {
+            "render_policy_version": first["render_policy_version"],
+            "request_kind": "final",
+            "master_seed": 86420,
+            "target_duration_seconds": 45.0,
+            "segments": cached_rows,
+        }
+
+        window._set_design_duration(120.0)
+        extended_path, _ = window._build_smart_render_job(
+            request_kind="final", megapixels=1.0, seed=86420,
+            enable_rtx_vsr=False,
+        )
+        extended = json.loads(extended_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(extended["segments"]), 8)
+        self.assertEqual(
+            [row.get("status") for row in extended["segments"][:3]],
+            ["cached", "cached", "cached"],
+        )
+        self.assertTrue(all(
+            row.get("status") != "cached" for row in extended["segments"][3:]
+        ))
+        window.example_work_dir = folder
+        estimate = window._resource_estimate("approved_final")
+        self.assertEqual(estimate.reusable_duration_seconds, 45.0)
+        self.assertEqual(estimate.render_duration_seconds, 75.0)
+        self.assertEqual(window.position_slider.maximum(), 120000)
+        self.assertEqual(window.timeline.duration, 120.0)
+        shutil.rmtree(folder)
+        window.project_dirty = False
+        window.close()
+
+    def test_alpha2_partial_manifest_is_checkpointed_for_resume(self):
+        folder = PROJECT_ROOT / ".director_cache" / "alpha2_resume_checkpoint_test"
+        if folder.is_dir():
+            shutil.rmtree(folder)
+        window = DirectorCutStudio()
+        window.example_work_dir = folder
+        window.submit_request_kind = "final"
+        partial = {
+            "format": "h3-smart-render-manifest",
+            "version": 1,
+            "render_policy_version": 16,
+            "request_kind": "final",
+            "master_seed": 1234,
+            "target_duration_seconds": 120.0,
+            "segments": [{
+                "segment_id": "segment_001_000000000_000015000",
+                "status": "complete",
+                "output_path": str(folder / "cache_segment.mp4"),
+            }],
+        }
+        window._generation_message({"partial_manifest": partial})
+        project = folder / "project" / "director_project.h3director.json"
+        self.assertTrue(project.is_file())
+        payload = json.loads(project.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["smart_render_manifests"]["production"]["master_seed"],
+            1234,
+        )
+        self.assertTrue((folder / "project" / "render_manifest.json").is_file())
+        self.assertTrue(window.project_dirty)
+        window.project_dirty = False
+        window.close()
+        shutil.rmtree(folder)
+
+    def test_long_render_jobs_are_project_scoped_and_instance_unique(self):
+        folder = PROJECT_ROOT / ".director_cache" / "project_scoped_render_job_test"
+        shutil.rmtree(folder, ignore_errors=True)
+        window = DirectorCutStudio()
+        window.example_work_dir = folder
+        window._set_design_duration(30.0)
+        first_path, _ = window._build_smart_render_job(
+            request_kind="final",
+            megapixels=1.0,
+            seed=101,
+            enable_rtx_vsr=False,
+        )
+        second_path, _ = window._build_smart_render_job(
+            request_kind="final",
+            megapixels=1.0,
+            seed=101,
+            enable_rtx_vsr=False,
+        )
+        self.assertNotEqual(first_path, second_path)
+        self.assertEqual(first_path.parent, folder / "project" / "render_jobs")
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        self.assertEqual(first["segment_attempts"], 3)
+        self.assertTrue(all(
+            Path(row["download_dir"]).is_relative_to(
+                folder / "cache" / "generated_outputs"
+            )
+            for row in first["segments"]
+        ))
+        window.project_dirty = False
+        window.close()
+        shutil.rmtree(folder)
+
+    def test_worker_written_manifest_recovers_after_ui_crash_before_checkpoint(self):
+        folder = PROJECT_ROOT / ".director_cache" / "worker_crash_manifest_recovery_test"
+        shutil.rmtree(folder, ignore_errors=True)
+        window = DirectorCutStudio()
+        window.example_work_dir = folder
+        project = folder / "project" / "director_project.h3director.json"
+        self.assertTrue(window.save_project())
+        take = folder / "cache" / "generated_outputs" / "final" / "123" / "seg.mp4"
+        take.parent.mkdir(parents=True, exist_ok=True)
+        take.write_bytes(b"completed-before-ui-crash")
+        render_jobs = folder / "project" / "render_jobs"
+        render_jobs.mkdir(parents=True, exist_ok=True)
+        worker_manifest = {
+            "format": "h3-smart-render-manifest",
+            "version": 1,
+            "render_policy_version": 16,
+            "request_kind": "final",
+            "updated_at": "2026-09-01T12:00:00+00:00",
+            "segments": [{
+                "segment_id": "seg",
+                "status": "complete",
+                "output_path": str(take),
+                "start_seconds": 0.0,
+                "end_seconds": 12.0,
+            }],
+        }
+        (render_jobs / "interrupted.manifest.json").write_text(
+            json.dumps(worker_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        window.project_dirty = False
+        window.close()
+
+        restored = DirectorCutStudio()
+        restored.load_project_path(project)
+        self.assertIn("production", restored.smart_render_manifests)
+        recovered = restored.smart_render_manifests["production"]
+        self.assertEqual(recovered["segments"][0]["status"], "complete")
+        self.assertEqual(Path(recovered["segments"][0]["output_path"]), take)
+        self.assertTrue(restored.project_dirty)
+        restored.project_dirty = False
+        restored.close()
+        shutil.rmtree(folder)
+
+    def test_manifest_recovery_prefers_more_durable_takes_over_newer_failure(self):
+        folder = PROJECT_ROOT / ".director_cache" / "manifest_best_checkpoint_test"
+        shutil.rmtree(folder, ignore_errors=True)
+        render_jobs = folder / "project" / "render_jobs"
+        render_jobs.mkdir(parents=True)
+        completed_rows = []
+        for index in range(2):
+            segment_id = f"seg{index + 1}"
+            take = folder / "segments" / segment_id / "takes" / "approved_final.mp4"
+            take.parent.mkdir(parents=True)
+            take.write_bytes(f"take-{index}".encode("ascii"))
+            completed_rows.append(
+                {
+                    "segment_id": segment_id,
+                    "status": "complete",
+                    "output_path": "missing-old-computer-path.mp4",
+                }
+            )
+        (render_jobs / "older_complete.manifest.json").write_text(
+            json.dumps(
+                {
+                    "request_kind": "final",
+                    "updated_at": "2026-09-01T10:00:00+00:00",
+                    "segments": completed_rows,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (render_jobs / "newer_failed.manifest.json").write_text(
+            json.dumps(
+                {
+                    "request_kind": "final",
+                    "updated_at": "2026-09-01T11:00:00+00:00",
+                    "segments": [
+                        {
+                            "segment_id": "seg3",
+                            "status": "failed",
+                            "output_path": "",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        recovered = DirectorCutStudio._recover_workspace_render_manifest(folder)
+        self.assertEqual(len(recovered["segments"]), 2)
+        self.assertTrue(all(Path(row["output_path"]).is_file() for row in recovered["segments"]))
+        shutil.rmtree(folder)
+
+    def test_blip_overview_renames_import_only_workspace_and_rebases_asset(self):
+        parent = PROJECT_ROOT / ".director_cache" / "workspace_overview_rename_test"
+        if parent.is_dir():
+            shutil.rmtree(parent)
+        parent.mkdir(parents=True)
+        with patch("director_cut_studio.DESIGN_EXAMPLE_ROOT", parent):
+            window = DirectorCutStudio()
+            provisional = window._ensure_project_workspace()
+            asset = next(item for item in window.scan.assets if item.media_type == "image")
+            imported = provisional / "media" / "imported" / "P1.png"
+            imported.write_bytes(b"source")
+            assign_local_media(window.scan, asset, imported)
+            asset.recognition = (
+                "BLIP VISUAL SUMMARY · CUDA\n"
+                "BLIP · Overview: a young girl running with a red flag"
+            )
+            refined = window._ensure_project_workspace(
+                "a_young_girl_running_with_a_red_flag"
+            )
+            self.assertEqual(
+                refined.name, "a_young_girl_running_with_a_red_flag"
+            )
+            self.assertFalse(provisional.exists())
+            self.assertEqual(
+                Path(asset.local_path),
+                refined / "media" / "imported" / "P1.png",
+            )
+            window.project_dirty = False
+            window.close()
+        shutil.rmtree(parent)
 
     def test_prompt_presets_caption_seed_and_timeline_auto_sync(self):
         self.assertTrue(all(len(items) == 32 for items in (
@@ -3415,7 +4789,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("Optional (omit before delaying core)", window.prompt_panel.shots.toPlainText())
         self.assertIn("S1 [English, Confident, lip sync]", window.prompt_panel.dialogue.toPlainText())
         self.assertIn("Hold the hero pose", window.prompt_panel.ending.toPlainText())
-        QTest.qWait(250)
+        # The full suite can leave the event loop busy after media/TTS smoke
+        # tests; allow the 180ms debounce to fire reliably under that load.
+        QTest.qWait(600)
         self.assertTrue(window.prompt_panel.output.toPlainText().strip())
         self.assertEqual(window.prompt_panel.brief_preset.count(), 33)
         self.assertEqual(window.prompt_panel.style_preset.count(), 33)
@@ -3557,6 +4933,53 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         restored.project_dirty = False
         restored.close()
+
+    def test_current_project_recovers_master_when_saved_output_fields_are_empty(self):
+        video = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
+        if not video.exists():
+            self.skipTest("runtime smoke video is not present")
+        workspace = (
+            PROJECT_ROOT / ".director_cache" / "empty_generated_output_restore_test"
+        )
+        shutil.rmtree(workspace, ignore_errors=True)
+        window = DirectorCutStudio()
+        window.example_work_dir = workspace
+        outputs = window._archive_generated_outputs(
+            [{"kind": "videos", "local_path": str(video)}], "accepted"
+        )
+        self.assertTrue(window._show_generated_output(outputs, autoplay=False))
+        window.submit_request_kind = "accepted"
+        window.smart_render_manifest = {
+            "format": "h3-smart-render-manifest",
+            "request_kind": "accepted",
+            "master_output": "D:/old-computer/old-project/generated_output.mp4",
+            "segments": [],
+        }
+        project = window._auto_save_example_project()
+        payload = json.loads(project.read_text(encoding="utf-8"))
+        payload["generated_output"] = ""
+        payload["smart_render"] = {}
+        payload["smart_render_manifests"] = {}
+        project.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        window.project_dirty = False
+        window.close()
+
+        restored = DirectorCutStudio()
+        restored.load_project_path(project)
+        expected = (workspace / "generated_output.mp4").resolve()
+        self.assertEqual(restored.generated_output_path, expected)
+        self.assertTrue(restored.export_generated_button.isEnabled())
+        self.assertIn("production", restored.smart_render_manifests)
+        self.assertEqual(
+            Path(restored.smart_render_manifest["master_output"]), expected
+        )
+        self.assertTrue(restored.project_dirty)
+        self.assertIn("Generated output", restored.generated_output_label.text())
+        restored.project_dirty = False
+        restored.close()
+        shutil.rmtree(workspace, ignore_errors=True)
 
     def test_completed_shot_previews_under_translucent_running_overlay(self):
         video = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
@@ -3714,9 +5137,10 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 11,
+            "render_policy_version": 16,
             "segments": completed,
         }
+        window.render_dirty_segment_ids.clear()
         window._refresh_render_status_bar()
         self.app.processEvents()
         self.assertEqual(
@@ -3788,6 +5212,72 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_interrupted_monitor_proxy_is_rebuilt_and_published_atomically(self):
+        folder = PROJECT_ROOT / ".director_cache" / "monitor_proxy_atomic_test"
+        folder.mkdir(parents=True, exist_ok=True)
+        source = (folder / "master.mp4").resolve()
+        proxy = (folder / "master_proxy.mp4").resolve()
+        source.write_bytes(b"source-master")
+        proxy.write_bytes(b"partial-mp4-without-moov")
+        window = DirectorCutStudio()
+        window.generated_output_path = source
+        with (
+            patch.object(window, "_generated_monitor_proxy_path", return_value=proxy),
+            patch.object(window, "_generated_monitor_proxy_is_valid", return_value=False),
+            patch.object(window.generated_player, "setSource"),
+            patch.object(window.generated_player, "setPosition"),
+            patch.object(window, "render_timeline_at"),
+            patch.object(JsonLineProcess, "start", return_value=True) as start,
+        ):
+            window._prepare_generated_monitor_video(source, autoplay=False)
+        runner = window.generated_proxy_runner
+        working = window.generated_proxy_working
+        self.assertIsNotNone(runner)
+        self.assertIsNotNone(working)
+        self.assertFalse(proxy.exists())
+        self.assertNotEqual(working, proxy)
+        self.assertTrue(str(working).endswith(".building.mp4"))
+        self.assertEqual(Path(start.call_args.args[1][-1]), working)
+
+        working.write_bytes(b"complete-proxy-with-moov")
+        with (
+            patch.object(window, "_generated_monitor_proxy_is_valid", return_value=True),
+            patch.object(window, "_load_generated_player_source") as load_source,
+        ):
+            window._generated_proxy_finished(
+                runner,
+                source,
+                proxy,
+                working,
+                0,
+                "",
+            )
+        self.assertTrue(proxy.is_file())
+        self.assertEqual(proxy.read_bytes(), b"complete-proxy-with-moov")
+        self.assertFalse(working.exists())
+        load_source.assert_called_once_with(proxy, autoplay=False)
+        proxy.unlink(missing_ok=True)
+        source.unlink(missing_ok=True)
+        folder.rmdir()
+        window.project_dirty = False
+        window.close()
+
+    def test_monitor_proxy_validation_rejects_missing_moov_probe_failure(self):
+        folder = PROJECT_ROOT / ".director_cache" / "monitor_proxy_validation_test"
+        folder.mkdir(parents=True, exist_ok=True)
+        source = folder / "master.mp4"
+        proxy = folder / "broken_proxy.mp4"
+        source.write_bytes(b"source-master")
+        proxy.write_bytes(b"x" * 2048)
+        window = DirectorCutStudio()
+        with patch("director_cut_studio.probe_media", side_effect=RuntimeError("moov atom not found")):
+            self.assertFalse(window._generated_monitor_proxy_is_valid(source, proxy))
+        proxy.unlink(missing_ok=True)
+        source.unlink(missing_ok=True)
+        folder.rmdir()
+        window.project_dirty = False
+        window.close()
+
     def test_edited_dialogue_invalidates_tts_contract_and_unmutes_reference_track(self):
         window = DirectorCutStudio()
         audio = next(asset for asset in window.scan.assets if asset.media_type == "audio")
@@ -3824,9 +5314,15 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window = DirectorCutStudio()
         context = window._design_context()
         context["dialogue_tts_engine"] = "h3_native"
-        with patch(
-            "director_cut_studio.voxcpm_model_missing",
-            return_value=["model folder"],
+        with (
+            patch(
+                "director_cut_studio.voxcpm_model_missing",
+                return_value=["model folder"],
+            ),
+            patch(
+                "director_cut_studio.qwen3_tts_runtime_missing",
+                return_value=["runtime folder"],
+            ),
         ):
             dialog = DesignPageDialog(
                 window.runtime, context, window.scan.counts, window,
@@ -3843,6 +5339,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
             self.assertTrue(dialog.dialogue_mode_buttons["voxcpm2_local"].isChecked())
             self.assertFalse(dialog.dialogue_model_warning.isHidden())
             self.assertIn("MODEL MISSING", dialog.dialogue_model_warning.text())
+            self.assertIn("qwen3_tts_local", dialog.dialogue_mode_buttons)
+            dialog.dialogue_mode_buttons["qwen3_tts_local"].click()
+            self.assertEqual(dialog.design_tts_engine, "qwen3_tts_local")
+            self.assertTrue(dialog.dialogue_mode_buttons["qwen3_tts_local"].isChecked())
+            self.assertIn("QWEN3-TTS MISSING", dialog.dialogue_model_warning.text())
             dialog.close()
 
         with patch(
@@ -3855,6 +5356,22 @@ class DirectorTimelineDragTests(unittest.TestCase):
             self.assertFalse(window._refresh_voxcpm_model_status_ui())
             self.assertIn(
                 "MODEL MISSING", window.settings_voxcpm_model_status.text()
+            )
+            self.assertIn("ff9d38", window.settings_dialogue_tts.styleSheet())
+
+        with (
+            patch("director_cut_studio.qwen3_tts_runtime_missing", return_value=[]),
+            patch(
+                "director_cut_studio.qwen3_tts_model_missing",
+                return_value=["model.safetensors"],
+            ),
+        ):
+            window.settings_dialogue_tts.setCurrentIndex(
+                window.settings_dialogue_tts.findData("qwen3_tts_local")
+            )
+            self.assertFalse(window._refresh_voxcpm_model_status_ui())
+            self.assertIn(
+                "MISSING", window.settings_qwen3_tts_model_status.text()
             )
             self.assertIn("ff9d38", window.settings_dialogue_tts.styleSheet())
 
@@ -3922,6 +5439,461 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("Text Layers were preserved", args[5][0])
         window.project_dirty = False
         window.close()
+
+    def test_alpha1_quality_tiers_are_visible_persistent_and_dispatch_safely(self):
+        window = DirectorCutStudio()
+        window.example_work_dir = (
+            PROJECT_ROOT / ".director_cache" / "alpha1_quality_profile_test"
+        )
+        combo = window.quality_profile_combo
+        self.assertEqual(combo.count(), 3)
+        self.assertEqual(
+            {combo.itemData(index) for index in range(combo.count())},
+            {"storyboard", "motion_preview", "approved_final"},
+        )
+
+        # RUN+QUEUE is a direct final render and must not be hijacked by a
+        # previously selected/hidden Storyboard or Motion Preview profile.
+        for profile in ("storyboard", "motion_preview", "approved_final"):
+            combo.setCurrentIndex(combo.findData(profile))
+            window.storyboard_preview_active = profile == "storyboard"
+            with (
+                patch.object(window, "_new_seed", return_value=123456),
+                patch.object(window, "_start_generation") as start_generation,
+                patch.object(window, "_activate_storyboard_mode") as storyboard,
+                patch.object(window, "generate_pre_run_preview") as preview,
+            ):
+                window.queue_to_comfyui()
+            start_generation.assert_called_once_with(
+                "final",
+                window.settings_megapixels.value(),
+                123456,
+                window.settings_rtx_vsr.isChecked(),
+            )
+            storyboard.assert_not_called()
+            preview.assert_not_called()
+            self.assertFalse(window.storyboard_preview_active)
+
+        combo.setCurrentIndex(combo.findData("approved_final"))
+        window._ensure_project_workspace("Alpha 1 Quality Test")
+        payload = window._project_payload()
+        self.assertEqual(payload["quality_profile"], "approved_final")
+        self.assertEqual(payload["workspace_layout_version"], 2)
+        self.assertTrue(payload["workspace_id"])
+        window.project_dirty = False
+        window.close()
+
+    def test_storyboard_at_work_area_end_rewinds_and_run_queue_exits_storyboard(self):
+        window = DirectorCutStudio()
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(45.0)
+        window.seek_timeline(45.0)
+
+        window.activate_storyboard_preview()
+
+        self.assertTrue(window.storyboard_preview_active)
+        self.assertAlmostEqual(window.playhead_seconds, 0.0, places=3)
+        self.assertTrue(window.timeline_playing)
+        self.assertIn("Storyboard playing", window.statusBar().currentMessage())
+
+        with (
+            patch.object(window, "_new_seed", return_value=246810),
+            patch.object(window, "_start_generation") as start_generation,
+        ):
+            window.queue_button.click()
+        start_generation.assert_called_once_with(
+            "final",
+            window.settings_megapixels.value(),
+            246810,
+            window.settings_rtx_vsr.isChecked(),
+        )
+        self.assertFalse(window.storyboard_preview_active)
+        window.timeline_playing = False
+        window.timeline_timer.stop()
+        window.project_dirty = False
+        window.close()
+
+    def test_generation_toolbar_uses_compact_requested_order_and_hover_text(self):
+        window = DirectorCutStudio()
+        widgets = [
+            window.generation_toolbar.widgetForAction(action)
+            for action in window.generation_toolbar.actions()
+            if window.generation_toolbar.widgetForAction(action) is not None
+        ]
+        ordered = [
+            window.clip_start,
+            window.clip_end,
+            window.aspect_ratio_combo,
+            window.production_strategy_combo,
+            window.production_batch_spin,
+            window.next_batch_button,
+            window.production_progress_label,
+            window.export_api_button,
+            window.server_url,
+            window.test_connection_button,
+            window.queue_button,
+            window.storyboard_button,
+            window.storyboard_target_spin,
+            window.storyboard_trim_button,
+            window.preview_button,
+            window.accept_preview_button,
+            window.reject_preview_button,
+            window.resource_estimate_button,
+        ]
+        positions = [widgets.index(widget) for widget in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(window.export_api_button.text(), "EXPORT API")
+        self.assertEqual(window.test_connection_button.text(), "TEST")
+        self.assertEqual(window.queue_button.text(), "RUN+QUEUE")
+        self.assertEqual(window.storyboard_button.text(), "STORYBOARD")
+        self.assertEqual(window.storyboard_trim_button.text(), "AUTO CUT")
+        self.assertEqual(window.preview_button.text(), "PREVIEW 0.2M")
+        self.assertEqual(window.accept_preview_button.text(), "ACCEPT 1.0M")
+        self.assertEqual(window.reject_preview_button.text(), "REJECT")
+        self.assertEqual(window.resource_estimate_button.text(), "ESTIMATE")
+        window.clip_start.setValue(0.0)
+        window.clip_end.setMaximum(120.0)
+        window.clip_end.setValue(15.0)
+        self.assertEqual(window.clip_start.text(), "0s")
+        self.assertEqual(window.clip_end.text(), "15s")
+        window.clip_start.setValue(0.5)
+        self.assertEqual(window.clip_start.text(), "0.5s")
+        self.assertIn("Export Active API", window.export_api_button.toolTip())
+        self.assertIn("Test Connection", window.test_connection_button.toolTip())
+        self.assertIn("Storyboard Editor", window.storyboard_button.toolTip())
+        self.assertIn("Motion Preview 0.2MP", window.preview_button.toolTip())
+        self.assertIn("Approved Final 1.0MP", window.accept_preview_button.toolTip())
+        self.assertTrue(window.quality_profile_combo.isHidden())
+        with patch.object(window, "open_storyboard_editor") as open_editor:
+            window.storyboard_button.clicked.disconnect()
+            window.storyboard_button.clicked.connect(window.open_storyboard_editor)
+            window.storyboard_button.click()
+        open_editor.assert_called_once_with()
+        window.project_dirty = False
+        window.close()
+
+    def test_generation_toolbar_overflow_wraps_to_persistent_second_row(self):
+        window = DirectorCutStudio()
+        window.resize(window.minimumWidth(), window.minimumHeight())
+        window.show()
+        self.app.processEvents()
+        window._reflow_generation_toolbar()
+        self.app.processEvents()
+        self.assertTrue(window._generation_overflow_actions)
+        self.assertFalse(hasattr(window, "generation_more_button"))
+        self.assertTrue(window.generation_overflow_toolbar.isVisible())
+        overflow_widgets = [
+            window.generation_overflow_toolbar.widgetForAction(action)
+            for action in window.generation_overflow_toolbar.actions()
+        ]
+        self.assertIn(window.preview_button, overflow_widgets)
+        self.assertIn(window.resource_estimate_button, overflow_widgets)
+        primary_widgets = [
+            window.generation_toolbar.widgetForAction(action)
+            for action in window.generation_toolbar.actions()
+        ]
+        expected = [
+            window.clip_start,
+            window.clip_end,
+            window.aspect_ratio_combo,
+            window.production_strategy_combo,
+            window.production_batch_spin,
+            window.next_batch_button,
+            window.production_progress_label,
+            window.export_api_button,
+            window.server_url,
+            window.test_connection_button,
+            window.queue_button,
+            window.storyboard_button,
+            window.storyboard_target_spin,
+            window.storyboard_trim_button,
+            window.preview_button,
+            window.accept_preview_button,
+            window.reject_preview_button,
+            window.resource_estimate_button,
+        ]
+        combined = [widget for widget in primary_widgets + overflow_widgets if widget in expected]
+        self.assertEqual(combined, expected)
+        for toolbar in (window.generation_toolbar, window.generation_overflow_toolbar):
+            native_more = toolbar.findChild(QToolButton, "qt_toolbar_ext_button")
+            self.assertFalse(native_more and native_more.isVisible())
+        self.app.sendEvent(window.generation_toolbar, QEvent(QEvent.Leave))
+        self.app.sendEvent(window.generation_overflow_toolbar, QEvent(QEvent.Leave))
+        self.app.processEvents()
+        self.assertTrue(window.generation_overflow_toolbar.isVisible())
+        for widget in (
+            window.clip_start,
+            window.production_strategy_combo,
+            window.queue_button,
+            window.storyboard_button,
+            window.preview_button,
+            window.resource_estimate_button,
+        ):
+            self.assertTrue(widget.property("generation_hover_help"))
+            self.assertIn("<b>", widget.toolTip())
+            self.assertIn("<br>", widget.toolTip())
+        window.project_dirty = False
+        window.close()
+
+    def test_compact_segment_take_preserves_preview_final_and_shot_state(self):
+        video = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
+        if not video.is_file():
+            self.skipTest("runtime smoke video is not present")
+        workspace = PROJECT_ROOT / ".director_cache" / "alpha1_shot_take_test"
+        if workspace.is_dir():
+            shutil.rmtree(workspace)
+        window = DirectorCutStudio()
+        window._set_design_duration(1.5)
+        window.example_work_dir = workspace
+        window.director_cues = [
+            DirectorCue("SHOT-001", "shot", 0.0, 1.5, "Test", "One action")
+        ]
+        outputs = window._archive_generated_outputs(
+            [{"kind": "videos", "local_path": str(video)}], "accepted"
+        )
+        self.assertTrue((workspace / "generated_output.mp4").is_file())
+        self.assertFalse(
+            any((workspace / "renders" / "final" / "takes").glob("*.mp4"))
+        )
+        self.assertFalse(
+            (workspace / "renders" / "final" / "generated_output.mp4").exists()
+        )
+        window.quality_profile = "approved_final"
+        window._record_generation_takes("accepted", 1234, outputs)
+        state = window.shot_take_states["SHOT-001"]
+        self.assertEqual(state["status"], "approved")
+        self.assertEqual(state["seed"], 1234)
+        self.assertEqual(state["approved_take"], "T0001")
+        self.assertTrue(Path(state["latest_output_path"]).is_file())
+        self.assertTrue(Path(state["approved_output_path"]).is_file())
+        self.assertEqual(
+            len(list((workspace / "segments").rglob("approved_final.mp4"))), 1
+        )
+        self.assertEqual(len(list((workspace / "shots").rglob("*.mp4"))), 0)
+        window.quality_profile = "motion_preview"
+        window._record_generation_takes("preview", 5678, outputs)
+        window._mark_latest_preview_rejected()
+        state = window.shot_take_states["SHOT-001"]
+        self.assertEqual(state["status"], "rejected")
+        self.assertEqual(state["latest_take"], "T0002")
+        self.assertEqual(state["approved_take"], "T0001")
+        self.assertTrue(Path(state["approved_output_path"]).is_file())
+        self.assertEqual(
+            len(list((workspace / "segments").rglob("motion_preview.mp4"))), 1
+        )
+        self.assertEqual(len(window.segment_take_states), 1)
+        payload = window._project_payload()
+        self.assertEqual(
+            payload["shot_take_states"]["SHOT-001"]["approved_take"],
+            "T0001",
+        )
+        project = workspace / "project" / "director_project.h3director.json"
+        project.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        window.project_dirty = False
+        window.close()
+
+        restored = DirectorCutStudio()
+        with patch.object(restored, "queue_media_preparation"):
+            restored.load_project_path(project)
+        self.assertEqual(
+            restored.shot_take_states["SHOT-001"]["approved_take"], "T0001"
+        )
+        self.assertTrue(
+            Path(restored.shot_take_states["SHOT-001"]["approved_output_path"]).is_file()
+        )
+        self.assertEqual(len(restored.segment_take_states), 1)
+        restored.project_dirty = False
+        restored.close()
+
+    def test_alpha1_legacy_open_preserves_source_and_redirects_future_save(self):
+        root = PROJECT_ROOT / ".director_cache" / "alpha1_legacy_migration_test"
+        if root.is_dir():
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        source_window = DirectorCutStudio()
+        payload = source_window._project_payload()
+        payload["version"] = 18
+        payload.pop("workspace_layout_version", None)
+        payload.pop("workspace_id", None)
+        payload.pop("workspace_root", None)
+        legacy = root / "legacy_project.h3director.json"
+        original = json.dumps(payload, ensure_ascii=False, indent=2)
+        legacy.write_text(original, encoding="utf-8")
+        source_window.project_dirty = False
+        source_window.close()
+
+        restored = DirectorCutStudio()
+        with patch.object(restored, "queue_media_preparation"):
+            restored.load_project_path(legacy)
+        self.assertEqual(legacy.read_text(encoding="utf-8"), original)
+        self.assertEqual(restored.legacy_project_source, legacy.resolve())
+        self.assertEqual(
+            restored.project_path,
+            root / "project" / "director_project.h3director.json",
+        )
+        self.assertTrue((root / "project_manifest.json").is_file())
+        restored.project_dirty = False
+        restored.close()
+
+    def test_long_form_special_selects_incremental_and_none_restores_full_range(self):
+        window = DirectorCutStudio()
+        long_index = window.special_combo.findData("long-form-h3-director")
+        self.assertGreaterEqual(long_index, 0)
+        window.special_combo.setCurrentIndex(long_index)
+        self.assertEqual(window.production_strategy, "incremental")
+        self.assertEqual(
+            window.production_strategy_combo.currentData(), "incremental"
+        )
+        self.assertFalse(window.next_batch_button.isHidden())
+        window.special_combo.setCurrentIndex(0)
+        self.assertEqual(window.production_strategy, "full_range")
+        window.project_dirty = False
+        window.close()
+
+    def test_incremental_batch_boundary_extends_to_protect_explicit_speech(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(120.0)
+        window.production_strategy = "incremental"
+        window.production_batch_seconds = 30.0
+        window.incremental_approved_horizon = 0.0
+        window.text_layers = [
+            TextLayer(
+                "D1", "不能切断这句对白。", 27.0, 33.5, "A4",
+                content_role="dialogue", language="Mandarin Chinese",
+            )
+        ]
+        window.director_cues = [
+            DirectorCue("S1", "shot", 26.0, 35.0, "Reveal", "Complete clue")
+        ]
+        self.assertEqual(window._next_incremental_batch_end(), 35.0)
+        window.project_dirty = False
+        window.close()
+
+    def test_next_incremental_batch_previews_only_new_range(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(120.0)
+        window.production_strategy = "incremental"
+        window.production_batch_seconds = 30.0
+        window.incremental_approved_horizon = 30.0
+        with patch.object(window, "generate_pre_run_preview") as preview:
+            window.start_next_incremental_batch()
+        preview.assert_called_once_with()
+        self.assertEqual(window.clip_start.value(), 30.0)
+        self.assertEqual(window.clip_end.value(), 60.0)
+        self.assertEqual(window.incremental_pending_start, 30.0)
+        self.assertEqual(window.incremental_pending_end, 60.0)
+        self.assertEqual(window.incremental_batch_phase, "previewing")
+        window.project_dirty = False
+        window.close()
+
+    def test_incremental_accept_switches_to_cumulative_master_with_preview_seed(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(120.0)
+        window.production_strategy = "incremental"
+        window.incremental_approved_horizon = 30.0
+        window.incremental_pending_start = 30.0
+        window.incremental_pending_end = 60.0
+        window.incremental_batch_phase = "preview_ready"
+        window.preview_seed = 987654
+        window.preview_ready = True
+        window.clip_start.setValue(30.0)
+        window.clip_end.setValue(60.0)
+        with patch.object(window, "_start_generation") as start:
+            window.accept_pre_run_preview()
+        start.assert_called_once_with(
+            "accepted", 1.0, 987654, window.settings_rtx_vsr.isChecked()
+        )
+        self.assertEqual(window.clip_start.value(), 0.0)
+        self.assertEqual(window.clip_end.value(), 60.0)
+        self.assertEqual(window.incremental_batch_phase, "accepting")
+        window.project_dirty = False
+        window.close()
+
+    def test_incremental_production_state_is_in_project_payload(self):
+        window = DirectorCutStudio()
+        window.production_strategy = "incremental"
+        window.production_batch_seconds = 30.0
+        window.incremental_approved_horizon = 60.0
+        window.incremental_pending_start = 60.0
+        window.incremental_pending_end = 90.0
+        window.incremental_batch_phase = "preview_ready"
+        window.preview_seed = 112233
+        window.preview_ready = True
+        payload = window._project_payload()
+        self.assertEqual(payload["production_strategy"], "incremental")
+        self.assertEqual(payload["production_batch_seconds"], 30.0)
+        self.assertEqual(
+            payload["incremental_production"],
+            {
+                "approved_horizon_seconds": 60.0,
+                "pending_start_seconds": 60.0,
+                "pending_end_seconds": 90.0,
+                "phase": "preview_ready",
+                "preview_seed": 112233,
+                "preview_ready": True,
+            },
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_incremental_horizon_advances_only_after_accepted_output_is_shown(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(120.0)
+        window.production_strategy = "incremental"
+        window.incremental_approved_horizon = 30.0
+        window.incremental_pending_start = 30.0
+        window.incremental_pending_end = 60.0
+        window.incremental_batch_phase = "accepting"
+        window._apply_incremental_generation_success("accepted", 77, False)
+        self.assertEqual(window.incremental_approved_horizon, 30.0)
+        self.assertEqual(window.incremental_batch_phase, "accepting")
+        window._apply_incremental_generation_success("accepted", 77, True)
+        self.assertEqual(window.incremental_approved_horizon, 60.0)
+        self.assertEqual(window.incremental_pending_end, 0.0)
+        self.assertEqual(window.incremental_batch_phase, "")
+        window.project_dirty = False
+        window.close()
+
+    def test_incremental_batch_state_restores_from_project_for_resume(self):
+        root = PROJECT_ROOT / ".director_cache" / "incremental_batch_restore_test"
+        if root.is_dir():
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        source = DirectorCutStudio()
+        source._set_design_duration(120.0)
+        source.production_strategy = "incremental"
+        source.production_batch_seconds = 30.0
+        source.incremental_approved_horizon = 30.0
+        source.incremental_pending_start = 30.0
+        source.incremental_pending_end = 60.0
+        source.incremental_batch_phase = "preview_ready"
+        source.preview_seed = 445566
+        source.preview_ready = True
+        source.special_combo.setCurrentIndex(
+            source.special_combo.findData("long-form-h3-director")
+        )
+        project = root / "incremental.h3director.json"
+        project.write_text(
+            json.dumps(source._project_payload(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        source.project_dirty = False
+        source.close()
+
+        restored = DirectorCutStudio()
+        with patch.object(restored, "queue_media_preparation"):
+            restored.load_project_path(project)
+        self.assertEqual(restored.production_strategy, "incremental")
+        self.assertEqual(restored.incremental_approved_horizon, 30.0)
+        self.assertEqual(restored.incremental_pending_start, 30.0)
+        self.assertEqual(restored.incremental_pending_end, 60.0)
+        self.assertEqual(restored.incremental_batch_phase, "preview_ready")
+        self.assertEqual(restored.preview_seed, 445566)
+        self.assertTrue(restored.preview_ready)
+        self.assertTrue(restored.accept_preview_button.isEnabled())
+        restored.project_dirty = False
+        restored.close()
+        shutil.rmtree(root)
 
 
 if __name__ == "__main__":

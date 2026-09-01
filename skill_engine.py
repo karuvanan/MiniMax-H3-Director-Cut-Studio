@@ -22,6 +22,35 @@ SPECIAL_SKILL = "minimalist-product-ad-generator"
 NONE_SPECIAL = "__none__"
 
 
+_SUPPORT_FACE_MARKER = "supporting environment or action-state reference only"
+_DISTINCT_CHARACTER_MARKER = "distinct secondary character reference only"
+_AUTHORITATIVE_FACE_MARKERS = (
+    "authoritative recurring face identity",
+    "authoritative identity reference",
+    "authoritative whole-design face identity anchor",
+    "strict identity anchor",
+    "primary face identity anchor",
+    "primary recurring character identity anchor",
+)
+
+
+def _picture_face_role(clip_prompt: str) -> str:
+    """Classify an image without letting quoted anchor guidance promote support art.
+
+    Generated support prompts deliberately mention the *authoritative* user Picture
+    while explaining what they must not replace.  The negative support declaration
+    therefore has precedence over every positive-looking identity phrase.
+    """
+    prompt_lower = str(clip_prompt or "").casefold()
+    if _SUPPORT_FACE_MARKER in prompt_lower:
+        return "support"
+    if _DISTINCT_CHARACTER_MARKER in prompt_lower:
+        return "distinct_character"
+    if any(marker in prompt_lower for marker in _AUTHORITATIVE_FACE_MARKERS):
+        return "authoritative"
+    return "unspecified"
+
+
 @dataclass(slots=True)
 class SkillProfile:
     key: str
@@ -403,10 +432,43 @@ def _asset_definition(
             + "."
         )
     director_prompt = display(asset.clip_prompt.strip())
+    # Older Design plans could contain the contradictory pair "PRIMARY ..."
+    # and "SUPPORTING ... ONLY" on the same generated Picture.  The support
+    # declaration wins whenever compiling a legacy project so the stale prefix
+    # cannot compete with a user-supplied identity Picture.
+    if "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY" in director_prompt:
+        director_prompt = re.sub(
+            r"^PRIMARY RECURRING CHARACTER IDENTITY ANCHOR\. Show one clear, unobstructed, "
+            r"recognizable face with exact age range, facial structure, hair, skin tone, wardrobe "
+            r"and owned props suitable for reuse through the full story\.\s*",
+            "",
+            director_prompt,
+            flags=re.I,
+        )
     if director_prompt:
         analysis += f" Director clip instruction: {director_prompt[:1200]}."
     if asset.media_type == "image":
-        return f"{asset.tag} is a reference image{source} used as a concrete visual and shot-planning anchor.{analysis}"
+        identity_role = ""
+        face_role = _picture_face_role(director_prompt)
+        if face_role == "authoritative":
+            identity_role = (
+                " It is the authoritative recurring face-identity source; preserve its exact facial "
+                "geometry, age, hair and recognizable identity in every appearance."
+            )
+        elif face_role == "support":
+            identity_role = (
+                " It supplies environment, prop or action-state guidance only and must not redefine "
+                "the recurring character's face identity."
+            )
+        elif face_role == "distinct_character":
+            identity_role = (
+                " It defines only a separate secondary character and must not redefine the "
+                "authoritative recurring character's face identity."
+            )
+        return (
+            f"{asset.tag} is a reference image{source} used as a concrete visual and "
+            f"shot-planning anchor.{identity_role}{analysis}"
+        )
     if asset.media_type == "video":
         audio_note = (
             f" Its synchronized soundtrack is enabled as {paired_audio_tag}."
@@ -447,10 +509,54 @@ def build_ref2va_prompt(
     paired_audio_tags = paired_audio_reference_tags(unique_assets)
     visual_assets = [asset for asset in unique_assets if asset.media_type in ("image", "video")]
     audio_assets = [asset for asset in unique_assets if asset.media_type == "audio"]
-    has_reused_audio = bool(audio_assets or any(a.paired_audio_binding for a in assets))
-    task_types = "reference generation + audio reuse" if has_reused_audio else "reference generation"
+    has_reference_audio = bool(audio_assets or any(a.paired_audio_binding for a in assets))
+    acoustic_reference_tags = {
+        tag
+        for row in spec.native_audio_ranges
+        for tag in re.findall(
+            r"<(?:Audio|Video(?: Audio)?)\s+\d+>",
+            str(row.get("audio_reference_intent", "")),
+            flags=re.I,
+        )
+    }
+    acoustic_reference_only = bool(acoustic_reference_tags)
+    if has_reference_audio and acoustic_reference_only:
+        task_types = "reference generation + acoustic reference"
+    elif has_reference_audio:
+        task_types = "reference generation + audio reuse"
+    else:
+        task_types = "reference generation"
 
+    authoritative_face = next(
+        (
+            asset for asset in visual_assets
+            if asset.media_type == "image"
+            and _picture_face_role(asset.clip_prompt) == "authoritative"
+        ),
+        None,
+    )
+    support_pictures = [
+        asset for asset in visual_assets
+        if asset.media_type == "image"
+        and _picture_face_role(asset.clip_prompt) == "support"
+    ]
     definition_rows: list[str] = []
+    if authoritative_face is not None:
+        support_labels = ", ".join(asset.tag for asset in support_pictures)
+        support_clause = (
+            f" {support_labels} may provide environment, prop, body-pose or composition guidance "
+            "but contributes no facial identity."
+            if support_labels else ""
+        )
+        definition_rows.append(
+            f"<Subject 1> is the recurring human character whose exact recognizable face identity, "
+            f"facial geometry, age, skin tone, hairstyle and hair color come exclusively from "
+            f"{authoritative_face.tag}. Body proportions, complete upper and lower wardrobe, shoes "
+            "and accessory ownership remain fixed to their first explicitly established visible "
+            "story state. Expressions, poses, arm and leg angles, gait phase, and physically caused "
+            "hair or clothing motion may vary without changing identity or wardrobe."
+            + support_clause
+        )
     for representative in unique_assets:
         instances = grouped[source_key(representative)]
         paired_audio_tag = paired_audio_tags.get(source_key(representative), "")
@@ -491,6 +597,11 @@ def build_ref2va_prompt(
         f"[{task_types}] The target is a {duration:.2f}-second {profile_phrase}. "
         f"{spec.brief.strip()}"
     )
+    if authoritative_face is not None:
+        summary += (
+            f" <Subject 1>'s recognizable face comes exclusively from {authoritative_face.tag}; "
+            "all support Pictures are non-identity references."
+        )
 
     retention_rows: list[str] = []
     for asset in visual_assets:
@@ -498,7 +609,23 @@ def build_ref2va_prompt(
         ranges = ", ".join(
             f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s" for item in instances
         )
+        face_role = _picture_face_role(asset.clip_prompt)
         role = "visual identity, composition, and referenced attributes are retained"
+        if asset.media_type == "image" and face_role == "authoritative":
+            role = (
+                "this is the authoritative recurring face-identity source; exact facial geometry, "
+                "age, hair and recognizable identity are preserved in every appearance"
+            )
+        elif asset.media_type == "image" and face_role == "support":
+            role = (
+                "only its environment, prop or action-state guidance is retained; it does not "
+                "redefine the recurring character's face identity"
+            )
+        elif asset.media_type == "image" and face_role == "distinct_character":
+            role = (
+                "only the separate secondary character assigned to this Picture is retained; its "
+                "face must never replace the authoritative recurring character"
+            )
         if asset.media_type == "video":
             role = "motion, camera, and temporal characteristics guide the target sequence"
         retention_rows.append(
@@ -520,6 +647,12 @@ def build_ref2va_prompt(
                 "diegetic ambience, synchronized Foley/SFX and ducked non-diegetic music around "
                 "it. Never duplicate, paraphrase, echo or replace the supplied voice."
             )
+        elif asset.tag in acoustic_reference_tags:
+            retention_rows.append(
+                f"{asset.tag}: acoustic_reference_only - during {ranges}, use only its spatial "
+                "acoustics, environmental bed, speaker distance and on-location texture. Never "
+                "copy or replay its words and never let its voice identity replace a Timeline Speaker."
+            )
         else:
             retention_rows.append(
                 f"{asset.tag}: fully_copy - the assigned signal is reused during its "
@@ -534,10 +667,17 @@ def build_ref2va_prompt(
             f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s"
             for item in instances
         )
-        retention_rows.append(
-            f"{paired_audio_tag}: fully_copy - the synchronized soundtrack from "
-            f"{asset.tag} is reused during its {ranges} timeline range."
-        )
+        if asset.tag in acoustic_reference_tags or paired_audio_tag in acoustic_reference_tags:
+            retention_rows.append(
+                f"{paired_audio_tag}: acoustic_reference_only - use the synchronized sound from "
+                f"{asset.tag} only for spatial acoustics, environmental bed, speaker distance and "
+                "on-location texture during {ranges}. Never copy its dialogue or voice identity."
+            )
+        else:
+            retention_rows.append(
+                f"{paired_audio_tag}: fully_copy - the synchronized soundtrack from "
+                f"{asset.tag} is reused during its {ranges} timeline range."
+            )
     if not retention_rows:
         retention_rows.append("No active reference relationship is retained in this time window.")
 
@@ -552,6 +692,16 @@ def build_ref2va_prompt(
     detailed_rows: list[str] = []
     style = spec.style.strip() or "The target uses a coherent, concrete visual style."
     detailed_rows.append(style.rstrip(".。") + ".")
+    if authoritative_face is not None:
+        detailed_rows.append(
+            "CHARACTER CONTINUITY CONTRACT - Keep <Subject 1>'s face, age, skin tone, hairstyle, "
+            "hair color, body proportions, upper and lower wardrobe style/color, shoes and accessory "
+            "ownership fixed by default. Expression, pose, arm/leg angles, walking or running phase, "
+            "and physically plausible wind or movement in hair and clothing may vary. Change wardrobe, "
+            "hairstyle, injury state, dirt, damage, shoes or accessory ownership only when an authored "
+            "Shot explicitly performs that change; preserve the changed outgoing state through every "
+            "following Shot until another explicit change. Never invent an appearance reset."
+        )
     if special_profile is not None:
         detailed_rows.append(
             "Apply the bound special-scene direction consistently: "
@@ -637,6 +787,32 @@ def build_ref2va_prompt(
                 f"exactly once in {language}, {delivery.lower()} delivery, {sync}: "
                 f"<d>[{language}] {text}</d> {source}."
             )
+    if spec.native_audio_ranges:
+        detailed_rows.append(
+            "NATIVE H3 AUDIO EXECUTION CONTRACT - Generate the soundtrack together with the "
+            "picture inside MiniMax H3. The following instructions describe sources in the filmed "
+            "world and are not requests for TTS replacement, source separation, convolution, EQ, "
+            "echo, reverb plug-ins or post-production remixing. Keep every exact Timeline dialogue "
+            "event synchronized with its matching visual interval. Never use the preceding generated "
+            "segment's audio as a reference, and never copy an earlier utterance across a boundary."
+        )
+        for row in sorted(
+            spec.native_audio_ranges,
+            key=lambda item: (
+                float(item.get("start_seconds", 0.0)),
+                float(item.get("end_seconds", 0.0)),
+                str(item.get("cue_id", "")),
+            ),
+        ):
+            start = float(row.get("start_seconds", 0.0))
+            end = max(start, float(row.get("end_seconds", start)))
+            cue_id = str(row.get("cue_id", "Shot"))
+            detailed_rows.append(
+                f"[Native Audio {cue_id} | {_timecode(start)}-{_timecode(end)}] "
+                f"{str(row.get('native_audio_direction', '')).strip()} "
+                f"ENVIRONMENT CONTINUITY - {str(row.get('environment_continuity', '')).strip()} "
+                f"AUDIO REFERENCE INTENT - {str(row.get('audio_reference_intent', '')).strip()}"
+            )
     active_labels = ", ".join(
         [asset.tag for asset in unique_assets]
         + list(paired_audio_tags.values())
@@ -680,7 +856,18 @@ def build_ref2va_prompt(
     if spec.must_keep.strip():
         detailed_rows.append("Hard constraints: " + spec.must_keep.strip().rstrip(".。") + ".")
 
-    soundscape = spec.audio.strip() or "N/A"
+    native_soundscape = "\n".join(
+        f"{_timecode(float(row.get('start_seconds', 0.0)))}-"
+        f"{_timecode(float(row.get('end_seconds', row.get('start_seconds', 0.0))))}: "
+        f"{str(row.get('native_audio_direction', '')).strip()} "
+        f"{str(row.get('environment_continuity', '')).strip()}"
+        for row in spec.native_audio_ranges
+    )
+    authored_soundscape = spec.audio.strip()
+    if authored_soundscape and native_soundscape:
+        soundscape = authored_soundscape + "\n" + native_soundscape
+    else:
+        soundscape = native_soundscape or authored_soundscape or "N/A"
     music = spec.music.strip() or (
         "Around 100 BPM with crisp pluck, restrained kick and sub-bass, airy noise, tactile wooden percussion, and no vocals."
         if special_profile is not None and special_profile.key == SPECIAL_SKILL

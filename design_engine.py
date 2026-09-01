@@ -18,10 +18,1274 @@ ACTION_BUDGET_WINDOW_SECONDS = 5.0
 MAX_CORE_ACTIONS_PER_WINDOW = 3
 MAX_REQUIRED_RESPONSES_PER_WINDOW = 2
 MAX_OPTIONAL_ACTIONS_PER_WINDOW = 2
+DEFAULT_SPEECH_CHARACTERS_PER_SECOND = 3.6
+DEFAULT_SPEECH_WORDS_PER_SECOND = 2.7
+
+H3_STABLE_DIALOGUE_LANGUAGES = (
+    "Arabic",
+    "Chinese",
+    "English",
+    "French",
+    "German",
+    "Italian",
+    "Japanese",
+    "Korean",
+    "Portuguese",
+    "Russian",
+    "Spanish",
+)
 
 
 class DesignDurationContractError(ValueError):
     """The model changed a duration that the user specified explicitly."""
+
+
+class DesignDialogueLanguageContractError(ValueError):
+    """The model ignored the dialogue language selected in Design."""
+
+
+class DesignSpeechLayerContractError(ValueError):
+    """The model described requested speech without creating editable Text Layers."""
+
+
+def speech_timing_budget(
+    content: object,
+    language: object = "",
+    delivery: object = "",
+    allocated_seconds: float = 0.0,
+) -> dict:
+    """Estimate whether exact authored speech can fit its Timeline interval.
+
+    This is deliberately deterministic and conservative.  It is not a TTS
+    duration oracle; it protects H3 native dialogue from being asked to speak
+    so quickly that words are advanced, reordered, omitted or paraphrased.
+    """
+    text = " ".join(str(content or "").split())
+    allocated = max(0.0, float(allocated_seconds or 0.0))
+    if not text:
+        return {
+            "required_seconds": 0.0,
+            "allocated_seconds": allocated,
+            "overflow_seconds": 0.0,
+            "risk": False,
+            "rate_label": "empty",
+        }
+    language_text = str(language or "").lower()
+    delivery_text = str(delivery or "").lower()
+    cjk_count = len(re.findall(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+    latin_words = len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)?", text))
+    is_cjk = bool(cjk_count) or any(
+        token in language_text
+        for token in ("chinese", "mandarin", "japanese", "korean", "中文", "普通话")
+    )
+    pace = 1.0
+    if re.search(r"fast|rapid|urgent|agitated|angry|激动|急促|快速", delivery_text):
+        pace = 1.16
+    elif re.search(
+        r"slow|tearful|hesitant|whisper|controlled|emotional|低声|哭|迟疑|缓慢",
+        delivery_text,
+    ):
+        pace = 0.86
+    if is_cjk:
+        units = cjk_count + latin_words * 2.0
+        base_seconds = units / max(0.1, DEFAULT_SPEECH_CHARACTERS_PER_SECOND * pace)
+        rate_label = f"{DEFAULT_SPEECH_CHARACTERS_PER_SECOND * pace:.2f} chars/s"
+    else:
+        words = max(latin_words, len(text.split()))
+        base_seconds = words / max(0.1, DEFAULT_SPEECH_WORDS_PER_SECOND * pace)
+        rate_label = f"{DEFAULT_SPEECH_WORDS_PER_SECOND * pace:.2f} words/s"
+    pause_seconds = (
+        len(re.findall(r"[,，、;；:]", text)) * 0.10
+        + len(re.findall(r"[.!?。！？]", text)) * 0.22
+        + len(re.findall(r"…|\.\.\.", text)) * 0.32
+    )
+    required = max(0.5, math.ceil((base_seconds + pause_seconds) * 2.0) / 2.0)
+    overflow = max(0.0, required - allocated)
+    return {
+        "required_seconds": round(required, 3),
+        "allocated_seconds": round(allocated, 3),
+        "overflow_seconds": round(overflow, 3),
+        "risk": overflow > 0.01,
+        "rate_label": rate_label,
+    }
+
+
+def _shift_interval_at_boundary(row: dict, boundary: float, delta: float) -> None:
+    start = float(row.get("start_seconds", 0.0))
+    end = float(row.get("end_seconds", start))
+    if start >= boundary - 1e-9:
+        row["start_seconds"] = round(start + delta, 6)
+        row["end_seconds"] = round(end + delta, 6)
+    elif end > boundary + 1e-9:
+        row["end_seconds"] = round(end + delta, 6)
+
+
+def _owning_shot_for_interval(shots: list[dict], start: float, end: float) -> dict | None:
+    """Return the Shot that owns the largest part of a timed speech event.
+
+    A line may end exactly on a Shot boundary.  The previous implementation
+    shifted only rows *after* that boundary, so a final line could extend the
+    project duration without extending its Shot.  Selecting the owner before
+    ripple editing lets the Shot absorb the complete authored performance.
+    """
+
+    midpoint = (start + end) / 2.0
+    candidates: list[tuple[float, int, dict]] = []
+    for index, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            continue
+        shot_start = float(shot.get("start_seconds", 0.0) or 0.0)
+        shot_end = float(shot.get("end_seconds", shot_start) or shot_start)
+        overlap = max(0.0, min(end, shot_end) - max(start, shot_start))
+        contains_midpoint = shot_start - 1e-9 <= midpoint <= shot_end + 1e-9
+        if overlap > 0.0 or contains_midpoint or (
+            shot_start - 1e-9 <= start <= shot_end + 1e-9
+        ):
+            candidates.append((overlap, -index, shot))
+    if candidates:
+        return max(candidates, key=lambda row: (row[0], row[1]))[2]
+    preceding = [
+        shot for shot in shots
+        if isinstance(shot, dict)
+        and float(shot.get("end_seconds", 0.0) or 0.0) <= start + 1e-9
+    ]
+    return max(
+        preceding,
+        key=lambda shot: float(shot.get("end_seconds", 0.0) or 0.0),
+        default=(shots[-1] if shots else None),
+    )
+
+
+def ensure_complete_shot_coverage(plan: dict) -> dict:
+    """Guarantee exactly one chronological Shot lane across the full duration.
+
+    Media and Text tracks may overlap.  Camera Shot blocks may not, and no
+    renderable time is allowed to exist without a Shot.  Gaps are resolved at
+    their nearest shared boundary; the first and last Shots absorb leading or
+    trailing time.  Timed speech is then rebound deterministically by midpoint.
+    """
+
+    duration = max(0.5, float(plan.get("duration_seconds", 0.5) or 0.5))
+    shots = sorted(
+        [row for row in (plan.get("shots") or []) if isinstance(row, dict)],
+        key=lambda row: (
+            float(row.get("start_seconds", 0.0) or 0.0),
+            float(row.get("end_seconds", 0.0) or 0.0),
+        ),
+    )
+    if not shots:
+        return plan
+    warnings = [str(value) for value in plan.get("design_warnings") or []]
+    first_start = float(shots[0].get("start_seconds", 0.0) or 0.0)
+    if first_start > 1e-9:
+        shots[0]["start_seconds"] = 0.0
+        warnings.append(
+            f"Extended the first Shot backward from {first_start:.2f}s to 0.00s so no render time is Shot-less."
+        )
+    previous = shots[0]
+    for current in shots[1:]:
+        previous_end = float(previous.get("end_seconds", 0.0) or 0.0)
+        current_start = float(current.get("start_seconds", 0.0) or 0.0)
+        if abs(current_start - previous_end) > 1e-9:
+            boundary = round((previous_end + current_start) / 2.0 * 2.0) / 2.0
+            minimum = float(previous.get("start_seconds", 0.0) or 0.0) + 0.5
+            maximum = float(current.get("end_seconds", current_start) or current_start) - 0.5
+            boundary = round(min(max(boundary, minimum), maximum), 6)
+            previous["end_seconds"] = boundary
+            current["start_seconds"] = boundary
+            warnings.append(
+                f"Closed a Shot-lane gap/overlap at {boundary:.2f}s; every renderable frame now belongs to one Shot."
+            )
+        previous = current
+    last_end = float(shots[-1].get("end_seconds", 0.0) or 0.0)
+    if last_end < duration - 1e-9:
+        shots[-1]["end_seconds"] = duration
+        warnings.append(
+            f"Extended the final Shot from {last_end:.2f}s to {duration:.2f}s so dialogue expansion cannot create a Shot-less Segment."
+        )
+    elif last_end > duration + 1e-9:
+        shots[-1]["end_seconds"] = duration
+    for index, shot in enumerate(shots, 1):
+        shot["id"] = f"S{index}"
+    for layer in plan.get("text_layers") or []:
+        if not isinstance(layer, dict):
+            continue
+        start = float(layer.get("start_seconds", 0.0) or 0.0)
+        end = float(layer.get("end_seconds", start) or start)
+        owner = _owning_shot_for_interval(shots, start, end)
+        if owner is not None:
+            layer["shot_id"] = str(owner.get("id", ""))
+    plan["shots"] = shots
+    plan["design_warnings"] = list(dict.fromkeys(warnings))
+    return plan
+
+
+def auto_adjust_speech_shot_timing(plan: dict) -> dict:
+    """Extend overloaded speech, its owning Shot and every later cue coherently."""
+    result = plan
+    original_duration = float(result.get("duration_seconds", 0.0) or 0.0)
+    result.setdefault("_speech_timing_base_duration", original_duration)
+    speech_layers = [
+        row for row in result.get("text_layers") or []
+        if isinstance(row, dict)
+        and str(row.get("role", "")).lower() in {"dialogue", "voice_over", "lyrics"}
+        and str(row.get("content", "")).strip()
+    ]
+    warnings = [str(value) for value in result.get("design_warnings") or []]
+    for layer in sorted(speech_layers, key=lambda row: (float(row["start_seconds"]), float(row["end_seconds"]))):
+        start = float(layer["start_seconds"])
+        end = float(layer["end_seconds"])
+        budget = speech_timing_budget(
+            layer.get("content", ""), layer.get("language", ""),
+            layer.get("delivery", ""), end - start,
+        )
+        layer["speech_budget"] = dict(budget)
+        if not budget["risk"]:
+            continue
+        if bool(layer.get("authored_timing_locked", False)):
+            layer["speech_budget"]["authored_timing_locked"] = True
+            warnings.append(
+                f"Exact authored speech at {start:.2f}-{end:.2f}s needs about "
+                f"{budget['required_seconds']:.2f}s. Its user timecode is locked, so the "
+                "Timeline clip remains red until the Shot is lengthened or the words are shortened."
+            )
+            continue
+        delta = math.ceil(float(budget["overflow_seconds"]) * 2.0) / 2.0
+        if float(result.get("duration_seconds", 0.0)) + delta > MAX_DESIGN_DURATION_SECONDS:
+            layer["speech_budget"]["blocked_by_max_duration"] = True
+            warnings.append(
+                f"Speech at {start:.2f}-{end:.2f}s needs about {budget['required_seconds']:.2f}s "
+                "and remains over budget because the 600-second Design limit was reached."
+            )
+            continue
+        boundary = end
+        shots = [row for row in result.get("shots") or [] if isinstance(row, dict)]
+        owning_shot = _owning_shot_for_interval(shots, start, end)
+        layer.setdefault("authored_start_seconds", start)
+        layer.setdefault("authored_end_seconds", end)
+        layer["end_seconds"] = round(end + delta, 6)
+        layer["speech_timing_auto_adjusted"] = True
+        layer["speech_budget_was_overloaded"] = True
+        for candidate in result.get("text_layers") or []:
+            if candidate is not layer and isinstance(candidate, dict):
+                _shift_interval_at_boundary(candidate, boundary, delta)
+        for family in ("shots", "existing_media_uses", "media_requests"):
+            for candidate in result.get(family) or []:
+                if isinstance(candidate, dict):
+                    if family == "shots" and candidate is owning_shot:
+                        candidate["end_seconds"] = round(
+                            max(float(candidate.get("end_seconds", end)), end) + delta,
+                            6,
+                        )
+                    else:
+                        _shift_interval_at_boundary(candidate, boundary, delta)
+        for family in ("transitions", "markers"):
+            for candidate in result.get(family) or []:
+                if not isinstance(candidate, dict):
+                    continue
+                cue_time = float(candidate.get("time_seconds", 0.0))
+                if cue_time >= boundary - 1e-9:
+                    candidate["time_seconds"] = round(cue_time + delta, 6)
+        result["duration_seconds"] = round(
+            float(result.get("duration_seconds", 0.0)) + delta, 6
+        )
+        layer["speech_budget"] = speech_timing_budget(
+            layer.get("content", ""), layer.get("language", ""),
+            layer.get("delivery", ""), float(layer["end_seconds"]) - start,
+        )
+        warnings.append(
+            f"Speech at {start:.2f}-{boundary:.2f}s exceeded its safe delivery budget; "
+            f"extended the owning Shot and all later Timeline events by {delta:.2f}s."
+        )
+    result["design_warnings"] = warnings
+    return ensure_complete_shot_coverage(result)
+
+
+_VISIBLE_PERSON_RE = re.compile(
+    r"\b(?:woman|man|girl|boy|female|male|person|protagonist|hero|heroine|actor|character)\b|"
+    r"女人|女子|女性|男人|男子|男性|女孩|男孩|主角|人物|角色|刺客|将军|將軍",
+    re.I,
+)
+
+_IDENTITY_REFERENCE_RE = re.compile(
+    r"(?:strict|primary|authoritative).{0,40}(?:identity|face)|"
+    r"(?:identity|face).{0,40}(?:anchor|match|consistent|preserv)|"
+    r"(?:preserv|keep).{0,40}(?:facial|face|identity)|"
+    r"人脸.{0,20}(?:保持|一致|相同)|"
+    r"(?:脸|面孔|身份).{0,20}(?:锚点|錨點|保持|一致|匹配)",
+    re.I | re.S,
+)
+
+_IDENTITY_WORD_RE = re.compile(
+    r"\b(?:face|facial|identity|same\s+person|same\s+character|look\s+exactly|consistent|match(?:es|ing)?)\b|"
+    r"人脸|面孔|长相|長相|样子|樣子|身份|"
+    r"同一人|同一人物|全程保持|保持一致",
+    re.I,
+)
+
+_GENERATED_IDENTITY_PREFIX = (
+    "PRIMARY RECURRING CHARACTER IDENTITY ANCHOR. Show one clear, unobstructed, "
+    "recognizable face with exact age range, facial structure, hair, skin tone, wardrobe "
+    "and owned props suitable for reuse through the full story. "
+)
+
+_CHARACTER_CONTINUITY_CONTRACT = {
+    "fixed": [
+        "face and recognizable identity",
+        "age",
+        "skin tone",
+        "hairstyle and hair color",
+        "body proportions and stable anatomy",
+        "top/outerwear style, material and color",
+        "trousers, skirt or other lower-body garment style and color",
+        "shoes style and color",
+        "accessory ownership",
+    ],
+    "variable": [
+        "facial expression",
+        "pose",
+        "arm angle",
+        "leg angle",
+        "walking and running phase",
+        "physically plausible hair and clothing motion caused by movement or wind",
+    ],
+    "story_only": [
+        "wardrobe change",
+        "hairstyle change",
+        "injury",
+        "dirt or stains",
+        "clothing or prop damage",
+        "removing shoes",
+        "losing or transferring an accessory",
+    ],
+}
+
+_SUPPORT_CONTINUITY_DIRECTION = (
+    " Preserve the anchor's current hairstyle, hair color, skin tone, body proportions, "
+    "top/outerwear, lower-body garment, shoes and accessory ownership. Expression, pose, "
+    "arm/leg angles, gait phase and physical cloth/hair motion may change. Never invent a "
+    "wardrobe or hairstyle change, injury, dirt, damage, shoe removal or accessory loss."
+)
+
+
+def _character_continuity_contract_text(anchor_label: str) -> str:
+    fixed = ", ".join(_CHARACTER_CONTINUITY_CONTRACT["fixed"])
+    variable = ", ".join(_CHARACTER_CONTINUITY_CONTRACT["variable"])
+    story_only = ", ".join(_CHARACTER_CONTINUITY_CONTRACT["story_only"])
+    return (
+        f"CHARACTER CONTINUITY CONTRACT for {anchor_label}. FIXED unless an explicitly authored "
+        f"Shot changes state: {fixed}. FREE TO VARY with the physical action: {variable}. "
+        f"STORY-ONLY CHANGES: {story_only}; never invent these changes. Every authored change must "
+        "name its exact trigger Shot, enter that Shot's outgoing continuity state, and persist as "
+        "the incoming state of every following Shot until another explicit change occurs."
+    )
+
+
+def _attach_character_continuity_contract(
+    plan: dict,
+    anchor: dict,
+    *,
+    anchor_label: str,
+    prompt_field: str,
+) -> None:
+    contract = _character_continuity_contract_text(anchor_label)
+    anchor["character_continuity_contract"] = deepcopy(
+        _CHARACTER_CONTINUITY_CONTRACT
+    )
+    if "CHARACTER CONTINUITY CONTRACT" not in str(anchor.get(prompt_field, "")):
+        anchor[prompt_field] = (
+            str(anchor.get(prompt_field, "")).rstrip(" .")
+            + (". " if str(anchor.get(prompt_field, "")).strip() else "")
+            + contract
+        )
+    plan["character_continuity_contract"] = deepcopy(
+        _CHARACTER_CONTINUITY_CONTRACT
+    )
+    if "CHARACTER CONTINUITY CONTRACT" not in str(plan.get("constraints", "")):
+        plan["constraints"] = (
+            str(plan.get("constraints", "")).rstrip(" .")
+            + (". " if str(plan.get("constraints", "")).strip() else "")
+            + contract
+        )
+
+
+def _existing_identity_anchor(plan: dict) -> dict | None:
+    """Prefer a loaded user Picture whenever it is declared as the face source."""
+    image_uses = [
+        row for row in plan.get("existing_media_uses") or []
+        if isinstance(row, dict) and row.get("media_type") == "image"
+    ]
+    return next(
+        (row for row in image_uses if bool(row.get("identity_anchor", False))),
+        None,
+    ) or next(
+        (
+            row for row in image_uses
+            if _IDENTITY_REFERENCE_RE.search(
+                " ".join(
+                    [str(row.get("instruction", ""))]
+                    + [str(value) for value in row.get("subject_keywords") or []]
+                )
+            )
+        ),
+        None,
+    )
+
+
+def _authored_identity_picture_ids(requirement: str) -> list[str]:
+    """Find @P references that the user explicitly binds to face identity."""
+    text = str(requirement or "")
+    found: list[str] = []
+    for match in re.finditer(r"@P([1-9]\d*)\b", text, re.I):
+        start = max(0, match.start() - 140)
+        end = min(len(text), match.end() + 140)
+        if _IDENTITY_WORD_RE.search(text[start:end]):
+            media_id = f"P{int(match.group(1))}"
+            if media_id not in found:
+                found.append(media_id)
+    return found
+
+
+def _request_recreates_existing_anchor(request: dict, media_id: str) -> bool:
+    """Return True for an independently generated pose of an existing identity.
+
+    A T2I model cannot guarantee the exact face from a textual ``face matching
+    @P1`` instruction.  Passing that independently synthesized face to H3 makes
+    it compete with the real P1, so these redundant action-state Pictures are
+    omitted and the Shot prose supplies the pose instead.
+    """
+    text = " ".join(
+        [str(request.get("prompt", ""))]
+        + [str(value) for value in request.get("subject_keywords") or []]
+    )
+    ordinal_match = re.search(r"(\d+)$", media_id)
+    picture_tag = (
+        rf"|<Picture\s+{ordinal_match.group(1)}>"
+        if ordinal_match else ""
+    )
+    token = re.compile(
+        rf"(?:@?{re.escape(media_id)}\b{picture_tag})",
+        re.I,
+    )
+    for match in token.finditer(text):
+        start = max(0, match.start() - 140)
+        end = min(len(text), match.end() + 140)
+        if _IDENTITY_WORD_RE.search(text[start:end]):
+            return True
+    return False
+
+
+def _strip_generated_anchor_augmentation(prompt: str) -> str:
+    """Remove identity/support text appended by an earlier normalization pass."""
+    text = str(prompt or "")
+    lower = text.casefold()
+    markers = (
+        "the authoritative recurring face identity is the user-supplied",
+        "supporting environment or action-state reference only",
+        "distinct secondary character reference only",
+        "distinct secondary character identity",
+    )
+    positions = [lower.find(marker) for marker in markers if lower.find(marker) >= 0]
+    if positions:
+        text = text[:min(positions)]
+    return text.rstrip(" .")
+
+
+def _direct_request_text(request: dict) -> str:
+    """Return only the requested still, excluding appended story-wide prose."""
+
+    prompt = _strip_generated_anchor_augmentation(str(request.get("prompt", "")))
+    prompt = re.split(r"\bStory identity ledger\s*:", prompt, maxsplit=1, flags=re.I)[0]
+    return " ".join(
+        [str(request.get("requirement_id", ""))]
+        + [str(value) for value in request.get("subject_keywords") or []]
+        + [prompt]
+    )
+
+
+def _request_visible_person_count(request: dict) -> int:
+    text = _direct_request_text(request).lower()
+    if re.search(r"\b(?:two|2)\s+(?:people|persons|figures|characters|actors)\b", text):
+        return 2
+    if re.search(r"\b(?:one|single|1)\s+(?:woman|man|girl|boy|person|figure|character|actor)\b", text):
+        return 1
+    named_roles = set()
+    if re.search(r"\b(?:woman|female|girl|heroine)\b|女人|女性|女孩", text, re.I):
+        named_roles.add("female")
+    if re.search(r"\b(?:man|male|boy|hero)\b|男人|男性|男孩", text, re.I):
+        named_roles.add("male")
+    return len(named_roles)
+
+
+def _request_is_distinct_character(request: dict, anchor: dict) -> bool:
+    """Distinguish another actor from another pose of the anchor.
+
+    Auto reference repair commonly emits several frozen states containing the
+    *same woman*.  Treating every person-bearing still after the first as a new
+    actor destroys identity continuity.  A different gender or an explicit
+    secondary/different-person declaration is authoritative; otherwise the
+    reference remains support for the established recurring identity.
+    """
+    if bool(request.get("distinct_character_identity", False)):
+        return True
+    text = _direct_request_text(request).lower()
+    if re.search(
+        r"\b(?:different|separate|secondary|another|other|second)\s+"
+        r"(?:woman|man|girl|boy|person|character|actor)\b|"
+        r"不同(?:的)?(?:女人|男人|人物|角色)|另一(?:个|個)(?:女人|男人|人物|角色)",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(r"\bthe\s+same\s+(?:woman|man|girl|boy|person|character)\b|同一(?:人物|角色|女人|男人)", text, re.I):
+        return False
+    anchor_text = _direct_request_text(anchor).lower()
+    request_female = bool(re.search(r"\b(?:woman|female|girl|heroine)\b|女人|女性|女孩", text))
+    request_male = bool(re.search(r"\b(?:man|male|boy|hero)\b|男人|男性|男孩", text))
+    anchor_female = bool(re.search(r"\b(?:woman|female|girl|heroine)\b|女人|女性|女孩", anchor_text))
+    anchor_male = bool(re.search(r"\b(?:man|male|boy|hero)\b|男人|男性|男孩", anchor_text))
+    return bool(
+        (request_female and anchor_male and not anchor_female)
+        or (request_male and anchor_female and not anchor_male)
+    )
+
+
+def _append_subject_count_guard(request: dict, *, identity: bool = False) -> None:
+    """Make T2I reference people deterministic and safe for later H3 reuse."""
+
+    prompt = str(request.get("prompt", "")).strip()
+    count = _request_visible_person_count(request)
+    if identity:
+        guard = (
+            " EXACT SUBJECT COUNT LOCK: exactly one visible identity subject. Use a clean "
+            "single-person composition with no background people, crowd, staff, silhouettes, "
+            "human reflections, portraits, mannequins, duplicated bodies or face-like figures."
+        )
+    elif count == 2:
+        guard = (
+            " EXACT SUBJECT COUNT LOCK: exactly two unique visible people and no one else. "
+            "Never duplicate either person; no crowd, staff, silhouettes, human reflections, "
+            "portraits, mannequins, split-screen copies or background figures."
+        )
+    elif count == 1:
+        guard = (
+            " EXACT SUBJECT COUNT LOCK: exactly one visible person and no one else. No crowd, "
+            "staff, silhouettes, human reflections, portraits, mannequins or duplicated bodies."
+        )
+    else:
+        guard = (
+            " ENVIRONMENT-ONLY COUNT LOCK: no visible people, human silhouettes, reflections, "
+            "portraits, mannequins or face-like figures."
+        )
+    if "SUBJECT COUNT LOCK:" not in prompt and "ENVIRONMENT-ONLY COUNT LOCK:" not in prompt:
+        request["prompt"] = prompt.rstrip(" .") + "." + guard
+
+
+def _scope_generated_environment_reference(plan: dict, request: dict) -> None:
+    """Prevent a project-wide environment still from contaminating every Segment."""
+
+    if str(request.get("reuse_policy", "")) != "whole_design":
+        return
+    if _request_visible_person_count(request):
+        return
+    shots = [row for row in plan.get("shots") or [] if isinstance(row, dict)]
+    if not shots:
+        return
+    keywords = {
+        token
+        for token in re.findall(r"[a-z0-9]{3,}", _direct_request_text(request).lower())
+        if token not in {
+            "reference", "image", "scene", "shot", "cinematic", "wide", "close",
+            "lighting", "background", "supporting", "environment", "action", "state",
+        }
+    }
+    def score(shot: dict) -> tuple[int, float]:
+        text = " ".join(
+            str(shot.get(key, ""))
+            for key in (
+                "preset", "subject_action", "environment_response",
+                "continuity_state", "additional_direction",
+            )
+        ).lower()
+        return (
+            sum(1 for token in keywords if token in text),
+            -float(shot.get("start_seconds", 0.0) or 0.0),
+        )
+    best = max(shots, key=score)
+    if score(best)[0] <= 0:
+        best = shots[0]
+    request["reuse_policy"] = "time_scoped"
+    request["start_seconds"] = float(best.get("start_seconds", 0.0) or 0.0)
+    request["end_seconds"] = float(
+        best.get("end_seconds", request.get("end_seconds", 0.5)) or 0.5
+    )
+    warnings = [str(value) for value in plan.get("design_warnings") or []]
+    warnings.append(
+        f"Scoped generated environment reference {request.get('requirement_id', '?')} to "
+        f"{request['start_seconds']:.2f}-{request['end_seconds']:.2f}s; environment stills "
+        "may not remain globally active and leak earlier locations into later Segments."
+    )
+    plan["design_warnings"] = warnings
+
+
+def stabilize_generated_identity_references(plan: dict) -> dict:
+    """Make one generated image authoritative for a recurring human identity.
+
+    Independent T2I calls cannot genuinely copy one another.  Letting every
+    action-state image define a prominent face therefore causes actor changes.
+    One face-bearing request is promoted to a whole-design identity anchor;
+    later reference requests become environment/pose support and may not
+    introduce a competing face.
+    """
+    requests = [
+        row for row in plan.get("media_requests") or []
+        if isinstance(row, dict) and row.get("media_type") == "image"
+    ]
+    existing_anchor = _existing_identity_anchor(plan)
+    if existing_anchor is not None:
+        duration = float(plan.get("duration_seconds", 0.0) or 0.0)
+        existing_anchor["reuse_policy"] = "whole_design"
+        existing_anchor["start_seconds"] = 0.0
+        existing_anchor["end_seconds"] = duration
+        existing_anchor["identity_anchor"] = True
+        media_id = str(existing_anchor.get("media_id") or "P1")
+        requirement_id = str(
+            existing_anchor.get("requirement_id") or f"identity_{media_id.lower()}"
+        )
+        anchor_label = f"@{media_id}"
+        _attach_character_continuity_contract(
+            plan,
+            existing_anchor,
+            anchor_label=anchor_label,
+            prompt_field="instruction",
+        )
+        omitted_request_ids: list[str] = []
+        kept_image_requests: list[dict] = []
+        for request in requests:
+            request.pop("identity_anchor", None)
+            prompt = _strip_generated_anchor_augmentation(
+                str(request.get("prompt", ""))
+            )
+            if prompt.startswith(_GENERATED_IDENTITY_PREFIX):
+                prompt = prompt[len(_GENERATED_IDENTITY_PREFIX):]
+            request["prompt"] = prompt
+            if _request_recreates_existing_anchor(request, media_id):
+                omitted_request_ids.append(str(request.get("requirement_id") or "generated_pose"))
+                continue
+            kept_image_requests.append(request)
+            request_text = " ".join(
+                [prompt]
+                + [str(value) for value in request.get("subject_keywords") or []]
+            )
+            if _VISIBLE_PERSON_RE.search(request_text):
+                request.pop("identity_anchor_requirement_id", None)
+                request.pop("identity_anchor_media_id", None)
+                distinct = (
+                    " DISTINCT SECONDARY CHARACTER REFERENCE ONLY. This Picture may define the "
+                    f"face of a separate story character, but its face belongs only to that character "
+                    f"and must never replace or blend with the user-supplied {anchor_label} identity."
+                )
+                if distinct.strip() not in request["prompt"]:
+                    request["prompt"] = request["prompt"].rstrip(" .") + "." + distinct
+                _append_subject_count_guard(request)
+                continue
+            request["identity_anchor_requirement_id"] = requirement_id
+            request["identity_anchor_media_id"] = media_id
+            authority = (
+                f" The authoritative recurring face identity is the user-supplied {anchor_label}; "
+                f"this generated Picture must never replace, reinterpret or compete with {anchor_label}. "
+                "If the recurring character is visible, keep the face fully out of frame, turned "
+                "away, motion-obscured or otherwise unreadable; never synthesize a substitute "
+                "front-facing face. H3 must derive the recognizable face exclusively from the "
+                f"user-supplied {anchor_label}."
+            )
+            if authority.strip() not in request["prompt"]:
+                request["prompt"] = request["prompt"].rstrip(" .") + "." + authority
+            if _SUPPORT_CONTINUITY_DIRECTION.strip() not in request["prompt"]:
+                request["prompt"] += _SUPPORT_CONTINUITY_DIRECTION
+            if "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY" not in request["prompt"]:
+                request["prompt"] += (
+                    " SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY. Do not define a "
+                    "different prominent human face and do not introduce another actor; prefer rear, "
+                    "profile, wide or partially obscured staging whenever a face is not essential."
+                )
+            _scope_generated_environment_reference(plan, request)
+            _append_subject_count_guard(request)
+        kept_object_ids = {id(row) for row in kept_image_requests}
+        omitted_objects = {id(row) for row in requests if id(row) not in kept_object_ids}
+        plan["media_requests"] = [
+            row for row in plan.get("media_requests") or []
+            if id(row) not in omitted_objects
+        ]
+        warnings = [str(value) for value in plan.get("design_warnings") or []]
+        warnings = [
+            value for value in warnings
+            if not value.startswith("Promoted ")
+            or "generated Pictures cannot redefine" not in value
+        ]
+        notice = (
+            f"Locked user-supplied {media_id} as the whole-design primary face identity anchor; "
+            "generated Pictures are support references and cannot redefine a competing face."
+        )
+        if notice not in warnings:
+            warnings.append(notice)
+        if omitted_request_ids:
+            warnings.append(
+                "Omitted independently generated action-state Picture request(s) "
+                + ", ".join(omitted_request_ids)
+                + f" because they attempted to recreate {media_id}; the real {media_id} remains the "
+                "only face source and Shot prose supplies those poses."
+            )
+        plan["design_warnings"] = warnings
+        return plan
+    if not requests:
+        return plan
+    explicit_anchor = next(
+        (row for row in requests if bool(row.get("identity_anchor", False))),
+        None,
+    )
+    # Normalization may run more than once (Plan, Apply, project reload).  Strip
+    # an earlier promotion from every non-authoritative request first so an
+    # environment still can never retain an identity-anchor prefix.
+    for request in requests:
+        if request is explicit_anchor:
+            continue
+        request["prompt"] = _strip_generated_anchor_augmentation(
+            str(request.get("prompt", ""))
+        )
+        request.pop("identity_anchor", None)
+    anchor = explicit_anchor or next(
+        (
+            row for row in requests
+            if _VISIBLE_PERSON_RE.search(
+                _direct_request_text(row)
+            )
+        ),
+        None,
+    )
+    if anchor is None:
+        for request in requests:
+            _scope_generated_environment_reference(plan, request)
+            _append_subject_count_guard(request)
+        return plan
+    duration = float(plan.get("duration_seconds", 0.0) or 0.0)
+    anchor["reuse_policy"] = "whole_design"
+    anchor["start_seconds"] = 0.0
+    anchor["end_seconds"] = duration
+    anchor["identity_anchor"] = True
+    anchor_id = str(anchor.get("requirement_id", "primary_identity"))
+    anchor["prompt"] = _strip_generated_anchor_augmentation(
+        str(anchor.get("prompt", ""))
+    )
+    if "PRIMARY RECURRING CHARACTER IDENTITY ANCHOR" not in anchor["prompt"]:
+        anchor["prompt"] = _GENERATED_IDENTITY_PREFIX + anchor["prompt"]
+    _append_subject_count_guard(anchor, identity=True)
+    _attach_character_continuity_contract(
+        plan,
+        anchor,
+        anchor_label=f"generated reference {anchor_id}",
+        prompt_field="prompt",
+    )
+    ledger = " ".join(str(plan.get("creative_brief", "")).split())[:700]
+    for request in requests:
+        if request is anchor:
+            continue
+        person_count = _request_visible_person_count(request)
+        if person_count and _request_is_distinct_character(request, anchor):
+            # A second actor is a separate identity source, not pose support
+            # for the primary character.  Binding it to the primary anchor
+            # causes face blending and duplicated dialogue partners.
+            request.pop("identity_anchor_requirement_id", None)
+            request.pop("identity_anchor_media_id", None)
+            request["distinct_character_identity"] = True
+            distinct = (
+                " DISTINCT SECONDARY CHARACTER IDENTITY. This Picture defines only this separate "
+                "story character. Never blend, replace or duplicate the primary character with it."
+            )
+            if "DISTINCT SECONDARY CHARACTER IDENTITY" not in str(request.get("prompt", "")):
+                request["prompt"] = str(request.get("prompt", "")).rstrip(" .") + "." + distinct
+            _append_subject_count_guard(request)
+            continue
+        request["identity_anchor_requirement_id"] = anchor_id
+        if "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY" not in str(
+            request.get("prompt", "")
+        ):
+            request["prompt"] = (
+                str(request.get("prompt", "")).rstrip(" .")
+                + ". SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY. Do not define a "
+                "different prominent human face and do not introduce another actor. If the recurring "
+                "character is visible, keep the same age, facial structure, hair, wardrobe and prop "
+                "ownership established by the primary identity anchor; prefer rear, profile, wide or "
+                "partially obscured staging when exact face consistency cannot be guaranteed."
+                + (f" Story identity ledger: {ledger}." if ledger else "")
+                + _SUPPORT_CONTINUITY_DIRECTION
+            )
+        elif _SUPPORT_CONTINUITY_DIRECTION.strip() not in str(request.get("prompt", "")):
+            request["prompt"] = str(request.get("prompt", "")).rstrip() + _SUPPORT_CONTINUITY_DIRECTION
+        _scope_generated_environment_reference(plan, request)
+        _append_subject_count_guard(request)
+    warnings = [str(value) for value in plan.get("design_warnings") or []]
+    notice = (
+        f"Promoted {anchor_id} to the whole-design primary character identity anchor; "
+        "later generated Pictures cannot redefine a competing face."
+    )
+    if notice not in warnings:
+        warnings.append(notice)
+    plan["design_warnings"] = warnings
+    return plan
+
+
+_DIALOGUE_LANGUAGE_ALIASES = {
+    "arabic": "Arabic",
+    "chinese": "Chinese",
+    "mandarin": "Chinese",
+    "mandarin chinese": "Chinese",
+    "english": "English",
+    "french": "French",
+    "german": "German",
+    "italian": "Italian",
+    "japanese": "Japanese",
+    "korean": "Korean",
+    "portuguese": "Portuguese",
+    "russian": "Russian",
+    "spanish": "Spanish",
+}
+
+
+def canonical_dialogue_language(value: object) -> str:
+    """Return an official H3 language label, ``auto``, or an empty value."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("auto"):
+        return "auto"
+    return _DIALOGUE_LANGUAGE_ALIASES.get(text.lower(), "")
+
+
+_EXPLICIT_DIALOGUE_LANGUAGE_PATTERNS = {
+    "Arabic": re.compile(r"\bArabic\b|\u963f\u62c9\u4f2f\u8bed|\u963f\u62c9\u4f2f\u8a9e", re.I),
+    "Chinese": re.compile(
+        r"\b(?:Chinese|Mandarin(?:\s+Chinese)?)\b|\u666e\u901a\u8bdd|\u666e\u901a\u8a71|"
+        r"\u56fd\u8bed|\u570b\u8a9e|\u4e2d\u6587|\u534e\u8bed|\u83ef\u8a9e",
+        re.I,
+    ),
+    "English": re.compile(r"\bEnglish\b|\u82f1\u8bed|\u82f1\u8a9e", re.I),
+    "French": re.compile(r"\bFrench\b|\u6cd5\u8bed|\u6cd5\u8a9e", re.I),
+    "German": re.compile(r"\bGerman\b|\u5fb7\u8bed|\u5fb7\u8a9e", re.I),
+    "Italian": re.compile(r"\bItalian\b|\u610f\u5927\u5229\u8bed|\u610f\u5927\u5229\u8a9e", re.I),
+    "Japanese": re.compile(r"\bJapanese\b|\u65e5\u8bed|\u65e5\u8a9e|\u65e5\u672c\u8a9e", re.I),
+    "Korean": re.compile(r"\bKorean\b|\u97e9\u8bed|\u97d3\u8a9e|\u671d\u9c9c\u8bed|\u671d\u9bae\u8a9e", re.I),
+    "Portuguese": re.compile(r"\bPortuguese\b|\u8461\u8404\u7259\u8bed|\u8461\u8404\u7259\u8a9e", re.I),
+    "Russian": re.compile(r"\bRussian\b|\u4fc4\u8bed|\u4fc4\u8a9e", re.I),
+    "Spanish": re.compile(r"\bSpanish\b|\u897f\u73ed\u7259\u8bed|\u897f\u73ed\u7259\u8a9e", re.I),
+}
+
+
+def infer_design_dialogue_language(requirement: str, preferred: object = "auto") -> str:
+    """Resolve Design's language selector without delegating the default to the LM."""
+    selected = canonical_dialogue_language(preferred)
+    if selected and selected != "auto":
+        return selected
+    text = str(requirement or "")
+    explicit: list[tuple[int, str]] = []
+    for language, pattern in _EXPLICIT_DIALOGUE_LANGUAGE_PATTERNS.items():
+        explicit.extend((match.end(), language) for match in pattern.finditer(text))
+    if explicit:
+        return max(explicit, key=lambda item: item[0])[1]
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "Japanese"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "Korean"
+    if re.search(r"[\u0600-\u06ff]", text):
+        return "Arabic"
+    if re.search(r"[\u0400-\u04ff]", text):
+        return "Russian"
+    if re.search(r"[\u3400-\u9fff]", text):
+        return "Chinese"
+    return "English"
+
+
+def _dialogue_text_matches_language(text: str, language: str) -> bool:
+    """Catch obvious script mismatches; Latin-language nuance remains an LM task."""
+    value = str(text or "").strip()
+    if not value:
+        return True
+    if language == "Chinese":
+        return bool(re.search(r"[\u3400-\u9fff]", value)) and not bool(
+            re.search(r"[\u3040-\u30ff\uac00-\ud7af]", value)
+        )
+    if language == "Japanese":
+        return bool(re.search(r"[\u3040-\u30ff]", value))
+    if language == "Korean":
+        return bool(re.search(r"[\uac00-\ud7af]", value))
+    if language == "Arabic":
+        return bool(re.search(r"[\u0600-\u06ff]", value))
+    if language == "Russian":
+        return bool(re.search(r"[\u0400-\u04ff]", value))
+    if language == "English":
+        return bool(re.search(r"[A-Za-z]", value)) and not bool(
+            re.search(r"[\u0400-\u04ff\u0600-\u06ff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", value)
+        )
+    return True
+
+
+def enforce_design_dialogue_language(
+    plan: dict,
+    language: object,
+    *,
+    authored_requirement: str = "",
+) -> dict:
+    """Reject silently wrong generated dialogue and normalize H3 language labels."""
+    selected = canonical_dialogue_language(language)
+    if not selected or selected == "auto":
+        selected = infer_design_dialogue_language(authored_requirement, "auto")
+    result = deepcopy(plan)
+    authored_contents = {
+        str(item.get("content", "")).strip()
+        for item in extract_explicit_timed_text_layers(
+            authored_requirement,
+            float(result.get("duration_seconds", 0.0) or 0.0) or None,
+        )
+    }
+    for index, layer in enumerate(result.get("text_layers") or [], 1):
+        if not isinstance(layer, dict) or str(layer.get("role", "")).lower() not in {
+            "dialogue", "voice_over", "lyrics",
+        }:
+            continue
+        content = str(layer.get("content", "")).strip()
+        current = canonical_dialogue_language(layer.get("language"))
+        is_exact_authored = content in authored_contents
+        if is_exact_authored:
+            if current:
+                layer["language"] = current
+            elif _dialogue_text_matches_language(content, selected):
+                layer["language"] = selected
+            else:
+                layer["language"] = infer_design_dialogue_language(content, "auto")
+            continue
+        if current and current != selected:
+            raise DesignDialogueLanguageContractError(
+                f"Dialogue language contract mismatch in text layer {index}: Design selected "
+                f"{selected}, but the AI returned {current}. Regenerate the dialogue in {selected}."
+            )
+        if not _dialogue_text_matches_language(content, selected):
+            raise DesignDialogueLanguageContractError(
+                f"Dialogue language contract mismatch in text layer {index}: Design selected "
+                f"{selected}, but the generated words do not use the expected script. "
+                f"Regenerate the words in {selected}; do not merely relabel English text."
+            )
+        layer["language"] = selected
+    result["_dialogue_language"] = selected
+    return result
+
+
+_REQUESTED_SPEECH_ROLE_PATTERNS = {
+    "dialogue": re.compile(
+        r"\b(?:dialogue|conversation|spoken\s+lines?)\b|"
+        r"\u5bf9\u767d|\u5c0d\u767d|\u5bf9\u8bdd|\u5c0d\u8a71",
+        re.I,
+    ),
+    "voice_over": re.compile(
+        r"\b(?:voice[ -]?over|narration|narrator)\b|"
+        r"\u65c1\u767d|\u753b\u5916\u97f3|\u756b\u5916\u97f3",
+        re.I,
+    ),
+    "lyrics": re.compile(
+        r"\blyrics?\b|\u6b4c\u8bcd|\u6b4c\u8a5e",
+        re.I,
+    ),
+}
+
+_SHOT_EMBEDDED_SPEECH_RE = re.compile(
+    r"\b(?:the\s+)?(?:narrator|voice[ -]?over|s[12]|woman|man|character)\s+"
+    r"(?:says?|speaks?|continues?|asks?|replies?|whispers?|shouts?)\s*[:\u2014-]|"
+    r"\u65c1\u767d\s*(?:\u8bf4|\u8aaa|\u7ee7\u7eed|\u7e7c\u7e8c)?\s*[:\uff1a]",
+    re.I,
+)
+
+
+def requested_speech_roles(requirement: str) -> set[str]:
+    """Return speech roles that the user explicitly asked Design to author."""
+    text = str(requirement or "")
+    return {
+        role for role, pattern in _REQUESTED_SPEECH_ROLE_PATTERNS.items()
+        if pattern.search(text)
+    }
+
+
+SPEECH_TIMELINE_REMINDER_PREFIX = "[TIMELINE REMINDER]"
+SPEECH_TIMELINE_MARKER_PREFIX = "⚠ ADD EDITABLE "
+
+
+def missing_requested_speech_roles(requirement: str, plan: dict) -> set[str]:
+    """Return requested spoken roles that have no editable authored layer."""
+    requested = requested_speech_roles(requirement)
+    present = {
+        str(item.get("role", "")).strip().lower()
+        for item in plan.get("text_layers") or []
+        if isinstance(item, dict)
+        and str(item.get("content", "")).strip()
+        and bool(item.get("explicit_user_requested", False))
+    }
+    return requested.difference(present)
+
+
+def reconcile_requested_speech_layer_contract(requirement: str, plan: dict) -> dict:
+    """Make missing AI-authored speech non-blocking without silently losing it.
+
+    Exact time-coded user wording remains protected by
+    :func:`validate_explicit_timed_text_contract`.  This fallback is only for a
+    broader request such as "add suitable dialogue" where the LM returned no
+    editable words.  The workspace can still be applied, while a red Timeline
+    marker makes the omission impossible to overlook.  The marker is UI-only
+    and the Studio compiler excludes it from H3 technical instructions.
+    """
+    result = deepcopy(plan)
+    missing = sorted(missing_requested_speech_roles(requirement, result))
+    marker_rows = [
+        item for item in result.get("markers") or []
+        if isinstance(item, dict)
+        and not str(item.get("preset", "")).startswith(SPEECH_TIMELINE_MARKER_PREFIX)
+    ]
+    warnings = [
+        str(item) for item in result.get("design_warnings") or []
+        if not str(item).startswith(SPEECH_TIMELINE_REMINDER_PREFIX)
+    ]
+    if not missing:
+        result.pop("_missing_speech_roles", None)
+        result["markers"] = marker_rows
+        result["design_warnings"] = warnings
+        return result
+
+    # If the user supplied exact timed words, losing them is still fatal.  The
+    # deterministic protection pass should normally have restored them first.
+    exact_roles = {
+        str(item.get("role", ""))
+        for item in extract_explicit_timed_text_layers(
+            requirement,
+            float(result.get("duration_seconds", 0.0) or 0.0) or None,
+        )
+    }
+    exact_missing = sorted(set(missing).intersection(exact_roles))
+    if exact_missing:
+        raise DesignSpeechLayerContractError(
+            "Exact user-authored "
+            + ", ".join(role.replace("_", "-") for role in exact_missing)
+            + " could not be restored as editable Text Layers. Apply remains blocked to "
+              "prevent loss or rewriting of the supplied words."
+        )
+
+    role_names = [role.replace("_", "-").upper() for role in missing]
+    readable_roles = " / ".join(role_names)
+    direction = (
+        f"Design requested {readable_roles}, but the AI supplied no editable words. "
+        "Use the Type Tool to add or confirm the spoken line before Preview/Run. "
+        "Workspace Apply is allowed; this UI reminder is never sent to H3."
+    )
+    marker_rows.append({
+        "time_seconds": 0.0,
+        "preset": SPEECH_TIMELINE_MARKER_PREFIX + readable_roles,
+        "direction": direction,
+    })
+    warning = f"{SPEECH_TIMELINE_REMINDER_PREFIX} {direction}"
+    warnings.append(warning)
+    result["markers"] = marker_rows
+    result["design_warnings"] = warnings
+    result["_missing_speech_roles"] = missing
+    return result
+
+
+def validate_requested_speech_layer_contract(requirement: str, plan: dict) -> set[str]:
+    """Require editable Dialogue/Voice-over/Lyrics tracks whenever speech was requested.
+
+    This closes the failure mode where an LM writes ``The narrator says ...`` inside a
+    Shot direction.  Shot prose cannot be edited as dialogue and H3 is free to omit,
+    paraphrase or translate it, so such a plan must be regenerated rather than applied.
+    """
+    requested = requested_speech_roles(requirement)
+    if not requested:
+        return set()
+    missing = sorted(missing_requested_speech_roles(requirement, plan))
+    if missing:
+        embedded: list[str] = []
+        for shot in plan.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            prose = " ".join(
+                str(shot.get(key, ""))
+                for key in ("subject_action", "additional_direction", "optional_flourish")
+            )
+            if _SHOT_EMBEDDED_SPEECH_RE.search(prose):
+                embedded.append(str(shot.get("id") or "Shot"))
+        detail = (
+            " Speech was incorrectly embedded in Shot prose at " + ", ".join(embedded) + "."
+            if embedded else ""
+        )
+        raise DesignSpeechLayerContractError(
+            "The Design Requirement explicitly requests "
+            + ", ".join(role.replace("_", "-") for role in missing)
+            + ", but the AI returned no editable Text Layer for that role."
+            + detail
+            + " Regenerate with every spoken line in text_layers, "
+              "explicit_user_requested=true, and keep spoken words out of Shot prompts."
+        )
+    return requested
+
+
+_VISIBLE_TEXT_REQUEST_RE = re.compile(
+    r"\b(?:on[ -]?screen\s+text|title\s+card|show\s+(?:the\s+)?title|subtitles?|captions?)\b|"
+    r"\u5c4f\u5e55\u6587\u5b57|\u87a2\u5e55\u6587\u5b57|\u753b\u9762\u6587\u5b57|\u756b\u9762\u6587\u5b57|"
+    r"\u663e\u793a\u6807\u9898|\u986f\u793a\u6a19\u984c|\u5b57\u5e55",
+    re.I,
+)
+
+_AI_VISIBLE_TEXT_SHOT_RE = re.compile(
+    r"\b(?:theme\s+text|hashtags?|subtitles?|captions?|on[ -]?screen\s+text|"
+    r"overlay\s+text)\b|\u5b57\u5e55|\u4e3b\u9898\u6587\u5b57|\u4e3b\u984c\u6587\u5b57|"
+    r"\u8bdd\u9898\u6807\u7b7e|\u8a71\u984c\u6a19\u7c64",
+    re.I,
+)
+
+
+def _remove_ai_visible_text_directions(value: object) -> str:
+    clauses = re.split(r"(?<=[.!?;\u3002\uff01\uff1f\uff1b])\s*", str(value or "").strip())
+    return " ".join(
+        clause.strip() for clause in clauses
+        if clause.strip() and not _AI_VISIBLE_TEXT_SHOT_RE.search(clause)
+    ).strip()
+
+
+def enforce_design_subtitle_policy(
+    plan: dict,
+    enabled: bool,
+    *,
+    authored_requirement: str = "",
+) -> dict:
+    """Apply the Design subtitle switch deterministically.
+
+    With subtitles off, AI-invented captions/theme hashtags are removed. Explicitly
+    authored title/on-screen-text instructions remain valid. With subtitles on, every
+    speech Text Layer receives a synchronized editable On-screen Text layer.
+    """
+    result = deepcopy(plan)
+    explicit_visible = [
+        item for item in extract_explicit_timed_text_layers(
+            authored_requirement,
+            float(result.get("duration_seconds", 0.0) or 0.0) or None,
+        )
+        if item.get("role") == "on_screen_text"
+    ]
+    exact_visible = {
+        (
+            str(item.get("content", "")).strip(),
+            round(float(item.get("start_seconds", 0.0)), 3),
+            round(float(item.get("end_seconds", 0.0)), 3),
+        )
+        for item in explicit_visible
+    }
+    retained: list[dict] = []
+    for layer in result.get("text_layers") or []:
+        if not isinstance(layer, dict):
+            continue
+        if str(layer.get("role", "")).strip().lower() != "on_screen_text":
+            retained.append(deepcopy(layer))
+            continue
+        identity = (
+            str(layer.get("content", "")).strip(),
+            round(float(layer.get("start_seconds", 0.0)), 3),
+            round(float(layer.get("end_seconds", 0.0)), 3),
+        )
+        if (
+            enabled
+            or identity in exact_visible
+            or (
+                not str(authored_requirement or "").strip()
+                and bool(layer.get("explicit_user_requested", False))
+            )
+        ):
+            retained.append(deepcopy(layer))
+
+    if enabled:
+        existing = {
+            (
+                str(item.get("content", "")).strip(),
+                round(float(item.get("start_seconds", 0.0)), 3),
+                round(float(item.get("end_seconds", 0.0)), 3),
+            )
+            for item in retained
+            if str(item.get("role", "")).strip().lower() == "on_screen_text"
+        }
+        for speech in result.get("text_layers") or []:
+            if not isinstance(speech, dict) or str(speech.get("role", "")).lower() not in {
+                "dialogue", "voice_over", "lyrics",
+            }:
+                continue
+            identity = (
+                str(speech.get("content", "")).strip(),
+                round(float(speech.get("start_seconds", 0.0)), 3),
+                round(float(speech.get("end_seconds", 0.0)), 3),
+            )
+            if not identity[0] or identity in existing:
+                continue
+            retained.append({
+                "start_seconds": float(speech.get("start_seconds", 0.0)),
+                "end_seconds": float(speech.get("end_seconds", 0.0)),
+                "track": "V4",
+                "content": identity[0],
+                "role": "on_screen_text",
+                "speaker": str(speech.get("speaker", "S1")),
+                "language": str(speech.get("language", "")),
+                "delivery": "Readable synchronized subtitle; preserve exact spoken words",
+                "lip_sync": False,
+                "explicit_user_requested": True,
+            })
+            existing.add(identity)
+
+    result["text_layers"] = retained
+    visible_requested = bool(_VISIBLE_TEXT_REQUEST_RE.search(str(authored_requirement or "")))
+    if (
+        not enabled
+        and str(authored_requirement or "").strip()
+        and not visible_requested
+    ):
+        result["theme_text"] = ""
+        result["theme_text_explicit_user_requested"] = False
+        for shot in result.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            for field in (
+                "subject_action", "continuity_state", "optional_flourish",
+                "additional_direction",
+            ):
+                original = str(shot.get(field, ""))
+                cleaned = _remove_ai_visible_text_directions(original)
+                if cleaned != original.strip():
+                    shot[field] = cleaned or (
+                        "None."
+                        if field == "optional_flourish"
+                        else "Preserve the established physical and camera continuity."
+                    )
+    subtitle_contract = (
+        "VISIBLE TEXT WHITELIST: render subtitles only from synchronized Timeline "
+        "on_screen_text layers, at their exact authored times and with their exact words. "
+        "Never invent, burn in or repeat any other subtitle, caption, lower-third or dialogue text."
+        if enabled else
+        "VISIBLE TEXT LOCK: do not render spoken Dialogue or Voice-over as visible words. "
+        "No subtitles, captions, lower-thirds or burned-in speech text are permitted unless an "
+        "explicit Timeline on_screen_text layer exists."
+    )
+    constraints = str(result.get("constraints", "")).strip()
+    constraints = re.sub(
+        r"(?:VISIBLE TEXT WHITELIST|VISIBLE TEXT LOCK):.*?(?=(?:CHARACTER CONTINUITY CONTRACT|$))",
+        "",
+        constraints,
+        flags=re.I | re.S,
+    ).strip(" .")
+    result["constraints"] = (
+        constraints + (". " if constraints else "") + subtitle_contract
+    )
+    result["_subtitles_enabled"] = bool(enabled)
+    return result
 
 
 _PICTURE_REFERENCE_RE = re.compile(r"<\s*picture\s+\d+\s*>", flags=re.I)
@@ -288,6 +1552,7 @@ def extract_explicit_timed_text_layers(
             "delivery": _timed_text_delivery(" ".join(active_context), role),
             "lip_sync": role == "dialogue",
             "explicit_user_requested": True,
+            "authored_timing_locked": True,
         }
         identity = (role, round(start, 3), round(end, 3), content)
         if not any(
@@ -358,6 +1623,30 @@ def protect_explicit_timed_text_layers(plan: dict, requirement: str) -> dict:
     )
     if not required:
         return result
+    # A prior deterministic speech-budget pass may have lengthened the exact
+    # authored line without changing a single word. Preserve that safe timing
+    # when this protection pass runs again during Validate and Apply.
+    for authored in required:
+        adjusted = next(
+            (
+                item for item in result.get("text_layers") or []
+                if isinstance(item, dict)
+                and bool(item.get("speech_timing_auto_adjusted", False))
+                and str(item.get("role", "")) == authored["role"]
+                and str(item.get("content", "")).strip() == authored["content"]
+                and abs(
+                    float(item.get("authored_start_seconds", item.get("start_seconds", -1.0)))
+                    - authored["start_seconds"]
+                ) <= 0.01
+                and abs(
+                    float(item.get("authored_end_seconds", item.get("end_seconds", -1.0)))
+                    - authored["end_seconds"]
+                ) <= 0.01
+            ),
+            None,
+        )
+        if adjusted is not None:
+            authored.update(deepcopy(adjusted))
     retained: list[dict] = []
     for existing in result.get("text_layers") or []:
         if not isinstance(existing, dict):
@@ -394,28 +1683,45 @@ def validate_explicit_timed_text_contract(requirement: str, plan: dict) -> list[
     if not required:
         return []
     actual = [item for item in plan.get("text_layers") or [] if isinstance(item, dict)]
-    missing = [
-        item for item in required
-        if not any(
-            str(candidate.get("role", "")) == item["role"]
-            and str(candidate.get("content", "")).strip() == item["content"]
-            and abs(float(candidate.get("start_seconds", -1.0)) - item["start_seconds"]) <= 0.01
-            and abs(float(candidate.get("end_seconds", -1.0)) - item["end_seconds"]) <= 0.01
-            for candidate in actual
+    matched: list[dict] = []
+    missing: list[dict] = []
+    for item in required:
+        candidate = next(
+            (
+                row for row in actual
+                if str(row.get("role", "")) == item["role"]
+                and str(row.get("content", "")).strip() == item["content"]
+                and (
+                    (
+                        abs(float(row.get("start_seconds", -1.0)) - item["start_seconds"]) <= 0.01
+                        and abs(float(row.get("end_seconds", -1.0)) - item["end_seconds"]) <= 0.01
+                    )
+                    or (
+                        bool(row.get("speech_timing_auto_adjusted", False))
+                        and abs(float(row.get("authored_start_seconds", -1.0)) - item["start_seconds"]) <= 0.01
+                        and abs(float(row.get("authored_end_seconds", -1.0)) - item["end_seconds"]) <= 0.01
+                    )
+                )
+            ),
+            None,
         )
-    ]
+        if candidate is None:
+            missing.append(item)
+        else:
+            matched.append(deepcopy(candidate))
     if missing:
         raise ValueError(
             "The Design requirement contains explicit timed Dialogue/Voice-over/Lyrics/On-screen "
             f"Text, but {len(missing)} exact layer(s) are missing. Apply/Run is blocked to prevent "
             "silent video generation. Regenerate or restore the authored text layers."
         )
-    return required
+    return matched
 
 
 _AUTO_SOUND_MIX_MARKER = "Production mix contract:"
 _AUTO_MUSIC_MIX_MARKER = "Music mix contract:"
 _SPATIAL_ACOUSTICS_MARKER = "Spatial acoustics contract:"
+DESIGN_MUSIC_MODES = ("off", "auto", "timeline")
 
 
 def _audio_design_evidence(plan: dict) -> str:
@@ -645,6 +1951,8 @@ def automatic_background_music(plan: dict) -> str:
     base = _without_generated_mix_contract(
         plan.get("non_diegetic_music", ""), _AUTO_MUSIC_MIX_MARKER
     )
+    if base.strip().lower() in {"n/a", "na", "none", "no music", "no score"}:
+        base = ""
     if not base:
         if any(word in evidence for word in ("fight", "battle", "chase", "assassin", "wuxia", "武侠", "武俠", "刺杀", "刺殺", "追捕")):
             base = "Tense cinematic action score with restrained percussion, low strings and short accents that follow major physical beats"
@@ -666,6 +1974,29 @@ def automatic_background_music(plan: dict) -> str:
         "maximum loudness, and use no vocals unless authored Lyrics explicitly require them."
     )
     return base.rstrip(". ") + "." + contract
+
+
+def normalize_design_music_mode(value: object) -> str:
+    """Return the persistent Design/H3 music policy, defaulting to AUTO."""
+    normalized = str(value or "auto").strip().lower()
+    return normalized if normalized in DESIGN_MUSIC_MODES else "auto"
+
+
+def enforce_design_music_mode(plan: dict, mode: object) -> dict:
+    """Apply the selected music policy without changing visual or speech data."""
+    result = deepcopy(plan)
+    resolved = normalize_design_music_mode(mode)
+    if resolved == "auto":
+        result["non_diegetic_music"] = automatic_background_music(result)
+    else:
+        result["non_diegetic_music"] = "N/A"
+    if resolved == "off":
+        result["markers"] = [
+            row for row in result.get("markers") or []
+            if "music" not in str(row.get("preset", "")).lower()
+        ]
+    result["_music_mode"] = resolved
+    return result
 
 
 DESIGN_JSON_SCHEMA = {
@@ -860,6 +2191,113 @@ def _interval(item: dict, duration: float) -> tuple[float, float]:
     return start, end
 
 
+def _repair_overlapping_camera_shots(
+    shots: list[dict],
+    duration: float,
+    warnings: list[str],
+) -> None:
+    """Move ambiguous adjacent camera cuts onto one shared 0.5s boundary.
+
+    Design models occasionally return ranges such as S5 20.0-26.0 and
+    S6 25.5-31.0 even though the Director Shot lane is sequential. Rejecting
+    the whole plan makes an otherwise usable Design impossible to Apply. A
+    camera cut has no overlap semantics, so split the disputed interval at the
+    nearest half-second midpoint while keeping at least one grid cell in both
+    Shots. Media and authored text layers are deliberately untouched: those
+    are allowed to overlap on their own Timeline tracks.
+    """
+    index = 1
+    while index < len(shots):
+        previous = shots[index - 1]
+        current = shots[index]
+        previous_end = float(previous["end_seconds"])
+        current_start = float(current["start_seconds"])
+        if current_start >= previous_end - 1e-6:
+            index += 1
+            continue
+
+        previous_start = float(previous["start_seconds"])
+        current_end = float(current["end_seconds"])
+        minimum_boundary = round(previous_start + 0.5, 2)
+        maximum_boundary = round(current_end - 0.5, 2)
+        if minimum_boundary > maximum_boundary + 1e-6:
+            merged_fields = (
+                "subject_action", "environment_response", "continuity_state",
+                "optional_flourish", "additional_direction",
+            )
+            for field_name in merged_fields:
+                first = str(previous.get(field_name, "")).strip()
+                second = str(current.get(field_name, "")).strip()
+                if second and second not in first:
+                    previous[field_name] = ". ".join(
+                        item.rstrip(" .") for item in (first, second) if item
+                    ) + "."
+            previous["start_seconds"] = min(previous_start, float(current["start_seconds"]))
+            previous["end_seconds"] = max(previous_end, current_end)
+            shots.pop(index)
+            warnings.append(
+                f"Auto-merged overlapping camera Shots S{index}/S{index + 1}: their "
+                "combined range was too short to preserve two 0.50s camera cells. "
+                "Core actions and continuity were retained in one executable Shot; "
+                "overlapping media/text tracks were preserved."
+            )
+            continue
+
+        boundary = snap_half_second(
+            (previous_end + current_start) / 2.0,
+            duration,
+        )
+        boundary = min(max(boundary, minimum_boundary), maximum_boundary)
+        boundary = round(boundary, 2)
+        previous["end_seconds"] = boundary
+        current["start_seconds"] = boundary
+        warnings.append(
+            f"Auto-repaired overlapping camera Shots S{index}/S{index + 1}: "
+            f"S{index} ended at {previous_end:.2f}s and S{index + 1} started at "
+            f"{current_start:.2f}s; both now share the {boundary:.2f}s cut boundary. "
+            "Only the Shot lane was repaired; overlapping media/text tracks were preserved."
+        )
+        index += 1
+
+
+def _retime_design_payload(source: dict, target_duration: float) -> str:
+    """Scale a model's complete timing plan onto an explicit user duration."""
+
+    original_duration = max(
+        0.5,
+        snap_half_second(
+            source.get("duration_seconds", target_duration),
+            MAX_DESIGN_DURATION_SECONDS,
+        ),
+    )
+    if abs(original_duration - target_duration) <= 0.01:
+        source["duration_seconds"] = target_duration
+        return ""
+    ratio = target_duration / original_duration
+    for family in ("shots", "text_layers", "existing_media_uses", "media_requests"):
+        for row in source.get(family) or []:
+            if not isinstance(row, dict):
+                continue
+            for key in ("start_seconds", "end_seconds"):
+                if key in row:
+                    row[key] = snap_half_second(
+                        float(row.get(key, 0.0) or 0.0) * ratio,
+                        target_duration,
+                    )
+    for family in ("transitions", "markers"):
+        for row in source.get(family) or []:
+            if isinstance(row, dict) and "time_seconds" in row:
+                row["time_seconds"] = snap_half_second(
+                    float(row.get("time_seconds", 0.0) or 0.0) * ratio,
+                    target_duration,
+                )
+    source["duration_seconds"] = target_duration
+    return (
+        f"Auto-retimed the complete Design from {original_duration:.2f}s to the "
+        f"explicit {target_duration:.2f}s contract on the 0.5s Timeline grid."
+    )
+
+
 def _validate_t2i_media_prompt(
     prompt: str,
     *,
@@ -1018,15 +2456,29 @@ def repair_design_media_plan(
     free_image_slots = max(
         0, int(capacities.get("image", 0)) - loaded_image_count
     )
+    warnings: list[str] = []
     requests = [
         dict(row) for row in source.get("media_requests") or []
         if isinstance(row, dict)
     ]
     shots = [dict(row) for row in source.get("shots") or [] if isinstance(row, dict)]
+    request_ids_seen: set[str] = set()
     for request_index, request in enumerate(requests):
         requirement_id = _normalized_requirement_id(
             request.get("requirement_id"), f"request_{request_index + 1}"
         )
+        original_requirement_id = requirement_id
+        suffix = 2
+        while requirement_id in request_ids_seen:
+            requirement_id = f"{original_requirement_id}_{suffix}"
+            suffix += 1
+        if requirement_id != original_requirement_id:
+            warnings.append(
+                f"Renamed duplicate media requirement_id {original_requirement_id!r} "
+                f"to {requirement_id!r}."
+            )
+        request["requirement_id"] = requirement_id
+        request_ids_seen.add(requirement_id)
         internal_auto = re.fullmatch(r"auto_image_s(\d+)(?:_\d+)?", requirement_id)
         if (
             internal_auto
@@ -1040,12 +2492,45 @@ def repair_design_media_plan(
                 requirement_id=requirement_id,
                 preferred_media_id=str(request.get("preferred_media_id", "")).strip(),
             )
+            continue
+        if str(request.get("media_type", "")).strip().lower() == "image":
+            start, end = _interval(request, duration)
+            try:
+                _validate_t2i_media_prompt(
+                    str(request.get("prompt", "")).strip(),
+                    request_number=request_index + 1,
+                    start_seconds=start,
+                    end_seconds=end,
+                    duration_seconds=duration,
+                )
+            except ValueError as exc:
+                shot = max(
+                    shots or [{"start_seconds": start, "end_seconds": end}],
+                    key=lambda row: max(
+                        0.0,
+                        min(end, _interval(row, duration)[1])
+                        - max(start, _interval(row, duration)[0]),
+                    ),
+                )
+                rebuilt = _auto_image_request(
+                    source,
+                    shot,
+                    duration,
+                    requirement_id=requirement_id,
+                    preferred_media_id=str(request.get("preferred_media_id", "")).strip(),
+                    instruction=" ".join(_string_list(request.get("subject_keywords") or [])),
+                )
+                rebuilt["start_seconds"], rebuilt["end_seconds"] = start, end
+                requests[request_index] = rebuilt
+                warnings.append(
+                    f"Rebuilt unsafe Z-Image request {requirement_id!r} as a standalone "
+                    f"in-world frozen frame: {exc}"
+                )
     request_ids = {
         _normalized_requirement_id(row.get("requirement_id"), f"request_{index}")
         for index, row in enumerate(requests, 1)
     }
     valid_uses: list[dict] = []
-    warnings: list[str] = []
     has_authored_speech = any(
         isinstance(row, dict)
         and str(row.get("role", "")).strip().lower()
@@ -1123,6 +2608,27 @@ def repair_design_media_plan(
             "into a Z-Image generation request."
         )
 
+    unique_uses: list[dict] = []
+    use_ids_seen: set[str] = set()
+    for use_number, raw in enumerate(valid_uses, 1):
+        row = dict(raw)
+        requirement_id = _normalized_requirement_id(
+            row.get("requirement_id"), f"reuse_{use_number}"
+        )
+        original_requirement_id = requirement_id
+        suffix = 2
+        while requirement_id in use_ids_seen:
+            requirement_id = f"{original_requirement_id}_{suffix}"
+            suffix += 1
+        if requirement_id != original_requirement_id:
+            warnings.append(
+                f"Renamed duplicate existing-media requirement_id "
+                f"{original_requirement_id!r} to {requirement_id!r}."
+            )
+        row["requirement_id"] = requirement_id
+        use_ids_seen.add(requirement_id)
+        unique_uses.append(row)
+    valid_uses = unique_uses
     source["existing_media_uses"] = valid_uses
 
     valid_picture_ids = {
@@ -1233,6 +2739,115 @@ def _media_inventory(items: list[dict] | None) -> dict[str, dict]:
         row["loaded"] = bool(row.get("loaded", row.get("available", True)))
         inventory[media_id] = row
     return inventory
+
+
+def collect_design_preflight_blockers(
+    payload: object,
+    capacities: dict[str, int],
+    *,
+    existing_media: list[dict] | None = None,
+    authored_requirement: str = "",
+    selected_media_ids: list[str] | None = None,
+) -> list[str]:
+    """Collect independent unrecoverable Design defects in one pass.
+
+    This deliberately excludes defects repaired by ``normalize_design_plan``
+    (duration, brief/style defaults, duplicate requirement IDs, unsafe T2I
+    prompts and camera overlap).  The UI can therefore show every real media /
+    structure Hard Block at once instead of revealing one modal per retry.
+    """
+
+    try:
+        source = extract_design_json(payload)
+    except ValueError as exc:
+        return [str(exc)]
+    blockers: list[str] = []
+    shots = [row for row in source.get("shots") or [] if isinstance(row, dict)]
+    if not shots:
+        blockers.append("Design JSON must contain at least one executable Shot.")
+
+    inventory = _media_inventory(existing_media)
+    inventory_was_supplied = existing_media is not None
+    selection_was_supplied = selected_media_ids is not None
+    selected = {
+        _normalized_media_id(value) for value in selected_media_ids or []
+        if _normalized_media_id(value)
+    }
+    explicit_ids = {
+        _normalized_media_id(f"{match.group(1)}{match.group(2)}")
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9_])@([PVA])(\d+)\b",
+            str(authored_requirement or ""),
+            flags=re.I,
+        )
+    }
+    has_authored_speech = bool(
+        extract_explicit_timed_text_layers(authored_requirement)
+        or re.search(
+            r"dialogue|voice[- ]?over|narration|对白|對白|旁白|台词|台詞|普通话|普通話",
+            str(authored_requirement or ""),
+            flags=re.I,
+        )
+    )
+
+    for use_number, raw in enumerate(source.get("existing_media_uses") or [], 1):
+        if not isinstance(raw, dict):
+            continue
+        media_id = _normalized_media_id(raw.get("media_id", ""))
+        if not media_id:
+            blockers.append(
+                f"Existing media use {use_number} has an invalid media_id; use P1, V1 or A1."
+            )
+            continue
+        inferred_type = _media_type_for_id(media_id)
+        declared_type = str(raw.get("media_type") or inferred_type).strip().lower()
+        if declared_type != inferred_type:
+            blockers.append(
+                f"Existing media {media_id} is {inferred_type}, not {declared_type}."
+            )
+            continue
+        ordinal = int(media_id[1:])
+        if ordinal > int(capacities.get(inferred_type, 0)):
+            blockers.append(
+                f"Existing media {media_id} is outside the API's "
+                f"{capacities.get(inferred_type, 0)} {inferred_type} slots."
+            )
+            continue
+        if inventory_was_supplied:
+            inventory_row = inventory.get(media_id)
+            if inventory_row is None:
+                blockers.append(
+                    f"Existing media {media_id} is not present in the Media Pool inventory."
+                )
+                continue
+            inventory_type = str(inventory_row.get("media_type", "")).strip().lower()
+            if inventory_type and inventory_type != inferred_type:
+                blockers.append(
+                    f"Media Pool {media_id} is {inventory_type}, not {inferred_type}."
+                )
+                continue
+            if not inventory_row.get("loaded", False):
+                authored_audio_placeholder = (
+                    inferred_type == "audio" and has_authored_speech
+                )
+                recoverable_picture_slot = inferred_type == "image"
+                if not authored_audio_placeholder and not recoverable_picture_slot:
+                    blockers.append(
+                        f"Existing media {media_id} is empty and cannot be reused."
+                    )
+
+    for media_id in sorted(explicit_ids):
+        row = inventory.get(media_id)
+        if not row or not row.get("loaded", False):
+            blockers.append(
+                f"Explicit reference @{media_id} has no loaded Media Pool file."
+            )
+        elif selection_was_supplied and media_id not in selected:
+            blockers.append(
+                f"Explicit reference @{media_id} is not enabled for this Design."
+            )
+
+    return list(dict.fromkeys(blockers))
 
 
 def _string_list(value: object) -> list[str]:
@@ -1541,29 +3156,47 @@ def normalize_design_plan(
     authored_requirement: str = "",
 ) -> dict:
     media_repair_warnings: list[str] = []
-    prepared_payload = extract_design_json(payload)
+    prepared_payload = deepcopy(extract_design_json(payload))
     authored_duration = infer_explicit_design_duration(authored_requirement)
     if authored_duration is not None:
         returned_duration = snap_half_second(
             prepared_payload.get("duration_seconds", 5.0),
             MAX_DESIGN_DURATION_SECONDS,
         )
-        if abs(returned_duration - authored_duration) > 0.01:
-            raise DesignDurationContractError(
-                "Duration contract mismatch: the user explicitly requested "
-                f"{authored_duration:.2f}s, but Design JSON returned "
-                f"{returned_duration:.2f}s. Do not condense, summarize, stretch or "
-                "inherit the current workspace Timeline duration; regenerate every Shot, "
-                "text layer, cue and media range for the exact requested duration."
-            )
+        speech_base_duration = float(
+            prepared_payload.get("_speech_timing_base_duration", 0.0) or 0.0
+        )
+        speech_adjusted_duration = bool(
+            returned_duration >= authored_duration
+            and abs(speech_base_duration - authored_duration) <= 0.01
+        )
+        if (
+            abs(returned_duration - authored_duration) > 0.01
+            and not speech_adjusted_duration
+        ):
+            if repair_media_plan:
+                repair_note = _retime_design_payload(
+                    prepared_payload, authored_duration
+                )
+                if repair_note:
+                    media_repair_warnings.append(repair_note)
+            else:
+                raise DesignDurationContractError(
+                    "Duration contract mismatch: the user explicitly requested "
+                    f"{authored_duration:.2f}s, but Design JSON returned "
+                    f"{returned_duration:.2f}s. Do not condense, summarize, stretch or "
+                    "inherit the current workspace Timeline duration; regenerate every Shot, "
+                    "text layer, cue and media range for the exact requested duration."
+                )
     if authored_requirement.strip():
         prepared_payload = protect_explicit_timed_text_layers(
             prepared_payload, authored_requirement
         )
     if repair_media_plan:
-        source, media_repair_warnings = repair_design_media_plan(
+        source, repaired_media_warnings = repair_design_media_plan(
             prepared_payload, capacities, existing_media
         )
+        media_repair_warnings.extend(repaired_media_warnings)
     else:
         source = prepared_payload
     duration = snap_half_second(
@@ -1584,9 +3217,25 @@ def normalize_design_plan(
     if not plan["title"]:
         plan["title"] = "AI Director Design"
     if not plan["creative_brief"]:
-        raise ValueError("Design JSON is missing creative_brief")
+        if not repair_media_plan:
+            raise ValueError("Design JSON is missing creative_brief")
+        plan["creative_brief"] = (
+            str(authored_requirement).strip()
+            or plan["title"]
+            or "Execute the supplied Shot plan as one continuous story."
+        )
+        media_repair_warnings.append(
+            "Inserted a Creative Brief from the authored requirement/title."
+        )
     if not plan["global_visual_style"]:
-        raise ValueError("Design JSON is missing global_visual_style")
+        if not repair_media_plan:
+            raise ValueError("Design JSON is missing global_visual_style")
+        plan["global_visual_style"] = (
+            "Cinematic realism with physically coherent lighting, identity, geography and motion."
+        )
+        media_repair_warnings.append(
+            "Inserted a safe cinematic Visual Style because the model omitted it."
+        )
     plan["overall_soundscape"] = automatic_background_soundscape({
         **plan,
         "shots": source.get("shots") or [],
@@ -1639,6 +3288,7 @@ def normalize_design_plan(
     if not shots:
         raise ValueError("Design JSON must contain at least one shot")
     plan["shots"] = sorted(shots, key=lambda item: (item["start_seconds"], item["end_seconds"]))
+    _repair_overlapping_camera_shots(plan["shots"], duration, design_warnings)
     for index, shot in enumerate(plan["shots"], 1):
         shot["id"] = f"S{index}"
         if not shot["subject_action"]:
@@ -1656,8 +3306,9 @@ def normalize_design_plan(
             previous = plan["shots"][index - 2]
             if shot["start_seconds"] < previous["end_seconds"] - 1e-6:
                 raise ValueError(
-                    f"Shot {previous['id']} overlaps S{index}. H3 camera Shots must be chronological "
-                    "and non-overlapping; use overlapping V tracks only for media layers."
+                    f"Shot {previous['id']} still overlaps S{index} after automatic boundary repair. "
+                    "H3 camera Shots must be chronological and non-overlapping; use overlapping "
+                    "V tracks only for media layers."
                 )
             if shot["start_seconds"] > previous["end_seconds"] + 1e-6:
                 design_warnings.append(
@@ -1688,18 +3339,32 @@ def normalize_design_plan(
         else:
             role_tracks = {"dialogue": "A4", "voice_over": "A5", "lyrics": "A6"}
             track = requested_track if requested_track.startswith("A") else role_tracks.get(role, "A4")
-        text_layers.append({
+        content = str(raw.get("content", "")).strip()
+        language = str(raw.get("language", "English")).strip() or "English"
+        if re.search(r"[\u3400-\u9fff]", content) and language.lower() in {
+            "english", "original language", "auto",
+        }:
+            language = "Mandarin Chinese"
+        normalized_layer = {
             "start_seconds": start,
             "end_seconds": end,
             "track": track,
-            "content": str(raw.get("content", "")).strip(),
+            "content": content,
             "role": role,
             "speaker": str(raw.get("speaker", "S1")) if str(raw.get("speaker", "S1")) in {"S1", "S2"} else "S1",
-            "language": str(raw.get("language", "English")).strip() or "English",
+            "language": language,
             "delivery": str(raw.get("delivery", "Natural")).strip() or "Natural",
             "lip_sync": role == "dialogue" and bool(raw.get("lip_sync", False)),
             "explicit_user_requested": True,
-        })
+        }
+        for metadata_key in (
+            "authored_start_seconds", "authored_end_seconds",
+            "speech_timing_auto_adjusted", "speech_budget_was_overloaded",
+            "speech_budget", "authored_timing_locked",
+        ):
+            if metadata_key in raw:
+                normalized_layer[metadata_key] = deepcopy(raw[metadata_key])
+        text_layers.append(normalized_layer)
     plan["text_layers"] = text_layers
 
     for family in ("transitions", "markers"):
@@ -1748,7 +3413,7 @@ def normalize_design_plan(
                 f"Existing media {media_id} is {inferred_type}, not {media_type}."
             )
         ordinal = int(media_id[1:])
-        if ordinal > int(capacities.get(media_type, 0)):
+        if not inventory_was_supplied and ordinal > int(capacities.get(media_type, 0)):
             raise ValueError(
                 f"Existing media {media_id} is outside the API's {capacities.get(media_type, 0)} "
                 f"{media_type} slots."
@@ -1790,7 +3455,7 @@ def normalize_design_plan(
                 or inventory_row.get("analysis_summary")
                 or ""
             ).strip()
-        existing_media_uses.append({
+        normalized_use = {
             "requirement_id": requirement_id,
             "media_id": media_id,
             "media_type": media_type,
@@ -1807,8 +3472,70 @@ def normalize_design_plan(
             ).strip() or ("A1" if media_type == "audio" else "V1"),
             "subject_keywords": keywords,
             "instruction": str(raw.get("instruction") or fallback_instruction).strip(),
-        })
+        }
+        if "identity_anchor" in raw:
+            normalized_use["identity_anchor"] = bool(raw.get("identity_anchor"))
+        existing_media_uses.append(normalized_use)
         reused_requirement_ids.add(requirement_id)
+
+    for media_id in _authored_identity_picture_ids(authored_requirement):
+        inventory_row = inventory.get(media_id)
+        if inventory_was_supplied and not bool(
+            inventory_row and inventory_row.get("loaded", False)
+        ):
+            # Existing validation will give the actionable missing/empty error
+            # when the model emitted the use.  Do not manufacture a valid row
+            # for an absent Picture here.
+            continue
+        identity_use = next(
+            (row for row in existing_media_uses if row.get("media_id") == media_id),
+            None,
+        )
+        if identity_use is None:
+            requirement_id = _normalized_requirement_id(
+                f"authored_identity_{media_id.lower()}",
+                f"authored_identity_{media_id.lower()}",
+            )
+            suffix = 2
+            while requirement_id in reused_requirement_ids:
+                requirement_id = f"authored_identity_{media_id.lower()}_{suffix}"
+                suffix += 1
+            fallback_instruction = ""
+            if inventory_row:
+                fallback_instruction = str(
+                    inventory_row.get("clip_prompt")
+                    or inventory_row.get("caption")
+                    or inventory_row.get("analysis_summary")
+                    or ""
+                ).strip()
+            identity_use = {
+                "requirement_id": requirement_id,
+                "media_id": media_id,
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "whole_design",
+                "start_seconds": 0.0,
+                "end_seconds": duration,
+                "track": "V1",
+                "subject_keywords": [],
+                "instruction": fallback_instruction,
+            }
+            existing_media_uses.append(identity_use)
+            reused_requirement_ids.add(requirement_id)
+        identity_use["identity_anchor"] = True
+        identity_use["reuse_policy"] = "whole_design"
+        identity_use["start_seconds"] = 0.0
+        identity_use["end_seconds"] = duration
+        identity_contract = (
+            f"Use @{media_id} as the authoritative whole-design face identity anchor. "
+            "Preserve the exact recognizable facial geometry, age, hair and identity in every appearance."
+        )
+        if identity_contract not in str(identity_use.get("instruction", "")):
+            identity_use["instruction"] = (
+                str(identity_use.get("instruction", "")).rstrip(" .")
+                + (". " if str(identity_use.get("instruction", "")).strip() else "")
+                + identity_contract
+            )
     plan["existing_media_uses"] = existing_media_uses
     reused_media_ids = sorted({row["media_id"] for row in existing_media_uses})
     if reused_media_ids:
@@ -1855,16 +3582,6 @@ def normalize_design_plan(
 
     media_requests: list[dict] = []
     counts = {"image": 0, "video": 0, "audio": 0}
-    occupied_counts = {"image": 0, "video": 0, "audio": 0}
-    if inventory_was_supplied:
-        for row in inventory.values():
-            media_type = str(row.get("media_type", "")).strip().lower()
-            if row.get("loaded", False) and media_type in occupied_counts:
-                occupied_counts[media_type] += 1
-    available_counts = {
-        media_type: max(0, int(capacities.get(media_type, 0)) - occupied_counts[media_type])
-        for media_type in counts
-    }
     requested_requirement_ids: set[str] = set()
     for request_number, raw in enumerate(source.get("media_requests") or [], 1):
         if not isinstance(raw, dict):
@@ -1885,17 +3602,9 @@ def normalize_design_plan(
                 f"Media requirement_id {requirement_id!r} is requested more than once."
             )
         counts[media_type] += 1
-        slot_limit = available_counts[media_type]
-        if counts[media_type] > slot_limit:
-            if inventory_was_supplied:
-                raise ValueError(
-                    f"Design requests {counts[media_type]} new {media_type} assets, but the API has "
-                    f"only {slot_limit} free slots ({occupied_counts[media_type]} already loaded)."
-                )
-            raise ValueError(
-                f"Design requests {counts[media_type]} {media_type} assets, but the API has only "
-                f"{capacities.get(media_type, 0)} slots"
-            )
+        # The Media Pool is logical and unlimited.  Physical 9/3/3 H3 slots
+        # are allocated dynamically per Segment during compilation; total
+        # project request count must never be compared with physical capacity.
         start, end = _interval(raw, duration)
         reuse_policy = str(raw.get("reuse_policy", "")).strip().lower()
         if reuse_policy not in {"whole_design", "time_scoped"}:
@@ -1931,19 +3640,27 @@ def normalize_design_plan(
             "subject_keywords": keywords,
             "prompt": prompt,
         }
+        for metadata_key in (
+            "identity_anchor", "identity_anchor_requirement_id", "identity_anchor_media_id",
+        ):
+            if metadata_key in raw:
+                normalized_request[metadata_key] = deepcopy(raw[metadata_key])
         preferred_media_id = _normalized_media_id(raw.get("preferred_media_id", ""))
         if media_type == "image" and preferred_media_id.startswith("P"):
-            preferred_ordinal = int(preferred_media_id[1:])
             preferred_row = inventory.get(preferred_media_id)
             if (
-                preferred_ordinal <= int(capacities.get("image", 0))
-                and not bool(preferred_row and preferred_row.get("loaded", False))
+                not bool(preferred_row and preferred_row.get("loaded", False))
             ):
                 normalized_request["preferred_media_id"] = preferred_media_id
         media_requests.append(normalized_request)
         requested_requirement_ids.add(requirement_id)
     plan["media_requests"] = media_requests
-    return plan
+    if "_speech_timing_base_duration" in source:
+        plan["_speech_timing_base_duration"] = float(
+            source.get("_speech_timing_base_duration", duration)
+        )
+    stabilize_generated_identity_references(plan)
+    return auto_adjust_speech_shot_timing(plan)
 
 
 def build_design_system_prompt(context: dict) -> str:
@@ -1968,11 +3685,62 @@ def build_design_system_prompt(context: dict) -> str:
             "final timestamp. Never condense, summarize, stretch or replace this duration with "
             "current_duration_seconds from the workspace. The current Timeline duration is context only. "
         )
+    selected_dialogue_language = canonical_dialogue_language(
+        context.get("dialogue_language")
+    )
+    language_contract = (
+        "H3 has stable native dialogue support for exactly 11 languages: "
+        + ", ".join(H3_STABLE_DIALOGUE_LANGUAGES)
+        + ". "
+    )
+    if selected_dialogue_language and selected_dialogue_language != "auto":
+        language_contract += (
+            "DIALOGUE LANGUAGE CONTRACT: Design selected "
+            f"{selected_dialogue_language}. Write every newly authored Dialogue, Voice-over "
+            f"and Lyrics line naturally in {selected_dialogue_language}, and set every matching "
+            f"text_layers.language value to exactly '{selected_dialogue_language}'. Never default "
+            "to English and never place English words under a non-English language label. Exact "
+            "verbatim words supplied by the user remain authoritative and must not be translated. "
+        )
+    subtitles_enabled = bool(context.get("subtitles_enabled", False))
+    subtitle_contract = (
+        "SUBTITLE CONTRACT: subtitles are ON. Keep all speech in editable audio text_layers "
+        "and also create synchronized on_screen_text subtitle layers with the same exact words. "
+        "Do not burn subtitles into generated reference images. "
+        if subtitles_enabled else
+        "SUBTITLE CONTRACT: subtitles are OFF. Do not create subtitle/caption on_screen_text "
+        "layers, do not invent theme hashtags, and never ask generated reference images to show "
+        "spoken words. Explicit non-subtitle title or on-screen text requested by the user is the "
+        "only visible text exception. "
+    )
+    music_mode = normalize_design_music_mode(context.get("music_mode", "auto"))
+    if music_mode == "off":
+        music_contract = (
+            "MUSIC POLICY: OFF. Set non_diegetic_music to exactly 'N/A', do not create Music Cue "
+            "markers, and rely only on diegetic ambience, Foley and authored speech. "
+        )
+    elif music_mode == "timeline":
+        music_contract = (
+            "MUSIC POLICY: TIMELINE. Set non_diegetic_music to exactly 'N/A' and do not invent "
+            "automatic score or Music Cue markers. Music will be enabled later only where the user "
+            "authors a Timeline Music Cue. "
+        )
+    else:
+        music_contract = (
+            "MUSIC POLICY: AUTO. Analyse every scene's genre, emotion, pacing and transitions, then "
+            "write a useful time-aware non_diegetic_music direction with suitable instrumentation "
+            "and dramatic development. Keep it subordinate to speech and important diegetic sound, "
+            "let it rise naturally between spoken lines, and use no vocals unless authored Lyrics "
+            "explicitly require them. "
+        )
     return (
         "You are the AI Design Planner inside a MiniMax H3 Director Cut application. "
         "Convert the user's concept into one production-ready JSON object that exactly matches the supplied schema. "
         + skill_direction
         + duration_contract
+        + language_contract
+        + subtitle_contract
+        + music_contract
         + "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
         "subject action, environmental response, continuity state, optional flourish and additional direction. "
@@ -1990,6 +3758,11 @@ def build_design_system_prompt(context: dict) -> str:
         "than the duration can render. Reserve the last 0.5 to 1.0 second before every native 15-second boundary for one "
         "simple outgoing state; do not introduce a new multi-beat technique there. Shots must be chronological and must not "
         "overlap; editorial V tracks may overlap for reference/compositing media, but simultaneous conflicting camera Shots may not. "
+        "The Shot lane must cover every frame from 0.00 through duration_seconds exactly once, with no gap and no overlap. "
+        "If speech timing lengthens the project, extend its owning Shot and ripple every later Shot, text layer, cue and media range; "
+        "never create a tail Segment that contains speech but no Shot. Do not compress several unrelated locations or editorial cuts "
+        "into one Shot: a private aircraft, hotel floor and cinema, for example, require separate chronological Shot Blocks even when "
+        "one voice-over sentence describes all three. "
         "Timeline tracks are editorial lanes, not the physical H3 reference-slot count. You may plan V4, V5 and higher "
         "visual lanes for overlapping action states, titles or compositing, and A4, A5 and higher audio lanes for dialogue, "
         "voice-over, lyrics, ambience or music stems; the Studio creates those tracks automatically. Keep on-screen text on "
@@ -2002,6 +3775,8 @@ def build_design_system_prompt(context: dict) -> str:
         "temporally relevant sources into physical H3 slots for each native Segment. Never exceed the supplied "
         "physical_segment_capacity (normally 9 images, 3 videos and 3 audios) within any one Segment, even though the whole "
         "project may use P10+, V4+ and A4+. Additional editorial tracks do not increase that per-Segment limit. "
+        "Never treat P9, V3 or A3 as a project-wide stopping point. Continue assigning stable logical IDs P10+, V4+ and A4+ when "
+        "new story needs occur later in the Timeline; capacity is validated only among references whose time ranges overlap the same Segment. "
         "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. The user may "
         "refer to its stable Media Pool IDs as @P1, @P2, @V1 or @A1; write the ID without @ in existing_media_uses.media_id. "
         "Inside creative_brief, Shot subject_action, environment_response, additional_direction, marker direction and every other "
@@ -2031,6 +3806,24 @@ def build_design_system_prompt(context: dict) -> str:
         "a later segment from replaying an earlier action. Do not return zero image references when the plan has visual Shots and empty "
         "Picture capacity. As a coverage floor, provide approximately one useful image state per five seconds, never more than one per "
         "Shot, while counting genuinely reused Picture assets toward that floor and staying within the per-Segment physical capacity. "
+        "For a recurring human character, designate one clear face-bearing Picture as the whole-design identity anchor. A user-supplied "
+        "Media Pool Picture explicitly cited for face or identity consistency is always authoritative and must win over every generated "
+        "Picture. Later generated Pictures are environment, prop or action-state support and must not redefine a competing face. When the "
+        "authoritative face comes from existing media, keep faces fully out of frame, turned away, motion-obscured or otherwise unreadable "
+        "in independent T2I support requests; H3 must derive the recognizable face only from that existing Picture. "
+        "Before planning references, build an exact cast ledger. Every Shot and every person-bearing image request must state the exact "
+        "number and identity of visible people. A one-person identity reference must show exactly that one foreground person with no crowd, "
+        "staff, silhouette, reflection, portrait, mannequin, double or background figure. A two-person conversation must show exactly the "
+        "two named speakers and no duplicate or third person. Secondary characters require their own distinct identity reference and must "
+        "never inherit or blend with the primary character anchor. Environment and prop references must contain no visible people unless the "
+        "Shot explicitly needs them. Only recurring identity references may span the whole design; scope environment, location, montage and "
+        "action-state references to the exact Shots where they are needed so an earlier airport, hotel, computer or other scene cannot leak "
+        "into a later Segment. "
+        "For every identity-anchored character, keep face, age, skin tone, hairstyle, hair color, body proportions, complete top and lower-body "
+        "wardrobe, shoes and accessory ownership fixed by default. Expressions, poses, arm/leg angles, gait phase and physically caused hair or "
+        "cloth motion may vary freely. Wardrobe or hairstyle changes, injury, dirt, damage, shoe removal and accessory loss may occur only when "
+        "the story explicitly authors the trigger in a Shot; write the changed outgoing state and carry it into every later incoming continuity "
+        "state until another explicit story change. Never invent an unrequested appearance reset between Shots or Segments. "
         "Every image media_request sent to Z-Image/T2I must contain a complete standalone visual prompt. Never put an H3 <Picture N> "
         "token in a T2I prompt and never ask it to copy, match, continue from or depend on a previous, current/self, next/future, generated "
         "or output image; those H3 slots do not exist when reference images are generated. Restate all required identity, appearance, wardrobe, "
@@ -2047,6 +3840,13 @@ def build_design_system_prompt(context: dict) -> str:
         "ownership, counts, action state and in-world environment. If BLIP conflicts on any of those facts, reject that generated reference "
         "and replan the affected media_request with a corrected standalone prompt for regeneration; never alter the story or ownership ledger "
         "to agree with an incorrect BLIP observation, and never approve the conflicting image as an H3 reference. "
+        "When the user asks for Dialogue, Voice-over, narration or Lyrics, create editable text_layers for every spoken line, set "
+        "explicit_user_requested=true, and keep the spoken words exclusively in those text_layers. Never hide, quote or paraphrase spoken "
+        "words inside Shot subject_action, environment_response, continuity_state, optional_flourish or additional_direction. "
+        "Budget spoken language before fixing Shot boundaries: use a natural conversational rate, give emotional or hesitant "
+        "delivery extra time, and lengthen the owning Shot instead of compressing exact dialogue. If a line cannot fit, shift "
+        "all later Shots, text layers, cues and media ranges together; never solve overload by speaking early, reordering, "
+        "omitting or paraphrasing authored words. "
         "Only create a text_layer or theme_text when the user explicitly requests visible text, dialogue, voice-over or lyrics, and set "
         "explicit_user_requested=true only in that case. Never turn the creative brief or scene description into on-screen text. "
         "For every dialogue text_layer, infer the gender of the speaking on-screen character from the user's story, Shot action and "
@@ -2062,9 +3862,6 @@ def build_design_system_prompt(context: dict) -> str:
         "reflections for covered semi-outdoor spaces, and almost no reverb with reduced low-mid fullness for open exteriors. Never carry "
         "a previous room's tail across a location change. Keep "
         "dialogue in the foreground, duck ambience beneath speech without muting it, and never replace or echo authored dialogue. "
-        "Always design a useful non_diegetic_music cue as a separate audible score layer. Specify its dramatic role and instrumentation, "
-        "duck it under speech, let it rise in dialogue gaps and transitions, and never leave it blank or use vocals unless authored Lyrics "
-        "explicitly require them. "
         "Always include a Final Hold marker before the final frame; cue timestamps must be earlier than duration_seconds. "
         "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
         "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. The Final Hold must resolve "
@@ -2107,11 +3904,25 @@ def _slate(path: Path, request: dict, title: str) -> None:
 
 
 def materialize_design_media(
-    plan: dict, example_root: Path, ffmpeg: Path
+    plan: dict,
+    example_root: Path,
+    ffmpeg: Path,
+    *,
+    design_dir: Path | None = None,
+    media_dir: Path | None = None,
+    audio_dir: Path | None = None,
 ) -> tuple[Path, list[dict]]:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    design_dir = example_root / f"{_slug(plan.get('title', ''), 'ai_design')}_{stamp}"
-    design_dir.mkdir(parents=True, exist_ok=False)
+    if design_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        design_dir = example_root / f"{_slug(plan.get('title', ''), 'ai_design')}_{stamp}"
+        design_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        design_dir = Path(design_dir)
+        design_dir.mkdir(parents=True, exist_ok=False)
+    media_output_dir = Path(media_dir) if media_dir is not None else design_dir
+    audio_output_dir = Path(audio_dir) if audio_dir is not None else media_output_dir
+    media_output_dir.mkdir(parents=True, exist_ok=True)
+    audio_output_dir.mkdir(parents=True, exist_ok=True)
     (design_dir / "design_plan.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -2124,12 +3935,12 @@ def materialize_design_media(
         )
         media_type = request["media_type"]
         if media_type == "image":
-            output = design_dir / f"{stem}.png"
+            output = media_output_dir / f"{stem}.png"
             _slate(output, request, plan["title"])
             preview_path = output
         elif media_type == "video":
-            slate = design_dir / f"{stem}_source.png"
-            output = design_dir / f"{stem}.mp4"
+            slate = media_output_dir / f"{stem}_source.png"
+            output = media_output_dir / f"{stem}.mp4"
             _slate(slate, request, plan["title"])
             preview_path = slate
             duration = max(0.5, request["end_seconds"] - request["start_seconds"])
@@ -2146,7 +3957,7 @@ def materialize_design_media(
                 timeout=60,
             )
         else:
-            output = design_dir / f"{stem}.wav"
+            output = audio_output_dir / f"{stem}.wav"
             preview_path = None
             duration = max(0.5, request["end_seconds"] - request["start_seconds"])
             sample_rate = 24000

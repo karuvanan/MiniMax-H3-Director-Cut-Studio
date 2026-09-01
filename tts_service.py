@@ -8,13 +8,24 @@ import gc
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shutil
 import subprocess
+import sys
 import uuid
 import wave
 
+from qwen3_tts_runtime import (
+    QWEN3_TTS_MODEL_DIR,
+    QWEN3_TTS_RUNTIME_DIR,
+    QWEN3_TTS_SUPPORT_DIR,
+    qwen3_tts_missing_message,
+    qwen3_tts_model_missing,
+    qwen3_tts_runtime_missing,
+    qwen3_tts_support_missing,
+)
 from voxcpm_runtime import (
     VOXCPM_MODEL_DIR,
     voxcpm_missing_message,
@@ -25,6 +36,7 @@ from voxcpm_runtime import (
 TTS_ENGINE_LABELS = {
     "edge_tts": "Edge neural Mandarin TTS with Windows SAPI fallback",
     "voxcpm2_local": "VoxCPM2 Local offline neural TTS",
+    "qwen3_tts_local": "Qwen3-TTS Local offline neural TTS",
 }
 
 
@@ -189,6 +201,233 @@ def voxcpm_voice_control(layer: dict) -> str:
 def voxcpm_speaker_seed(speaker: object) -> int:
     digest = hashlib.sha256(str(speaker or "S1").upper().encode("utf-8")).digest()
     return 1000 + int.from_bytes(digest[:4], "big") % 2_000_000_000
+
+
+def qwen3_tts_speaker(speaker: object) -> str:
+    """Map stable Studio speaker IDs to Qwen's native Mandarin voices."""
+    raw = str(speaker or "S1").strip().upper() or "S1"
+    digits = "".join(character for character in raw if character.isdigit())
+    number = max(1, int(digits) if digits else 1)
+    female = ("Vivian", "Serena")
+    male = ("Uncle_Fu", "Dylan")
+    voices = male if number % 2 == 0 else female
+    return voices[((number - 1) // 2) % len(voices)]
+
+
+def qwen3_tts_language(language: object) -> str:
+    raw = str(language or "Auto").strip().lower()
+    aliases = {
+        "mandarin": "Chinese",
+        "mandarin chinese": "Chinese",
+        "chinese": "Chinese",
+        "中文": "Chinese",
+        "普通话": "Chinese",
+        "普通話": "Chinese",
+        "english": "English",
+        "japanese": "Japanese",
+        "korean": "Korean",
+        "german": "German",
+        "french": "French",
+        "russian": "Russian",
+        "portuguese": "Portuguese",
+        "spanish": "Spanish",
+        "italian": "Italian",
+    }
+    return aliases.get(raw, "Auto")
+
+
+def _load_qwen3_tts_api(runtime_dir: Path):
+    runtime_text = str(runtime_dir.resolve())
+    if runtime_text not in sys.path:
+        sys.path.insert(0, runtime_text)
+    support_text = str(QWEN3_TTS_SUPPORT_DIR.resolve())
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if support_text not in path_entries:
+        os.environ["PATH"] = support_text + os.pathsep + os.environ.get("PATH", "")
+    from qwen_tts import Qwen3TTSModel
+
+    return Qwen3TTSModel
+
+
+class Qwen3TTSLocalSynthesizer:
+    """Run Qwen3-TTS in the isolated TTS worker with CUDA-to-CPU recovery."""
+
+    def __init__(self, job: dict):
+        self.model_id = str(job.get("qwen3_tts_model") or QWEN3_TTS_MODEL_DIR).strip()
+        self.runtime_dir = Path(
+            str(job.get("qwen3_tts_runtime") or QWEN3_TTS_RUNTIME_DIR)
+        )
+        requested_device = str(job.get("qwen3_tts_device") or "auto").strip() or "auto"
+        self.local_only = bool(job.get("qwen3_tts_local_files_only", True))
+        if (
+            qwen3_tts_runtime_missing(self.runtime_dir)
+            or qwen3_tts_support_missing()
+            or qwen3_tts_model_missing(self.model_id)
+        ):
+            raise RuntimeError(
+                qwen3_tts_missing_message(self.model_id, self.runtime_dir)
+            )
+        try:
+            import soundfile
+
+            self._qwen_class = _load_qwen3_tts_api(self.runtime_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "Qwen3-TTS Local could not import its isolated runtime from "
+                f"{self.runtime_dir}: {exc}"
+            ) from exc
+        self.soundfile = soundfile
+        self.model = None
+        self._released = False
+        self.device = self._resolve_device(requested_device)
+        try:
+            self._load_model(self.device)
+        except Exception as first_exc:
+            if not self.device.startswith("cuda"):
+                self._clear_model_and_cuda()
+                raise RuntimeError(
+                    "Qwen3-TTS Local model could not be loaded from the project models "
+                    f"folder. Details: {first_exc}"
+                ) from first_exc
+            self._clear_model_and_cuda()
+            emit({
+                "progress": (
+                    "Qwen3-TTS Local · CUDA model load failed; releasing GPU memory "
+                    f"and retrying on CPU ({self._short_error(first_exc)})"
+                )
+            })
+            self.device = "cpu"
+            try:
+                self._load_model("cpu", fallback_reason=self._short_error(first_exc))
+            except Exception as cpu_exc:
+                self._clear_model_and_cuda()
+                raise RuntimeError(
+                    "Qwen3-TTS Local model failed on both CUDA and CPU. "
+                    f"CUDA: {first_exc}; CPU: {cpu_exc}"
+                ) from cpu_exc
+
+    @staticmethod
+    def _resolve_device(requested_device: str) -> str:
+        requested = str(requested_device or "auto").strip().lower() or "auto"
+        if requested != "auto":
+            return requested
+        try:
+            import torch
+
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    @staticmethod
+    def _short_error(exc: Exception) -> str:
+        detail = " ".join(str(exc).split()) or exc.__class__.__name__
+        return detail[:240]
+
+    def _load_model(self, device: str, *, fallback_reason: str = "") -> None:
+        import torch
+
+        stage = f"Qwen3-TTS Local · loading model on {device}"
+        if fallback_reason:
+            stage += f" · CUDA fallback reason: {fallback_reason}"
+        emit({"progress": stage})
+        is_cuda = str(device).startswith("cuda")
+        self.model = self._qwen_class.from_pretrained(
+            self.model_id,
+            device_map=device,
+            dtype=torch.bfloat16 if is_cuda else torch.float32,
+            attn_implementation="sdpa" if is_cuda else "eager",
+            local_files_only=self.local_only,
+        )
+        self._released = False
+        self.device = device
+        emit({"progress": f"Qwen3-TTS Local · model ready on {device}"})
+
+    def _clear_model_and_cuda(self) -> None:
+        model = getattr(self, "model", None)
+        self.model = None
+        if model is not None:
+            del model
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def _generate(self, layer: dict):
+        seed = voxcpm_speaker_seed(layer.get("speaker", "S1"))
+        random.seed(seed)
+        try:
+            import numpy as np
+
+            np.random.seed(seed % (2**32))
+        except Exception:
+            pass
+        try:
+            import torch
+
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+        delivery = " ".join(str(layer.get("delivery", "")).split())[:240]
+        return self.model.generate_custom_voice(
+            text=str(layer.get("content", "")).strip(),
+            language=qwen3_tts_language(layer.get("language")),
+            speaker=qwen3_tts_speaker(layer.get("speaker", "S1")),
+            instruct=delivery or None,
+        )
+
+    def _fallback_after_cuda_inference(self, cuda_exc: Exception) -> None:
+        self._clear_model_and_cuda()
+        emit({
+            "progress": (
+                "Qwen3-TTS Local · CUDA synthesis failed; releasing GPU memory and "
+                f"retrying the current dialogue on CPU ({self._short_error(cuda_exc)})"
+            )
+        })
+        self.device = "cpu"
+        try:
+            self._load_model("cpu", fallback_reason=self._short_error(cuda_exc))
+        except Exception as cpu_exc:
+            raise RuntimeError(
+                "Qwen3-TTS Local CUDA synthesis failed and the CPU fallback model "
+                f"could not be loaded. CUDA: {cuda_exc}; CPU: {cpu_exc}"
+            ) from cpu_exc
+
+    def synthesize(self, layer: dict, output: Path) -> None:
+        try:
+            wavs, sample_rate = self._generate(layer)
+        except Exception as first_exc:
+            if not str(self.device).startswith("cuda"):
+                raise
+            self._fallback_after_cuda_inference(first_exc)
+            try:
+                wavs, sample_rate = self._generate(layer)
+            except Exception as cpu_exc:
+                raise RuntimeError(
+                    "Qwen3-TTS Local synthesis failed on both CUDA and CPU. "
+                    f"CUDA: {first_exc}; CPU: {cpu_exc}"
+                ) from cpu_exc
+        if not wavs:
+            raise RuntimeError("Qwen3-TTS Local produced no usable audio")
+        self.soundfile.write(
+            str(output), wavs[0], int(sample_rate), format="WAV", subtype="PCM_16"
+        )
+        if not output.is_file() or output.stat().st_size <= 44:
+            raise RuntimeError("Qwen3-TTS Local produced no usable audio")
+
+    def release(self) -> None:
+        if self._released:
+            return
+        emit({"progress": "Qwen3-TTS Local · unloading model and releasing VRAM/RAM"})
+        self._clear_model_and_cuda()
+        self._released = True
+        emit({"progress": "Qwen3-TTS Local · model unloaded · VRAM/RAM released"})
 
 
 class VoxCPM2LocalSynthesizer:
@@ -416,11 +655,12 @@ def synthesize_timeline(job: dict) -> dict:
     transcript_rows: list[dict] = []
     synthesizer = None
     try:
-        synthesizer = (
-            VoxCPM2LocalSynthesizer(job)
-            if engine == "voxcpm2_local"
-            else EdgeTTSSynthesizer(script=script, ffmpeg=ffmpeg)
-        )
+        if engine == "voxcpm2_local":
+            synthesizer = VoxCPM2LocalSynthesizer(job)
+        elif engine == "qwen3_tts_local":
+            synthesizer = Qwen3TTSLocalSynthesizer(job)
+        else:
+            synthesizer = EdgeTTSSynthesizer(script=script, ffmpeg=ffmpeg)
         for index, layer in enumerate(layers):
             start = max(0.0, float(layer.get("start_seconds", 0.0)))
             end = min(duration, max(start + 0.1, float(layer.get("end_seconds", duration))))
@@ -458,17 +698,16 @@ def synthesize_timeline(job: dict) -> dict:
                 "tts_engine": engine,
             })
 
-        # VoxCPM is no longer needed once all source utterances exist. Release
-        # its CUDA/CPU tensors before FFmpeg composition instead of retaining
-        # several gigabytes until the whole worker exits.
-        if engine == "voxcpm2_local":
+        # Local neural models are no longer needed once all source utterances
+        # exist. Release their CUDA/CPU tensors before FFmpeg composition.
+        if engine in {"voxcpm2_local", "qwen3_tts_local"}:
             synthesizer.release()
             synthesizer = None
 
         labels = "".join(f"[speech{index}]" for index in range(len(inputs)))
         filters.append(
             f"{labels}amix=inputs={len(inputs)}:duration=longest:normalize=0,"
-            "alimiter=limit=0.95[out]"
+            f"alimiter=limit=0.95,apad=pad_dur={duration:.6f}[out]"
         )
         command = [str(ffmpeg), "-y"]
         for source in inputs:

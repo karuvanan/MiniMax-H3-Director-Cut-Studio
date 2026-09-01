@@ -11,6 +11,7 @@ import sys
 
 from audio_engine import (
     SAMPLE_RATE,
+    ambient_presence,
     audio_analysis_summary,
     estimate_tempo,
     stream_audio_chunks,
@@ -58,6 +59,9 @@ def main() -> int:
             transcript_rows: list[str] = []
             decoded_seconds = 0.0
             voiced_seconds = 0.0
+            ambient_weighted_rms = 0.0
+            ambient_sample_seconds = 0.0
+            ambient_detected = False
             for chunk_index, (offset, samples) in enumerate(
                 stream_audio_chunks(
                     job["media"],
@@ -71,6 +75,10 @@ def main() -> int:
                 decoded_seconds += local_duration
                 local_vad = voice_activity(samples)
                 local_segments = local_vad["segments"]
+                local_ambient = ambient_presence(samples, local_segments)
+                ambient_detected = ambient_detected or bool(local_ambient["present"])
+                ambient_weighted_rms += float(local_ambient["nonvoice_rms"]) * local_duration
+                ambient_sample_seconds += local_duration
                 for start, end in local_segments:
                     all_segments.append([round(offset + start, 3), round(offset + end, 3)])
                     voiced_seconds += end - start
@@ -146,6 +154,12 @@ def main() -> int:
                     "voice_ratio": round(voiced_seconds / decoded_seconds, 4) if decoded_seconds else 0.0,
                     "threshold": 0.0,
                 },
+                "ambient": {
+                    "present": ambient_detected,
+                    "nonvoice_rms": round(
+                        ambient_weighted_rms / ambient_sample_seconds, 7
+                    ) if ambient_sample_seconds else 0.0,
+                },
             }
             summary = audio_analysis_summary(analysis)
             print(
@@ -155,6 +169,7 @@ def main() -> int:
                         "summary": summary,
                         "tempo": analysis["tempo"],
                         "vad": analysis["vad"],
+                        "ambient": analysis["ambient"],
                         "transcript": "\n".join(transcript_rows),
                         "speech_device": device,
                         "decoded_seconds": round(decoded_seconds, 3),

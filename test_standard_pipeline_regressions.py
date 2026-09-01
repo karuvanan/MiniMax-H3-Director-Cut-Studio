@@ -2,15 +2,17 @@
 
 Run this file before generating a new project whenever Timeline, Design,
 reference mapping, track handling or long-render continuity code changes.
-The five tests intentionally describe user-visible invariants instead of
+The eleven tests intentionally describe user-visible invariants instead of
 individual helper implementations.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import unittest
 from unittest.mock import patch
@@ -18,13 +20,15 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 import comfy_submit_worker
 from design_engine import normalize_design_plan
 from director_cut_studio import (
+    DesignPageDialog,
     DirectorCue,
     DirectorCutStudio,
+    TextLayer,
     media_shortcut,
     resolve_project_media_path,
     timeline_state,
@@ -32,6 +36,8 @@ from director_cut_studio import (
 from test_design_engine import sample_design
 from runtime_paths import PROJECT_ROOT
 import smart_render_worker
+from project_integrity import repair_project_payload
+from project_storage import archive_workspace, safe_cleanup_plan
 from workflow_engine import (
     assign_local_media,
     create_virtual_media_asset,
@@ -42,7 +48,7 @@ from workflow_engine import (
 
 
 class StandardPipelineRegressions(unittest.TestCase):
-    """The small, mandatory release gate for the five highest-risk flows."""
+    """The small, mandatory release gate for the eleven highest-risk flows."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -118,7 +124,11 @@ class StandardPipelineRegressions(unittest.TestCase):
         # Simulate a project copied from an unavailable drive.  All supported
         # media types must resolve beside the moved project by basename rather
         # than retaining the former machine's absolute path.
-        moved_project = portable_root / "director_project.h3director.json"
+        # Canonical workspaces keep Project JSON in a project/ child and media
+        # in sibling trees.  Gate 1 must exercise this exact cross-computer
+        # layout, not only the legacy flat example folder.
+        moved_project = portable_root / "project" / "director_project.h3director.json"
+        moved_project.parent.mkdir(parents=True, exist_ok=True)
         old_root = Path("Z:/old-computer/example/portable_project")
         for asset in (pictures[3], pictures[6], videos[1], audios[2], p10, v4, a4):
             resolved = resolve_project_media_path(
@@ -482,21 +492,29 @@ class StandardPipelineRegressions(unittest.TestCase):
                 )
         self.assertTrue(all("SEGMENT-LOCAL VISUAL STYLE SCHEDULE" in prompt for prompt in prompts))
         self.assertTrue(all("TIMELESS_STYLE" in prompt for prompt in prompts))
-        self.assertTrue(all("Production mix contract" in prompt for prompt in prompts))
-        self.assertTrue(all("Spatial acoustics contract" in prompt for prompt in prompts))
-        self.assertTrue(all("Music mix contract" in prompt for prompt in prompts))
-        self.assertTrue(all("SHOT SOUND EXECUTION" in prompt for prompt in prompts))
-        self.assertTrue(all("SHOT SPATIAL ACOUSTICS" in prompt for prompt in prompts))
+        self.assertTrue(all("NATIVE H3 AUDIO EXECUTION CONTRACT" in prompt for prompt in prompts))
+        self.assertTrue(all("NATIVE AUDIO DIRECTION" in prompt for prompt in prompts))
+        self.assertTrue(all("ENVIRONMENT CONTINUITY" in prompt for prompt in prompts))
+        self.assertTrue(all("AUDIO REFERENCE INTENT" in prompt for prompt in prompts))
+        self.assertTrue(all("diegetic sound" in prompt for prompt in prompts))
+        self.assertTrue(all("Production mix contract" not in prompt for prompt in prompts))
+        self.assertTrue(all("Spatial acoustics contract" not in prompt for prompt in prompts))
+        self.assertTrue(all("Music mix contract" not in prompt for prompt in prompts))
         acoustic_tokens = (
-            "small furnished room",
-            "large interior",
+            "furnished office interior",
+            "large interior hall",
             "open exterior",
         )
         for index, unique in enumerate(acoustic_tokens):
-            self.assertIn(unique, prompts[index])
+            active_profile = f"Acoustic space: {unique}."
+            self.assertIn(active_profile, prompts[index])
             self.assertTrue(
-                all(unique not in prompt for other, prompt in enumerate(prompts) if other != index),
-                msg=f"{unique} leaked across native acoustic schedules",
+                all(
+                    active_profile not in prompt
+                    for other, prompt in enumerate(prompts)
+                    if other != index
+                ),
+                msg=f"{unique} became another Segment's active acoustic profile",
             )
         for segment, active_video in zip(job["segments"][1:], (phase_two_video, phase_three_video)):
             continuity = segment["continuity"]
@@ -504,6 +522,8 @@ class StandardPipelineRegressions(unittest.TestCase):
             prompt = self._prompt(segment["workflow"])
             self.assertEqual(continuity["kind"], "video")
             self.assertEqual(continuity["frame_count"], 24)
+            self.assertTrue(continuity["visual_only"])
+            self.assertNotIn("paired_audio_binding", continuity)
             self.assertEqual(continuity["binding"], "ref_videos.ref_video_1")
             self.assertEqual(continuity["tag"], "<Video 2>")
             self.assertIn("Do not replay", prompt)
@@ -569,11 +589,41 @@ class StandardPipelineRegressions(unittest.TestCase):
                 )
                 if before != after
             ],
-            [1],
+            [1, 2],
         )
         edited_prompts = [self._prompt(row["workflow"]) for row in edited["segments"]]
-        self.assertIn("corridor or stairwell", edited_prompts[1])
-        self.assertNotIn("corridor or stairwell", edited_prompts[0] + edited_prompts[2])
+        self.assertIn("Acoustic space: narrow corridor.", edited_prompts[1])
+        self.assertNotIn("Acoustic space: narrow corridor.", edited_prompts[0])
+        self.assertIn(
+            "Acoustic-space transition: change from narrow corridor",
+            edited_prompts[2],
+        )
+
+        # Gate 4 also protects native H3 audio edits. A complete 45-second
+        # three-window plan has no spare room to move its 30s boundary
+        # forward, so the compiler must add a safe fourth window instead of
+        # cutting or repeating an authored utterance.
+        exact_line = "这一句不能在三十秒的原生分段接缝被切断。"
+        window.text_layers = [TextLayer(
+            "D-boundary", exact_line, 29.0, 31.0, "A4",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            shot_id="S2",
+        )]
+        speech_path, speech_count = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=4300,
+            enable_rtx_vsr=False,
+        )
+        speech_job = json.loads(speech_path.read_text(encoding="utf-8"))
+        self.assertEqual(speech_count, 4)
+        self.assertEqual(
+            [(row["start_seconds"], row["end_seconds"]) for row in speech_job["segments"]],
+            [(0.0, 15.0), (15.0, 29.0), (29.0, 44.0), (44.0, 45.0)],
+        )
+        speech_prompts = [self._prompt(row["workflow"]) for row in speech_job["segments"]]
+        self.assertEqual(sum(exact_line in prompt for prompt in speech_prompts), 1)
+        self.assertTrue(all(
+            "AUDIO SEGMENT BOUNDARY CONTRACT" in prompt for prompt in speech_prompts
+        ))
 
     def test_05_backend_rejects_missing_or_stale_media_before_comfyui_queue(self):
         """No missing cross-computer media or inactive Loader may reach Queue."""
@@ -698,6 +748,559 @@ class StandardPipelineRegressions(unittest.TestCase):
                         smart_render_worker.preflight_smart_render(smart_job)
                     request_mock.assert_not_called()
 
+    def test_06_unique_media_union_never_overwrites_segment_local_workflows(self):
+        """Upload union stays global while every Segment keeps its own Loader file."""
+
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        window._set_design_duration(45.0)
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(45.0)
+        for asset in window.scan.timeline_assets():
+            asset.timeline_placed = False
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        chosen = (pictures[0], pictures[3], pictures[6])
+        gate_root = PROJECT_ROOT / ".director_cache" / "standard_unique_media_gate"
+        gate_root.mkdir(parents=True, exist_ok=True)
+        for index, asset in enumerate(chosen, 1):
+            fixture = gate_root / f"segment_{index}_identity.png"
+            Image.new("RGB", (16, 16), (index * 55, 30, 80)).save(fixture)
+            self.addCleanup(fixture.unlink, missing_ok=True)
+            assign_local_media(window.scan, asset, fixture)
+            self._place(
+                asset,
+                (index - 1) * 15.0,
+                index * 15.0,
+                "V1",
+                f"SEGMENT_{index}_IDENTITY_ONLY @{media_shortcut(asset)}.",
+            )
+        window.director_cues = [
+            DirectorCue(
+                f"S{index}", "shot", (index - 1) * 15.0, index * 15.0,
+                f"Segment {index}", subject_action=f"Complete unique phase {index}.",
+            )
+            for index in range(1, 4)
+        ]
+
+        job_path, count = window._build_smart_render_job(
+            request_kind="preview", megapixels=0.2, seed=4600,
+            enable_rtx_vsr=False,
+        )
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        self.assertEqual(count, 3)
+        expected_names = [
+            media_upload_manifest([asset])[0]["upload_name"] for asset in chosen
+        ]
+        actual_names = []
+        for segment in job["segments"]:
+            loaders = [
+                node for node in segment["workflow"].values()
+                if node.get("class_type") == "LoadImage"
+            ]
+            self.assertEqual(len(loaders), 1)
+            actual_names.append(loaders[0]["inputs"]["image"])
+            continuity = segment.get("continuity") or {}
+            validate_portable_media_manifest(
+                segment["workflow"],
+                job["media"],
+                runtime_loader_node_ids=(
+                    {str(continuity["loader_node_id"])}
+                    if continuity.get("loader_node_id") else set()
+                ),
+            )
+        self.assertEqual(actual_names, expected_names)
+        self.assertEqual(len(set(actual_names)), 3)
+        self.assertTrue(all(name in {row["upload_name"] for row in job["media"]} for name in actual_names))
+
+    def test_07_segment_store_survives_partial_rerender_and_project_reload(self):
+        """One 15s asset serves its Shots; Preview/Final and reload stay editable."""
+
+        workspace = PROJECT_ROOT / ".director_cache" / "standard_segment_store_gate"
+        if workspace.is_dir():
+            shutil.rmtree(workspace)
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        workspace.mkdir(parents=True)
+        source_root = workspace / "sources"
+        source_root.mkdir()
+
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        window.example_work_dir = workspace
+        window._set_design_duration(45.0)
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(45.0)
+        window.director_cues = [
+            DirectorCue(
+                f"S{index + 1}", "shot", index * 5.0, (index + 1) * 5.0,
+                f"Shot {index + 1}", subject_action="One executable action.",
+            )
+            for index in range(9)
+        ]
+        preview_sources = []
+        final_sources = []
+        rows = []
+        for index in range(3):
+            preview = source_root / f"preview_{index + 1}.mp4"
+            final = source_root / f"final_{index + 1}.mp4"
+            preview.write_bytes(f"preview-{index + 1}".encode())
+            final.write_bytes(f"final-{index + 1}".encode())
+            preview_sources.append(preview)
+            final_sources.append(final)
+            rows.append({
+                "segment_id": (
+                    f"segment_{index + 1:03d}_{index * 15000:09d}_"
+                    f"{(index + 1) * 15000:09d}"
+                ),
+                "index": index,
+                "start_seconds": index * 15.0,
+                "end_seconds": (index + 1) * 15.0,
+                "core_start_seconds": index * 15.0,
+                "core_end_seconds": (index + 1) * 15.0,
+                "shot_ids": [f"S{index * 3 + offset}" for offset in (1, 2, 3)],
+            })
+
+        preview_manifest = {"request_kind": "preview", "segments": []}
+        for row, source in zip(rows, preview_sources):
+            preview_manifest["segments"].append({**row, "output_path": str(source)})
+        window._record_generation_takes(
+            "preview", 4600, [], preview_manifest
+        )
+        final_manifest = {"request_kind": "accepted", "segments": []}
+        for row, source in zip(rows, final_sources):
+            final_manifest["segments"].append({**row, "output_path": str(source)})
+        window._record_generation_takes(
+            "accepted", 4600, [], final_manifest
+        )
+
+        self.assertEqual(len(list((workspace / "segments").rglob("*.mp4"))), 6)
+        self.assertEqual(len(list((workspace / "shots").rglob("*.mp4"))), 0)
+        self.assertEqual(len(window.segment_take_states), 3)
+        self.assertEqual(
+            window.shot_take_states["S2"]["approved_segment_refs"][0]["source_in_seconds"],
+            5.0,
+        )
+        self.assertTrue(window.shot_take_states["S2"]["preview_segment_refs"])
+        self.assertTrue(window.shot_take_states["S2"]["approved_segment_refs"])
+
+        # Edit only the middle 15-second unit. Its stable Final is replaced;
+        # the first/last Segment files and every Shot reference remain intact.
+        first_final = Path(
+            window.segment_take_states[rows[0]["segment_id"]]["approved_output_path"]
+        )
+        third_final = Path(
+            window.segment_take_states[rows[2]["segment_id"]]["approved_output_path"]
+        )
+        first_bytes, third_bytes = first_final.read_bytes(), third_final.read_bytes()
+        replacement = source_root / "final_2_revised.mp4"
+        replacement.write_bytes(b"final-2-revised")
+        window.clip_start.setValue(15.0)
+        window.clip_end.setValue(30.0)
+        middle_row = {**rows[1], "output_path": str(replacement)}
+        window._record_generation_takes(
+            "accepted", 4601, [], {"request_kind": "accepted", "segments": [middle_row]}
+        )
+        self.assertEqual(len(list((workspace / "segments").rglob("*.mp4"))), 6)
+        self.assertEqual(first_final.read_bytes(), first_bytes)
+        self.assertEqual(third_final.read_bytes(), third_bytes)
+        middle_final = Path(
+            window.segment_take_states[rows[1]["segment_id"]]["approved_output_path"]
+        )
+        self.assertEqual(middle_final.read_bytes(), b"final-2-revised")
+        self.assertEqual(
+            window.shot_take_states["S1"]["approved_segment_refs"][0]["segment_id"],
+            rows[0]["segment_id"],
+        )
+
+        # A copied/reopened project uses relative Segment paths and does not
+        # depend on the disposable render cache.
+        window.smart_render_manifest = final_manifest
+        window.smart_render_manifests = {
+            "preview": preview_manifest,
+            "production": final_manifest,
+        }
+        project = workspace / "project" / "director_project.h3director.json"
+        project.parent.mkdir(parents=True, exist_ok=True)
+        project.write_text(
+            json.dumps(window._project_payload(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        restored = DirectorCutStudio()
+        self.addCleanup(self._close, restored)
+        with patch.object(restored, "queue_media_preparation"):
+            restored.load_project_path(project)
+        self.assertEqual(len(restored.segment_take_states), 3)
+        self.assertTrue(
+            Path(
+                restored.shot_take_states["S5"]["approved_segment_refs"][0][
+                    "output_path"
+                ]
+            ).is_file()
+        )
+        self.assertTrue(restored.shot_take_states["S5"]["preview_segment_refs"])
+        self.assertTrue(restored.shot_take_states["S5"]["approved_segment_refs"])
+
+        # Completed disposable cache is reclaimed only after the Workspace
+        # master and every canonical Segment have been verified.
+        stable_master = workspace / "generated_output.mp4"
+        stable_master.write_bytes(b"assembled-master")
+        cache_root = (
+            PROJECT_ROOT / ".director_cache" / "generated_outputs"
+            / "accepted" / "standard-segment-store-gate"
+        )
+        if cache_root.is_dir():
+            shutil.rmtree(cache_root)
+        cache_root.mkdir(parents=True)
+        (cache_root / "master.mp4").write_bytes(b"assembled-master")
+        portable_manifest = {
+            "master_output": str(stable_master),
+            "segments": [
+                {
+                    "segment_id": segment_id,
+                    "output_path": state["approved_output_path"],
+                }
+                for segment_id, state in restored.segment_take_states.items()
+            ],
+        }
+        self.assertTrue(
+            restored._cleanup_completed_render_cache(cache_root, portable_manifest)
+        )
+        self.assertFalse(cache_root.exists())
+
+    def test_08_apply_preflight_repairs_predictable_design_errors_without_popup_chain(self):
+        """Apply is transactional: repair/report first, close only after commit."""
+
+        payload = sample_design()
+        payload["creative_brief"] = ""
+        payload["global_visual_style"] = ""
+        payload["shots"][1]["start_seconds"] = payload["shots"][0]["start_seconds"]
+        payload["shots"][1]["end_seconds"] = payload["shots"][0]["end_seconds"]
+        payload["media_requests"][0]["prompt"] = (
+            "Use <Picture 1> as the previous frame on a blank studio background."
+        )
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            repair_media_plan=True,
+            authored_requirement="Create an exact 15 second video about a cola reveal.",
+        )
+        warnings = "\n".join(plan["design_warnings"])
+        self.assertEqual(plan["duration_seconds"], 15.0)
+        self.assertTrue(plan["creative_brief"])
+        self.assertTrue(plan["global_visual_style"])
+        self.assertIn("Rebuilt unsafe Z-Image request", warnings)
+        self.assertTrue(
+            "Auto-repaired overlapping camera Shots" in warnings
+            or "Auto-merged overlapping camera Shots" in warnings
+        )
+
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
+            dialog = DesignPageDialog(
+                window.runtime, window._design_context(), window.scan.counts, window
+            )
+        self.addCleanup(dialog.close)
+        dialog.json_edit.setPlainText(json.dumps(plan, ensure_ascii=False))
+        with (
+            patch("director_cut_studio.QMessageBox.warning") as warning_popup,
+            patch("director_cut_studio.QMessageBox.critical") as critical_popup,
+            patch("director_cut_studio.QMessageBox.information") as info_popup,
+        ):
+            self.assertTrue(dialog.validate_json())
+            emitted = []
+            dialog.apply_requested.connect(
+                lambda ready, replace: emitted.append((ready, replace))
+            )
+            dialog.apply_design()
+            self.assertEqual(len(emitted), 1)
+            self.assertTrue(dialog.apply_in_progress)
+            self.assertEqual(dialog.result(), QDialog.Rejected)
+            dialog.mark_apply_failed("Workspace is temporarily read-only")
+            self.assertTrue(dialog.apply_button.isEnabled())
+            self.assertIn("HARD BLOCK", dialog.summary_edit.toPlainText())
+            self.assertEqual(dialog.result(), QDialog.Rejected)
+            warning_popup.assert_not_called()
+            critical_popup.assert_not_called()
+            info_popup.assert_not_called()
+        dialog.mark_apply_succeeded()
+        self.assertEqual(dialog.result(), QDialog.Accepted)
+
+    def test_09_reference_mapping_is_segment_local_with_unlimited_virtual_pool(self):
+        """P10+ is legal project-wide and inactive references never leak into a Segment."""
+
+        payload = sample_design()
+        payload["duration_seconds"] = 45.0
+        payload["shots"] = [
+            {
+                **payload["shots"][0],
+                "id": f"S{index + 1}",
+                "start_seconds": index * 5.0,
+                "end_seconds": (index + 1) * 5.0,
+                "subject_action": f"Complete unique story phase {index + 1}.",
+            }
+            for index in range(9)
+        ]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        for index in range(12):
+            segment = index // 4
+            start = segment * 15.0 + (index % 4) * 3.0
+            payload["media_requests"].append({
+                "requirement_id": f"location_state_{index + 1}",
+                "preferred_media_id": f"P{index + 1}",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": start,
+                "end_seconds": min((segment + 1) * 15.0, start + 3.0),
+                "track": f"V{index % 4 + 1}",
+                "subject_keywords": [f"location {index + 1}"],
+                "prompt": (
+                    f"Empty real-world city location state {index + 1}, one frozen instant, "
+                    "cinematic lighting, no people."
+                ),
+            })
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[],
+        )
+        self.assertEqual(len(plan["media_requests"]), 12)
+        self.assertEqual(plan["media_requests"][-1]["preferred_media_id"], "P12")
+        self.assertTrue(
+            all("ENVIRONMENT-ONLY COUNT LOCK" in row["prompt"] for row in plan["media_requests"])
+        )
+
+        uploaded = [
+            {"file": f"p{index}.png", "upload_name": f"p{index}.png"}
+            for index in range(1, 13)
+        ]
+        workflow = {
+            "137": {"class_type": "LoadImage", "inputs": {"image": "p10.png"}},
+            "153": {"class_type": "LoadImage", "inputs": {"image": "p12.png"}},
+        }
+        scoped = smart_render_worker.uploaded_media_for_workflow(workflow, uploaded)
+        self.assertEqual(
+            [row["upload_name"] for row in scoped], ["p10.png", "p12.png"]
+        )
+
+    def test_10_speech_extension_cannot_create_a_shotless_segment(self):
+        """Dialogue ripple extends its owning final Shot and survives Project repair/load."""
+
+        payload = sample_design()
+        payload["duration_seconds"] = 60.0
+        payload["shots"] = [
+            {
+                **payload["shots"][0],
+                "id": f"S{index + 1}",
+                "start_seconds": index * 15.0,
+                "end_seconds": (index + 1) * 15.0,
+                "subject_action": f"Story phase {index + 1} reaches its final state.",
+            }
+            for index in range(4)
+        ]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        payload["text_layers"] = [{
+            "start_seconds": 59.5,
+            "end_seconds": 60.0,
+            "track": "A1",
+            "content": "我以为我会哭，但我的心跳很稳，原来真正贵的不是那笔钱，而是第一次拒绝。",
+            "role": "voice_over",
+            "speaker": "S1",
+            "language": "Chinese",
+            "delivery": "controlled, reflective live production audio",
+            "lip_sync": False,
+            "explicit_user_requested": True,
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[],
+        )
+        self.assertGreater(plan["duration_seconds"], 60.0)
+        self.assertEqual(plan["shots"][-1]["end_seconds"], plan["duration_seconds"])
+        self.assertEqual(plan["text_layers"][-1]["shot_id"], "S4")
+
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        window._apply_ai_design_direct(plan, [], True)
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(plan["duration_seconds"])
+        segments = window._planned_render_segments()
+        self.assertTrue(segments)
+        self.assertTrue(all(segment.shot_ids for segment in segments))
+        self.assertIn("S4", segments[-1].shot_ids)
+
+        broken = window._project_payload()
+        final_shot = next(
+            row for row in broken["director_cues"] if row["cue_id"] == "S4"
+        )
+        final_shot["end_seconds"] = 60.0
+        broken["text_layers"][-1]["shot_id"] = ""
+        repaired, report = repair_project_payload(broken)
+        repaired_final = next(
+            row for row in repaired["director_cues"] if row["cue_id"] == "S4"
+        )
+        self.assertEqual(
+            repaired_final["end_seconds"], repaired["timeline_duration_seconds"]
+        )
+        self.assertEqual(repaired["text_layers"][-1]["shot_id"], "S4")
+        self.assertTrue(any("final Shot" in row for row in report))
+
+        # Old Projects may have passed the earlier 4.2 chars/s estimate but
+        # still be speaking at the exact Master endpoint. Gate 10 requires a
+        # conservative ripple plus a real final breath/room-tone tail.
+        endpoint = deepcopy(broken)
+        endpoint["timeline_duration_seconds"] = 70.0
+        endpoint["work_area"] = [0.0, 70.0]
+        endpoint["director_cues"] = [{
+            **endpoint["director_cues"][0],
+            "cue_id": "S1",
+            "cue_type": "shot",
+            "start_seconds": 0.0,
+            "end_seconds": 70.0,
+        }]
+        endpoint["text_layers"] = [{
+            "layer_id": "T-final",
+            "text": "我以为我会哭。但我的心跳很稳。原来真正贵的，不是那笔钱，是第一次拒绝。",
+            "start_seconds": 61.0,
+            "end_seconds": 69.5,
+            "track_id": "A4",
+            "content_role": "voice_over",
+            "speaker": "S1",
+            "language": "English",
+            "delivery": "calm resolved final reflection",
+            "lip_sync": False,
+            "shot_id": "S1",
+        }]
+        endpoint["assets"] = {}
+        endpoint["timeline_clips"] = []
+        endpoint_repaired, endpoint_report = repair_project_payload(endpoint)
+        self.assertEqual(endpoint_repaired["text_layers"][0]["end_seconds"], 70.5)
+        self.assertEqual(endpoint_repaired["timeline_duration_seconds"], 72.0)
+        self.assertEqual(endpoint_repaired["director_cues"][0]["end_seconds"], 72.0)
+        self.assertEqual(endpoint_repaired["work_area"], [0.0, 72.0])
+        self.assertEqual(
+            endpoint_repaired["text_layers"][0]["language"], "Mandarin Chinese"
+        )
+        self.assertTrue(any("final breath/room-tone tail" in row for row in endpoint_report))
+        stable, stable_report = repair_project_payload(
+            endpoint_repaired, invalidate_stale_renders=False
+        )
+        self.assertEqual(stable["timeline_duration_seconds"], 72.0)
+        self.assertFalse(any("Extended native speech" in row for row in stable_report))
+
+    def test_11_long_render_recovery_cache_and_portable_archive_are_safe(self):
+        """Crash-resumable cache is protected and only stable Projects can archive."""
+
+        workspace = PROJECT_ROOT / ".director_cache" / "standard_gate_11_workspace"
+        shutil.rmtree(workspace, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, workspace, True)
+        (workspace / "project" / "render_jobs").mkdir(parents=True)
+        (workspace / "cache" / "generated_outputs" / "final" / "run" / "SEG1").mkdir(
+            parents=True
+        )
+        (workspace / "project" / "director_project.h3director.json").write_text(
+            json.dumps(
+                {
+                    "format": "h3-director-project",
+                    "workflow_path": "",
+                    "assets": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        recoverable = (
+            workspace
+            / "cache"
+            / "generated_outputs"
+            / "final"
+            / "run"
+            / "SEG1"
+            / "segment.mp4"
+        )
+        recoverable.write_bytes(b"recoverable")
+        abandoned = workspace / "cache" / "abandoned.bin"
+        abandoned.write_bytes(b"abandoned")
+        manifest_path = workspace / "project" / "render_jobs" / "run.manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "request_kind": "final",
+                    "segments": [
+                        {
+                            "segment_id": "SEG1",
+                            "status": "complete",
+                            "output_path": str(recoverable),
+                            "download_dir": str(recoverable.parent),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        job_path = workspace / "project" / "render_jobs" / "run.job.json"
+        job_path.write_text(
+            json.dumps(
+                {
+                    "manifest_path": str(manifest_path),
+                    "segments": [{"download_dir": str(recoverable.parent)}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        plan = safe_cleanup_plan(workspace)
+        candidates = {row["path"] for row in plan["candidates"]}
+        self.assertIn("cache/abandoned.bin", candidates)
+        self.assertNotIn(
+            "cache/generated_outputs/final/run/SEG1/segment.mp4", candidates
+        )
+        with self.assertRaisesRegex(RuntimeError, "interrupted render job"):
+            archive_workspace(workspace, workspace.parent / "blocked_gate_11.zip")
+
+        job_path.unlink()
+        # A standalone worker manifest still protects cache until the UI has
+        # durably published the completed Segment Take.
+        standalone_plan = safe_cleanup_plan(workspace)
+        self.assertNotIn(
+            "cache/generated_outputs/final/run/SEG1/segment.mp4",
+            {row["path"] for row in standalone_plan["candidates"]},
+        )
+        with self.assertRaisesRegex(RuntimeError, "interrupted render job"):
+            archive_workspace(workspace, workspace.parent / "still_blocked_gate_11.zip")
+
+        durable = workspace / "segments" / "SEG1" / "takes" / "approved_final.mp4"
+        durable.parent.mkdir(parents=True)
+        durable.write_bytes(recoverable.read_bytes())
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "request_kind": "final",
+                    "segments": [
+                        {
+                            "segment_id": "SEG1",
+                            "status": "complete",
+                            "output_path": str(durable),
+                            "download_dir": "",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        archive = archive_workspace(
+            workspace, workspace.parent / "standard_gate_11.h3project.zip"
+        )
+        self.addCleanup(Path(archive["archive"]).unlink, missing_ok=True)
+        self.assertTrue(archive["verified"])
+        self.assertEqual(
+            smart_render_worker.classify_generation_error(
+                "CUDA out of memory while allocating tensor"
+            ),
+            "oom",
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

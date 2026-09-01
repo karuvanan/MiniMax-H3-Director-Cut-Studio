@@ -1,12 +1,14 @@
 import unittest
 
 from segment_engine import (
+    align_segments_to_dialogue_turns,
     content_fingerprint,
     derive_segment_seed,
     derive_named_segment_seed,
     dirty_segment_indexes,
     plan_render_segments,
     plan_shot_render_segments,
+    protect_segment_boundaries_from_speech,
     rebase_timed_rows,
     reuse_cached_segments,
     scope_timed_prompt_text,
@@ -80,6 +82,135 @@ class SegmentEngineTests(unittest.TestCase):
         )
         self.assertEqual(rows[1].continuity_mode, "hard_cut")
         self.assertEqual(rows[1].start_seconds, rows[1].core_start_seconds)
+
+    def test_native_speech_moves_internal_boundaries_past_line_and_decay_tail(self):
+        planned = plan_shot_render_segments(
+            0.0,
+            70.0,
+            [
+                {"cue_id": "S1", "start_seconds": 0.0, "end_seconds": 8.0},
+                {"cue_id": "S2", "start_seconds": 8.0, "end_seconds": 20.0},
+                {"cue_id": "S3", "start_seconds": 20.0, "end_seconds": 32.5},
+                {"cue_id": "S4", "start_seconds": 32.5, "end_seconds": 40.5},
+                {"cue_id": "S5", "start_seconds": 40.5, "end_seconds": 53.0},
+                {"cue_id": "S6", "start_seconds": 53.0, "end_seconds": 59.5},
+                {"cue_id": "S7", "start_seconds": 59.5, "end_seconds": 70.0},
+            ],
+            min_segment_seconds=15.0,
+            overlap_seconds=0.0,
+        )
+        protected = protect_segment_boundaries_from_speech(
+            planned,
+            [
+                {"content_role": "voice_over", "start_seconds": 0.5, "end_seconds": 7.5},
+                {"content_role": "voice_over", "start_seconds": 8.5, "end_seconds": 19.5},
+                {"content_role": "voice_over", "start_seconds": 33.0, "end_seconds": 40.0},
+                {"content_role": "dialogue", "start_seconds": 58.0, "end_seconds": 60.0},
+            ],
+            tail_seconds=1.0,
+        )
+        self.assertEqual(
+            [row.core_end_seconds for row in protected[:-1]],
+            [8.5, 20.5, 32.5, 41.0, 53.0, 61.0],
+        )
+        self.assertTrue(all(row.duration_seconds <= 15.0 for row in protected))
+        self.assertTrue(
+            all(
+                not (line[0] < row.core_end_seconds < line[1])
+                for row in protected[:-1]
+                for line in [(0.5, 7.5), (8.5, 19.5), (33.0, 40.0), (58.0, 60.0)]
+            )
+        )
+
+    def test_speech_boundary_uses_backward_safe_cut_when_forward_exceeds_h3_limit(self):
+        planned = plan_render_segments(0.0, 25.0, overlap_seconds=0.0)
+        protected = protect_segment_boundaries_from_speech(
+            planned,
+            [{
+                "content_role": "dialogue",
+                "start_seconds": 14.0,
+                "end_seconds": 16.0,
+            }],
+            tail_seconds=1.0,
+        )
+        self.assertEqual(protected[0].core_end_seconds, 14.0)
+        self.assertEqual(protected[1].core_start_seconds, 14.0)
+        self.assertTrue(all(row.duration_seconds <= 15.0 for row in protected))
+
+    def test_decay_tail_never_pushes_cut_across_next_speech_start(self):
+        shots = [
+            {"cue_id": f"S{index + 1}", "start_seconds": start, "end_seconds": end}
+            for index, (start, end) in enumerate((
+                (0.0, 8.5), (8.5, 22.0), (22.0, 32.5), (32.5, 41.0),
+                (41.0, 49.5), (49.5, 60.0), (60.0, 70.0),
+            ))
+        ]
+        planned = plan_shot_render_segments(
+            0.0, 70.0, shots, min_segment_seconds=15.0,
+            max_segment_seconds=15.0, overlap_seconds=0.0,
+        )
+        speech = [
+            {"content_role": role, "start_seconds": start, "end_seconds": end}
+            for role, start, end in (
+                ("voice_over", 0.5, 8.0),
+                ("voice_over", 8.5, 21.5),
+                ("dialogue", 22.0, 25.0),
+                ("dialogue", 25.5, 27.5),
+                ("dialogue", 28.0, 31.5),
+                ("voice_over", 32.5, 40.5),
+                ("voice_over", 41.0, 48.5),
+                ("dialogue", 50.5, 51.5),
+                ("dialogue", 54.0, 56.5),
+                ("voice_over", 60.0, 70.0),
+            )
+        ]
+        dialogue_speakers = iter(("S2", "S1", "S2", "S2", "S1"))
+        for row in speech:
+            if row["content_role"] == "dialogue":
+                row["speaker"] = next(dialogue_speakers)
+        protected = protect_segment_boundaries_from_speech(
+            planned, speech, max_segment_seconds=15.0,
+            tail_seconds=1.0, grid_seconds=0.5,
+        )
+        self.assertEqual(
+            [row.core_end_seconds for row in protected[:-1]],
+            [8.5, 22.0, 32.5, 41.0, 49.5, 60.0],
+        )
+        for line in speech:
+            owners = [
+                row for row in protected
+                if row.core_start_seconds <= line["start_seconds"] + 1e-6
+                and row.core_end_seconds >= line["end_seconds"] - 1e-6
+            ]
+            self.assertEqual(len(owners), 1, line)
+        aligned = align_segments_to_dialogue_turns(
+            protected, speech, max_segment_seconds=15.0, grid_seconds=0.5
+        )
+        self.assertEqual(
+            [row.core_end_seconds for row in aligned[:-1]],
+            [8.5, 22.0, 25.5, 28.0, 32.5, 41.0, 50.5, 54.0, 60.0],
+        )
+
+    def test_packed_native_windows_add_a_safe_segment_instead_of_cutting_speech(self):
+        planned = plan_render_segments(0.0, 45.0, overlap_seconds=0.0)
+        protected = protect_segment_boundaries_from_speech(
+            planned,
+            [{
+                "content_role": "dialogue",
+                "start_seconds": 29.0,
+                "end_seconds": 31.0,
+            }],
+            tail_seconds=1.0,
+        )
+        self.assertEqual(
+            [row.core_end_seconds for row in protected],
+            [15.0, 29.0, 44.0, 45.0],
+        )
+        self.assertTrue(all(row.duration_seconds <= 15.0 for row in protected))
+        self.assertTrue(all(
+            not (29.0 < row.core_end_seconds < 32.0)
+            for row in protected[:-1]
+        ))
 
     def test_dirty_range_only_selects_intersecting_segments(self):
         rows = plan_render_segments(0.0, 60.0)

@@ -100,6 +100,54 @@ class WorkflowEngineTests(unittest.TestCase):
         ]
         self.assertEqual(duration_values, [5.0])
 
+    def test_generated_pose_with_competing_p1_face_is_excluded_from_h3_request(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        anchor, environment, competing_pose = pictures[:3]
+        for asset in (anchor, environment, competing_pose):
+            asset.timeline_placed = True
+            asset.start_seconds = 0.0
+            asset.end_seconds = 5.0
+        anchor.clip_prompt = (
+            "Use @P1 as the authoritative whole-design face identity anchor."
+        )
+        environment.clip_prompt = (
+            "An empty running track. The authoritative recurring face identity is the "
+            "user-supplied @P1. SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY."
+        )
+        competing_pose.clip_prompt = (
+            "The same girl, face matching @P1 identity, runs toward camera. "
+            "The authoritative recurring face identity is the user-supplied @P1. "
+            "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY."
+        )
+        compiled, active = compile_active_workflow(scan, 0.0, 5.0)
+        self.assertIn(anchor, active)
+        self.assertIn(environment, active)
+        self.assertNotIn(competing_pose, active)
+        h3_inputs = compiled[scan.h3_node_ids[0]]["inputs"]
+        image_inputs = [name for name in h3_inputs if name.startswith("ref_images.ref_image_")]
+        self.assertEqual(len(image_inputs), 2)
+
+    def test_generated_pose_with_bare_p1_match_is_excluded_from_h3_request(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        anchor, competing_pose = pictures[:2]
+        for asset in (anchor, competing_pose):
+            asset.timeline_placed = True
+            asset.start_seconds = 0.0
+            asset.end_seconds = 5.0
+        anchor.clip_prompt = "Use @P1 as the authoritative face identity anchor."
+        competing_pose.clip_prompt = (
+            "A running girl matching P1 crosses the finish line. "
+            "The authoritative recurring face identity is the user-supplied @P1. "
+            "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY."
+        )
+        _compiled, active = compile_active_workflow(scan, 0.0, 5.0)
+        self.assertIn(anchor, active)
+        self.assertNotIn(competing_pose, active)
+
     def test_effective_tags_follow_connected_r2v_order_not_pool_slot(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
         scan = load_workflow(path)

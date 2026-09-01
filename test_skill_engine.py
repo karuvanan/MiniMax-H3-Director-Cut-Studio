@@ -120,6 +120,38 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("MIT License", license_text)
         self.assertIn("POUND0423/AI-drama-pound", license_text)
 
+    def test_long_form_special_is_default_bound_and_batch_boundary_safe(self):
+        profile = self.profiles["long-form-h3-director"]
+        self.assertTrue(profile.special)
+        self.assertFalse(profile.standalone)
+        system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
+        self.assertIn("DEFAULT H3 SKILL", system)
+        self.assertIn("SPECIAL SCENE SKILL (long-form-h3-director)", system)
+        for phrase in (
+            "Plan Approval Horizons",
+            "24 frames at 24 fps",
+            "Incoming and Outgoing State",
+            "never repeat, recap or re-perform",
+            "exactly one Final Hold",
+            "Segment-scoped media use",
+            "one schema-valid Director Design JSON",
+        ):
+            self.assertIn(phrase, system)
+
+    def test_long_form_special_has_chinese_mirror(self):
+        folder = self.profiles["long-form-h3-director"].path.parent
+        chinese = (folder / "SKILL.cn.md").read_text(encoding="utf-8-sig")
+        for phrase in (
+            "长片 H3 导演",
+            "30 秒作为批准点",
+            "最后 24 帧",
+            "Incoming State",
+            "Outgoing State",
+            "逐字放进 `text_layers`",
+            "Final Hold 只存在于真正项目终点",
+        ):
+            self.assertIn(phrase, chinese)
+
     def test_wuxia_english_and_chinese_skills_share_asymmetry_guardrails(self):
         profile = self.profiles["wuxia-blade-film"]
         english = profile.instruction
@@ -212,7 +244,9 @@ class SkillEngineTests(unittest.TestCase):
             ["P1", "P2", "P3", "P4", "P5", "P6"],
         )
         self.assertEqual(plan["existing_media_uses"], [])
-        self.assertEqual(plan["design_warnings"], [])
+        self.assertTrue(
+            any("primary character identity anchor" in row for row in plan["design_warnings"])
+        )
         self.assertEqual(
             [row["time_seconds"] for row in plan["transitions"]],
             [15.0, 30.0],
@@ -235,7 +269,83 @@ class SkillEngineTests(unittest.TestCase):
         ]
         positions = [prompt.index(section) for section in sections]
         self.assertEqual(positions, sorted(positions))
+        self.assertIn("summary:\n[reference generation]", prompt)
         self.assertIn("[Shot 2] At 00:05.000", prompt)
+
+    def test_user_face_anchor_is_authoritative_and_support_picture_cannot_compete(self):
+        spec = PromptSpec(brief="The same child runs throughout.", shots=["She runs."])
+        face = MediaAsset(
+            "1", "LoadImage", "image", "child.png", "<Picture 1>",
+            "ref_images.ref_image_0", end_seconds=5.0,
+            clip_prompt=(
+                "Use this image as the strict identity anchor. Preserve the exact face throughout."
+            ),
+        )
+        support = MediaAsset(
+            "2", "LoadImage", "image", "track.png", "<Picture 2>",
+            "ref_images.ref_image_1", end_seconds=5.0,
+            clip_prompt=(
+                "PRIMARY RECURRING CHARACTER IDENTITY ANCHOR. Show one clear, unobstructed, "
+                "recognizable face with exact age range, facial structure, hair, skin tone, wardrobe "
+                "and owned props suitable for reuse through the full story. "
+                "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY. "
+                "Do not define a different prominent human face."
+            ),
+        )
+        prompt = build_ref2va_prompt(
+            spec, [face, support], 5.0, self.profiles[DEFAULT_SKILL]
+        )
+        self.assertIn(
+            "<Picture 1> is a reference image", prompt
+        )
+        self.assertIn(
+            "<Subject 1> is the recurring human character whose exact recognizable face identity",
+            prompt,
+        )
+        self.assertIn("come exclusively from <Picture 1>", prompt)
+        self.assertIn("<Picture 2> may provide environment, prop, body-pose", prompt)
+        self.assertIn("authoritative recurring face-identity source", prompt)
+        self.assertIn("must not redefine the recurring character's face identity", prompt)
+        self.assertIn("CHARACTER CONTINUITY CONTRACT", prompt)
+        self.assertIn("upper and lower wardrobe style/color", prompt)
+        self.assertIn("Expression, pose, arm/leg angles", prompt)
+        self.assertIn("Never invent an appearance reset", prompt)
+        self.assertNotIn("PRIMARY RECURRING CHARACTER IDENTITY ANCHOR", prompt)
+        self.assertIn("summary:\n[reference generation]", prompt)
+
+    def test_support_prompt_quoting_authority_cannot_steal_user_picture_identity(self):
+        spec = PromptSpec(brief="The same child runs throughout.", shots=["She runs."])
+        face = MediaAsset(
+            "1", "LoadImage", "image", "child.png", "<Picture 1>",
+            "ref_images.ref_image_0", end_seconds=5.0,
+            clip_prompt=(
+                "Use <Picture 1> as the authoritative identity reference. "
+                "Use <Picture 1> as the authoritative whole-design face identity anchor."
+            ),
+        )
+        support = MediaAsset(
+            "2", "LoadImage", "image", "pose.png", "<Picture 2>",
+            "ref_images.ref_image_1", end_seconds=5.0,
+            clip_prompt=(
+                "The authoritative recurring face identity is the user-supplied <Picture 1>. "
+                "SUPPORTING ENVIRONMENT OR ACTION-STATE REFERENCE ONLY."
+            ),
+        )
+        prompt = build_ref2va_prompt(
+            spec, [face, support], 5.0, self.profiles[DEFAULT_SKILL]
+        )
+        self.assertIn("come exclusively from <Picture 1>", prompt)
+        self.assertNotIn("come exclusively from <Picture 2>", prompt)
+        self.assertIn(
+            "<Picture 2> may provide environment, prop, body-pose or composition guidance",
+            prompt,
+        )
+        picture_2_retention = next(
+            line for line in prompt.splitlines()
+            if line.startswith("<Picture 2> (active from")
+        )
+        self.assertIn("does not redefine", picture_2_retention)
+        self.assertNotIn("authoritative recurring face-identity source", picture_2_retention)
 
     def test_repeated_timeline_uses_share_one_h3_tag_and_keep_both_ranges(self):
         spec = PromptSpec(brief="A subject returns later in the story.")
@@ -513,6 +623,41 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("<Audio 1> is the enabled synchronized soundtrack", prompt)
         self.assertIn("<Audio 1>: fully_copy", prompt)
         self.assertIn("<Audio 2>: fully_copy", prompt)
+
+    def test_native_acoustic_reference_does_not_copy_words_or_voice_identity(self):
+        video = MediaAsset(
+            "20", "LoadVideo", "video", "location.mp4", "<Video 1>",
+            "ref_videos.ref_video_0",
+            paired_audio_binding="ref_video_audios.ref_video_audio_0",
+            start_seconds=0.0, end_seconds=5.0,
+        )
+        audio = MediaAsset(
+            "30", "LoadAudio", "audio", "room-tone.wav", "<Audio 2>",
+            "ref_audios.ref_audio_1", start_seconds=0.0, end_seconds=5.0,
+        )
+        spec = PromptSpec(
+            brief="A conversation in the referenced location.",
+            native_audio_ranges=[{
+                "cue_id": "S1",
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "native_audio_direction": "Generate diegetic location sound.",
+                "environment_continuity": "Establish this room from frame one.",
+                "audio_reference_intent": (
+                    "Active acoustic references: <Video 1>, <Audio 2>. Use active real-world "
+                    "Audio or Video reference sound only to infer spatial acoustics."
+                ),
+            }],
+        )
+        prompt = build_ref2va_prompt(
+            spec, [video, audio], 5.0, self.profiles[DEFAULT_SKILL]
+        )
+        self.assertIn("reference generation + acoustic reference", prompt)
+        self.assertIn("<Audio 1>: acoustic_reference_only", prompt)
+        self.assertIn("<Audio 2>: acoustic_reference_only", prompt)
+        self.assertIn("Never copy its dialogue or voice identity", prompt)
+        self.assertNotIn("<Audio 1>: fully_copy", prompt)
+        self.assertNotIn("<Audio 2>: fully_copy", prompt)
 
     def test_fresh_semantic_enrichment_reaches_h3_prompt_but_stale_does_not(self):
         asset = MediaAsset(

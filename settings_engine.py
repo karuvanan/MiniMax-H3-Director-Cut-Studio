@@ -17,7 +17,9 @@ ENV_KEYS = {
     "generation_timeout": "H3_GENERATION_TIMEOUT",
     "http_request_timeout": "H3_HTTP_REQUEST_TIMEOUT",
     "dialogue_tts_engine": "H3_DIALOGUE_TTS_ENGINE",
+    "music_mode": "H3_MUSIC_MODE",
     "blip_device": "H3_BLIP_DEVICE",
+    "workspace_free_disk_reserve_gb": "H3_WORKSPACE_FREE_DISK_RESERVE_GB",
 }
 
 
@@ -33,7 +35,9 @@ class RenderSettings:
     generation_timeout: int = 1800
     http_request_timeout: int = 30
     dialogue_tts_engine: str = "h3_native"
+    music_mode: str = "auto"
     blip_device: str = "auto"
+    workspace_free_disk_reserve_gb: float = 50.0
 
     @classmethod
     def defaults(cls) -> "RenderSettings":
@@ -50,11 +54,16 @@ class RenderSettings:
                 return cast(defaults[name])
 
         dialogue_tts_engine = str(merged["dialogue_tts_engine"]).strip().lower()
-        if dialogue_tts_engine not in {"h3_native", "edge_tts", "voxcpm2_local"}:
+        if dialogue_tts_engine not in {
+            "h3_native", "edge_tts", "voxcpm2_local", "qwen3_tts_local"
+        }:
             dialogue_tts_engine = defaults["dialogue_tts_engine"]
         blip_device = str(merged["blip_device"]).strip().lower()
         if blip_device not in {"auto", "cuda", "cpu"}:
             blip_device = defaults["blip_device"]
+        music_mode = str(merged["music_mode"]).strip().lower()
+        if music_mode not in {"off", "auto", "timeline"}:
+            music_mode = defaults["music_mode"]
 
         return cls(
             server_url=str(merged["server_url"]).strip() or defaults["server_url"],
@@ -67,7 +76,11 @@ class RenderSettings:
             generation_timeout=max(10, number("generation_timeout", int)),
             http_request_timeout=max(1, number("http_request_timeout", int)),
             dialogue_tts_engine=dialogue_tts_engine,
+            music_mode=music_mode,
             blip_device=blip_device,
+            workspace_free_disk_reserve_gb=max(
+                0.0, number("workspace_free_disk_reserve_gb", float)
+            ),
         )
 
 

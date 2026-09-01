@@ -5,6 +5,9 @@ __pycache__/
 ai_libraries_common/python_env/
 ai_libraries_common/engine_ffmpeg/
 ai_libraries_common/models/
+ai_libraries_common/qwen_tts_runtime/
+ai_libraries_common/qwen_tts_support/
+ai_libraries_common/sox-14.4.2-win32.zip
 models/*
 !models/README.md
 .director_cache/

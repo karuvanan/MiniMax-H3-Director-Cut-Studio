@@ -440,6 +440,11 @@ def plan_shot_render_segments(
                 row["start_seconds"], row["end_seconds"], core_start, core_end
             )
         ]
+        if clipped_shots and not shot_ids:
+            raise ValueError(
+                f"Shot-less render Segment {core_start:.2f}-{core_end:.2f}s. "
+                "Repair the Director Shot lane so it covers the complete Timeline."
+            )
         segment_id = (
             f"shot_{round(core_start * 1000):09d}_{round(core_end * 1000):09d}"
         )
@@ -459,6 +464,313 @@ def plan_shot_render_segments(
     for index, row in enumerate(result[:-1]):
         row.overlap_after_seconds = result[index + 1].overlap_before_seconds
     return result
+
+
+def protect_segment_boundaries_from_speech(
+    segments: Iterable[RenderSegment],
+    speech_rows: Iterable[Mapping[str, Any]],
+    *,
+    max_segment_seconds: float = MAX_NATIVE_SECONDS,
+    tail_seconds: float = 1.0,
+    grid_seconds: float = TIMELINE_GRID_SECONDS,
+) -> list[RenderSegment]:
+    """Move internal render cuts away from authored speech and its decay tail.
+
+    Native H3 speech cannot continue one utterance across two independently
+    generated requests.  This keeps a complete Dialogue/Voice-over/Lyrics row
+    on one side of every feasible boundary and reserves a short ambience/room
+    decay tail before the edit.  Timeline coverage remains continuous and no
+    Segment is allowed to exceed H3's native duration.
+    """
+
+    rows = [RenderSegment.from_dict(row.to_dict()) for row in segments]
+    if len(rows) < 2:
+        return rows
+    maximum = max(grid_seconds, snap_seconds(max_segment_seconds, grid_seconds))
+    tail = max(0.0, snap_seconds(tail_seconds, grid_seconds))
+    speech = sorted(
+        (
+            snap_seconds(float(item.get("start_seconds", 0.0)), grid_seconds),
+            snap_seconds(
+                float(item.get("end_seconds", item.get("start_seconds", 0.0))),
+                grid_seconds,
+            ),
+        )
+        for item in speech_rows
+        if str(item.get("content_role", item.get("role", "")))
+        in {"dialogue", "voice_over", "lyrics"}
+    )
+    speech = [(start, end) for start, end in speech if end > start + 1e-6]
+    if not speech:
+        return rows
+
+    boundaries = [
+        float(rows[0].core_start_seconds if rows[0].core_start_seconds is not None else rows[0].start_seconds)
+    ]
+    boundaries.extend(
+        float(row.core_end_seconds if row.core_end_seconds is not None else row.end_seconds)
+        for row in rows
+    )
+    moved: set[int] = set()
+    for index in range(1, len(boundaries) - 1):
+        boundary = boundaries[index]
+        hard_blockers = [
+            (start, end)
+            for start, end in speech
+            if start < boundary - 1e-6 and boundary < end - 1e-6
+        ]
+        tail_blockers = [
+            (start, end)
+            for start, end in speech
+            if start < boundary - 1e-6
+            and end - 1e-6 <= boundary < end + tail - 1e-6
+        ]
+        # A decay-tail preference must never move an already speech-safe cut
+        # across the beginning of the next authored line.  Doing that put the
+        # next line into the preceding H3 request and removed it from its own
+        # request because Text Ranges are owned by their start time.
+        if not hard_blockers and tail_blockers:
+            preferred = snap_seconds(
+                max(end + tail for _start, end in tail_blockers), grid_seconds
+            )
+            if any(
+                start >= boundary - 1e-6
+                and start < preferred - 1e-6
+                and end > boundary + 1e-6
+                for start, end in speech
+            ):
+                continue
+        blockers = hard_blockers or tail_blockers
+        if not blockers:
+            continue
+        lower = max(
+            boundaries[index - 1] + grid_seconds,
+            boundaries[index + 1] - maximum,
+        )
+        upper = min(
+            boundaries[index + 1] - grid_seconds,
+            boundaries[index - 1] + maximum,
+        )
+        forward = snap_seconds(max(end + tail for _start, end in blockers), grid_seconds)
+        backward = snap_seconds(min(start for start, _end in blockers), grid_seconds)
+        forward_crosses_new_speech = any(
+            start >= boundary - 1e-6
+            and start < forward - 1e-6
+            and (start, end) not in blockers
+            for start, end in speech
+        )
+        candidate = None
+        if (
+            not forward_crosses_new_speech
+            and lower - 1e-6 <= forward <= upper + 1e-6
+        ):
+            candidate = forward
+        elif lower - 1e-6 <= backward <= upper + 1e-6:
+            candidate = backward
+        elif (
+            boundaries[index - 1] + grid_seconds - 1e-6
+            <= backward
+            <= boundaries[index - 1] + maximum + 1e-6
+            and backward < boundaries[index + 1] - 1e-6
+        ):
+            # Moving backward keeps the current native request valid but may
+            # make the following interval longer than 15 seconds. The rebuild
+            # pass below inserts a new safe boundary into that following span.
+            candidate = backward
+        if candidate is None or abs(candidate - boundary) <= 1e-6:
+            continue
+        boundaries[index] = candidate
+        moved.add(index)
+
+    # A completely packed sequence (for example 0-15, 15-30, 30-45)
+    # cannot always move one boundary without making its neighbour longer than
+    # H3's native limit. In that case keep the safe earlier cut and insert an
+    # additional native window later. This is preferable to splitting one
+    # authored utterance across two independent H3 requests.
+    safe_boundaries = [boundaries[0]]
+    for target in boundaries[1:]:
+        cursor = safe_boundaries[-1]
+        while target - cursor > maximum + 1e-6:
+            candidate = snap_seconds(cursor + maximum, grid_seconds)
+            blockers = [
+                (start, end)
+                for start, end in speech
+                if start < candidate - 1e-6 and candidate < end + tail - 1e-6
+            ]
+            if blockers:
+                backward = snap_seconds(min(start for start, _end in blockers), grid_seconds)
+                forward = snap_seconds(max(end + tail for _start, end in blockers), grid_seconds)
+                if backward > cursor + 1e-6:
+                    candidate = backward
+                elif forward <= cursor + maximum + 1e-6:
+                    candidate = forward
+                else:
+                    # One authored line itself exceeds a native H3 window. The
+                    # Text Layer is still compiled into every intersecting
+                    # window; UI timing validation is responsible for asking
+                    # the editor to split such an exceptional line.
+                    candidate = snap_seconds(cursor + maximum, grid_seconds)
+            if candidate <= cursor + 1e-6:
+                candidate = snap_seconds(cursor + maximum, grid_seconds)
+            safe_boundaries.append(candidate)
+            cursor = candidate
+        if target > safe_boundaries[-1] + 1e-6:
+            safe_boundaries.append(target)
+    boundaries = safe_boundaries
+
+    source_rows = rows
+    rebuilt: list[RenderSegment] = []
+    original_starts = {
+        snap_seconds(
+            float(row.core_start_seconds if row.core_start_seconds is not None else row.start_seconds),
+            grid_seconds,
+        ): row
+        for row in source_rows
+    }
+    for index in range(len(boundaries) - 1):
+        core_start = snap_seconds(boundaries[index], grid_seconds)
+        core_end = snap_seconds(boundaries[index + 1], grid_seconds)
+        template = original_starts.get(core_start)
+        if template is None:
+            template = next(
+                (
+                    row for row in source_rows
+                    if ranges_intersect(
+                        float(row.core_start_seconds if row.core_start_seconds is not None else row.start_seconds),
+                        float(row.core_end_seconds if row.core_end_seconds is not None else row.end_seconds),
+                        core_start,
+                        core_end,
+                    )
+                ),
+                source_rows[-1],
+            )
+        row = RenderSegment.from_dict(template.to_dict())
+        row.index = index
+        row.start_seconds = core_start
+        row.end_seconds = core_end
+        row.core_start_seconds = core_start
+        row.core_end_seconds = core_end
+        row.overlap_before_seconds = 0.0
+        row.overlap_after_seconds = 0.0
+        row.segment_id = (
+            f"shot_{round(core_start * 1000):09d}_{round(core_end * 1000):09d}"
+        )
+        if index and (index in moved or core_start not in original_starts):
+            row.continuity_mode = "motion_reference"
+        elif index == 0:
+            row.continuity_mode = "none"
+        rebuilt.append(row)
+    return rebuilt
+
+
+def align_segments_to_dialogue_turns(
+    segments: Iterable[RenderSegment],
+    speech_rows: Iterable[Mapping[str, Any]],
+    *,
+    max_segment_seconds: float = MAX_NATIVE_SECONDS,
+    grid_seconds: float = TIMELINE_GRID_SECONDS,
+) -> list[RenderSegment]:
+    """Give alternating on-camera speakers separate H3 request boundaries.
+
+    H3 native dialogue may compress multiple timed turns toward the beginning
+    of one request and animate the listener's mouth.  A dialogue turn that
+    starts a request has an unambiguous local zero and speaker identity.  This
+    pass moves a nearby silent boundary to the first turn when safe, then
+    inserts boundaries at later speaker changes without cutting any line.
+    """
+    rows = [RenderSegment.from_dict(row.to_dict()) for row in segments]
+    if not rows:
+        return rows
+    speech = sorted(
+        (
+            snap_seconds(float(item.get("start_seconds", 0.0)), grid_seconds),
+            snap_seconds(
+                float(item.get("end_seconds", item.get("start_seconds", 0.0))),
+                grid_seconds,
+            ),
+            str(item.get("content_role", item.get("role", ""))),
+            str(item.get("speaker", "S1")),
+        )
+        for item in speech_rows
+        if str(item.get("content_role", item.get("role", "")))
+        in {"dialogue", "voice_over", "lyrics"}
+    )
+    dialogue = [row for row in speech if row[2] == "dialogue" and row[1] > row[0]]
+    if not dialogue:
+        return rows
+
+    boundaries = [float(rows[0].core_start_seconds or rows[0].start_seconds)]
+    boundaries.extend(
+        float(row.core_end_seconds if row.core_end_seconds is not None else row.end_seconds)
+        for row in rows
+    )
+    maximum = max(grid_seconds, snap_seconds(max_segment_seconds, grid_seconds))
+
+    # Move an internal boundary forward through genuine silence so the first
+    # on-camera line starts at local 0.00s. Never exceed H3's native duration.
+    for index in range(1, len(boundaries) - 1):
+        start, end = boundaries[index], boundaries[index + 1]
+        turns = [row for row in dialogue if start < row[0] < end - 1e-6]
+        if not turns:
+            continue
+        first = turns[0][0]
+        has_prior_speech = any(
+            speech_start < first - 1e-6 and speech_end > start + 1e-6
+            for speech_start, speech_end, _role, _speaker in speech
+        )
+        if (
+            not has_prior_speech
+            and first - boundaries[index - 1] <= maximum + 1e-6
+        ):
+            boundaries[index] = first
+
+    # A later change of speaking face receives its own request. Same-speaker
+    # continuation can stay together unless a long authored silence separates it.
+    inserts: set[float] = set()
+    for start, end in zip(boundaries, boundaries[1:]):
+        turns = [row for row in dialogue if start - 1e-6 <= row[0] < end - 1e-6]
+        for previous, current in zip(turns, turns[1:]):
+            silent_gap = current[0] - previous[1]
+            if current[3] != previous[3] or silent_gap >= 1.5 - 1e-6:
+                if current[0] - start >= grid_seconds - 1e-6:
+                    inserts.add(current[0])
+    boundaries = sorted(set(boundaries).union(inserts))
+
+    rebuilt: list[RenderSegment] = []
+    original_starts = {
+        snap_seconds(
+            float(row.core_start_seconds if row.core_start_seconds is not None else row.start_seconds),
+            grid_seconds,
+        ): row
+        for row in rows
+    }
+    for index, (core_start, core_end) in enumerate(zip(boundaries, boundaries[1:])):
+        template = next(
+            (
+                row for row in rows
+                if ranges_intersect(
+                    float(row.core_start_seconds if row.core_start_seconds is not None else row.start_seconds),
+                    float(row.core_end_seconds if row.core_end_seconds is not None else row.end_seconds),
+                    core_start,
+                    core_end,
+                )
+            ),
+            rows[-1],
+        )
+        row = RenderSegment.from_dict(template.to_dict())
+        row.index = index
+        row.start_seconds = row.core_start_seconds = core_start
+        row.end_seconds = row.core_end_seconds = core_end
+        row.overlap_before_seconds = row.overlap_after_seconds = 0.0
+        row.segment_id = f"shot_{round(core_start * 1000):09d}_{round(core_end * 1000):09d}"
+        if index == 0:
+            row.continuity_mode = "none"
+        elif core_start in original_starts:
+            row.continuity_mode = original_starts[core_start].continuity_mode
+        else:
+            row.continuity_mode = "motion_reference"
+        rebuilt.append(row)
+    return rebuilt
 
 
 def derive_segment_seed(master_seed: int, segment_index: int) -> int:

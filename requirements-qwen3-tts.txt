@@ -1,0 +1,11 @@
+# Qwen3-TTS isolated overlay for ai_libraries_common/qwen_tts_runtime
+# Installed with --target and --no-deps by install_qwen3_tts_runtime.bat.
+# Torch, Torchaudio, NumPy, Gradio, Librosa, SoundFile and Einops are supplied
+# by the locked main Studio runtime in requirements.txt.
+qwen-tts==0.1.1
+transformers==4.57.3
+accelerate==1.12.0
+huggingface-hub==0.36.0
+onnxruntime==1.23.2
+sox==1.5.0
+
