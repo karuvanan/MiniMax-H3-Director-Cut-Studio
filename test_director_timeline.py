@@ -2147,6 +2147,30 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_design_page_retries_truncated_json_before_hard_blocking(self):
+        window = DirectorCutStudio()
+        with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
+            dialog = DesignPageDialog(
+                window.runtime, window._design_context(), window.scan.counts, window
+            )
+        dialog.pending_requirement = "Create a 45-second rescue film in Mandarin."
+        dialog.pipeline_stage = "lm_plan"
+        with patch.object(dialog, "_start_lm_design") as restart:
+            dialog._handle_design_generated({
+                "text": '{"title":"Rescue","shots":[',
+                "finish_reason": "length",
+                "output_characters": 54314,
+            })
+        self.assertEqual(dialog.design_json_retry_count, 1)
+        restart.assert_called_once()
+        recovery_note = restart.call_args.kwargs["fallback_note"]
+        self.assertIn("JSON COMPLETION RECOVERY", recovery_note)
+        self.assertIn("finish_reason=length", recovery_note)
+        self.assertIn("54314", recovery_note)
+        dialog.close()
+        window.project_dirty = False
+        window.close()
+
     def test_ai_design_auto_creates_higher_visual_and_audio_tracks(self):
         window = DirectorCutStudio()
         plan = sample_design()

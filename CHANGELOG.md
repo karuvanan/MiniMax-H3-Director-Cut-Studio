@@ -4,6 +4,14 @@ Every user-visible correction receives an application version and a dated entry 
 
 ## [0.3.2-alpha.2] - 2026-09-02
 
+### Design JSON completion reliability
+
+- Removed the hidden 12,000-token completion bottleneck that could truncate a valid 45-second Special Skill plan even when LM Studio had a 100k context window. Director Design now allows up to 32,768 output tokens for its schema response.
+- Added provider-neutral `finish_reason`, output-size and usage diagnostics so a completion stopped by `length` is distinguishable from a Design Requirement text-box problem.
+- Added one automatic compact full-plan recovery pass when Qwen returns malformed or truncated JSON. The first failure no longer immediately blocks Apply; a second failure reports its exact line, column, finish reason and output size.
+- Added a compact-output contract to every Design planning and BLIP-refinement prompt: required Shots, editable speech, continuity and media ranges are preserved while repeated prose and formatting overhead are removed.
+- Refinement JSON failure is non-destructive: the already validated first Design Plan is retained instead of being replaced by incomplete BLIP-refinement output.
+
 ### Special Skill Design Requirement templates
 
 - Added optional per-Skill `DESIGN_REQUIREMENT.txt` starter templates. Selecting a Special Skill and opening `DESIGN` now fills an empty Design Requirement with that Skill's editable production example.

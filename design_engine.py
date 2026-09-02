@@ -48,6 +48,16 @@ class DesignSpeechLayerContractError(ValueError):
     """The model described requested speech without creating editable Text Layers."""
 
 
+class DesignJSONDecodeError(ValueError):
+    """The model returned a malformed or completion-truncated Design JSON object."""
+
+    def __init__(self, message: str, *, line: int, column: int, position: int) -> None:
+        super().__init__(message)
+        self.line = int(line)
+        self.column = int(column)
+        self.position = int(position)
+
+
 def speech_timing_budget(
     content: object,
     language: object = "",
@@ -2351,7 +2361,12 @@ def extract_design_json(value: object) -> dict:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"AI response is not valid JSON: line {exc.lineno}, column {exc.colno}") from exc
+        raise DesignJSONDecodeError(
+            f"AI response is not valid JSON: line {exc.lineno}, column {exc.colno}",
+            line=exc.lineno,
+            column=exc.colno,
+            position=exc.pos,
+        ) from exc
     if not isinstance(payload, dict):
         raise ValueError("AI design JSON must be an object")
     return payload
@@ -3868,6 +3883,9 @@ def build_design_system_prompt(context: dict) -> str:
         "the last Shot's outgoing physical state rather than introduce a new action. "
         "Media requests are reference requirements, not final generated media. "
         "Keep exact product/subject continuity, realistic object interaction and H3-friendly concise directions. "
+        "OUTPUT SIZE CONTRACT: Return one compact but complete JSON object. Do not repeat the same prose across fields, "
+        "do not add indentation for readability, and keep directions concise while preserving every required Shot, "
+        "text layer, continuity state and media range. Close every string, array and object. "
         "Do not include markdown or commentary. Available workspace context: "
         + json.dumps(context, ensure_ascii=False)
     )

@@ -12,6 +12,7 @@ from design_engine import (
     H3_STABLE_DIALOGUE_LANGUAGES,
     DesignDialogueLanguageContractError,
     DesignDurationContractError,
+    DesignJSONDecodeError,
     DesignSpeechLayerContractError,
     automatic_background_music,
     automatic_background_soundscape,
@@ -21,6 +22,7 @@ from design_engine import (
     enforce_design_dialogue_language,
     enforce_design_music_mode,
     enforce_design_subtitle_policy,
+    extract_design_json,
     extract_explicit_timed_text_layers,
     infer_design_dialogue_language,
     infer_explicit_design_duration,
@@ -440,6 +442,15 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("stable native dialogue support for exactly 11 languages", prompt)
         self.assertIn("DIALOGUE LANGUAGE CONTRACT: Design selected Chinese", prompt)
         self.assertIn("Never default to English", prompt)
+        self.assertIn("OUTPUT SIZE CONTRACT", prompt)
+        self.assertIn("compact but complete JSON object", prompt)
+
+    def test_truncated_design_json_raises_structured_decode_error(self):
+        with self.assertRaises(DesignJSONDecodeError) as caught:
+            extract_design_json('{"shots":[{"start_seconds":0.0}')
+        self.assertGreaterEqual(caught.exception.line, 1)
+        self.assertGreaterEqual(caught.exception.column, 1)
+        self.assertGreaterEqual(caught.exception.position, 1)
 
     def test_requested_narration_cannot_hide_inside_shot_prompt(self):
         requirement = "\u8bf7\u7528\u4e2d\u6587\u65c1\u767d\u8bb2\u8ff0\u8fd9\u4e2a\u6545\u4e8b\u3002"
@@ -1057,6 +1068,64 @@ On-screen text: "EXACT TITLE"'''
             timeout=30.0,
             payload={"unload_models": True, "free_memory": True},
         )
+
+    def test_design_ai_generation_allows_large_json_and_reports_truncation(self):
+        calls = []
+
+        def fake_request(url, *, api_key, timeout, payload=None):
+            calls.append((url, payload))
+            if url.endswith("/models"):
+                return {"data": [{"id": "qwen-local"}]}
+            return {
+                "choices": [{
+                    "message": {"content": "{}"},
+                    "finish_reason": "length",
+                }],
+                "usage": {"completion_tokens": 32768},
+            }
+
+        with patch("design_ai_service.request_json", side_effect=fake_request):
+            result = handle_design_ai_job({
+                "action": "generate",
+                "provider": "lm_studio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "model": "qwen-local",
+                "system_prompt": "Return JSON.",
+                "user_prompt": "Plan a 45-second film.",
+                "schema": {"type": "object"},
+            })
+
+        completion_payload = next(
+            payload for url, payload in calls if url.endswith("/chat/completions")
+        )
+        self.assertEqual(completion_payload["max_tokens"], 32768)
+        self.assertEqual(result["max_output_tokens"], 32768)
+        self.assertEqual(result["finish_reason"], "length")
+        self.assertEqual(result["output_characters"], 2)
+
+    def test_design_ai_preserves_empty_length_stop_for_ui_recovery(self):
+        def fake_request(url, *, api_key, timeout, payload=None):
+            if url.endswith("/models"):
+                return {"data": [{"id": "qwen-local"}]}
+            return {
+                "choices": [{
+                    "message": {"content": None},
+                    "finish_reason": "length",
+                }]
+            }
+
+        with patch("design_ai_service.request_json", side_effect=fake_request):
+            result = handle_design_ai_job({
+                "action": "generate",
+                "provider": "lm_studio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "model": "qwen-local",
+                "system_prompt": "Return JSON.",
+                "user_prompt": "Plan the film.",
+                "schema": {"type": "object"},
+            })
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["finish_reason"], "length")
 
     def test_lm_origin_removes_openai_compatible_v1_path(self):
         self.assertEqual(

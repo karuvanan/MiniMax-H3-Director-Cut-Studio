@@ -14,6 +14,8 @@ from design_cleanup_service import unload_lm_studio
 
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+DEFAULT_STRUCTURED_OUTPUT_TOKENS = 32768
+MAX_STRUCTURED_OUTPUT_TOKENS = 32768
 
 
 def _urlopen(request: urllib.request.Request, timeout: float):
@@ -77,6 +79,22 @@ def response_text(payload: dict) -> str:
         if isinstance(content, str):
             return content
     raise RuntimeError("The model response did not contain text output")
+
+
+def response_finish_reason(payload: dict) -> str:
+    """Normalize completion/truncation metadata across supported providers."""
+
+    choices = payload.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        reason = str(choices[0].get("finish_reason", "")).strip()
+        if reason:
+            return reason
+    status = str(payload.get("status", "")).strip()
+    if status == "incomplete":
+        details = payload.get("incomplete_details") or {}
+        if isinstance(details, dict):
+            return str(details.get("reason", "incomplete")).strip() or "incomplete"
+    return status
 
 
 def _model_family(value: str) -> str:
@@ -164,10 +182,14 @@ def generate(job: dict) -> dict:
     schema_name = re.sub(r"[^A-Za-z0-9_-]", "_", raw_schema_name)[:64]
     schema_name = schema_name or "structured_response"
     try:
-        max_output_tokens = int(job.get("max_output_tokens", 12000))
+        max_output_tokens = int(
+            job.get("max_output_tokens", DEFAULT_STRUCTURED_OUTPUT_TOKENS)
+        )
     except (TypeError, ValueError):
-        max_output_tokens = 12000
-    max_output_tokens = max(512, min(12000, max_output_tokens))
+        max_output_tokens = DEFAULT_STRUCTURED_OUTPUT_TOKENS
+    max_output_tokens = max(
+        512, min(MAX_STRUCTURED_OUTPUT_TOKENS, max_output_tokens)
+    )
     if not model:
         raise ValueError("Model is required")
     if provider == "openai":
@@ -236,7 +258,27 @@ def generate(job: dict) -> dict:
                 timeout=timeout,
                 payload=chat_payload,
             )
-    return {"response": payload, "text": response_text(payload), "resolved_model": model}
+    finish_reason = response_finish_reason(payload)
+    try:
+        text = response_text(payload)
+    except RuntimeError:
+        # A provider may report a length/incomplete stop before publishing even
+        # a partial content field.  Preserve that state for the UI recovery
+        # path instead of collapsing it into an opaque worker error.
+        if finish_reason.casefold() not in {
+            "length", "incomplete", "max_output_tokens", "max_tokens"
+        }:
+            raise
+        text = ""
+    return {
+        "response": payload,
+        "text": text,
+        "resolved_model": model,
+        "finish_reason": finish_reason,
+        "output_characters": len(text),
+        "max_output_tokens": max_output_tokens,
+        "usage": payload.get("usage") or {},
+    }
 
 
 def handle(job: dict) -> dict:

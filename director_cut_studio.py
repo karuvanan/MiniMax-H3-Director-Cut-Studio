@@ -110,6 +110,7 @@ from design_engine import (
     H3_STABLE_DIALOGUE_LANGUAGES,
     DesignDialogueLanguageContractError,
     DesignDurationContractError,
+    DesignJSONDecodeError,
     DesignSpeechLayerContractError,
     automatic_background_music,
     automatic_background_soundscape,
@@ -5835,6 +5836,7 @@ class DesignPageDialog(QDialog):
         self.duration_contract_retry_count = 0
         self.dialogue_language_retry_count = 0
         self.speech_layer_retry_count = 0
+        self.design_json_retry_count = 0
         self.concept_image_path: Path | None = None
         self.concept_blip_caption = ""
         self.concept_media_result: dict = {}
@@ -7023,6 +7025,7 @@ class DesignPageDialog(QDialog):
             "system_prompt": build_design_system_prompt(planning_context),
             "user_prompt": prompt,
             "schema": DESIGN_JSON_SCHEMA,
+            "max_output_tokens": 32768,
         })
         self._set_design_stage(
             "Stage 1/4 · LM Studio is planning shots and requested image count…",
@@ -7119,6 +7122,48 @@ class DesignPageDialog(QDialog):
             validate_requested_speech_layer_contract(
                 self.pending_requirement, plan
             )
+        except DesignJSONDecodeError as exc:
+            finish_reason = str(payload.get("finish_reason", "")).strip() or "not reported"
+            output_characters = int(payload.get("output_characters", 0) or 0)
+            if self.pipeline_stage == "lm_refine" and self.planned_plan:
+                self.design_image_warnings.append(
+                    "LM refinement returned incomplete JSON; retained the validated first "
+                    f"Design Plan. finish_reason={finish_reason}, output={output_characters:,} "
+                    f"characters, error line {exc.line}, column {exc.column}."
+                )
+                self._finish_design_pipeline(self.planned_plan)
+                return
+            if self.pipeline_stage == "lm_plan" and self.design_json_retry_count < 1:
+                self.design_json_retry_count += 1
+                self._set_design_stage(
+                    "Stage 1/4 · JSON was incomplete · automatically retrying a compact complete Plan…"
+                )
+                self._start_lm_design(
+                    fallback_note=(
+                        "JSON COMPLETION RECOVERY: The previous response could not be parsed "
+                        f"at line {exc.line}, column {exc.column}; finish_reason={finish_reason}, "
+                        f"output_characters={output_characters}. Rebuild the entire plan from the "
+                        "original requirement. Return exactly one compact schema-valid JSON object "
+                        "with no markdown or commentary. Preserve every required Shot, Dialogue, "
+                        "Voice-over, continuity state and media range, but remove redundant prose. "
+                        "Close every string, array and object and include the final Shot and Final Hold."
+                    )
+                )
+                return
+            self._set_pipeline_busy(False)
+            self.design_busy_overlay.stop()
+            self.json_edit.setPlainText(str(payload.get("text", "")))
+            self._show_preflight_failure(
+                (
+                    f"{exc}. The model returned invalid JSON after one automatic retry. "
+                    "This is not the Design Requirement text-box limit. "
+                    f"finish_reason={finish_reason}; output={output_characters:,} characters; "
+                    "completion budget=32,768 tokens. Try a structured-output-capable model or "
+                    "reduce unusually repetitive Skill instructions."
+                ),
+                category="Design JSON completion",
+            )
+            return
         except DesignDurationContractError as exc:
             if self.pipeline_stage == "lm_refine" and self.planned_plan:
                 self.design_image_warnings.append(
@@ -7315,6 +7360,7 @@ class DesignPageDialog(QDialog):
         self.duration_contract_retry_count = 0
         self.dialogue_language_retry_count = 0
         self.speech_layer_retry_count = 0
+        self.design_json_retry_count = 0
         self.planned_plan = None
         self.generated_references = []
         self.design_image_warnings = []
