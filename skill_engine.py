@@ -61,6 +61,7 @@ class SkillProfile:
     special: bool = False
     description: str = ""
     standalone: bool = False
+    design_requirement_template: str = ""
 
     @property
     def summary(self) -> str:
@@ -116,6 +117,12 @@ def load_skill_profiles(workspace: str | Path) -> dict[str, SkillProfile]:
             if not skill_path.is_file():
                 continue
             instruction = skill_path.read_text(encoding="utf-8-sig")
+            requirement_template_path = folder / "DESIGN_REQUIREMENT.txt"
+            design_requirement_template = (
+                requirement_template_path.read_text(encoding="utf-8-sig").strip()
+                if requirement_template_path.is_file()
+                else ""
+            )
             name, description = _frontmatter(instruction, folder.name)
             key = folder.name
             profiles[key] = SkillProfile(
@@ -133,6 +140,7 @@ def load_skill_profiles(workspace: str | Path) -> dict[str, SkillProfile]:
                         flags=re.I,
                     )
                 ),
+                design_requirement_template=design_requirement_template,
             )
     return profiles
 

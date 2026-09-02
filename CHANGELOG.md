@@ -2,6 +2,24 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.2-alpha.2] - 2026-09-02
+
+### Special Skill Design Requirement templates
+
+- Added optional per-Skill `DESIGN_REQUIREMENT.txt` starter templates. Selecting a Special Skill and opening `DESIGN` now fills an empty Design Requirement with that Skill's editable production example.
+- Existing authored Design Requirement text always has priority and is never overwritten. Skills without a template remain compatible and continue to open with an empty requirement.
+- Added a `DESIGN REQUIREMENT TEMPLATE` editor to `SPECIAL SKILL CREATOR`; templates are loaded and saved independently from `SKILL.md` and the optional `SKILL.cn.md`.
+- Added tailored templates for all 12 bundled Special Skills: 3D animation, brand promo, co-op game intro, dark rescue, hand-drawn/live-action fusion, long-form production, minimalist product advertising, music video, paper collage, papercraft stop-motion, short drama and wuxia blade film.
+- Added the new `dark-rescue-h3` Default-bound Special Skill, distilled from five user-tested first-person rescue structures and their proven environmental-lighting vocabulary. Its starter request demonstrates a fictional Wall Street-inspired damaged office tower without inventing unloaded Media Pool IDs.
+- Added a 45-second Tang-dynasty courtyard starter requirement to `wuxia-blade-film`, including executable action budgets, character/weapon/prop ledgers, native 15-second boundary contracts and non-magical physical combat constraints.
+- Increased the Studio Special Skill Creator description limit from 600 to 1,200 characters so every bundled Skill can be edited and saved without rejecting its existing metadata.
+
+### Verification and compatibility
+
+- Added regressions proving every bundled Special Skill has a non-empty editable template, all templates load through the Studio profile system, and `dark-rescue-h3` opens Design with the expected starter requirement under `Default + Special` binding.
+- All 38 focused Skill store, profile, creator compatibility and Design UI tests pass.
+- Project format remains `21`; Workspace layout, Timeline mapping, Segment compilation, render policy, saved Projects and generated media are unchanged.
+
 ## [0.3.2-alpha.1] - 2026-09-01
 
 ### MiniMax H3 native production sound

@@ -42,6 +42,7 @@ class SpecialSkillDocument:
     body: str
     chinese_body: str = ""
     standalone: bool = False
+    design_requirement_template: str = ""
     path: Path | None = None
 
 
@@ -87,8 +88,8 @@ def validate_special_skill_document(document: SpecialSkillDocument) -> None:
     description = " ".join(document.description.split())
     if not description:
         raise ValueError("Skill description is required so the Studio can explain its purpose.")
-    if len(description) > 600:
-        raise ValueError("Skill description must contain at most 600 characters.")
+    if len(description) > 1_200:
+        raise ValueError("Skill description must contain at most 1,200 characters.")
     body = document.body.strip()
     if not body:
         raise ValueError("English SKILL.md instructions cannot be empty.")
@@ -98,6 +99,8 @@ def validate_special_skill_document(document: SpecialSkillDocument) -> None:
         raise ValueError(
             "Standalone mode conflicts with instructions that bind the Default H3 Skill."
         )
+    if len(document.design_requirement_template.strip()) > 20_000:
+        raise ValueError("Design Requirement template must contain at most 20,000 characters.")
 
 
 def render_special_skill(document: SpecialSkillDocument, *, chinese: bool = False) -> str:
@@ -132,12 +135,19 @@ def load_special_skill_document(folder: str | Path) -> SpecialSkillDocument:
         _cn_name, _cn_description, chinese_body = _split_frontmatter(
             chinese_path.read_text(encoding="utf-8-sig")
         )
+    requirement_template_path = folder_path / "DESIGN_REQUIREMENT.txt"
+    design_requirement_template = (
+        requirement_template_path.read_text(encoding="utf-8-sig").strip()
+        if requirement_template_path.is_file()
+        else ""
+    )
     return SpecialSkillDocument(
         key=folder_path.name,
         description=description,
         body=body.replace(STANDALONE_MARKER, "").strip(),
         chinese_body=chinese_body.replace(STANDALONE_MARKER, "").strip(),
         standalone=STANDALONE_MARKER in text,
+        design_requirement_template=design_requirement_template,
         path=skill_path.resolve(),
     )
 
@@ -175,5 +185,16 @@ def save_special_skill_document(
         chinese_temporary.replace(chinese_path)
     elif chinese_path.is_file():
         chinese_path.unlink()
+
+    requirement_template = document.design_requirement_template.strip()
+    requirement_template_path = folder / "DESIGN_REQUIREMENT.txt"
+    if requirement_template:
+        requirement_template_temporary = folder / "DESIGN_REQUIREMENT.txt.tmp"
+        requirement_template_temporary.write_text(
+            requirement_template + "\n", encoding="utf-8"
+        )
+        requirement_template_temporary.replace(requirement_template_path)
+    elif requirement_template_path.is_file():
+        requirement_template_path.unlink()
 
     return load_special_skill_document(folder)

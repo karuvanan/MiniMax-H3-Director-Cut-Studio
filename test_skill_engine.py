@@ -75,10 +75,20 @@ class SkillEngineTests(unittest.TestCase):
         self.assertTrue(profile.description)
         self.assertIn("Music Video", profile.display_name)
 
+    def test_every_special_skill_has_an_editable_design_requirement_template(self):
+        special_profiles = [profile for profile in self.profiles.values() if profile.special]
+        self.assertTrue(special_profiles)
+        for profile in special_profiles:
+            with self.subTest(skill=profile.key):
+                self.assertTrue(profile.design_requirement_template.strip())
+                self.assertLessEqual(len(profile.design_requirement_template), 20_000)
+
     def test_wuxia_special_binds_default_h3_skill(self):
         profile = self.profiles["wuxia-blade-film"]
         self.assertTrue(profile.special)
         self.assertFalse(profile.standalone)
+        self.assertIn("45秒的唐朝写实高速武侠刺杀视频", profile.design_requirement_template)
+        self.assertIn("没有明确写出的 @P／@V／@A 时不得虚构素材编号", profile.design_requirement_template)
         system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
         self.assertIn("DEFAULT H3 SKILL", system)
         self.assertIn("SPECIAL SCENE SKILL (wuxia-blade-film)", system)
@@ -119,6 +129,44 @@ class SkillEngineTests(unittest.TestCase):
             self.assertIn(phrase, chinese)
         self.assertIn("MIT License", license_text)
         self.assertIn("POUND0423/AI-drama-pound", license_text)
+
+    def test_dark_rescue_special_is_default_bound_and_uses_proven_scene_grammar(self):
+        profile = self.profiles["dark-rescue-h3"]
+        self.assertTrue(profile.special)
+        self.assertFalse(profile.standalone)
+        self.assertIn("华尔街建筑风格", profile.design_requirement_template)
+        self.assertIn("45秒救援视频", profile.design_requirement_template)
+        system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
+        self.assertIn("DEFAULT H3 SKILL", system)
+        self.assertIn("SPECIAL SCENE SKILL (dark-rescue-h3)", system)
+        for phrase in (
+            "Use Only the Proven Visual-effect Palette",
+            "Abandoned academic building",
+            "Bangkok Yaowarat back lanes",
+            "Kuala Lumpur Petaling Street back lanes",
+            "Historical Kowloon dense interior",
+            "Damaged high-rise office or Wall Street-inspired tower",
+            "MUSIC AUTO",
+            "must never cause the Skill to invent `@P1`",
+            "preceding 24 frames are visual motion context only",
+            "Director Design JSON",
+        ):
+            self.assertIn(phrase, system)
+
+    def test_dark_rescue_special_has_matching_chinese_operational_contract(self):
+        folder = self.profiles["dark-rescue-h3"].path.parent
+        chinese = (folder / "SKILL.cn.md").read_text(encoding="utf-8-sig")
+        for phrase in (
+            "只使用已验证的光影效果库",
+            "曼谷耀华力路后巷",
+            "吉隆坡茨厂街后巷",
+            "历史九龙密集室内",
+            "受损高层办公室／华尔街风格大楼",
+            "不能自行发明 `@P1`",
+            "MUSIC TIMELINE",
+            "Director Design JSON",
+        ):
+            self.assertIn(phrase, chinese)
 
     def test_long_form_special_is_default_bound_and_batch_boundary_safe(self):
         profile = self.profiles["long-form-h3-director"]

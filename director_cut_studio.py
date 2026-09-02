@@ -3576,6 +3576,19 @@ class SpecialSkillCreatorDialog(QDialog):
         metadata.setColumnStretch(3, 1)
         layout.addLayout(metadata)
 
+        template_label = QLabel(
+            "DESIGN REQUIREMENT TEMPLATE · optional text inserted when this Special Skill opens Design"
+        )
+        template_label.setStyleSheet("color:#aeb9c3;")
+        layout.addWidget(template_label)
+        self.requirement_template_edit = QPlainTextEdit()
+        self.requirement_template_edit.setObjectName("specialSkillRequirementTemplateEdit")
+        self.requirement_template_edit.setPlaceholderText(
+            "Example: Create a 45-second scene using this Skill's dialogue, sound and visual rules."
+        )
+        self.requirement_template_edit.setMaximumHeight(90)
+        layout.addWidget(self.requirement_template_edit)
+
         editors = QSplitter(Qt.Horizontal)
         english_panel = QWidget()
         english_layout = QVBoxLayout(english_panel)
@@ -3657,6 +3670,7 @@ class SpecialSkillCreatorDialog(QDialog):
         self.binding_combo.setCurrentIndex(0)
         self.english_edit.setPlainText(DEFAULT_SPECIAL_SKILL_BODY)
         self.chinese_edit.clear()
+        self.requirement_template_edit.clear()
         self.path_label.setText(
             f"New folder will be saved under: {self.special_root.resolve()}"
         )
@@ -3680,6 +3694,9 @@ class SpecialSkillCreatorDialog(QDialog):
         self.binding_combo.setCurrentIndex(1 if document.standalone else 0)
         self.english_edit.setPlainText(document.body)
         self.chinese_edit.setPlainText(document.chinese_body)
+        self.requirement_template_edit.setPlainText(
+            document.design_requirement_template
+        )
         self.path_label.setText(str(document.path or (self.special_root / key / "SKILL.md")))
 
     def _document(self) -> SpecialSkillDocument:
@@ -3689,6 +3706,9 @@ class SpecialSkillCreatorDialog(QDialog):
             body=self.english_edit.toPlainText().strip(),
             chinese_body=self.chinese_edit.toPlainText().strip(),
             standalone=bool(self.binding_combo.currentData()),
+            design_requirement_template=(
+                self.requirement_template_edit.toPlainText().strip()
+            ),
         )
 
     def _validate(self) -> bool:
@@ -6057,6 +6077,20 @@ class DesignPageDialog(QDialog):
             "then slowly zoom out to reveal a woman drinking it."
         )
         self.requirement_edit.setMinimumHeight(180)
+        initial_requirement = str(self.context.get("design_requirement", "")).strip()
+        special_skill_context = (
+            (self.context.get("bound_h3_skills") or {}).get("special") or {}
+        )
+        requirement_template = str(
+            special_skill_context.get("design_requirement_template", "")
+        ).strip()
+        if initial_requirement:
+            self.requirement_edit.setPlainText(initial_requirement)
+        elif requirement_template:
+            self.requirement_edit.setPlainText(requirement_template)
+            self.requirement_edit.setToolTip(
+                "Starter template loaded from the selected Special Skill. You can edit or replace it."
+            )
         concept_layout.addWidget(self.requirement_edit)
 
         media_intelligence = QGroupBox("MEDIA POOL INTELLIGENCE")
@@ -9770,6 +9804,9 @@ class DirectorCutStudio(QMainWindow):
                     "key": special_profile.key,
                     "instruction": special_profile.instruction,
                     "standalone": special_profile.standalone,
+                    "design_requirement_template": (
+                        special_profile.design_requirement_template
+                    ),
                 },
             },
         }

@@ -186,6 +186,37 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertFalse(wuxia_context["special"]["standalone"])
         self.assertNotIn("not bound", window.default_skill_label.text().lower())
         self.assertEqual(window.special_skill_label.text(), "+ Special")
+
+        dark_rescue_index = window.special_combo.findData("dark-rescue-h3")
+        self.assertGreaterEqual(dark_rescue_index, 0)
+        window.special_combo.setCurrentIndex(dark_rescue_index)
+        dark_rescue_context = window._design_context()["bound_h3_skills"]
+        self.app.processEvents()
+        self.assertEqual(dark_rescue_context["binding_mode"], "default_plus_special")
+        self.assertEqual(dark_rescue_context["default"]["key"], "h3-prompt-writing")
+        self.assertEqual(dark_rescue_context["special"]["key"], "dark-rescue-h3")
+        self.assertFalse(dark_rescue_context["special"]["standalone"])
+        self.assertIn(
+            "A simple request with no explicit `@ID` must never cause the Skill to invent",
+            dark_rescue_context["special"]["instruction"],
+        )
+        self.assertIn(
+            "华尔街建筑风格",
+            dark_rescue_context["special"]["design_requirement_template"],
+        )
+        complete_dark_context = window._design_context()
+        template_dialog = DesignPageDialog(
+            window.runtime,
+            complete_dark_context,
+            complete_dark_context["media_capacity"],
+            window,
+        )
+        self.assertEqual(
+            template_dialog.requirement_edit.toPlainText().strip(),
+            dark_rescue_context["special"]["design_requirement_template"],
+        )
+        template_dialog.close()
+        template_dialog.deleteLater()
         window.special_combo.setCurrentIndex(0)
 
         creator_button = window.findChild(QPushButton, "specialSkillCreatorButton")
