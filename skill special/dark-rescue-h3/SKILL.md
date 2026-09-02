@@ -73,11 +73,38 @@ For every Shot state:
 - `environment_response` as a visible result of contact, force, water, wind, electricity or structural movement;
 - `continuity_state` with incoming and outgoing rescuer hand/tool state, victim pose, travel direction, door/obstruction state, flashlight direction and unresolved motion;
 - `optional_flourish` containing expendable mist, drifting paper, small sparks or secondary light motion;
-- `additional_direction` containing first-person visibility, performance, exposure and location rules.
+- `additional_direction` beginning with the exact `Strict first-person POV from S2's eye line` camera lock, followed by first-person visibility, performance, exposure and location rules.
+
+### Repeat `first-person POV` in Every Executable Shot Field
+
+Global camera constraints alone are insufficient. For every Shot, repeat the first-person identity across the exact executable fields that Studio emits. This repetition is mandatory because each field may independently influence the generated image, keyframe, action prompt, or H3 Segment.
+
+- `framing` must begin with: `Strict first-person POV from S2's eye line, ...`
+- `subject_action` must begin with: `S2's first-person POV ...`
+- `additional_direction` must begin with the exact camera lock and then state the permitted visible fragment, hand/tool state, head/body motion, flashlight direction, and what remains outside the field of view.
+- `h3_executable_action` must begin with: `S2's first-person POV ...` and preserve the same visible hand, tool, direction, and contact physics as `subject_action`.
+- When the schema includes `original_subject_action`, it must preserve the same `S2's first-person POV ...` wording rather than reducing the action to a neutral camera description.
+- Every location, obstruction, stairwell, room, doorway, rooftop, skyline, or Final Hold `media_request` must begin with: `A strict first-person POV reference image from S2's eye line ...`.
+
+Do not replace these repetitions with pronouns such as “the camera,” “the officer,” “we,” or “a viewer.” Use `first-person POV` literally in every required field. A Shot is invalid if any generated visual field lacks the explicit phrase or allows an external observer interpretation.
 
 At 15- and 30-second native boundaries, leave one clean outgoing physical state. The next Segment inherits it and immediately advances; it must not replay the door opening, climb, discovery, hand grasp, collapse or route decision. The preceding 24 frames are visual motion context only, never an audio reference.
 
 ## Lock First-person Continuity
+
+### Absolute `first-person POV` Camera Lock
+
+Every Shot and every generated H3 Segment must explicitly begin its camera or `additional_direction` field with this exact requirement:
+
+`Strict first-person POV from S2's eye line. The camera is physically inside S2's body and never leaves S2's point of view.`
+
+Treat this as a hard generation constraint, not a style preference. The audience only sees what S2 can physically see at that instant. Camera motion must be motivated only by S2 walking, breathing, crouching, climbing, turning their head, raising a tool, reaching, or making contact.
+
+The only permitted visible portions of S2 are physically plausible fragments: one or both gloved hands when free, one forearm, uniform sleeve, flashlight, radio, helmet rim, reflective strip, or one role-correct tool. Never reveal S2's face, full body, back, silhouette as an observer, reflection, or shadow in a way that creates an external viewpoint.
+
+Forbidden in every Shot: `third-person view`, `external camera`, `over-the-shoulder shot`, `hero shot`, `tracking shot`, `follow shot`, `drone shot`, `crane shot`, `orbit shot`, `security-camera view`, `wide observer view`, `camera outside S2's body`, or any camera position that S2 cannot physically occupy.
+
+Even an exterior arrival, skyline reveal, rooftop release, broken-window reveal, or location-establishing moment must remain strict `first-person POV`: it is seen from S2 standing at the doorway, street entrance, roof edge, window, or other physically reachable eye-line position.
 
 The camera remains the rescuer’s eye line. It may show only physically plausible fragments of the rescuer: wet or dusty gloves, a flashlight, radio, helmet rim, uniform sleeve, reflective strip, firefighter axe or one role-correct tool. Never cut to a third-person hero view, reveal the rescuer’s face, float outside the body or show both of the rescuer’s hands while one hand is holding the camera/tool impossibly.
 
@@ -165,7 +192,7 @@ Music never masks speech and uses no vocals unless the user explicitly requests 
 
 Use a stable Media Pool source only when it is actually loaded and selected. Cite it only by the exact authored `@P`, `@V` or `@A` ID. A simple request with no explicit `@ID` must never cause the Skill to invent `@P1`, `@P2`, `@V1` or `@A1`.
 
-Reuse valid loaded media before requesting new material. For first-person stories, do not waste an identity image on the unseen rescuer’s face; prioritize the trapped person’s stable identity, the location, a critical obstruction or a native boundary state. Every generated image request depicts exactly one frozen instant, the exact visible person count and the story’s real environment—not a neutral studio background or a sequence of actions.
+Reuse valid loaded media before requesting new material. For first-person stories, do not waste an identity image on the unseen rescuer’s face; prioritize the trapped person’s stable identity, the location, a critical obstruction or a native boundary state. Every generated location or action image request must start with `A strict first-person POV reference image from S2's eye line ...`, depict exactly one frozen instant, preserve the exact visible person count, and show the story’s real environment—not a neutral studio background or a sequence of actions.
 
 Time-scope location, damage, victim-pose and boundary references to the Shots that need them. Never let an earlier school, alley, hotel, tea room or office reference leak into a later location. The Virtual Media Pool may hold many logical sources, but each native Segment must remain within the actual 9 Picture / 3 Video / 3 Audio physical reference limit.
 
@@ -183,7 +210,11 @@ Before returning the Design JSON, verify:
 
 - the named location is fictionalized responsibly and uses the correct cultural/architectural module;
 - the responder profession matches the hazard and stays fixed;
-- the camera never leaves first person or reveals an impossible body configuration;
+- every Shot explicitly starts with `Strict first-person POV from S2's eye line`, and the camera never leaves first person or reveals an impossible body configuration;
+- every Shot repeats literal `first-person POV` wording in `framing`, `subject_action`, `additional_direction`, and `h3_executable_action`; `original_subject_action` repeats it when that schema field exists;
+- every location, obstruction, doorway, room, stairwell, rooftop, skyline and Final Hold media request begins with `A strict first-person POV reference image from S2's eye line`;
+- no Shot contains a third-person, external, over-the-shoulder, hero, tracking, follow, drone, crane, orbit, security-camera, or wide-observer camera view;
+- every exterior, rooftop, skyline, doorway and Final Hold is visibly framed from S2's physically reachable eye-line rather than an external establishing camera;
 - exactly one trapped person exists unless the user explicitly requests otherwise;
 - only S1 and S2 speak by default, and every exact line appears once in editable `text_layers`;
 - every five-second action budget is executable;

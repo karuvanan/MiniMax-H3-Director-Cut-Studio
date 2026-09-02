@@ -60,9 +60,36 @@ description: |
 
 每个Shot必须包含：一个故事职责、一个主要镜头运动或固定镜头、只写核心动作的 `subject_action`、只写接触后果的 `environment_response`、记录手部/工具/受困者/路线/手电方向和未完成运动的 `continuity_state`、可省略的雾气/纸张/小火花/次要灯光，以及第一人称可见范围、表演和曝光规则。
 
+### 每个可执行镜头字段重复 `first-person POV`
+
+只在全局写第一人称规则并不够。每个Shot都必须在Studio会输出的可执行字段中重复第一人称身份；因为每个字段都可能独立影响生成图片、关键帧、动作提示词或H3 Segment。
+
+- `framing` 必须以这句话开始：`Strict first-person POV from S2's eye line, ...`
+- `subject_action` 必须以这句话开始：`S2's first-person POV ...`
+- `additional_direction` 必须以完整镜头锁定句开始，然后说明允许出现的身体局部、手部或工具状态、头部/身体运动、手电方向，以及画外必须保持不可见的内容。
+- `h3_executable_action` 必须以这句话开始：`S2's first-person POV ...`，并与 `subject_action` 保持相同的可见手部、工具、移动方向和接触物理。
+- schema存在 `original_subject_action` 时，该字段也必须保留 `S2's first-person POV ...`，不能降级为中性的摄影机描述。
+- 每个地点、障碍、楼梯、房间、门口、天台、天际线或Final Hold的 `media_request` 必须以这句话开始：`A strict first-person POV reference image from S2's eye line ...`。
+
+禁止用“镜头”“警察”“我们”或“观众”等代词取代以上重复。每个必填字段都必须逐字包含 `first-person POV`；任何一个视觉字段缺少该文字或允许外部观察者理解时，该Shot均视为不合格。
+
 15秒与30秒边界前留下一个清楚的物理状态。下一段继承后马上推进，禁止重复开门、攀爬、发现、牵手、坍塌或改道。上一段24帧只能作为视觉运动上下文，不能成为声音参考。
 
 ## 锁定第一人称连续性
+
+### 绝对 `first-person POV` 镜头锁定
+
+每个Shot和每个生成的H3 Segment，其镜头描述或 `additional_direction` 都必须以以下英文原句开始：
+
+`Strict first-person POV from S2's eye line. The camera is physically inside S2's body and never leaves S2's point of view.`
+
+这是一条硬性生成限制，而不是风格偏好。观众只能看见S2在该瞬间以身体和眼睛实际能看见的内容。镜头运动只能由S2走路、呼吸、下蹲、攀爬、转头、抬工具、伸手或接触物体造成。
+
+S2只能以合理身体局部出现：空闲时的一只或两只戴手套的手、一只前臂、制服袖口、手电筒、对讲机、头盔边缘、反光条或一件符合职业的工具。禁止出现S2的脸、全身、背影、作为旁观者的剪影、反射或会造成外部摄影机理解的影子。
+
+每个Shot严格禁止：`third-person view`、`external camera`、`over-the-shoulder shot`、`hero shot`、`tracking shot`、`follow shot`、`drone shot`、`crane shot`、`orbit shot`、`security-camera view`、`wide observer view`、`camera outside S2's body`，以及任何S2身体不可能实际到达的摄影机位置。
+
+即使是外部到达、天际线、天台释放、破窗或地点建立画面，也必须保持严格 `first-person POV`：只能从S2站在门口、街道入口、屋顶边缘、窗前或其他实际可到达的视线位置拍摄。
 
 镜头始终是救援者眼睛位置。只能合理看到湿污手套、手电筒、对讲机、头盔边缘、制服袖口、反光条、消防斧或一件符合职业的工具。禁止切到第三人称英雄镜头、看见救援者脸、镜头离体漂浮，或在一只手持工具时又出现不可能的双手配置。
 
@@ -139,7 +166,7 @@ description: |
 
 只有素材真实加载并选中时才使用其稳定Media Pool编号，而且只能引用用户实际写出的 `@P`、`@V` 或 `@A`。简单需求没有明确 `@ID` 时，Skill绝对不能自行发明 `@P1`、`@P2`、`@V1` 或 `@A1`。
 
-先复用有效素材，再请求缺失素材。第一人称救援不应浪费图片建立看不见的救援者脸；优先保持受困者身份、地点、关键障碍或原生边界状态。每张生成参考图只能显示一个冻结瞬间、正确人物数量及真实剧情环境，禁止中性摄影棚背景或一张图描述连续动作。
+先复用有效素材，再请求缺失素材。第一人称救援不应浪费图片建立看不见的救援者脸；优先保持受困者身份、地点、关键障碍或原生边界状态。每一张地点或动作生成参考图都必须以 `A strict first-person POV reference image from S2's eye line ...` 开始，只显示一个冻结瞬间、正确人物数量及真实剧情环境，禁止中性摄影棚背景或一张图描述连续动作。
 
 地点、损坏、受困姿势和边界参考必须限制在需要的Shot。禁止前段校舍、暗巷、旅馆、茶室或办公室素材污染后段地点。Virtual Media Pool可容纳很多逻辑素材，但每个原生Segment仍必须遵守9 Picture／3 Video／3 Audio实体参考限制。
 
@@ -155,7 +182,11 @@ Constraints必须明确保护第一人称镜头、人物身份、制服、工具
 
 - 地点已负责任地虚构化，并使用正确文化/建筑模块；
 - 职业符合灾害且全程不变；
-- 镜头从未离开第一人称，也没有不可能的身体配置；
+- 每个Shot都以 `Strict first-person POV from S2's eye line` 明确开头，镜头从未离开第一人称，也没有不可能的身体配置；
+- 每个Shot在 `framing`、`subject_action`、`additional_direction` 和 `h3_executable_action` 都逐字重复 `first-person POV`；存在 `original_subject_action` 时也必须重复；
+- 每个地点、障碍、门口、房间、楼梯、天台、天际线和Final Hold媒体请求都以 `A strict first-person POV reference image from S2's eye line` 开始；
+- 不出现第三人称、外部摄影机、过肩、英雄、跟拍、航拍、摇臂、环绕、监控或广角旁观者镜头；
+- 外部、屋顶、天际线、门口和Final Hold都必须从S2实际可到达的眼睛位置取景，而非外部建立镜头；
 - 除非用户明确要求，否则只有一名受困者；
 - 默认只有S1/S2说话，每句逐字台词只在可编辑 `text_layers` 出现一次；
 - 每5秒动作预算可执行；
