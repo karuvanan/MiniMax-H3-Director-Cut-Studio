@@ -217,6 +217,20 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         template_dialog.close()
         template_dialog.deleteLater()
+        authored_context = deepcopy(complete_dark_context)
+        authored_context["design_requirement"] = "Keep this authored requirement unchanged."
+        authored_dialog = DesignPageDialog(
+            window.runtime,
+            authored_context,
+            authored_context["media_capacity"],
+            window,
+        )
+        self.assertEqual(
+            authored_dialog.requirement_edit.toPlainText(),
+            "Keep this authored requirement unchanged.",
+        )
+        authored_dialog.close()
+        authored_dialog.deleteLater()
         window.special_combo.setCurrentIndex(0)
 
         creator_button = window.findChild(QPushButton, "specialSkillCreatorButton")
