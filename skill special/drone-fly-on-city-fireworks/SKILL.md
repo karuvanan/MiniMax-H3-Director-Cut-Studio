@@ -30,7 +30,7 @@ Default to one smooth wide clockwise orbit around the named landmark while gradu
 - keep the target readable and the horizon level;
 - use natural parallax and exposure adaptation;
 - avoid towers, roofs, cables, trees, traffic and people;
-- finish high on the right, centre the landmark, decelerate and hold for one second.
+- finish the moving orbit high on the right, let the active sequence finish, then return to P1's exact original camera position and composition for the final one-second plate hold.
 
 Never reverse direction, repeat the orbit, teleport, pass through architecture or allow the skyline geometry to flicker.
 
@@ -48,7 +48,7 @@ For 15 seconds, prefer three phases:
 
 1. **Approach / ignition**: establish the landmark and begin the orbit; only a few distant rooftop launches appear.
 2. **Side reveal / escalation**: gold, white and deep-red bursts expand behind and above the towers; glass and wet streets respond.
-3. **High-right finale**: the orbit resolves; one large golden chrysanthemum blooms behind the spires, followed by a stable one-second Final Hold.
+3. **High-right finale / P1 return**: the moving orbit resolves and its fireworks complete; earlier smoke disperses while the camera returns to P1's exact original composition. The final second directly displays the immutable P1 plate with a new frozen celebration-effect layer.
 
 Scale the phases proportionally for other durations. Do not make every Shot a new location or reset the fireworks between cuts.
 
@@ -66,11 +66,11 @@ Fireworks are visible environmental events, never graphic overlays. For every Sh
 
 Each shell follows physical order: a distant launch source or rising spark, aerial burst, expanding particles, delayed boom according to distance, falling embers, smoke drift and fading reflections. Bursts occur behind or above the landmark and must not touch, wrap around, emerge from, replace or deform the towers. Avoid a continuous wall of fireworks: keep skyline depth, negative space and readable architecture.
 
-The final golden chrysanthemum is a discrete radial particle blossom behind the spires. It is not an orbit ring, halo, solid disc, neon loop, energy circle or light ribbon. Smoke left by earlier bursts remains and drifts consistently instead of vanishing at a cut.
+The final plate's gold/white/deep-red bursts are discrete radial particle blossoms behind and above the spires. They are not orbit rings, halos, solid discs, neon loops, energy circles or light ribbons. Smoke in the moving sequence drifts consistently; the earlier moving smoke may fully disperse during the return, after which the final plate receives only its own thin frozen smoke layer.
 
-## 5. Scene Keyframe Chain
+## 5. Scene Keyframe Chain and Immutable P1 Effects Plate
 
-With only P1/P2, use one visual scene and do not force extra keyframes. If the user has loaded and selected P3/P4/P5 or later city-scene Pictures, treat them as an ordered user-authored chain while skipping analysis-only P2:
+With only P1/P2, use P1 for the moving scene and create one terminal P1 effects plate. If the user has loaded and selected P3/P4/P5 or later city-scene Pictures, treat them as an ordered user-authored chain while skipping analysis-only P2:
 
 - each scene Picture owns one disjoint `time_scoped` interval;
 - no future Picture is loaded while an earlier interval renders;
@@ -80,7 +80,9 @@ With only P1/P2, use one visual scene and do not force extra keyframes. If the u
 - create exactly one automatic environment-only terminal keyframe after the latest user anchor;
 - leave its Picture ID unassigned so Studio chooses the next genuinely empty P slot.
 
-The automatic terminal image inherits the last scene's skyline, fireworks phase, smoke, reflections, exposure and outgoing camera position. It never introduces a person or changes the city.
+The terminal request must set `source_plate_media_id="P1"`, `source_plate_mode="immutable_effect_composite"`, `source_plate_effect_profile="fireworks"`, `immutable_scene_plate=true` and `final_hold_seconds=1.0`. It does not inherit or redesign the last scene. P1 is the immutable scene plate: preserve its exact camera position, altitude, focal length, framing, horizon height, landmark size/spacing, skyline geometry, roads, buildings, weather, cool-blue grade, baseline exposure, contrast and original city lights. Add only separate fireworks particles, thin smoke and permitted warm reflection/illumination effects on top. The final second is perfectly static.
+
+The moving fireworks and earlier smoke complete and disperse during the transition back to P1. The terminal plate then shows a newly composed frozen celebration moment; this effect layer is not motion history and cannot move or reshape P1 pixels. It never introduces a person or changes the city.
 
 ## 6. Z-Image Still Isolation
 
@@ -107,7 +109,7 @@ Compile each Segment into a single chronological English H3 prompt. Match visual
 1. establish P1's city geometry, landmark, cool-blue night grade, realistic architecture and wide-angle aerial lens;
 2. describe the continuous physical flight and one clockwise orbit;
 3. describe distinct gold, white and deep-red particle bursts behind/above the skyline, smoke drift, glass/wet-street reflections and natural exposure adaptation;
-4. resolve at the high-right finale with the golden chrysanthemum and one-second hold;
+4. resolve the moving sequence high-right, disperse its earlier smoke, return to P1's exact original framing, then display the immutable P1-plus-effects plate for one second;
 5. end with positive clean-frame language: realistic unobstructed city imagery, non-visual planning controls kept off-screen, stable horizon, coherent city geometry and continuous aerial inertia.
 
 Do not name P2, red routes, waypoint graphics or the Z-Image negative list in the final H3 prompt. Do not add people, text, subtitles, logos, watermarks, duplicate towers, cartoon styling, unexplained spotlights or extra landmarks.
@@ -124,11 +126,11 @@ Before returning a Design:
 
 - P1 is the only scene master; P2 is registered `analysis_only` and absent from visual loaders.
 - Shots cover the complete duration without gaps/overlap and use one main camera movement each.
-- There is exactly one continuous 360-degree orbit and one final one-second hold.
+- There is exactly one continuous 360-degree orbit, one return to P1's exact original composition and one final one-second immutable-plate hold.
 - Landmark count, spacing and architecture remain stable; no collision or geometry flicker occurs.
 - Fireworks remain discrete sky particles behind/above buildings, with continuous smoke, reflections and exposure state.
 - Generated Pictures contain no orbit/yaw/trajectory clause in ordinary prompt text or keywords and carry both still contracts plus the dedicated negative prompt.
 - The final H3 prompt retains the true camera orbit but contains no route graphics, negative-prompt catalogue or visible control layer.
 - Multi-scene keyframes own disjoint ranges; future Pictures and previous audio never cross the wrong Segment boundary.
 - Native firework sound belongs to visible events and is not cut at Shot boundaries.
-
+- The terminal Picture is produced from P1's local pixels with effect-only compositing; it is never a text-to-image reinterpretation of the city.
