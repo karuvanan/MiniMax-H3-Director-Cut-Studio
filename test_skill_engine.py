@@ -78,6 +78,14 @@ class SkillEngineTests(unittest.TestCase):
     def test_analysis_only_special_discovery_text_never_primes_h3_pixels(self):
         special = self.profiles["drone-fly-on-city"]
         self.assertIn("red route", special.description.lower())
+        skill_text = special.path.read_text(encoding="utf-8-sig")
+        self.assertIn(
+            "The drone flight path is implied only through camera motion",
+            skill_text,
+        )
+        self.assertIn("visible flight path, orbit ring, circular light trail", skill_text)
+        self.assertIn("Still-reference Isolation", skill_text)
+        self.assertIn("专用Z-Image负面提示词", special.design_requirement_template)
         prompt = build_ref2va_prompt(
             PromptSpec(
                 brief="A clean city flyover.",
@@ -94,6 +102,32 @@ class SkillEngineTests(unittest.TestCase):
         self.assertNotIn("waypoint marker", prompt.lower())
         self.assertNotIn(special.description, prompt)
         self.assertIn("approved Drone Fly On City Director cues", prompt)
+
+    def test_drone_fireworks_profile_preserves_route_isolation_and_effect_ledger(self):
+        special = self.profiles["drone-fly-on-city-fireworks"]
+        self.assertFalse(special.standalone)
+        self.assertIn("fireworks", special.description.lower())
+        self.assertIn("Fireworks Physics and Continuity Ledger", special.instruction)
+        self.assertIn("separate radial particle bursts", special.instruction)
+        self.assertIn("usage=\"analysis_only\"", special.instruction)
+        self.assertIn("专用Z-Image负面提示词", special.design_requirement_template)
+        self.assertIn("金色菊花烟花", special.design_requirement_template)
+        prompt = build_ref2va_prompt(
+            PromptSpec(
+                brief="A photoreal night skyline celebration.",
+                style="Cool blue city light with warm gold fireworks.",
+                shots=[
+                    "A smooth clockwise orbit rises while discrete fireworks bloom behind the towers."
+                ],
+            ),
+            [],
+            15.0,
+            self.profiles[DEFAULT_SKILL],
+            special,
+        )
+        self.assertNotIn("red route", prompt.lower())
+        self.assertNotIn("route graphics", prompt.lower())
+        self.assertIn("approved Drone Fly On City Fireworks Director cues", prompt)
 
     def test_every_special_skill_has_an_editable_design_requirement_template(self):
         special_profiles = [profile for profile in self.profiles.values() if profile.special]
@@ -204,6 +238,86 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("No rescuer-eye POV", no_pov.instruction)
         self.assertIn("no-POV外部电影摄影机", no_pov.design_requirement_template)
         self.assertNotIn("The camera is physically inside S2", no_pov.instruction)
+
+    def test_live_action_arcade_fighter_special_has_executable_short_fight_contract(self):
+        profile = self.profiles["street-fighter-live-action-h3"]
+        self.assertTrue(profile.special)
+        self.assertFalse(profile.standalone)
+        self.assertIn("准确45.00秒的电影级真人街机格斗短片", profile.design_requirement_template)
+        self.assertIn("12个编号近身攻防动作", profile.design_requirement_template)
+        self.assertIn("36个编号且不重复的Combat Beat", profile.design_requirement_template)
+        self.assertIn("单腿抱摔", profile.design_requirement_template)
+        self.assertIn("切换双腿抱摔", profile.design_requirement_template)
+        self.assertIn("上位压制", profile.design_requirement_template)
+        self.assertIn("MMA露指拳套", profile.design_requirement_template)
+        self.assertIn("三个Segment沿同一条可见路线", profile.design_requirement_template)
+        self.assertIn("IES工业灯管", profile.design_requirement_template)
+        self.assertIn("舞台Spot Light", profile.design_requirement_template)
+        system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
+        for phrase in (
+            "Live-action Arcade Fighter H3 Director",
+            "15-second structure",
+            "30-second structure",
+            "45-second structure — three different phases, 36 non-repeating beats",
+            "Action Ledger",
+            "open-finger MMA gloves",
+            "Sealed industrial vertical-maze environment",
+            "Environment Ledger",
+            "IES-profiled industrial tubes",
+            "exactly 12 numbered combat beats",
+            "Four-style Close-combat Grammar",
+            "Karate",
+            "Judo",
+            "Jeet Kune Do",
+            "Wing Chun",
+            "MMA Ground-game Variant",
+            "single- or double-leg capture",
+            "Grappling control",
+            "Ground-and-pound",
+            "Submission",
+            "visible tap and immediate release",
+            "At least 80%",
+            "no more than 1.0 second",
+            "Do not use a theatre spotlight",
+            "body load → release trajectory → contact point → recovery/result",
+            "Projectile palm burst",
+            "Rotating kick",
+            "preceding 24 frames are silent visual motion context only",
+            "two principal fighters only",
+            "Never bake uncontrolled text",
+            "Director Design JSON Contract",
+        ):
+            self.assertIn(phrase, system)
+        folder = profile.path.parent
+        chinese = (folder / "SKILL.cn.md").read_text(encoding="utf-8-sig")
+        for phrase in (
+            "15秒",
+            "30秒",
+            "45秒——三个不同阶段、36个不重复Beat",
+            "Action Ledger",
+            "露指MMA拳套",
+            "上锁工业垂直迷宫环境",
+            "Environment Ledger",
+            "IES工业灯管",
+            "准确12个",
+            "四种近身攻防语法",
+            "空手道",
+            "柔道",
+            "截拳道",
+            "咏春",
+            "MMA地面战变体",
+            "抱摔（Takedown）",
+            "地面压制（Grappling Control）",
+            "地面打击（Ground and Pound）",
+            "关节／绞技（Submission）",
+            "至少80%",
+            "舞台Spot Light",
+            "身体蓄力",
+            "掌心能量弹",
+            "旋转踢",
+            "Virtual Media Pool",
+        ):
+            self.assertIn(phrase, chinese)
 
     def test_long_form_special_is_default_bound_and_batch_boundary_safe(self):
         profile = self.profiles["long-form-h3-director"]

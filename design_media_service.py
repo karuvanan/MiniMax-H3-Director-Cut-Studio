@@ -28,6 +28,15 @@ def image_workflow(
     template: dict | None = None,
 ) -> dict:
     positive = request.get("prompt", "").strip()
+    negative_parts = [
+        str(value).strip(" ,")
+        for value in (
+            settings.get("negative_prompt", ""),
+            request.get("negative_prompt", ""),
+        )
+        if str(value).strip(" ,")
+    ]
+    negative = ", ".join(dict.fromkeys(negative_parts))
     keywords = ", ".join(request.get("subject_keywords") or [])
     if keywords:
         positive = f"{positive}. Key subjects: {keywords}."
@@ -52,6 +61,17 @@ def image_workflow(
         _latent_id, latent_node = require_node("EmptySD3LatentImage")
         _save_id, save_node = require_node("SaveImage")
         prompt_node["inputs"]["text"] = positive
+        if negative:
+            numeric_ids = [int(node_id) for node_id in workflow if str(node_id).isdigit()]
+            negative_id = str(max(numeric_ids, default=0) + 1)
+            workflow[negative_id] = {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": negative,
+                    "clip": deepcopy(prompt_node["inputs"].get("clip")),
+                },
+            }
+            sampler_node["inputs"]["negative"] = [negative_id, 0]
         sampler_node["inputs"].update({
             "seed": seed,
             "steps": int(settings["steps"]),
@@ -83,7 +103,7 @@ def image_workflow(
         },
         "3": {
             "class_type": "CLIPTextEncode",
-            "inputs": {"text": settings.get("negative_prompt", ""), "clip": ["1", 1]},
+            "inputs": {"text": negative, "clip": ["1", 1]},
         },
         "4": {
             "class_type": "EmptyLatentImage",

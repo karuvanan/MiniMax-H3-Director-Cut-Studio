@@ -2,6 +2,33 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.2-alpha.3] - 2026-09-03
+
+### Drone still-reference orbit-ring isolation
+
+- Split camera-motion planning from Z-Image still composition for `drone-fly-on-city`. Sentences and subject keywords describing a 360-degree orbit, orbital yaw, route or trajectory are removed from generated still-reference requests while the real H3 video Shot keeps its intended orbit movement.
+- Added a mandatory clean-frame contract stating that the drone path is implied only through camera motion, plus a request-scoped Z-Image negative prompt covering visible flight paths, orbit rings, circular light trails, glowing ellipses, HUD graphics and neon loops.
+- The active Z-Image ComfyUI template now receives request-specific negative conditioning instead of silently ignoring it. Right-click Z-Image regeneration applies the same protection to old drone reference Pictures without changing their stable `P` mapping.
+
+### Drone city-fireworks Special Skill
+
+- Added `drone-fly-on-city-fireworks`, a Default-bound night-city aerial celebration Skill that combines the proven P1 scene-master/P2 analysis-only route contract with one physically plausible 360-degree landmark orbit.
+- Added a per-Shot fireworks continuity ledger covering launch and burst position, gold/white/deep-red particle phase, smoke drift, façade/wet-street reflections, exposure response and distance-delayed native firework sound.
+- Added fireworks-aware Z-Image still isolation. Static references retain discrete chrysanthemum bursts and smoke while camera-orbit clauses are removed; an additional request-scoped negative contract rejects continuous firework rings, tower-wrapping effects, fused landmarks and solid neon fireworks.
+- Added English/Chinese Skill instructions, an editable 15-second Petronas Twin Towers Design Requirement template, common Scene Keyframe Chain support and regression coverage for Design normalization, H3 motion retention and right-click Z-Image regeneration.
+
+### Live-action arcade fighter Special Skill
+
+- Added `street-fighter-live-action-h3`, a Default-bound Special Skill for 15-45 second live-action arcade martial-arts film scenes. It distils the supplied 2026 trailer reference into reusable original production grammar rather than copying its edit: two readable fighters, grounded live-action materials, bold tournament staging and selectively heightened signature attacks.
+- Added a deterministic seven-Shot, 12-Beat close-combat structure per 15 seconds: one eye-level establishing Wide capped at 1.0 second followed by six Close-up/Extreme close-up action Shots carrying two beats each. A 30-second design uses two continuous, non-repeating 12-Beat Segments and a stable two-fighter identity/style/ability ledger.
+- Added move-specific execution rules for compact palm projectiles, rotating kicks, forward rolling attacks, close electric strikes and rapid hand strikes, with physically motivated light, Foley and post-contact environment response.
+- Added English/Chinese Skill instructions, an editable 15-second Design Requirement template and regression coverage for profile loading, binding, action budgeting, Segment continuity, visible-text control and Virtual Media Pool mapping.
+- Added fixed Karate, Judo, Jeet Kune Do and Wing Chun attack/defence reversals, contact-driven water splashes, sourced smoke, grounded cyberpunk practical lighting and an explicit ban on stage spotlights.
+- Added an optional MMA ground-game branch inside the same 12-Beat budget: visible level change and single/double-leg capture, controlled takedown, locked top/bottom control, a maximum two-contact ground-and-pound burst, controlled submission, visible tap and immediate release. Ground-state continuity now records top/bottom identity, head direction, screen side, grip ownership and simple leg position across cuts.
+- Extended the Skill to 45 seconds using three connected native Segments, 21 Shots and a 36-entry global Action Ledger. Duplicate technique/target/outcome combinations must be rewritten rather than disguised through a new camera angle or visual effect.
+- Replaced generic gloves with locked open-finger MMA glove geometry: visible separate fingers for grappling, compact padded knuckles, rounded streamlined shell, secured wrist wrap and persistent wet grime along the lower cuff.
+- Added a reference-derived fictional sealed industrial vertical-maze environment across a lower service corridor, flooded utility landing and upper maintenance catwalk. Per-Shot environment state now preserves gates, cable/pipe landmarks, wet patches, mould/rust, IES-profiled practical lights, alarms, steam sources and contact-displaced debris while allowing one causal environment change per Shot.
+
 ## [0.3.2-alpha.2] - 2026-09-03
 
 ### Dark rescue camera-mode repair

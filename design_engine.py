@@ -2996,6 +2996,94 @@ def _remove_control_artifact_priming(text: object) -> str:
     return " ".join(result.split())
 
 
+DRONE_STILL_CLEAN_FRAME_CONTRACT = (
+    "The drone flight path is implied only through camera motion and must never be visible "
+    "in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory "
+    "line, no HUD, no graphic overlay around the towers."
+)
+DRONE_STILL_NEGATIVE_PROMPT = (
+    "visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, "
+    "trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings"
+)
+DRONE_FIREWORKS_STILL_CONTRACT = (
+    "Fireworks are separate radial particle bursts located behind and above the skyline, with "
+    "individual sparks, natural smoke and physically plausible reflections; they never form a "
+    "continuous ring, ribbon, ellipse or flight path around any building."
+)
+DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT = (
+    "continuous firework ring around buildings, fireworks forming a flight path, fireworks "
+    "wrapped around towers, solid neon fireworks, duplicated landmark, fused towers"
+)
+DRONE_SPECIAL_SKILL_KEYS = frozenset({
+    "drone-fly-on-city",
+    "drone-fly-on-city-fireworks",
+})
+_DRONE_STILL_MOTION_PRIMING_RE = re.compile(
+    r"(?:360\s*(?:°|degrees?|[- ]degree)?|full\s+(?:circle|rotation)|"
+    r"orbit(?:al|ing)?|yaw(?:ing)?|waypoints?|"
+    r"flight\s+path|camera\s+path|trajectory|route[- ]following|route\s+path|"
+    r"(?:circle|circular)\s+(?:path|route|motion|track|arc|loop|ring)|"
+    r"light\s+(?:trail|ribbon)|glowing\s+ellipse|energy\s+ring|neon\s+loop)",
+    flags=re.I,
+)
+
+
+def is_drone_special_skill(value: object) -> bool:
+    return str(value or "").strip().casefold() in DRONE_SPECIAL_SKILL_KEYS
+
+
+def sanitize_drone_still_image_request(
+    request: dict,
+    *,
+    fireworks: bool = False,
+) -> dict:
+    """Keep drone camera motion from becoming pixels in a generated still.
+
+    A T2I reference is one frozen environment state.  Sentences describing a
+    360-degree orbit, yaw path or trajectory often become literal rings around
+    buildings, even when the route-control Picture itself is correctly marked
+    analysis-only.  Remove those motion-bearing sentences from the still prompt,
+    preserve environment sentences, and add an explicit clean-frame contract.
+    The detailed artifact list remains in the dedicated negative prompt and is
+    never copied into the later H3 video prompt.
+    """
+
+    result = dict(request)
+    original = " ".join(str(result.get("prompt", "") or "").split())
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?。！？])\s+", original)
+        if part.strip()
+    ]
+    kept = [part for part in sentences if not _DRONE_STILL_MOTION_PRIMING_RE.search(part)]
+    if kept:
+        prompt = " ".join(kept)
+    else:
+        prompt = (
+            "Photoreal frozen aerial city reference frame with coherent architecture, roads, "
+            "skyline, weather, natural lighting, colour grade and a stable level horizon."
+        )
+    if DRONE_STILL_CLEAN_FRAME_CONTRACT not in prompt:
+        prompt = prompt.rstrip(" .") + ". " + DRONE_STILL_CLEAN_FRAME_CONTRACT
+    if fireworks and DRONE_FIREWORKS_STILL_CONTRACT not in prompt:
+        prompt = prompt.rstrip(" .") + ". " + DRONE_FIREWORKS_STILL_CONTRACT
+    result["prompt"] = prompt
+
+    clean_keywords: list[str] = []
+    for value in _string_list(result.get("subject_keywords") or []):
+        if _DRONE_STILL_MOTION_PRIMING_RE.search(value):
+            continue
+        clean_keywords.append(value)
+    result["subject_keywords"] = clean_keywords
+
+    existing_negative = str(result.get("negative_prompt", "") or "").strip(" ,")
+    negative_parts = [part for part in (existing_negative, DRONE_STILL_NEGATIVE_PROMPT) if part]
+    if fireworks:
+        negative_parts.append(DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT)
+    result["negative_prompt"] = ", ".join(dict.fromkeys(negative_parts))
+    return result
+
+
 _DARK_RESCUE_POV_LOCK = (
     "Strict first-person POV from S2's eye line. The camera is physically inside "
     "S2's body and never leaves S2's point of view."
@@ -4237,6 +4325,10 @@ def normalize_design_plan(
             "subject_keywords": keywords,
             "prompt": prompt,
         }
+        if media_type == "image" and str(raw.get("negative_prompt", "")).strip():
+            normalized_request["negative_prompt"] = str(
+                raw.get("negative_prompt", "")
+            ).strip()
         for metadata_key in (
             "identity_anchor", "identity_anchor_requirement_id", "identity_anchor_media_id",
         ):
@@ -4256,10 +4348,17 @@ def normalize_design_plan(
         plan["_speech_timing_base_duration"] = float(
             source.get("_speech_timing_base_duration", duration)
         )
-    if str(special_skill_key).strip().casefold() == "drone-fly-on-city":
+    if is_drone_special_skill(special_skill_key):
+        fireworks = str(special_skill_key).strip().casefold() == "drone-fly-on-city-fireworks"
         enforce_drone_scene_keyframe_chain(
             plan, existing_media, selected_media_ids=selected_media_ids
         )
+        plan["media_requests"] = [
+            sanitize_drone_still_image_request(row, fireworks=fireworks)
+            if isinstance(row, dict) and row.get("media_type") == "image"
+            else row
+            for row in plan.get("media_requests") or []
+        ]
     if str(special_skill_key).strip().casefold() == "dark-rescue-h3":
         enforce_dark_rescue_first_person(plan)
     stabilize_generated_identity_references(plan)

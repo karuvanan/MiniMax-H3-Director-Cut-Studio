@@ -9,6 +9,10 @@ from design_cleanup_service import cleanup, lm_origin, unload_lm_studio
 from design_ai_service import handle as handle_design_ai_job, select_available_model
 from design_engine import (
     DESIGN_JSON_SCHEMA,
+    DRONE_FIREWORKS_STILL_CONTRACT,
+    DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT,
+    DRONE_STILL_CLEAN_FRAME_CONTRACT,
+    DRONE_STILL_NEGATIVE_PROMPT,
     H3_STABLE_DIALOGUE_LANGUAGES,
     DesignDialogueLanguageContractError,
     DesignDurationContractError,
@@ -33,6 +37,7 @@ from design_engine import (
     normalize_design_plan,
     protect_explicit_timed_text_layers,
     reconcile_requested_speech_layer_contract,
+    sanitize_drone_still_image_request,
     speech_timing_budget,
     spatial_acoustics_profile,
     spatial_acoustics_schedule,
@@ -1341,6 +1346,43 @@ On-screen text: "EXACT TITLE"'''
             any("RTXVideoSuperResolution" in row.get("class_type", "") for row in workflow.values())
         )
 
+    def test_z_image_template_receives_request_specific_negative_prompt(self):
+        template = json.loads(
+            (PROJECT_ROOT / "Z-Image_Text2Image_for_webui_t2i_api.json").read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        workflow = image_workflow(
+            {
+                "prompt": "A clean frozen Kuala Lumpur skyline at blue hour.",
+                "subject_keywords": ["Kuala Lumpur skyline"],
+                "negative_prompt": DRONE_STILL_NEGATIVE_PROMPT,
+            },
+            {
+                "checkpoint": "z_image_turbo_bf16.safetensors",
+                "width": 768,
+                "height": 1024,
+                "steps": 8,
+                "cfg": 1.0,
+                "negative_prompt": "blurry",
+            },
+            4321,
+            "h3_design/drone_still",
+            template,
+        )
+        sampler = next(
+            node for node in workflow.values() if node.get("class_type") == "KSampler"
+        )
+        negative_link = sampler["inputs"]["negative"]
+        negative_node = workflow[str(negative_link[0])]
+        self.assertEqual(negative_node["class_type"], "CLIPTextEncode")
+        self.assertIn("blurry", negative_node["inputs"]["text"])
+        self.assertIn("orbit ring", negative_node["inputs"]["text"])
+        self.assertIn("neon loop around buildings", negative_node["inputs"]["text"])
+        self.assertEqual(
+            negative_node["inputs"]["clip"], workflow["6"]["inputs"]["clip"]
+        )
+
     def test_z_image_patching_finds_nodes_by_class_type_not_fixed_ids(self):
         template = {
             "prompt-any-id": {"class_type": "CLIPTextEncode", "inputs": {"text": "old"}},
@@ -2286,6 +2328,101 @@ On-screen text: "EXACT TITLE"'''
         self.assertNotIn("identity_anchor", terminal)
         self.assertIn("AUTO TERMINAL KEYFRAME", terminal["prompt"])
         self.assertIn("harbour towers at blue hour", terminal["prompt"])
+        self.assertIn(DRONE_STILL_CLEAN_FRAME_CONTRACT, terminal["prompt"])
+        self.assertEqual(terminal["negative_prompt"], DRONE_STILL_NEGATIVE_PROMPT)
+
+    def test_drone_still_reference_removes_motion_trajectory_priming(self):
+        request = sanitize_drone_still_image_request({
+            "requirement_id": "city_orbit_reference",
+            "media_type": "image",
+            "subject_keywords": [
+                "Kuala Lumpur skyline",
+                "360-degree orbit",
+                "visible orbit ring",
+            ],
+            "prompt": (
+                "Photoreal Kuala Lumpur skyline at blue hour. "
+                "The camera completes one seamless full 360-degree orbital yaw around the towers. "
+                "Stable exposure and detailed architecture."
+            ),
+        })
+        self.assertIn("Photoreal Kuala Lumpur skyline", request["prompt"])
+        self.assertIn("Stable exposure and detailed architecture", request["prompt"])
+        self.assertNotIn("orbital yaw", request["prompt"])
+        self.assertIn(DRONE_STILL_CLEAN_FRAME_CONTRACT, request["prompt"])
+        self.assertEqual(request["subject_keywords"], ["Kuala Lumpur skyline"])
+        self.assertEqual(request["negative_prompt"], DRONE_STILL_NEGATIVE_PROMPT)
+
+        payload = sample_design()
+        payload["shots"][0]["camera_movement"] = (
+            "One continuous 360-degree orbital yaw around the central tower"
+        )
+        payload["media_requests"][0].update({
+            "subject_keywords": ["city skyline", "360-degree orbit"],
+            "prompt": (
+                "Photoreal city skyline at blue hour. The camera follows a 360-degree orbit "
+                "around the central tower. Stable architecture and clean natural lights."
+            ),
+        })
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            special_skill_key="drone-fly-on-city",
+        )
+        self.assertIn("360-degree orbital yaw", plan["shots"][0]["camera_movement"])
+        still_request = next(
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        )
+        self.assertNotIn("camera follows a 360-degree orbit", still_request["prompt"])
+        self.assertIn(DRONE_STILL_CLEAN_FRAME_CONTRACT, still_request["prompt"])
+
+    def test_drone_fireworks_still_keeps_bursts_but_removes_camera_orbit(self):
+        request = sanitize_drone_still_image_request(
+            {
+                "media_type": "image",
+                "subject_keywords": [
+                    "gold chrysanthemum fireworks",
+                    "clockwise orbital yaw",
+                    "wet street reflections",
+                ],
+                "prompt": (
+                    "Photoreal Petronas Twin Towers at night. "
+                    "The camera performs a wide clockwise orbital yaw around the towers. "
+                    "Gold chrysanthemum fireworks bloom behind the spires with natural smoke "
+                    "and wet-street reflections."
+                ),
+            },
+            fireworks=True,
+        )
+        self.assertNotIn("orbital yaw", request["prompt"])
+        self.assertIn("Gold chrysanthemum fireworks", request["prompt"])
+        self.assertIn(DRONE_STILL_CLEAN_FRAME_CONTRACT, request["prompt"])
+        self.assertIn(DRONE_FIREWORKS_STILL_CONTRACT, request["prompt"])
+        self.assertNotIn("clockwise orbital yaw", request["subject_keywords"])
+        self.assertIn("gold chrysanthemum fireworks", request["subject_keywords"])
+        self.assertIn(DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT, request["negative_prompt"])
+
+        payload = sample_design()
+        payload["shots"][0]["camera_movement"] = (
+            "One smooth clockwise 360-degree orbit around the Petronas Twin Towers"
+        )
+        payload["media_requests"][0].update({
+            "subject_keywords": ["night skyline", "360-degree orbit", "gold fireworks"],
+            "prompt": (
+                "Night skyline with gold fireworks above the towers. "
+                "The camera completes a 360-degree orbit around the towers."
+            ),
+        })
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            special_skill_key="drone-fly-on-city-fireworks",
+        )
+        self.assertIn("360-degree orbit", plan["shots"][0]["camera_movement"])
+        still = next(row for row in plan["media_requests"] if row["media_type"] == "image")
+        self.assertNotIn("camera completes a 360-degree orbit", still["prompt"])
+        self.assertIn("gold fireworks", still["prompt"].lower())
+        self.assertIn(DRONE_FIREWORKS_STILL_CONTRACT, still["prompt"])
 
     def test_old_generated_terminal_is_not_promoted_but_user_replacement_is(self):
         payload = sample_design()

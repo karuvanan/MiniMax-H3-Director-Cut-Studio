@@ -123,6 +123,7 @@ from design_engine import (
     extract_explicit_timed_text_layers,
     infer_design_dialogue_language,
     infer_explicit_design_duration,
+    is_drone_special_skill,
     is_analysis_only_media_use,
     materialize_design_media,
     normalize_shot_action_budget,
@@ -131,6 +132,7 @@ from design_engine import (
     protect_explicit_timed_text_layers,
     reconcile_requested_speech_layer_contract,
     requested_speech_roles,
+    sanitize_drone_still_image_request,
     SPEECH_TIMELINE_MARKER_PREFIX,
     SPEECH_TIMELINE_REMINDER_PREFIX,
     speech_timing_budget,
@@ -13428,7 +13430,7 @@ class DirectorCutStudio(QMainWindow):
         if end <= start:
             return []
         keyframe_boundaries = {start, end}
-        if str(self.special_combo.currentData() or "") == "drone-fly-on-city":
+        if is_drone_special_skill(self.special_combo.currentData()):
             for asset in self.scan.timeline_assets():
                 if asset.media_type != "image" or not asset.timeline_placed:
                     continue
@@ -14513,7 +14515,7 @@ class DirectorCutStudio(QMainWindow):
         )
         if f"REGENERATION CONTRACT FOR {stable_id}:" not in prompt:
             prompt = prompt.rstrip(" .") + ". " + contract
-        return {
+        request = {
             "requirement_id": str(
                 metadata.get("requirement_id") or f"regenerate_{stable_id.lower()}"
             ),
@@ -14537,6 +14539,7 @@ class DirectorCutStudio(QMainWindow):
             ),
             "subject_keywords": list(metadata.get("subject_keywords") or []),
             "prompt": prompt,
+            "negative_prompt": str(metadata.get("negative_prompt") or ""),
             "identity_anchor_requirement_id": str(
                 metadata.get("identity_anchor_requirement_id") or ""
             ),
@@ -14548,6 +14551,13 @@ class DirectorCutStudio(QMainWindow):
                 "previous_sidecar": str(sidecar or ""),
             },
         }
+        special_key = str(self.special_combo.currentData() or "")
+        if is_drone_special_skill(special_key):
+            request = sanitize_drone_still_image_request(
+                request,
+                fireworks=special_key == "drone-fly-on-city-fireworks",
+            )
+        return request
 
     def regenerate_media_asset_with_z_image(self, asset: MediaAsset) -> None:
         """Generate a corrected take and replace the same logical Picture source."""

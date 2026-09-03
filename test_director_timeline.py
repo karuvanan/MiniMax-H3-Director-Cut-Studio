@@ -75,6 +75,29 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "dark-rescue-h3-no-pov",
         )
 
+    def test_live_action_arcade_fighter_profile_is_selectable_and_seeds_design(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData("street-fighter-live-action-h3")
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        context = window._design_context()
+        special = context["bound_h3_skills"]["special"]
+        self.assertEqual(special["key"], "street-fighter-live-action-h3")
+        self.assertEqual(
+            context["bound_h3_skills"]["binding_mode"], "default_plus_special"
+        )
+        dialog = DesignPageDialog(
+            window.runtime, context, context["media_capacity"], window
+        )
+        self.assertEqual(
+            dialog.requirement_edit.toPlainText().strip(),
+            special["design_requirement_template"],
+        )
+        dialog.close()
+        dialog.deleteLater()
+        window.close()
+        window.deleteLater()
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -2692,6 +2715,62 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 p5, auto_analyze=True, preserve_recognition=True
             )
             self.assertTrue(window.render_dirty_segment_ids)
+        finally:
+            window.project_dirty = False
+            window.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_drone_z_image_regeneration_removes_visible_orbit_priming(self):
+        root = PROJECT_ROOT / ".director_cache" / "drone_z_image_regeneration_test"
+        root.mkdir(parents=True, exist_ok=True)
+        old_image = root / "p3_orbit.png"
+        Image.new("RGB", (32, 32), (20, 30, 40)).save(old_image)
+        window = DirectorCutStudio()
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        p3 = pictures[2]
+        assign_local_media(window.scan, p3, old_image)
+        p3.clip_prompt = (
+            "Photoreal city towers at blue hour. The camera performs a full 360-degree "
+            "orbital yaw around the towers. Stable architecture and natural city lights."
+        )
+        drone_index = window.special_combo.findData("drone-fly-on-city")
+        self.assertGreaterEqual(drone_index, 0)
+        window.special_combo.setCurrentIndex(drone_index)
+        try:
+            request = window._z_image_regeneration_request(p3)
+            self.assertNotIn("orbital yaw", request["prompt"])
+            self.assertIn("flight path is implied only through camera motion", request["prompt"])
+            self.assertIn("visible flight path", request["negative_prompt"])
+            self.assertIn("neon loop around buildings", request["negative_prompt"])
+            self.assertEqual(request["preferred_media_id"], "P3")
+        finally:
+            window.project_dirty = False
+            window.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_drone_fireworks_z_image_regeneration_keeps_effect_not_orbit_diagram(self):
+        root = PROJECT_ROOT / ".director_cache" / "drone_fireworks_regeneration_test"
+        root.mkdir(parents=True, exist_ok=True)
+        old_image = root / "p3_fireworks_orbit.png"
+        Image.new("RGB", (32, 32), (15, 25, 55)).save(old_image)
+        window = DirectorCutStudio()
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        p3 = pictures[2]
+        assign_local_media(window.scan, p3, old_image)
+        p3.clip_prompt = (
+            "Petronas Twin Towers at night. The camera follows a 360-degree orbit around them. "
+            "Gold and deep-red fireworks bloom behind the towers with drifting smoke."
+        )
+        special_index = window.special_combo.findData("drone-fly-on-city-fireworks")
+        self.assertGreaterEqual(special_index, 0)
+        window.special_combo.setCurrentIndex(special_index)
+        try:
+            request = window._z_image_regeneration_request(p3)
+            self.assertNotIn("camera follows a 360-degree orbit", request["prompt"])
+            self.assertIn("Gold and deep-red fireworks", request["prompt"])
+            self.assertIn("separate radial particle bursts", request["prompt"])
+            self.assertIn("continuous firework ring around buildings", request["negative_prompt"])
+            self.assertEqual(request["preferred_media_id"], "P3")
         finally:
             window.project_dirty = False
             window.close()
