@@ -38,7 +38,7 @@ P2 只保留在 Virtual Media Pool 的分析资料中，不得放入 Timeline，
 - 收尾图继承最后一个用户场景的视觉世界和 Outgoing State，不能读取、引用或派生自 P2。生成请求保持未命名并且不填写 `preferred_media_id`，由 Studio 分配真正空置的下一个编号：P1/P2/P3 已占用时生成 P4；P1 至 P5 已占用时生成 P6。
 - 城市、建筑、道路、天际线及其他纯环境补图必须是 environment-only reference：不得设置 `identity_anchor=true`，不得加入人物身份连续性合约，不得要求出现人脸、人物、巨型人物、雕像式人像或楼顶人物。
 - 补图只能改变摄影机位置、取景、视角与运动阶段；不得改变城市结构、地标、天气、时段、照明、色调、曝光或镜头质感。
-- 所有补图提示词只能使用正向的干净实景描述。不得复制 P2 的标签、颜色、线条、箭头、标记、文字、界面或图层外观，也不得列出一串这些内容作为负面提示词。
+- 所有补图都是冻结静态环境画面。从普通Prompt与subject_keywords删除360度、orbit、orbital yaw、圆形、轨迹、路线及航点运动描述，只保留建筑、天气、光线、色彩、曝光、镜头与冻结机位；不得复制P2的标签、颜色、线条、箭头、标记、文字、界面或图层外观。正向提示词准确追加：`The drone flight path is implied only through camera motion and must never be visible in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory line, no HUD, no graphic overlay around the towers.` 专用Z-Image负面提示词使用：`visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings`。这份负面词表不得进入最终H3视频Prompt。
 
 ## 5. 最终 H3 Prompt 合约
 
@@ -59,3 +59,4 @@ P2 只保留在 Virtual Media Pool 的分析资料中，不得放入 Timeline，
 6. 只执行一次 360 度旋转，最终 1 秒稳定停留，没有重复动作或突然跳变。
 7. 最终 H3 Prompt 使用当前 Segment 动态映射后的 Picture 编号，不使用 Media Pool 的固定物理槽假设。
 8. 当前关键帧 Job 没有加载未来 Picture；边界衔接只使用上一段最后 24 个无声视频帧。
+9. 每张自动参考图已经移除360度环绕／yaw／trajectory摄影机运动词，包含精确Clean Frame句及专用负面词表；最终H3 Prompt不包含这份负面词表。

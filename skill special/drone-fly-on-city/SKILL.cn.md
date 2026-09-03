@@ -67,6 +67,8 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 
 自动收尾请求绝不得设置 `identity_anchor=true`。城市、建筑、道路、天际线等纯环境图禁止人物、人脸、人形、肖像、假人、雕像式人物和楼顶人物。提示词不得引用任何 Picture 标签或控制图外观，而要用自包含文字重述最后场景的已观察环境、光线、构图与最终机位状态。
 
+所有Z-Image／T2I请求都是冻结静态画面，不是摄影机运动图解。从普通图片提示词和 `subject_keywords` 删除 `360-degree`、`orbit`、`orbital yaw`、圆形、轨迹、路线、航点及同类运动规划短语，只保留城市建筑、构图、天气、光线、色彩、曝光、镜头与唯一冻结机位。随后准确追加：`The drone flight path is implied only through camera motion and must never be visible in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory line, no HUD, no graphic overlay around the towers.` 并设置专用Z-Image负面提示词：`visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings`。这份负面词表绝不能复制进H3视频提示词。
+
 只有 `@P1` 与控制用 `@P2` 时，保持普通单场景流程。只有用户明确要求且确实有助连续性时才可创建其他机位参考，而且每张图仍只能继承 P1 的地点、布局、地标、建筑、物件、天气、时间、光线、色彩、曝光、氛围、镜头和特效；P2 始终不得成为视觉母版。
 
 ## 4. 旋转模式
@@ -114,7 +116,7 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 2. 只描述物理路线运动；不得在正文提及 “red line”、“map” 或 “route graphic”。说明连续运动、真实惯性、加速与减速。
 3. 明确写出环绕或偏航自旋模式及稳定目标锁定。环绕可用：`While translating along the path, the camera completes one seamless full 360-degree orbital yaw around [target], keeping the target continuously readable and the horizon stable.`
 4. 写出最终构图与短暂稳定停留。
-5. H3 只有一个生成提示词，不要附加一整串禁用路线图形词汇；反复写出这些图形反而可能诱导模型画出来。结尾只加入正向约束：`写实城市画面保持干净无遮挡，所有导航控制均为非视觉数据并完全位于画外；水平线稳定，航拍视差与惯性连续可信。` 具体控制图形名称只保留在 P2 的 `analysis_only` 登记说明内，Studio 会在 H3 编译前排除该行。
+5. H3 只有一个视频生成提示词，不要把Z-Image负面词表附加到H3；反复写出这些图形反而可能诱导视频模型画出来。结尾只加入正向约束：`写实城市画面保持干净无遮挡，所有导航控制均为非视觉数据并完全位于画外；水平线稳定，航拍视差与惯性连续可信。` 精确的静态图排除句和负面词表只属于Z-Image参考图生成，Studio会在H3编译前排除它们。
 
 若启用音频生成，只追加与场景相符的环境音描述；除非用户要求，否则不要加对白。
 
@@ -219,7 +221,8 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 - **语言**：最终提示词只用英文，不含实现说明。
 - **JSON 完整**：`@P1` 与 `@P2` 均正确登记于 `existing_media_uses`；只使用归一化屏幕坐标，不声称真实世界遥测。
 - **关键帧隔离**：后续用户场景图各自拥有独立区间；自动收尾图只位于链尾；渲染前一场景时没有加载任何未来 Picture。
+- **静态参考图隔离**：每张生成城市Picture都是冻结环境画面；普通提示词及关键词没有orbit／yaw／trajectory运动指令，包含精确Clean Frame句，并在专用负面提示词保存光环／光带伪影词表。
 
 ## 10. 控制数据卫生
 
-具体路线伪影词汇只允许出现在 P2 的 `analysis_only` 登记说明中供规划质检，不得复制进 creative_brief、Shot、constraints、marker、transition、补图提示词或最终 H3 Prompt。最终生成指令只用正向语言描述稳定水平线、连续惯性、干净写实画面、避碰航线和一致的城市几何。
+具体路线伪影词汇只允许出现在P2的 `analysis_only` 登记与专用Z-Image `negative_prompt`。正向补图提示词只能额外保留一条精确Clean Frame排除句。不得把负面词表复制进creative_brief、Shot、constraints、marker、transition或最终H3 Prompt；H3最终生成指令只用正向语言描述稳定水平线、连续惯性、干净写实画面、避碰航线和一致城市几何。
