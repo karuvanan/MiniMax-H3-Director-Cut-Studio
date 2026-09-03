@@ -528,15 +528,29 @@ def _direct_request_text(request: dict) -> str:
 
 def _request_visible_person_count(request: dict) -> int:
     text = _direct_request_text(request).lower()
-    if re.search(r"\b(?:two|2)\s+(?:people|persons|figures|characters|actors)\b", text):
+    if re.search(
+        r"\b(?:two|2)\s+(?:people|persons|figures|characters|actors|fighters|warriors)\b",
+        text,
+    ):
         return 2
-    if re.search(r"\b(?:one|single|1)\s+(?:woman|man|girl|boy|person|figure|character|actor)\b", text):
+    if re.search(
+        r"\b(?:one|single|1|exactly\s+one)\s+"
+        r"(?:woman|man|girl|boy|person|figure|character|actor|general|assassin|fighter|warrior)\b",
+        text,
+    ):
         return 1
     named_roles = set()
     if re.search(r"\b(?:woman|female|girl|heroine)\b|女人|女性|女孩", text, re.I):
         named_roles.add("female")
     if re.search(r"\b(?:man|male|boy|hero)\b|男人|男性|男孩", text, re.I):
         named_roles.add("male")
+    if not named_roles and re.search(
+        r"\b(?:general|assassin|fighter|warrior|soldier|guard|officer|protagonist)\b|"
+        r"将军|將軍|刺客|战士|戰士|士兵|守卫|守衛|主角",
+        text,
+        re.I,
+    ):
+        named_roles.add("person")
     return len(named_roles)
 
 
@@ -696,11 +710,7 @@ def stabilize_generated_identity_references(plan: dict) -> dict:
                 omitted_request_ids.append(str(request.get("requirement_id") or "generated_pose"))
                 continue
             kept_image_requests.append(request)
-            request_text = " ".join(
-                [prompt]
-                + [str(value) for value in request.get("subject_keywords") or []]
-            )
-            if _VISIBLE_PERSON_RE.search(request_text):
+            if _request_visible_person_count(request) > 0:
                 request.pop("identity_anchor_requirement_id", None)
                 request.pop("identity_anchor_media_id", None)
                 distinct = (
@@ -763,8 +773,33 @@ def stabilize_generated_identity_references(plan: dict) -> dict:
         return plan
     if not requests:
         return plan
+    # A planner can incorrectly label a landscape/prop still as an identity
+    # anchor. Identity metadata is valid only when the requested frozen frame
+    # positively contains a person; negative wording such as ``no people`` is
+    # not evidence of a character.
+    for request in requests:
+        if bool(request.get("identity_anchor", False)) and not _request_visible_person_count(request):
+            request.pop("identity_anchor", None)
+            request.pop("identity_anchor_requirement_id", None)
+            request.pop("identity_anchor_media_id", None)
+            request.pop("character_continuity_contract", None)
+            request["prompt"] = _strip_generated_anchor_augmentation(
+                str(request.get("prompt", ""))
+            )
+            if request["prompt"].startswith(_GENERATED_IDENTITY_PREFIX):
+                request["prompt"] = request["prompt"][len(_GENERATED_IDENTITY_PREFIX):]
+            request["prompt"] = re.split(
+                r"\s+(?:EXACT SUBJECT COUNT LOCK:|CHARACTER CONTINUITY CONTRACT for )",
+                request["prompt"],
+                maxsplit=1,
+                flags=re.I,
+            )[0].rstrip(" .")
     explicit_anchor = next(
-        (row for row in requests if bool(row.get("identity_anchor", False))),
+        (
+            row for row in requests
+            if bool(row.get("identity_anchor", False))
+            and _request_visible_person_count(row) > 0
+        ),
         None,
     )
     # Normalization may run more than once (Plan, Apply, project reload).  Strip
@@ -780,9 +815,7 @@ def stabilize_generated_identity_references(plan: dict) -> dict:
     anchor = explicit_anchor or next(
         (
             row for row in requests
-            if _VISIBLE_PERSON_RE.search(
-                _direct_request_text(row)
-            )
+            if _request_visible_person_count(row) > 0
         ),
         None,
     )
@@ -2946,20 +2979,426 @@ def _remove_control_artifact_priming(text: object) -> str:
 
     result = str(text or "")
     result = re.sub(
-        r"\b(?:red\s+(?:route\s+)?line|red\s+waypoint|route\s+path\s+overlay|"
-        r"flight\s+path\s+line|map\s+(?:line|overlay)|visible\s+(?:control\s+path|route\s+guide))\b",
+        r"\b(?:red\s+(?:route\s+)?line|red\s+route|red\s+waypoint|route\s+graphics?|"
+        r"route\s+path\s+overlays?|flight\s+path\s+lines?|map\s+(?:line|overlay)s?|"
+        r"visible\s+(?:control\s+path|route\s+guide))\b",
         "the planned camera trajectory",
         result,
         flags=re.I,
     )
     result = re.sub(
-        r"\b(?:red\s+arrow|waypoint\s+marker|navigation\s+marker|HUD|UI\s+overlay|"
-        r"graphic\s+overlay|red\s+scribble|red\s+stroke)\b",
+        r"\b(?:red\s+arrows?|waypoint\s+markers?|navigation\s+markers?|HUD|UI\s+overlays?|"
+        r"graphic\s+overlays?|red\s+scribbles?|red\s+strokes?)\b",
         "editing-only data",
         result,
         flags=re.I,
     )
     return " ".join(result.split())
+
+
+_DARK_RESCUE_POV_LOCK = (
+    "Strict first-person POV from S2's eye line. The camera is physically inside "
+    "S2's body and never leaves S2's point of view."
+)
+_DARK_RESCUE_POV_FORBIDDEN_RE = re.compile(
+    r"\b(?:third[- ]person(?:\s+(?:view|shot|camera))?|external\s+camera|"
+    r"over[- ]the[- ]shoulder(?:\s+shot)?|hero\s+shot|drone\s+shot|"
+    r"crane\s+shot|orbit(?:ing)?\s+shot|security[- ]camera\s+view|"
+    r"wide[- ]observer\s+view|camera\s+outside\s+S2(?:'s)?\s+body)\b",
+    flags=re.I,
+)
+
+
+def _dark_rescue_pov_sanitize(value: object) -> str:
+    """Remove camera language that can pull a rescue Shot outside S2's body."""
+
+    text = str(value or "").strip()
+    text = _DARK_RESCUE_POV_FORBIDDEN_RE.sub(
+        "body-mounted S2 eye-line composition", text
+    )
+    text = re.sub(
+        r"\b(?:the\s+)?camera\s+(?:follows|tracks)\s+S2\b",
+        "S2 moves and the eye-line view moves with S2's body",
+        text,
+        flags=re.I,
+    )
+    return " ".join(text.split())
+
+
+def enforce_dark_rescue_first_person(plan: dict) -> dict:
+    """Turn the dark-rescue camera contract into visible, executable POV evidence.
+
+    Language models often retain the words ``first-person`` globally while still
+    returning external establishing shots.  H3 receives Shot fields separately,
+    so every generated Shot and image request needs both an absolute eye-line lock
+    and positive objects that prove the viewpoint in-frame.
+    """
+
+    anchors = (
+        "the lower edge of S2's wet or dusty glove and flashlight beam",
+        "S2's gloved forearm and one role-correct rescue tool in extreme foreground",
+        "the edge of S2's helmet and a gloved hand at the lower frame boundary",
+    )
+    proof_tail = (
+        "S2's face, full body, back, observer silhouette and reflection remain off-screen. "
+        "All parallax is body-motivated: perspective, head turns, footstep bob, crouching "
+        "height and contact recoil are generated only by S2's physically plausible movement."
+    )
+    for index, shot in enumerate(plan.get("shots") or []):
+        if not isinstance(shot, dict):
+            continue
+        anchor = anchors[index % len(anchors)]
+        original_framing = _dark_rescue_pov_sanitize(shot.get("framing"))
+        if not original_framing.casefold().startswith(
+            "strict first-person pov from s2's eye line"
+        ):
+            shot["framing"] = (
+                f"Strict first-person POV from S2's eye line; {anchor} visibly anchors "
+                "near-field depth"
+                + (f"; {original_framing}" if original_framing else "")
+            )
+        else:
+            shot["framing"] = original_framing
+        original_angle = _dark_rescue_pov_sanitize(shot.get("camera_angle"))
+        shot["camera_angle"] = (
+            original_angle
+            if original_angle.casefold().startswith("s2 body-mounted natural human eye line")
+            else "S2 body-mounted natural human eye line"
+            + (f"; {original_angle}" if original_angle else "")
+        )
+        original_movement = _dark_rescue_pov_sanitize(shot.get("camera_movement"))
+        shot["camera_movement"] = (
+            original_movement
+            if original_movement.casefold().startswith(
+                "body-motivated first-person movement caused only by s2"
+            )
+            else "Body-motivated first-person movement caused only by S2"
+            + (f"; {original_movement}" if original_movement else "")
+        )
+        action = _dark_rescue_pov_sanitize(
+            shot.get("h3_executable_action") or shot.get("subject_action")
+        )
+        executable = (
+            action
+            if action.casefold().startswith("s2's first-person pov")
+            else f"S2's first-person POV visibly includes {anchor}. "
+            + (action or "Continue the current rescue action from S2's eye line.")
+        )
+        shot["subject_action"] = executable
+        shot["h3_executable_action"] = executable
+        budget = shot.get("action_budget")
+        if isinstance(budget, dict):
+            original = _dark_rescue_pov_sanitize(
+                budget.get("original_subject_action") or action
+            )
+            budget["original_subject_action"] = (
+                original
+                if original.casefold().startswith("s2's first-person pov")
+                else (
+                    "S2's first-person POV visibly includes " + anchor + ". " + original
+                ).strip()
+            )
+        detail = _dark_rescue_pov_sanitize(shot.get("additional_direction"))
+        if detail.casefold().startswith(_DARK_RESCUE_POV_LOCK.casefold()):
+            shot["additional_direction"] = detail
+        else:
+            shot["additional_direction"] = " ".join(
+                part for part in (
+                    _DARK_RESCUE_POV_LOCK,
+                    f"POV proof in this Shot: {anchor} remains optically near the lens.",
+                    proof_tail,
+                    detail,
+                ) if part
+            )
+        continuity = _dark_rescue_pov_sanitize(shot.get("continuity_state"))
+        pov_continuity = (
+            f"Preserve first-person eye height and the screen-side continuity of {anchor}; "
+            "the next Shot inherits S2's head direction, hand/tool state and body momentum."
+        )
+        shot["continuity_state"] = (
+            continuity
+            if "preserve first-person eye height" in continuity.casefold()
+            else " ".join(part for part in (continuity, pov_continuity) if part)
+        )
+
+    for request in plan.get("media_requests") or []:
+        if not isinstance(request, dict) or request.get("media_type") != "image":
+            continue
+        prompt = _dark_rescue_pov_sanitize(request.get("prompt"))
+        prefix = (
+            "A strict first-person POV reference image from S2's physical eye line, "
+            "with one wet or dusty gloved hand, flashlight, helmet rim, uniform sleeve "
+            "or role-correct rescue tool visible in extreme foreground as perspective proof. "
+            "S2's face, full body, back, reflection and observer view are absent."
+        )
+        if not prompt.casefold().startswith("a strict first-person pov reference image"):
+            request["prompt"] = f"{prefix} {prompt}".strip()
+        else:
+            request["prompt"] = prompt
+
+    for use in plan.get("existing_media_uses") or []:
+        if not isinstance(use, dict) or use.get("media_type") != "image":
+            continue
+        instruction = _dark_rescue_pov_sanitize(use.get("instruction"))
+        camera_contract = (
+            "Use this image only for its assigned identity, place, prop or damage state; "
+            "do not inherit an external camera angle. Render the active Shot from S2's "
+            "strict first-person physical eye line."
+        )
+        use["instruction"] = (
+            instruction
+            if "do not inherit an external camera angle" in instruction.casefold()
+            else " ".join(part for part in (instruction, camera_contract) if part)
+        )
+
+    constraint = (
+        _DARK_RESCUE_POV_LOCK
+        + " Every Shot must visibly prove the viewpoint with a near-lens glove, forearm, "
+          "flashlight/tool or helmet rim and body-motivated parallax; never render S2 as an "
+          "externally visible subject."
+    )
+    current = _dark_rescue_pov_sanitize(plan.get("constraints"))
+    if _DARK_RESCUE_POV_LOCK.casefold() not in current.casefold():
+        plan["constraints"] = " ".join(part for part in (current, constraint) if part)
+    else:
+        plan["constraints"] = current
+    warnings = plan.setdefault("design_warnings", [])
+    note = (
+        "dark-rescue-h3 enforced physical first-person POV evidence in every Shot and "
+        "generated image reference."
+    )
+    if note not in warnings:
+        warnings.append(note)
+    return plan
+
+
+def enforce_drone_scene_keyframe_chain(
+    plan: dict,
+    existing_media: list[dict] | None,
+    selected_media_ids: list[str] | None = None,
+) -> dict:
+    """Build an isolated user-anchor chain plus one generated terminal frame.
+
+    MiniMax sees every Picture supplied to one native request, even when the
+    Pictures occupy different Shot ranges. For the drone route Skill, multiple
+    user-authored scene Pictures must therefore own disjoint Timeline ranges;
+    the renderer can split those ranges into separate native requests and use
+    its visual-only 24-frame continuity handoff between them.
+
+    P2 remains analysis-only. Existing Design-generated Pictures are not
+    promoted into new user anchors. The one terminal request intentionally has
+    no preferred_media_id, so normal Virtual Media Pool allocation gives it
+    the next truly empty Picture number (P4 after P1/P2/P3, P6 after P1-P5).
+    """
+
+    result = plan
+    duration = float(result.get("duration_seconds", 0.0) or 0.0)
+    if duration < 1.5:
+        return result
+    inventory = {
+        str(row.get("media_id", "")).strip().upper(): row
+        for row in existing_media or []
+        if isinstance(row, dict)
+    }
+
+    def ordinal(row: dict) -> int:
+        match = re.fullmatch(r"P(\d+)", str(row.get("media_id", "")).upper())
+        return int(match.group(1)) if match else 10**9
+
+    def is_generated(media_id: str) -> bool:
+        row = inventory.get(media_id, {})
+        evidence = " ".join(
+            str(row.get(key, ""))
+            for key in ("filename", "raw_analysis_summary", "analysis_summary", "clip_prompt")
+        ).casefold()
+        return bool(
+            "ai design generated reference" in evidence
+            or "auto terminal keyframe" in evidence
+            or "generated_references" in evidence
+            or "regenerated_references" in evidence
+        )
+
+    uses = [row for row in result.get("existing_media_uses") or [] if isinstance(row, dict)]
+    selected_ids = {
+        _normalized_media_id(value) for value in selected_media_ids or []
+        if _normalized_media_id(value)
+    }
+    if selected_media_ids is not None:
+        declared_ids = {
+            str(row.get("media_id", "")).strip().upper() for row in uses
+        }
+        if "P2" in selected_ids and "P2" not in declared_ids and "P2" in inventory:
+            uses.append({
+                "requirement_id": "route_control_p2",
+                "media_id": "P2",
+                "media_type": "image",
+                "usage": "analysis_only",
+                "reuse_policy": "whole_design",
+                "start_seconds": 0.0,
+                "end_seconds": duration,
+                "track": "V2",
+                "subject_keywords": ["off-screen route geometry"],
+                "instruction": "Use @P2 only to derive abstract camera motion; never render or upload it.",
+            })
+            declared_ids.add("P2")
+        for media_id in sorted(selected_ids, key=lambda value: int(value[1:]) if value[1:].isdigit() else 10**9):
+            if not media_id.startswith("P") or media_id == "P2" or media_id in declared_ids:
+                continue
+            row = inventory.get(media_id)
+            if not row or not bool(row.get("loaded", False)) or is_generated(media_id):
+                continue
+            evidence = str(
+                row.get("semantic_enrichment")
+                or row.get("caption")
+                or row.get("analysis_summary")
+                or row.get("raw_analysis_summary")
+                or row.get("filename")
+                or "the supplied city scene"
+            ).strip()
+            uses.append({
+                "requirement_id": f"authored_scene_{media_id.lower()}",
+                "media_id": media_id,
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": 0.0,
+                "end_seconds": duration,
+                "track": "V1",
+                "subject_keywords": ["user-authored scene keyframe", media_id],
+                "instruction": (
+                    f"Use @{media_id} as an authoritative user-authored scene keyframe. "
+                    f"Preserve its real environment: {evidence[:900]}"
+                ),
+            })
+            declared_ids.add(media_id)
+    result["existing_media_uses"] = uses
+
+    image_uses = [
+        row for row in result.get("existing_media_uses") or []
+        if isinstance(row, dict)
+        and row.get("media_type") == "image"
+        and not is_analysis_only_media_use(row)
+    ]
+    authored_anchors: list[dict] = []
+    anchor_ids_seen: set[str] = set()
+    for row in sorted(image_uses, key=ordinal):
+        media_id = str(row.get("media_id", "")).upper()
+        if media_id in anchor_ids_seen:
+            continue
+        if media_id != "P1" and is_generated(media_id):
+            continue
+        authored_anchors.append(row)
+        anchor_ids_seen.add(media_id)
+    # P1 alone remains the ordinary scene-master workflow. The chain activates
+    # only after the user supplies at least one additional visual scene.
+    if len(authored_anchors) < 2:
+        return result
+    if duration + 1e-6 < (len(authored_anchors) + 1) * 0.5:
+        result.setdefault("design_warnings", []).append(
+            "Drone keyframe chain needs at least 0.5s for every user scene and its terminal frame; "
+            "the current duration is too short, so automatic terminal generation was skipped."
+        )
+        return result
+
+    boundaries = [0.0]
+    for index in range(1, len(authored_anchors) + 1):
+        boundary = snap_half_second(
+            duration * index / (len(authored_anchors) + 1), duration
+        )
+        boundary = max(boundaries[-1] + 0.5, boundary)
+        boundaries.append(min(duration - 0.5, boundary))
+    boundaries.append(duration)
+
+    authored_ids = {
+        str(row.get("media_id", "")).upper() for row in authored_anchors
+    }
+    authored_row_objects = {id(row) for row in authored_anchors}
+    retained_uses: list[dict] = []
+    for row in result.get("existing_media_uses") or []:
+        if not isinstance(row, dict):
+            continue
+        media_id = str(row.get("media_id", "")).upper()
+        if row.get("media_type") == "image" and not is_analysis_only_media_use(row):
+            if media_id not in authored_ids or id(row) not in authored_row_objects:
+                continue
+        retained_uses.append(row)
+    result["existing_media_uses"] = retained_uses
+
+    for index, anchor in enumerate(authored_anchors):
+        start = boundaries[index]
+        end = boundaries[index + 1]
+        media_id = str(anchor.get("media_id", "")).upper()
+        anchor["reuse_policy"] = "time_scoped"
+        anchor["start_seconds"] = start
+        anchor["end_seconds"] = end
+        anchor["track"] = "V1"
+        anchor.pop("identity_anchor", None)
+        marker = (
+            f"SCENE KEYFRAME CHAIN ANCHOR {index + 1}/{len(authored_anchors)}. "
+            f"User-authored {media_id} owns only {start:.2f}-{end:.2f}s; reconstruct it as the "
+            "authoritative real scene for this interval and do not let later scene anchors alter "
+            "any earlier frame."
+        )
+        instruction = str(anchor.get("instruction", "")).strip()
+        if "SCENE KEYFRAME CHAIN ANCHOR" in instruction:
+            instruction = instruction.split("SCENE KEYFRAME CHAIN ANCHOR", 1)[0].rstrip(" .")
+        anchor["instruction"] = (
+            instruction.rstrip(" .") + (". " if instruction else "") + marker
+        )
+
+    last_anchor = authored_anchors[-1]
+    last_id = str(last_anchor.get("media_id", "")).upper()
+    last_inventory = inventory.get(last_id, {})
+    evidence = str(
+        last_inventory.get("semantic_enrichment")
+        or last_inventory.get("caption")
+        or last_inventory.get("analysis_summary")
+        or last_anchor.get("instruction")
+        or result.get("creative_brief", "")
+    )
+    evidence = _remove_control_artifact_priming(
+        _replace_analysis_only_media_mentions(evidence, ["P2"])
+    )[:1800].strip()
+    terminal_start = boundaries[-2]
+    terminal_prompt = (
+        "AUTO TERMINAL KEYFRAME. ENVIRONMENT-ONLY FINAL FRAME. Create one photoreal settled "
+        "closing view continuing the latest user-authored city scene and its exact architecture, "
+        "landmark layout, weather, time of day, lighting direction, colour grade, exposure, "
+        "atmosphere and lens character. The drone has completed its planned movement, decelerated "
+        "naturally and now holds a stable level horizon with coherent aerial parallax. Do not "
+        "introduce a person, face, figure, statue-like portrait or rooftop character. Scene evidence: "
+        + evidence
+    )
+    non_image_requests = [
+        row for row in result.get("media_requests") or []
+        if isinstance(row, dict) and row.get("media_type") != "image"
+    ]
+    non_image_requests.append({
+        "requirement_id": f"auto_terminal_keyframe_after_{last_id.lower()}",
+        "media_type": "image",
+        "usage": "h3_reference",
+        "reuse_policy": "time_scoped",
+        "start_seconds": terminal_start,
+        "end_seconds": duration,
+        "track": "V1",
+        "subject_keywords": [
+            "automatic terminal keyframe",
+            "environment-only closing view",
+            "stable drone final hold",
+        ],
+        "prompt": terminal_prompt,
+    })
+    result["media_requests"] = non_image_requests
+    warning = (
+        "Drone scene keyframe chain: "
+        + " -> ".join(str(row.get("media_id", "")) for row in authored_anchors)
+        + " -> AUTO TERMINAL. User scene anchors were isolated into disjoint native render ranges; "
+        "the terminal frame will use the next empty Virtual Media Pool Picture ID."
+    )
+    warnings = result.setdefault("design_warnings", [])
+    if warning not in warnings:
+        warnings.append(warning)
+    return result
 
 
 def split_action_beats(value: object) -> list[str]:
@@ -3245,6 +3684,8 @@ def normalize_design_plan(
     strict_t2i_prompts: bool = False,
     repair_media_plan: bool = False,
     authored_requirement: str = "",
+    special_skill_key: str = "",
+    selected_media_ids: list[str] | None = None,
 ) -> dict:
     media_repair_warnings: list[str] = []
     prepared_payload = deepcopy(extract_design_json(payload))
@@ -3761,6 +4202,10 @@ def normalize_design_plan(
         if reuse_policy == "whole_design":
             start, end = 0.0, duration
         prompt = str(raw.get("prompt", "")).strip()
+        if analysis_only_ids:
+            prompt = _remove_control_artifact_priming(
+                _replace_analysis_only_media_mentions(prompt, analysis_only_ids)
+            )
         if media_type == "image" and strict_t2i_prompts:
             _validate_t2i_media_prompt(
                 prompt,
@@ -3770,6 +4215,13 @@ def normalize_design_plan(
                 duration_seconds=duration,
             )
         keywords = _string_list(raw.get("subject_keywords") or [])
+        if analysis_only_ids:
+            keywords = [
+                _remove_control_artifact_priming(
+                    _replace_analysis_only_media_mentions(value, analysis_only_ids)
+                )
+                for value in keywords
+            ]
         normalized_request = {
             "requirement_id": requirement_id,
             "media_type": media_type,
@@ -3804,6 +4256,12 @@ def normalize_design_plan(
         plan["_speech_timing_base_duration"] = float(
             source.get("_speech_timing_base_duration", duration)
         )
+    if str(special_skill_key).strip().casefold() == "drone-fly-on-city":
+        enforce_drone_scene_keyframe_chain(
+            plan, existing_media, selected_media_ids=selected_media_ids
+        )
+    if str(special_skill_key).strip().casefold() == "dark-rescue-h3":
+        enforce_dark_rescue_first_person(plan)
     stabilize_generated_identity_references(plan)
     return auto_adjust_speech_shot_timing(plan)
 

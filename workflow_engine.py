@@ -1156,6 +1156,12 @@ def assign_local_media(scan: WorkflowScan, asset: MediaAsset, path: str | Path) 
     if not local_path.is_file():
         raise FileNotFoundError(local_path)
     if asset.local_path != str(local_path):
+        # Recognition belongs to the previous file, not to the permanent P/V/A
+        # slot.  Clearing it is particularly important for scene-keyframe
+        # chains: when a user replaces an AI-generated terminal Picture, the
+        # replacement must become a real authored scene anchor instead of
+        # inheriting the old "AI DESIGN GENERATED REFERENCE" classification.
+        asset.recognition = ""
         asset.semantic_enrichment = ""
         asset.semantic_enrichment_source_hash = ""
         asset.semantic_enrichment_model = ""

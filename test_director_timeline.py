@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from PIL import Image
 
 from director_cut_studio import (
+    _canonical_special_skill_key,
     ContentLayerDialog,
     DesignPageDialog,
     DirectorCutStudio,
@@ -68,6 +69,12 @@ from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_historical_dark_rescue_no_pov_key_migrates_to_lowercase_profile(self):
+        self.assertEqual(
+            _canonical_special_skill_key("dark-rescue-h3-no-POV"),
+            "dark-rescue-h3-no-pov",
+        )
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -2333,6 +2340,96 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.assertNotIn(route.node_id, {asset.node_id for asset in compiled_assets})
         self.assertNotIn(route_path.name, json.dumps(compiled, ensure_ascii=False))
+        window.project_dirty = False
+        window.close()
+
+    def test_drone_user_scene_chain_allocates_p6_and_never_co_loads_future_picture(self):
+        window = DirectorCutStudio()
+        drone_index = window.special_combo.findData("drone-fly-on-city")
+        self.assertGreaterEqual(drone_index, 0)
+        window.special_combo.setCurrentIndex(drone_index)
+        media_root = PROJECT_ROOT / ".director_cache" / "drone_scene_keyframe_chain_test"
+        media_root.mkdir(parents=True, exist_ok=True)
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        inventory = []
+        for index, asset in enumerate(pictures[:5], 1):
+            image_path = media_root / f"authored_p{index}.png"
+            Image.new("RGB", (48, 48), (index * 25, 50, 100)).save(image_path)
+            self.addCleanup(lambda path=image_path: path.unlink(missing_ok=True))
+            assign_local_media(window.scan, asset, image_path)
+            inventory.append({
+                "media_id": f"P{index}", "media_type": "image", "loaded": True,
+                "filename": image_path.name,
+                "analysis_summary": f"user-authored city scene P{index}",
+            })
+
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        payload["shots"][-1]["end_seconds"] = 12.0
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "route_control", "media_id": "P2",
+                "media_type": "image", "usage": "analysis_only",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V2", "subject_keywords": ["route"],
+                "instruction": "Use @P2 only to derive camera geometry.",
+            },
+            *[
+                {
+                    "requirement_id": f"scene_{media_id.lower()}",
+                    "media_id": media_id, "media_type": "image",
+                    "usage": "h3_reference", "reuse_policy": "time_scoped",
+                    "start_seconds": 0.0, "end_seconds": 12.0, "track": "V1",
+                    "subject_keywords": ["city scene"],
+                    "instruction": f"Use @{media_id} as its authored scene.",
+                }
+                for media_id in ("P1", "P3", "P4", "P5")
+            ],
+        ]
+        plan = normalize_design_plan(
+            payload, window.scan.counts, existing_media=inventory,
+            special_skill_key="drone-fly-on-city",
+        )
+        terminal = next(
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        )
+        terminal_path = media_root / "automatic_terminal.png"
+        Image.new("RGB", (48, 48), (15, 35, 75)).save(terminal_path)
+        self.addCleanup(lambda: terminal_path.unlink(missing_ok=True))
+        material = dict(terminal)
+        material.update(local_path=str(terminal_path), generated_by_comfyui=True)
+        window._apply_ai_design_direct(plan, [material], replace=True)
+
+        p6 = pictures[5]
+        self.assertEqual(media_shortcut(p6), "P6")
+        self.assertEqual(Path(p6.local_path), terminal_path.resolve())
+        self.assertIn("AUTO TERMINAL KEYFRAME", p6.clip_prompt)
+        self.assertFalse(pictures[1].timeline_placed)
+
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(12.0)
+        segments = window._planned_render_segments()
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in segments],
+            [(0.0, 2.5), (2.5, 5.0), (5.0, 7.0), (7.0, 9.5), (9.5, 12.0)],
+        )
+        self.assertEqual(
+            [row.continuity_mode for row in segments],
+            ["none", "motion_reference", "motion_reference", "motion_reference", "motion_reference"],
+        )
+        expected = ["P1", "P3", "P4", "P5", "P6"]
+        for segment, expected_media_id in zip(segments, expected):
+            window.clip_start.setValue(segment.start_seconds)
+            window.clip_end.setValue(segment.end_seconds)
+            _compiled, active = window._compiled_job(
+                megapixels=0.2, seed=12345, enable_rtx_vsr=False
+            )
+            active_picture_ids = [
+                media_shortcut(asset) for asset in active if asset.media_type == "image"
+            ]
+            self.assertEqual(active_picture_ids, [expected_media_id])
+
         window.project_dirty = False
         window.close()
 

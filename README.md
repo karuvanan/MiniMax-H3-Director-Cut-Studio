@@ -704,6 +704,7 @@ skill default/
 
 skill special/
 ├─ dark-rescue-h3/
+├─ dark-rescue-h3-no-pov/
 ├─ minimalist-product-ad-generator/
 ├─ music-video-subtitle-generator/
 ├─ long-form-h3-director/
@@ -718,7 +719,8 @@ skill special/
 - Studio 内置的每一个 Special Skill 都附带与自身工作流对应的 `DESIGN_REQUIREMENT.txt`，可作为直接测试的范例，也可以在生成前替换其中的人物、产品、主题、时长、画幅、对白和素材要求。
 - `short-drama-h3-director` 是适配 Studio 的短剧 Special Skill，默认采用 `Default + Special`。它把短剧冲突、人物因果、伏笔反转、集尾钩子及竖屏构图转换为完整时间范围的 Shot Blocks，同时逐字保护 `text_layers`，优先复用 `existing_media_uses`，仅为缺失证据建立 `media_requests`，并遵守每 5 秒动作预算、环境因果、声音层与 Final Hold 规则。英文主文件、中文对照版及第三方许可证均位于 `skill special/short-drama-h3-director/`。
 - `long-form-h3-director` 是长片 Default-bound Special Skill。它输出一份覆盖完整总时长的 Design JSON，而不是每批一份 JSON；默认按约 30 秒规划安全批准点，保持 15 秒原生 Segment 的 Incoming／Outgoing State、上一段最后 24 帧运动上下文、逐字对白、稳定 Reference ID 与唯一项目终点 Final Hold。选择它会让主页自动采用 Incremental production；不选择时仍保留 Full Range 一次过处理。
-- `dark-rescue-h3` 是第一人称暗场救援 Special Skill，默认采用 `Default + Special`。只需提供地点、时长和基本目标，它会从五套已验证的场景语法中选择或改编废弃校舍、曼谷耀华力后巷、吉隆坡茨厂街后巷、历史城寨重建空间或受华尔街启发的损坏高楼，自动建立普通话对白／克制旁白、九镜救援因果链、现场环境声、可解释光源与 15 秒边界连续性。它只使用既有的低调照明、手电光束、体积散射、短促故障闪烁、背光剪影、机械阴影、红色警示灯、湿面高光及写实工业残损效果；没有明确 `@P/@V/@A` 时不会虚构 Media Pool 编号。英文执行文件和中文对照版位于 `skill special/dark-rescue-h3/`。
+- `dark-rescue-h3` 是严格第一人称暗场救援 Special Skill，默认采用 `Default + Special`。除了救援者双眼位置的文字锁定，每个Shot还必须出现近镜头手套、前臂/袖口、手电、头盔边缘或救援工具作为POV证明，并使用视线高度、身体运动视差与受困者看向救援者眼睛的互动防止镜头退化为第三人称。它会从五套已验证的场景语法中改编地点，自动建立普通话对白／克制旁白、九镜救援因果链、现场环境声、可解释光源与15秒边界连续性；没有明确 `@P/@V/@A` 时不会虚构Media Pool编号。
+- `dark-rescue-h3-no-pov` 是独立的外部摄影机版本：救援者会作为稳定角色出现在画面中，使用中远景双人构图、侧面走廊或三分之四救援机位，不会注入救援者眼睛、头盔摄影机或只见双手的构图规则。两个Skill各有自己的英文/中文规则及Design Requirement模板。
 - 该短剧 Skill 参考并重新设计自 MIT 授权的 [POUND0423/AI-drama-pound](https://github.com/POUND0423/AI-drama-pound)。上游侧重剧本创作；Studio 版本另外加入 H3 Director Design JSON、Timeline、素材映射、对白、音景和可执行 Shot 预算规则。
 - `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它会先诊断并自动改写不适合 H3 的武侠输入，再建立物理连续、武器因果、每 5 秒动作预算、15 秒无重播边界、人物／武器／空间／消耗品账本、写实轻功、碎片式镜头和环境同步。输入修正会自动重新分配缺失或不均匀的 Shot 时间，压缩同镜多招，把气劲捷径、无支点飞行、长时间 Bullet-time、完整 360 度环绕及多个竞争镜头运动改写成可执行的接触、动量和镜头重构，并在输出前以零预算警告为目标再次编译。最新版亦包含断刀内圈贴身流、链索张力轴心、凌空双刀掠食流、“一秒生死”距离判定、肢体／刀身几何／累积伤势锁定，以及单一冻结动作参考图规则。选择此 Skill 后打开 Design，会从 `DESIGN_REQUIREMENT.txt` 自动载入可编辑的45秒唐朝庭院刺杀模板。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。旧版《一叶杀》V2 保留于 `example/one_leaf_kill_45s_design_requirement.txt`；推荐的长枪将军对双短剑刺客 V3 同时提供可贴入 Design 的 `example/one_leaf_kill_45s_design_requirement_v3.txt` 与可直接 Load JSON 的 `example/one_leaf_kill_45s_design_plan_v3.json`。
 

@@ -75,6 +75,26 @@ class SkillEngineTests(unittest.TestCase):
         self.assertTrue(profile.description)
         self.assertIn("Music Video", profile.display_name)
 
+    def test_analysis_only_special_discovery_text_never_primes_h3_pixels(self):
+        special = self.profiles["drone-fly-on-city"]
+        self.assertIn("red route", special.description.lower())
+        prompt = build_ref2va_prompt(
+            PromptSpec(
+                brief="A clean city flyover.",
+                style="Photoreal skyline. No visible route graphics or waypoint markers.",
+                shots=["Camera arcs left, then right with a stable horizon."],
+            ),
+            [],
+            6.0,
+            self.profiles[DEFAULT_SKILL],
+            special,
+        )
+        self.assertNotIn("red route", prompt.lower())
+        self.assertNotIn("route graphics", prompt.lower())
+        self.assertNotIn("waypoint marker", prompt.lower())
+        self.assertNotIn(special.description, prompt)
+        self.assertIn("approved Drone Fly On City Director cues", prompt)
+
     def test_every_special_skill_has_an_editable_design_requirement_template(self):
         special_profiles = [profile for profile in self.profiles.values() if profile.special]
         self.assertTrue(special_profiles)
@@ -167,6 +187,23 @@ class SkillEngineTests(unittest.TestCase):
             "Director Design JSON",
         ):
             self.assertIn(phrase, chinese)
+
+    def test_dark_rescue_profiles_separate_physical_pov_from_external_camera(self):
+        pov = self.profiles["dark-rescue-h3"]
+        no_pov = self.profiles["dark-rescue-h3-no-pov"]
+        for phrase in (
+            "Prove POV Positively in the Image",
+            "POV proof object",
+            "extreme foreground",
+            "body-caused parallax",
+            "victim looks toward S2's eye line",
+        ):
+            self.assertIn(phrase, pov.instruction)
+        self.assertIn("严格第一人称视角", pov.design_requirement_template)
+        self.assertIn("External-camera Contract", no_pov.instruction)
+        self.assertIn("No rescuer-eye POV", no_pov.instruction)
+        self.assertIn("no-POV外部电影摄影机", no_pov.design_requirement_template)
+        self.assertNotIn("The camera is physically inside S2", no_pov.instruction)
 
     def test_long_form_special_is_default_bound_and_batch_boundary_safe(self):
         profile = self.profiles["long-form-h3-director"]

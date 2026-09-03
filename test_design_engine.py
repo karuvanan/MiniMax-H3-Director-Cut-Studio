@@ -1501,6 +1501,60 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("analysis_only", usage_enum)
         self.assertIn("route_control_analysis_only", usage_enum)
 
+    def test_analysis_only_control_is_removed_from_generated_reference_prompts(self):
+        payload = sample_design()
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "scene_master", "media_id": "P1",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V1", "subject_keywords": ["city"],
+                "instruction": "Preserve @P1 as the city scene master.",
+            },
+            {
+                "requirement_id": "route_control", "media_id": "P2",
+                "media_type": "image", "usage": "analysis_only",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V1", "subject_keywords": ["route"],
+                "instruction": "Read @P2 only to extract abstract waypoints.",
+            },
+        ]
+        payload["media_requests"] = [{
+            "requirement_id": "clean_city_midpoint",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "track": "V2",
+            "subject_keywords": ["@P2 red route waypoint marker"],
+            "prompt": (
+                "Photoreal city aerial matching @P1. Follow the red route from @P2. "
+                "No visible route graphics or waypoint markers. No visible people."
+            ),
+            "identity_anchor": True,
+        }]
+        inventory = [
+            {"media_id": "P1", "media_type": "image", "loaded": True},
+            {"media_id": "P2", "media_type": "image", "loaded": True},
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+        )
+
+        request = plan["media_requests"][0]
+        renderable = " ".join([request["prompt"], *request["subject_keywords"]]).lower()
+        self.assertNotIn("@p2", renderable)
+        self.assertNotIn("red route", renderable)
+        self.assertNotIn("route graphics", renderable)
+        self.assertNotIn("waypoint marker", renderable)
+        self.assertFalse(request.get("identity_anchor", False))
+        self.assertNotIn("PRIMARY RECURRING CHARACTER IDENTITY ANCHOR", request["prompt"])
+        self.assertIn("ENVIRONMENT-ONLY COUNT LOCK", request["prompt"])
+
     def test_shot_schema_separates_core_state_and_optional_flourish(self):
         shot = DESIGN_JSON_SCHEMA["properties"]["shots"]["items"]
         self.assertIn("continuity_state", shot["required"])
@@ -2165,6 +2219,221 @@ On-screen text: "EXACT TITLE"'''
             len([row for row in plan["media_requests"] if row["media_type"] == "image"]),
             2,
         )
+
+    def test_drone_scene_keyframe_chain_isolates_user_anchors_and_adds_one_terminal(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        payload["shots"][-1]["end_seconds"] = 12.0
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "opening_scene", "media_id": "P1",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V1",
+                "subject_keywords": ["opening city"],
+                "instruction": "Use @P1 as the opening city scene.",
+            },
+            {
+                "requirement_id": "route_control", "media_id": "P2",
+                "media_type": "image", "usage": "analysis_only",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V2",
+                "subject_keywords": ["route"],
+                "instruction": "Extract route geometry from @P2 only.",
+            },
+            {
+                "requirement_id": "later_scene", "media_id": "P3",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "time_scoped", "start_seconds": 6.0,
+                "end_seconds": 12.0, "track": "V1",
+                "subject_keywords": ["later skyline"],
+                "instruction": "Use @P3 as the next city scene.",
+            },
+        ]
+        duplicate_p3 = dict(payload["existing_media_uses"][-1])
+        duplicate_p3["requirement_id"] = "later_scene_duplicate"
+        duplicate_p3["start_seconds"] = 9.0
+        payload["existing_media_uses"].append(duplicate_p3)
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[
+                {"media_id": "P1", "media_type": "image", "loaded": True,
+                 "filename": "opening.png", "analysis_summary": "opening river skyline"},
+                {"media_id": "P2", "media_type": "image", "loaded": True,
+                 "filename": "route.png", "analysis_summary": "editor route control"},
+                {"media_id": "P3", "media_type": "image", "loaded": True,
+                 "filename": "later.png", "analysis_summary": "harbour towers at blue hour"},
+            ],
+            special_skill_key="drone-fly-on-city",
+        )
+        uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
+        self.assertEqual((uses["P1"]["start_seconds"], uses["P1"]["end_seconds"]), (0.0, 4.0))
+        self.assertEqual((uses["P3"]["start_seconds"], uses["P3"]["end_seconds"]), (4.0, 8.0))
+        self.assertEqual(
+            sum(row.get("media_id") == "P3" for row in plan["existing_media_uses"]), 1
+        )
+        self.assertEqual(uses["P2"]["usage"], "analysis_only")
+        self.assertIn("owns only 0.00-4.00s", uses["P1"]["instruction"])
+        image_requests = [
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        ]
+        self.assertEqual(len(image_requests), 1)
+        terminal = image_requests[0]
+        self.assertEqual(terminal["requirement_id"], "auto_terminal_keyframe_after_p3")
+        self.assertEqual((terminal["start_seconds"], terminal["end_seconds"]), (8.0, 12.0))
+        self.assertNotIn("preferred_media_id", terminal)
+        self.assertNotIn("identity_anchor", terminal)
+        self.assertIn("AUTO TERMINAL KEYFRAME", terminal["prompt"])
+        self.assertIn("harbour towers at blue hour", terminal["prompt"])
+
+    def test_old_generated_terminal_is_not_promoted_but_user_replacement_is(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        payload["shots"][-1]["end_seconds"] = 12.0
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": f"scene_{media_id.lower()}",
+                "media_id": media_id, "media_type": "image",
+                "usage": "h3_reference", "reuse_policy": "time_scoped",
+                "start_seconds": 0.0, "end_seconds": 12.0, "track": "V1",
+                "subject_keywords": ["city"], "instruction": f"Use @{media_id}.",
+            }
+            for media_id in ("P1", "P3", "P4", "P5")
+        ]
+        inventory = [
+            {"media_id": media_id, "media_type": "image", "loaded": True,
+             "filename": f"{media_id.lower()}.png", "analysis_summary": "user city scene"}
+            for media_id in ("P1", "P2", "P3", "P5")
+        ]
+        inventory.append({
+            "media_id": "P4", "media_type": "image", "loaded": True,
+            "filename": "generated_references/terminal.png",
+            "analysis_summary": "AI DESIGN GENERATED REFERENCE auto terminal keyframe",
+        })
+        plan = normalize_design_plan(
+            payload, {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory, special_skill_key="drone-fly-on-city",
+        )
+        self.assertNotIn("P4", {row["media_id"] for row in plan["existing_media_uses"]})
+        self.assertEqual(
+            [row for row in plan["media_requests"] if row["media_type"] == "image"][0]["requirement_id"],
+            "auto_terminal_keyframe_after_p5",
+        )
+
+        # A manually replaced P4 has no stale generated marker and therefore
+        # becomes a user-authored anchor in its proper numeric position.
+        replaced_inventory = [dict(row) for row in inventory]
+        replaced_p4 = next(row for row in replaced_inventory if row["media_id"] == "P4")
+        replaced_p4.update(filename="user_replacement.png", analysis_summary="new riverside scene")
+        replaced = normalize_design_plan(
+            payload, {"image": 9, "video": 3, "audio": 3},
+            existing_media=replaced_inventory, special_skill_key="drone-fly-on-city",
+        )
+        self.assertIn("P4", {row["media_id"] for row in replaced["existing_media_uses"]})
+
+    def test_selected_drone_picture_becomes_anchor_even_if_model_omits_its_use(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        payload["shots"][-1]["end_seconds"] = 12.0
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [{
+            "requirement_id": "opening_scene", "media_id": "P1",
+            "media_type": "image", "usage": "h3_reference",
+            "reuse_policy": "whole_design", "start_seconds": 0.0,
+            "end_seconds": 12.0, "track": "V1", "subject_keywords": ["city"],
+            "instruction": "Use @P1 as the opening.",
+        }]
+        plan = normalize_design_plan(
+            payload, {"image": 9, "video": 3, "audio": 3},
+            existing_media=[
+                {"media_id": "P1", "media_type": "image", "loaded": True,
+                 "filename": "opening.png"},
+                {"media_id": "P2", "media_type": "image", "loaded": True,
+                 "filename": "route.png"},
+                {"media_id": "P3", "media_type": "image", "loaded": True,
+                 "filename": "new_scene.png", "analysis_summary": "new coastal skyline"},
+            ],
+            special_skill_key="drone-fly-on-city",
+            selected_media_ids=["P1", "P2", "P3"],
+        )
+        uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
+        self.assertEqual(set(uses), {"P1", "P2", "P3"})
+        self.assertEqual(uses["P2"]["usage"], "analysis_only")
+        self.assertIn("new coastal skyline", uses["P3"]["instruction"])
+        self.assertEqual(
+            next(row for row in plan["media_requests"] if row["media_type"] == "image")["requirement_id"],
+            "auto_terminal_keyframe_after_p3",
+        )
+
+    def test_dark_rescue_first_person_is_enforced_in_every_renderable_field(self):
+        payload = sample_design()
+        payload["shots"][0].update({
+            "framing": "Third-person hero shot",
+            "camera_angle": "External camera above the rescuer",
+            "camera_movement": "The camera follows S2 through the doorway",
+            "subject_action": "S2 walks to the trapped woman and opens the door.",
+            "additional_direction": "Use an over-the-shoulder shot.",
+        })
+        payload["media_requests"][0]["prompt"] = (
+            "An external camera shows S2 and the damaged doorway."
+        )
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            special_skill_key="dark-rescue-h3",
+        )
+        for shot in plan["shots"]:
+            self.assertTrue(
+                shot["framing"].startswith("Strict first-person POV from S2's eye line")
+            )
+            self.assertTrue(shot["subject_action"].startswith("S2's first-person POV"))
+            self.assertTrue(shot["h3_executable_action"].startswith("S2's first-person POV"))
+            self.assertIn("POV proof in this Shot", shot["additional_direction"])
+            self.assertIn("body-motivated", shot["additional_direction"].lower())
+            self.assertIn("first-person eye height", shot["continuity_state"])
+            self.assertTrue(
+                shot["action_budget"]["original_subject_action"].startswith(
+                    "S2's first-person POV"
+                )
+            )
+        image_request = next(
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        )
+        self.assertTrue(
+            image_request["prompt"].startswith(
+                "A strict first-person POV reference image from S2's physical eye line"
+            )
+        )
+        self.assertIn("never leaves S2's point of view", plan["constraints"])
+        self.assertIn(
+            "dark-rescue-h3 enforced physical first-person POV evidence",
+            " ".join(plan["design_warnings"]),
+        )
+        reapplied = normalize_design_plan(
+            plan,
+            {"image": 9, "video": 3, "audio": 3},
+            special_skill_key="dark-rescue-h3",
+        )
+        for first, second in zip(plan["shots"], reapplied["shots"]):
+            self.assertEqual(second["framing"], first["framing"])
+            self.assertEqual(second["subject_action"], first["subject_action"])
+            self.assertEqual(second["additional_direction"], first["additional_direction"])
+            self.assertEqual(second["continuity_state"], first["continuity_state"])
+
+    def test_dark_rescue_no_pov_does_not_receive_first_person_rewrite(self):
+        payload = sample_design()
+        payload["shots"][0]["framing"] = "External medium-wide rescue two-shot"
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            special_skill_key="dark-rescue-h3-no-pov",
+        )
+        self.assertEqual(
+            plan["shots"][0]["framing"], "External medium-wide rescue two-shot"
+        )
+        self.assertNotIn("camera is physically inside S2", plan["constraints"])
 
     def test_materialize_creates_timed_keyword_placeholders_and_sidecars(self):
         plan = normalize_design_plan(sample_design(), {"image": 9, "video": 3, "audio": 3})

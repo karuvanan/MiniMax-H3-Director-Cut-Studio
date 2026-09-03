@@ -431,6 +431,27 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(asset.filename, "sample.png")
         self.assertEqual(scan.nodes[asset.node_id]["inputs"]["image"], "sample.png")
 
+    def test_replacing_local_media_clears_analysis_that_belongs_to_old_file(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        asset = next(item for item in scan.assets if item.media_type == "image")
+        folder = Path(__file__).parent / ".director_cache" / "replacement_analysis_test"
+        folder.mkdir(parents=True, exist_ok=True)
+        first = folder / "first.png"
+        second = folder / "replacement.png"
+        try:
+            first.write_bytes(b"first")
+            second.write_bytes(b"replacement")
+            assign_local_media(scan, asset, first)
+            asset.recognition = "AI DESIGN GENERATED REFERENCE\nRequirement: old terminal"
+            asset.semantic_enrichment = "old generated terminal scene"
+            assign_local_media(scan, asset, second)
+            self.assertEqual(asset.recognition, "")
+            self.assertEqual(asset.semantic_enrichment, "")
+        finally:
+            first.unlink(missing_ok=True)
+            second.unlink(missing_ok=True)
+
     def test_generation_parameters_patch_latest_nodes_and_bypass_rtx_for_preview(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
         scan = load_workflow(path)

@@ -34,6 +34,32 @@ _AUTHORITATIVE_FACE_MARKERS = (
 )
 
 
+_NONVISUAL_CONTROL_ARTIFACT_RE = re.compile(
+    r"\b(?:red\s+(?:route\s+)?line|red\s+route|red\s+waypoint|"
+    r"route\s+graphics?|route\s+path\s+overlays?|flight\s+path\s+lines?|"
+    r"map\s+(?:line|overlay)s?|visible\s+(?:control\s+path|route\s+guide)|"
+    r"red\s+arrows?|waypoint\s+markers?|navigation\s+markers?|"
+    r"HUD|UI\s+overlays?|graphic\s+overlays?|red\s+scribbles?|red\s+strokes?)\b",
+    re.I,
+)
+
+
+def _sanitize_nonvisual_control_artifacts(text: str) -> str:
+    """Keep analysis-only planning graphics from priming the video model.
+
+    A Special Skill's frontmatter description is discovery metadata, not a
+    render instruction. Older saved projects may also contain negative phrases
+    such as ``no visible route graphics`` in otherwise renderable prose. Naming
+    those graphics can make a generative model draw them, so a control-only
+    Skill receives a final prompt-level vocabulary scrub as a compatibility
+    safety net.
+    """
+
+    return _NONVISUAL_CONTROL_ARTIFACT_RE.sub(
+        "non-visual planning data", str(text or "")
+    )
+
+
 def _picture_face_role(clip_prompt: str) -> str:
     """Classify an image without letting quoted anchor guidance promote support art.
 
@@ -711,9 +737,13 @@ def build_ref2va_prompt(
             "following Shot until another explicit change. Never invent an appearance reset."
         )
     if special_profile is not None:
+        # Frontmatter ``description`` exists for Skill discovery/selection and
+        # can mention analysis inputs that must never become video pixels. The
+        # executable Special rules have already been expressed by the approved
+        # Timeline and Director cues, so do not copy discovery prose into H3.
         detailed_rows.append(
-            "Apply the bound special-scene direction consistently: "
-            f"{special_profile.description or special_profile.display_name}."
+            f"Apply the approved {special_profile.display_name} Director cues already encoded "
+            "in this Timeline; treat Skill discovery metadata as non-rendering context."
         )
     if special_profile is not None and special_profile.key == SPECIAL_SKILL:
         detailed_rows.append(
@@ -881,7 +911,7 @@ def build_ref2va_prompt(
         if special_profile is not None and special_profile.key == SPECIAL_SKILL
         else "N/A"
     )
-    return "\n\n".join(
+    result = "\n\n".join(
         (
             "subject_definitions:\n" + definitions,
             "summary:\n" + summary,
@@ -891,3 +921,6 @@ def build_ref2va_prompt(
             "non_diegetic_music:\n" + music,
         )
     )
+    if special_profile is not None and "analysis_only" in special_profile.instruction.casefold():
+        result = _sanitize_nonvisual_control_artifacts(result)
+    return result

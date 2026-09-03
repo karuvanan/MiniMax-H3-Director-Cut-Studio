@@ -4,12 +4,30 @@ Every user-visible correction receives an application version and a dated entry 
 
 ## [0.3.2-alpha.2] - 2026-09-03
 
+### Dark rescue camera-mode repair
+
+- Repaired the invalid mixed-case `dark-rescue-h3-no-POV` folder as the creator-valid `dark-rescue-h3-no-pov` profile and separated its behavior from the first-person Skill. The no-POV version now explicitly uses an external cinematic observer camera with a visible rescuer instead of accidentally inheriting rescuer-eye instructions.
+- Strengthened `dark-rescue-h3` with positive in-frame POV evidence distilled from the five supplied production references: near-lens glove/forearm/tool/helmet anchors, eye-height geometry, body-motivated parallax, victim-to-eye-line interaction and reachable exterior/Final Hold viewpoints.
+- Added deterministic Design normalization for `dark-rescue-h3`. Every Shot's framing, angle, movement, executable action, continuity and additional direction now carries the physical S2 eye-line contract; generated image references receive the same perspective proof and external-camera language is neutralized before H3 compilation.
+- Updated both English/Chinese Skill files and their distinct Design Requirement templates, plus regression coverage proving the first-person and no-POV profiles cannot collapse into the same camera mode.
+
+### Drone scene keyframe chain
+
+- Added an ordered user-authored scene chain for `drone-fly-on-city`: P1 and later selected P3/P4/P5 Pictures now own disjoint Timeline ranges instead of being loaded together for the complete clip. A future Picture can no longer alter the earlier P1 scene.
+- Added exactly one environment-only automatic terminal keyframe after the latest user scene. It has no forced Picture number, so the Virtual Media Pool assigns the next truly empty slot automatically: P4 after P1/P2/P3, or P6 after P1-P5.
+- Each keyframe interval is compiled as an independent native H3 Job even inside a 12-second work area. Only the preceding final 24 silent video frames cross the boundary as motion context; future Pictures and previous audio never cross it.
+- Replaced automatic terminal Pictures remain inactive history. If the user manually replaces one with a local image, stale generated-reference analysis is cleared and the new image becomes an authored scene anchor.
+- Updated the English/Chinese Skill and `DESIGN_REQUIREMENT.txt` with the new keyframe ownership, terminal-frame and continuity contracts.
+
 ### Analysis-only route controls
 
 - Added a real `analysis_only` Media Pool usage for planning maps, route drawings, masks and other control images. The compatibility alias `route_control_analysis_only` is accepted and normalized automatically.
 - Analysis-only sources remain available to Design intelligence but are never placed on the Timeline, counted against per-Segment H3 capacity, uploaded to ComfyUI/MiniMax, treated as identity anchors or assigned an H3 Picture slot. Reapplying a Design also removes a control image that an older build mistakenly placed on a V track.
 - Removed analysis-only `@P/@V/@A` labels from every H3-renderable Shot, cue and creative field, replacing them with the already extracted abstract control instruction so reference-token parsing cannot reactivate the source.
 - Updated `drone-fly-on-city` in English, Chinese and its Design Requirement template. The former long negative-prompt catalogue repeated route-artifact vocabulary inside H3's single prompt and could visually prime the model; it is now replaced by a positive clean-frame/off-screen-control contract.
+- Fixed a second prompt-priming path found during real-output acceptance: Special Skill frontmatter descriptions are discovery metadata and are no longer copied verbatim into the H3 render prompt. Control-only Skills also scrub legacy route-graphic vocabulary from loaded older Projects at final prompt compilation.
+- Extended analysis-only isolation to generated-reference prompts and subject keywords, preventing a Z-Image continuation reference from inheriting control-image labels or visual annotation vocabulary.
+- Reject incorrect `identity_anchor=true` metadata on environment-only image requests. Pure skyline, room, prop and landscape references now receive an environment-only subject-count guard instead of generating an unrelated prominent person.
 - Added Design normalization and end-to-end workflow regressions proving a loaded P2 route-control picture remains in the Media Pool while its filename, loader and pixels are absent from the compiled H3 job.
 
 ### Design JSON completion reliability

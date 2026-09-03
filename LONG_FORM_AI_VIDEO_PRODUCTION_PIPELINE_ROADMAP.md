@@ -411,6 +411,33 @@ v0.4.0 计划包括：
 - 先压缩 Optional Flourish 与装饰时间，再考虑合并重复反应或删除第二次说明；任何自动删除都必须经过 Review／Apply。
 - 为每项 KEEP／TRIM／MERGE／REMOVE 显示完整加减分、依赖和风险证据，并建立专属 Auto Cut Release Gate。
 
+### Universal Scene Keyframe Chain
+
+把 `drone-fly-on-city` 已验证的场景关键帧隔离机制升级成不依赖 Special Skill 的通用 `Scene Keyframe Chain` 引擎。引擎必须先识别每张 Picture 的职责，再决定它是否可以跨 Shot／Segment 持续、是否需要隔离，以及是否需要自动建立收尾帧：
+
+- **人物身份图**：可以跨多个 Segment 持续加载，用于固定脸、年龄、肤色、发型、服装、身材比例、鞋子和配饰归属；不得被误当成场景切换点。
+- **场景关键帧**：必须按时间隔离。后一场景不得提前进入前一场景的原生 H3 Job，避免未来 Picture 改变较早画面的建筑、构图、照明、天气或色调。
+- **动作状态图**：只在对应 Shot 或动作时间窗使用，不得扩散到之前或之后的 Shot，也不得重新定义人物身份。
+- **路线／控制图**：永远只作 Design 分析；不得进入 Timeline、ComfyUI 上传、实体 Picture Loader 或最终 H3 Prompt。
+- **自动收尾图**：每条场景链只生成一次，继承最后一个用户场景的环境与 Outgoing State，由 Virtual Media Pool 分配下一个真实空置 Picture ID。
+
+实现边界：
+
+- Default-only、Default＋Special 和 standalone Special 三种模式采用同一套职责分类，不再由某一个 Skill 私有处理。
+- 用户可以在 Inspector 覆盖自动分类；手动修改后不得再次被 Qwen 或自动分析覆盖。
+- 相邻场景 Job 只允许传递上一段最后 24 个无声视频帧作为运动上下文，不得传递旧音频、未来 Picture 或 analysis-only 素材。
+- Storyboard、Auto Cut、Shot 移动、删除、增减时长和局部重算后，场景链范围、自动收尾图归属及 Segment Mapping 必须同步重算。
+- 未建立多场景链的旧 Project 保持原有行为；人物身份图和产品母版不得因为升级而被错误切成短时间参考。
+
+验收标准：
+
+- [ ] 不选择任何 Special Skill 时，P1 人物身份图仍可跨 Segment 稳定使用。
+- [ ] 不选择任何 Special Skill 时，P1 场景、P3 新场景和自动 P4 收尾不会在同一个错误时间窗互相污染。
+- [ ] P1–P5 已占用时，自动收尾图稳定分配为 P6，不覆盖现有素材。
+- [ ] 动作状态图只进入拥有它的 Shot；路线／控制图在最终 H3 Workflow 中为零 Loader、零上传、零 Prompt 引用。
+- [ ] Storyboard／Auto Cut 调整后，每个 Scene Keyframe 的 ownership、时间范围、24 帧衔接和局部重算范围保持一致。
+- [ ] 新增独立的 Universal Scene Keyframe Chain Release Gate，并通过 Default-only、Default＋Special、长片分段和旧 Project 回归。
+
 ---
 
 ## 最终愿景

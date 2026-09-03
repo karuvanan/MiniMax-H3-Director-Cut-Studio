@@ -263,6 +263,23 @@ PROMPT_PRESET_ENV_ROOT = PROJECT_ROOT / "preset_env"
 MIME_SLOT = "application/x-h3-media-slot"
 MEDIA_POOL_COLUMNS = 3
 MEDIA_CARD_MIN_WIDTH = 80
+
+
+def _canonical_special_skill_key(value: object) -> str:
+    """Migrate historical Special Skill keys without breaking saved projects."""
+
+    key = str(value or "").strip()
+    if key.casefold() == "dark-rescue-h3-no-pov":
+        return "dark-rescue-h3-no-pov"
+    return key
+
+
+def _bound_special_skill_key(context: dict | None) -> str:
+    """Return the selected Special Skill key from a Design context."""
+
+    bound = (context or {}).get("bound_h3_skills") or {}
+    special = bound.get("special") or {}
+    return _canonical_special_skill_key(special.get("key", ""))
 TIMELINE_RULER_HEIGHT = 20
 RENDER_STATUS_BAR_HEIGHT = 6
 DIRECTOR_LANE_HEIGHT = 20
@@ -7035,13 +7052,20 @@ class DesignPageDialog(QDialog):
 
     def _handle_design_generated(self, payload: dict) -> None:
         try:
+            planning_context = (
+                self.active_design_context or self._selected_design_context()
+            )
             plan = normalize_design_plan(
                 payload.get("text", ""),
                 self.capacities,
-                existing_media=self.context.get("existing_media") or [],
+                existing_media=planning_context.get("existing_media") or [],
                 strict_t2i_prompts=True,
                 repair_media_plan=True,
                 authored_requirement=self.pending_requirement,
+                special_skill_key=_bound_special_skill_key(
+                    planning_context
+                ),
+                selected_media_ids=planning_context.get("selected_existing_media_ids"),
             )
             if self.pipeline_stage == "lm_refine" and self.planned_plan:
                 # Refinement may improve generated-image prompts and shot language,
@@ -7615,10 +7639,18 @@ class DesignPageDialog(QDialog):
                 plan = normalize_design_plan(
                     payload.get("text", ""),
                     self.capacities,
-                    existing_media=self.context.get("existing_media") or [],
+                    existing_media=(
+                        self.active_design_context or self._selected_design_context()
+                    ).get("existing_media") or [],
                     strict_t2i_prompts=True,
                     repair_media_plan=True,
                     authored_requirement=self.pending_requirement,
+                    special_skill_key=_bound_special_skill_key(
+                        self.active_design_context or self._selected_design_context()
+                    ),
+                    selected_media_ids=(
+                        self.active_design_context or self._selected_design_context()
+                    ).get("selected_existing_media_ids"),
                 )
             except ValueError as exc:
                 self.json_edit.setPlainText(str(payload.get("text", "")))
@@ -7773,9 +7805,11 @@ class DesignPageDialog(QDialog):
             plan = normalize_design_plan(
                 self.json_edit.toPlainText(),
                 self.capacities,
-                existing_media=self.context.get("existing_media") or [],
+                existing_media=context.get("existing_media") or [],
                 repair_media_plan=True,
                 authored_requirement=requirement,
+                special_skill_key=_bound_special_skill_key(context),
+                selected_media_ids=context.get("selected_existing_media_ids"),
             )
             plan = protect_explicit_timed_text_layers(plan, requirement)
             validate_explicit_timed_text_contract(requirement, plan)
@@ -11262,6 +11296,7 @@ class DirectorCutStudio(QMainWindow):
                 existing_media=self._design_context().get("existing_media") or [],
                 repair_media_plan=True,
                 authored_requirement=authored_requirement,
+                special_skill_key=str(self.special_combo.currentData() or ""),
             )
             plan = enforce_design_music_mode(plan, selected_music_mode)
             plan = protect_explicit_timed_text_layers(
@@ -13392,7 +13427,39 @@ class DirectorCutStudio(QMainWindow):
         end = float(self.clip_end.value())
         if end <= start:
             return []
-        if end - start > MAX_NATIVE_SECONDS + 1e-6:
+        keyframe_boundaries = {start, end}
+        if str(self.special_combo.currentData() or "") == "drone-fly-on-city":
+            for asset in self.scan.timeline_assets():
+                if asset.media_type != "image" or not asset.timeline_placed:
+                    continue
+                direction = str(asset.clip_prompt or "")
+                if not (
+                    "SCENE KEYFRAME CHAIN ANCHOR" in direction
+                    or "AUTO TERMINAL KEYFRAME" in direction
+                ):
+                    continue
+                clipped_start = max(start, float(asset.start_seconds))
+                clipped_end = min(end, float(asset.end_seconds))
+                if clipped_end > clipped_start + 1e-6:
+                    keyframe_boundaries.update((clipped_start, clipped_end))
+        keyframe_chain_active = len(keyframe_boundaries) > 2
+        if keyframe_chain_active:
+            # A later Picture must never be present in the same native H3
+            # request as an earlier scene anchor. Render each ownership range
+            # independently and carry only the previous final 24 video frames
+            # forward as motion context.
+            planned = []
+            ordered = sorted(keyframe_boundaries)
+            for range_start, range_end in zip(ordered, ordered[1:]):
+                if range_end <= range_start + 1e-6:
+                    continue
+                planned.extend(plan_render_segments(
+                    range_start,
+                    range_end,
+                    max_segment_seconds=MAX_NATIVE_SECONDS,
+                    overlap_seconds=0.0,
+                ))
+        elif end - start > MAX_NATIVE_SECONDS + 1e-6:
             shots = [
                 asdict(cue) for cue in self.director_cues
                 if cue.cue_type == "shot"
@@ -13448,23 +13515,29 @@ class DirectorCutStudio(QMainWindow):
         for index, segment in enumerate(planned):
             if index == 0:
                 segment.continuity_mode = "none"
+            elif keyframe_chain_active:
+                # Scene-anchor isolation is a deliberate visual handoff: no
+                # Picture or soundtrack crosses the boundary, only the prior
+                # segment's final 24 silent frames.
+                segment.continuity_mode = "motion_reference"
             elif segment.continuity_mode in {"", "auto", "match_action"}:
                 segment.continuity_mode = self._continuity_mode_at_boundary(
                     segment.start_seconds
                 )
-        planned = protect_segment_boundaries_from_speech(
-            planned,
-            [asdict(layer) for layer in self.text_layers],
-            max_segment_seconds=MAX_NATIVE_SECONDS,
-            tail_seconds=1.0,
-            grid_seconds=TIMELINE_SNAP_SECONDS,
-        )
-        planned = align_segments_to_dialogue_turns(
-            planned,
-            [asdict(layer) for layer in self.text_layers],
-            max_segment_seconds=MAX_NATIVE_SECONDS,
-            grid_seconds=TIMELINE_SNAP_SECONDS,
-        )
+        if not keyframe_chain_active:
+            planned = protect_segment_boundaries_from_speech(
+                planned,
+                [asdict(layer) for layer in self.text_layers],
+                max_segment_seconds=MAX_NATIVE_SECONDS,
+                tail_seconds=1.0,
+                grid_seconds=TIMELINE_SNAP_SECONDS,
+            )
+            planned = align_segments_to_dialogue_turns(
+                planned,
+                [asdict(layer) for layer in self.text_layers],
+                max_segment_seconds=MAX_NATIVE_SECONDS,
+                grid_seconds=TIMELINE_SNAP_SECONDS,
+            )
         shots_in_area = [
             cue for cue in self.director_cues
             if cue.cue_type == "shot"
@@ -13924,7 +13997,9 @@ class DirectorCutStudio(QMainWindow):
                 if isinstance(field, QPlainTextEdit):
                     field.setPlainText(str(value))
             self.prompt_panel.auto_sync.setChecked(bool(payload.get("prompt_auto_sync", True)))
-            special = payload.get("special_skill", NONE_SPECIAL)
+            special = _canonical_special_skill_key(
+                payload.get("special_skill", NONE_SPECIAL)
+            )
             index = self.special_combo.findData(special)
             self.special_combo.setCurrentIndex(max(0, index))
             self.production_strategy = str(
