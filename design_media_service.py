@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
+import random
 import secrets
 import sys
 import urllib.parse
@@ -14,6 +16,142 @@ import uuid
 
 from comfy_submit_worker import _direct_urlopen, _request_json, wait_for_history
 from media_engine import remove_solid_background
+
+
+def render_immutable_source_plate(
+    request: dict,
+    destination: Path,
+    seed: int,
+) -> dict:
+    """Copy P1 exactly, optionally adding only a deterministic effect layer."""
+
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+
+    source = Path(str(request.get("source_plate_local_path", "")))
+    if not source.is_file():
+        raise FileNotFoundError(
+            "Immutable terminal frame requires the loaded P1 local image."
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    profile = str(request.get("source_plate_effect_profile", "preserve_existing"))
+    if profile != "fireworks":
+        ImageOps.exif_transpose(Image.open(source)).convert("RGB").save(
+            destination,
+            format="PNG",
+        )
+        return {
+            "mode": "immutable_copy",
+            "source_plate": str(source.resolve()),
+            "effect_profile": profile,
+        }
+
+    base = ImageOps.exif_transpose(Image.open(source)).convert("RGBA")
+    width, height = base.size
+    scale = 2
+    canvas = (width * scale, height * scale)
+    rng = random.Random(seed)
+
+    glow = Image.new("RGBA", canvas, (0, 0, 0, 0))
+    particles = Image.new("RGBA", canvas, (0, 0, 0, 0))
+    smoke = Image.new("RGBA", canvas, (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow, "RGBA")
+    particle_draw = ImageDraw.Draw(particles, "RGBA")
+    smoke_draw = ImageDraw.Draw(smoke, "RGBA")
+    colours = [
+        (255, 196, 72),
+        (255, 244, 220),
+        (188, 38, 45),
+        (255, 215, 120),
+    ]
+    centres = [
+        (0.17, 0.19),
+        (0.82, 0.22),
+        (0.34, 0.10),
+        (0.68, 0.11),
+        (0.50, 0.055),
+    ]
+    burst_records: list[dict] = []
+    for burst_index, (cx_ratio, cy_ratio) in enumerate(centres):
+        cx = int(cx_ratio * canvas[0])
+        cy = int(cy_ratio * canvas[1])
+        colour = colours[burst_index % len(colours)]
+        radius = int(min(canvas) * (0.075 if burst_index < 4 else 0.095))
+        rays = 52 if burst_index < 4 else 72
+        glow_draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=(*colour, 38),
+        )
+        for ray in range(rays):
+            angle = (math.tau * ray / rays) + rng.uniform(-0.035, 0.035)
+            inner = radius * rng.uniform(0.10, 0.22)
+            outer = radius * rng.uniform(0.70, 1.08)
+            x1 = cx + math.cos(angle) * inner
+            y1 = cy + math.sin(angle) * inner
+            x2 = cx + math.cos(angle) * outer
+            y2 = cy + math.sin(angle) * outer + rng.uniform(0, radius * 0.10)
+            particle_draw.line(
+                (x1, y1, x2, y2),
+                fill=(*colour, rng.randint(145, 235)),
+                width=max(1, scale),
+            )
+            particle_draw.ellipse(
+                (x2 - scale, y2 - scale, x2 + scale, y2 + scale),
+                fill=(255, 248, 225, rng.randint(155, 245)),
+            )
+        smoke_width = radius * rng.uniform(0.9, 1.5)
+        smoke_height = radius * rng.uniform(0.45, 0.75)
+        smoke_draw.ellipse(
+            (
+                cx - smoke_width * 0.15,
+                cy - smoke_height * 0.10,
+                cx + smoke_width,
+                cy + smoke_height,
+            ),
+            fill=(155, 158, 170, rng.randint(20, 42)),
+        )
+        burst_records.append({
+            "centre": [round(cx_ratio, 3), round(cy_ratio, 3)],
+            "colour": list(colour),
+        })
+
+    glow = glow.filter(ImageFilter.GaussianBlur(max(5, int(min(canvas) * 0.025))))
+    smoke = smoke.filter(ImageFilter.GaussianBlur(max(7, int(min(canvas) * 0.018))))
+    effects = Image.alpha_composite(glow, smoke)
+    effects = Image.alpha_composite(effects, particles)
+    effects = effects.resize((width, height), Image.Resampling.LANCZOS)
+
+    # Protect existing high-contrast architecture edges in the upper frame so
+    # particles read as behind the P1 skyline rather than painted over it.
+    luminance = base.convert("L")
+    edges = luminance.filter(ImageFilter.FIND_EDGES)
+    threshold = edges.point(lambda value: 255 if value > 28 else 0)
+    threshold = threshold.filter(ImageFilter.MaxFilter(7))
+    protect = Image.new("L", (width, height), 0)
+    protect.paste(threshold.crop((0, 0, width, int(height * 0.62))), (0, 0))
+    effect_alpha = effects.getchannel("A")
+    effect_alpha = ImageChops.subtract(effect_alpha, protect)
+    effects.putalpha(effect_alpha)
+
+    composite = Image.alpha_composite(base, effects)
+
+    # Low-opacity warm illumination changes colour only; it never moves or
+    # replaces P1 geometry. The original cool-blue plate remains dominant.
+    warm = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    warm_draw = ImageDraw.Draw(warm, "RGBA")
+    warm_draw.rectangle(
+        (0, int(height * 0.38), width, height),
+        fill=(255, 142, 52, 12),
+    )
+    warm = warm.filter(ImageFilter.GaussianBlur(max(3, int(height * 0.03))))
+    composite = Image.alpha_composite(composite, warm).convert("RGB")
+    composite.save(destination, format="PNG")
+    return {
+        "mode": "immutable_effect_composite",
+        "source_plate": str(source.resolve()),
+        "effect_profile": profile,
+        "bursts": burst_records,
+        "geometry_source": "unchanged P1 pixels",
+    }
 
 
 def emit(payload: dict) -> None:
@@ -178,6 +316,30 @@ def _generate_request(
     server = str(job["server"]).rstrip("/")
     destination = Path(item["local_path"])
     seed = secrets.randbits(63)
+    source_plate_mode = str(item.get("source_plate_mode", "")).strip()
+    if source_plate_mode in {"immutable_copy", "immutable_effect_composite"}:
+        plate_result = render_immutable_source_plate(item, destination, seed)
+        sidecar = destination.with_suffix(destination.suffix + ".request.json")
+        if sidecar.is_file():
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            metadata["immutable_source_plate_generation"] = {
+                **plate_result,
+                "seed": seed,
+            }
+            sidecar.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return {
+            "local_path": str(destination.resolve()),
+            "original_local_path": str(destination.resolve()),
+            "seed": seed,
+            "prompt_id": "local-immutable-source-plate",
+            "generated": True,
+            "request_index": item.get("request_index", number - 1),
+            "background_removal": {},
+            "immutable_source_plate_generation": plate_result,
+        }
     workflow = image_workflow(
         item,
         settings,

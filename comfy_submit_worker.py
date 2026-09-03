@@ -15,6 +15,7 @@ import urllib.request
 import uuid
 
 from workflow_engine import validate_portable_media_manifest
+from final_hold_engine import apply_final_hold_plate
 
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -222,6 +223,23 @@ def main() -> int:
     downloaded = outputs
     if job.get("download_dir") and outputs:
         downloaded = download_outputs(server, outputs, Path(job["download_dir"]), http_timeout)
+    final_hold_plate = Path(str(job.get("final_hold_plate", "")))
+    if final_hold_plate.is_file():
+        ffmpeg = Path(str(job.get("ffmpeg", "")))
+        ffprobe = Path(str(job.get("ffprobe", "")))
+        for output in downloaded:
+            local_path = Path(str(output.get("local_path", "")))
+            if local_path.suffix.lower() not in {".mp4", ".mov", ".mkv", ".webm", ".m4v"}:
+                continue
+            print(json.dumps({"progress": "Applying immutable P1 final-frame hold…"}, ensure_ascii=False), flush=True)
+            apply_final_hold_plate(
+                ffmpeg,
+                ffprobe,
+                local_path,
+                final_hold_plate,
+                hold_seconds=float(job.get("final_hold_seconds", 1.0) or 1.0),
+                target_duration=float(job.get("target_duration_seconds", 0.0) or 0.0),
+            )
     print(
         json.dumps(
             {

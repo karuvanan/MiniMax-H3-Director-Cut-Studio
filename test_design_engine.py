@@ -21,6 +21,7 @@ from design_engine import (
     automatic_background_music,
     automatic_background_soundscape,
     authored_text_layers_with_plan_assignments,
+    bind_design_source_plate_paths,
     build_design_system_prompt,
     collect_design_preflight_blockers,
     enforce_design_dialogue_language,
@@ -45,7 +46,11 @@ from design_engine import (
     validate_explicit_timed_text_contract,
     validate_requested_speech_layer_contract,
 )
-from design_media_service import generate as generate_design_media, image_workflow
+from design_media_service import (
+    generate as generate_design_media,
+    image_workflow,
+    render_immutable_source_plate,
+)
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 from tts_service import (
@@ -2310,26 +2315,143 @@ On-screen text: "EXACT TITLE"'''
             special_skill_key="drone-fly-on-city",
         )
         uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
-        self.assertEqual((uses["P1"]["start_seconds"], uses["P1"]["end_seconds"]), (0.0, 4.0))
-        self.assertEqual((uses["P3"]["start_seconds"], uses["P3"]["end_seconds"]), (4.0, 8.0))
+        self.assertEqual((uses["P1"]["start_seconds"], uses["P1"]["end_seconds"]), (0.0, 4.5))
+        self.assertEqual((uses["P3"]["start_seconds"], uses["P3"]["end_seconds"]), (4.5, 9.0))
         self.assertEqual(
             sum(row.get("media_id") == "P3" for row in plan["existing_media_uses"]), 1
         )
         self.assertEqual(uses["P2"]["usage"], "analysis_only")
-        self.assertIn("owns only 0.00-4.00s", uses["P1"]["instruction"])
+        self.assertIn("owns only 0.00-4.50s", uses["P1"]["instruction"])
         image_requests = [
             row for row in plan["media_requests"] if row["media_type"] == "image"
         ]
         self.assertEqual(len(image_requests), 1)
         terminal = image_requests[0]
         self.assertEqual(terminal["requirement_id"], "auto_terminal_keyframe_after_p3")
-        self.assertEqual((terminal["start_seconds"], terminal["end_seconds"]), (8.0, 12.0))
+        self.assertEqual((terminal["start_seconds"], terminal["end_seconds"]), (9.0, 12.0))
         self.assertNotIn("preferred_media_id", terminal)
         self.assertNotIn("identity_anchor", terminal)
         self.assertIn("AUTO TERMINAL KEYFRAME", terminal["prompt"])
         self.assertIn("harbour towers at blue hour", terminal["prompt"])
         self.assertIn(DRONE_STILL_CLEAN_FRAME_CONTRACT, terminal["prompt"])
         self.assertEqual(terminal["negative_prompt"], DRONE_STILL_NEGATIVE_PROMPT)
+        self.assertEqual(terminal["source_plate_media_id"], "P1")
+        self.assertEqual(terminal["source_plate_mode"], "immutable_copy")
+        self.assertTrue(terminal["immutable_scene_plate"])
+        self.assertEqual(terminal["final_hold_seconds"], 1.0)
+
+    def test_drone_single_p1_still_creates_one_immutable_terminal_plate(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        payload["shots"][-1]["end_seconds"] = 12.0
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [{
+            "requirement_id": "opening_scene", "media_id": "P1",
+            "media_type": "image", "usage": "h3_reference",
+            "reuse_policy": "whole_design", "start_seconds": 0.0,
+            "end_seconds": 12.0, "track": "V1",
+            "subject_keywords": ["city"], "instruction": "Use @P1.",
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "filename": "p1.png", "analysis_summary": "cool blue city skyline",
+            }],
+            special_skill_key="drone-fly-on-city",
+        )
+        terminal = next(
+            row for row in plan["media_requests"] if row["media_type"] == "image"
+        )
+        self.assertEqual((terminal["start_seconds"], terminal["end_seconds"]), (9.0, 12.0))
+        self.assertEqual(terminal["source_plate_mode"], "immutable_copy")
+        self.assertIn("exact P1 base composition", terminal["prompt"])
+
+    def test_fireworks_terminal_is_p1_effect_only_composite(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 15.0
+        payload["shots"][-1]["end_seconds"] = 15.0
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [{
+            "requirement_id": "scene", "media_id": "P1",
+            "media_type": "image", "usage": "h3_reference",
+            "reuse_policy": "whole_design", "start_seconds": 0.0,
+            "end_seconds": 15.0, "track": "V1",
+            "subject_keywords": ["towers"], "instruction": "Use @P1.",
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "filename": "p1.png", "analysis_summary": "Petronas towers night skyline",
+            }],
+            special_skill_key="drone-fly-on-city-fireworks",
+        )
+        terminal = next(row for row in plan["media_requests"] if row["media_type"] == "image")
+        self.assertEqual(terminal["source_plate_mode"], "immutable_effect_composite")
+        self.assertEqual(terminal["source_plate_effect_profile"], "fireworks")
+        self.assertIn("Do not move, rotate, raise, reframe", terminal["prompt"])
+        self.assertIn("discrete gold, white and deep-red firework", terminal["prompt"])
+
+    def test_source_plate_path_is_bound_locally_and_not_sent_to_design_model(self):
+        folder = PROJECT_ROOT / ".director_cache" / "immutable_path_binding_test"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            source = folder / "p1.png"
+            source.write_bytes(b"image")
+            material = {"source_plate_media_id": "P1"}
+            bind_design_source_plate_paths(
+                [material],
+                [{"media_id": "P1", "local_path": str(source)}],
+            )
+            self.assertEqual(Path(material["source_plate_local_path"]), source.resolve())
+            prompt = build_design_system_prompt({
+                "existing_media": [{
+                    "media_id": "P1", "loaded": True, "local_path": str(source),
+                }]
+            })
+            self.assertNotIn(str(source), prompt)
+            self.assertNotIn("local_path", prompt)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_immutable_plate_renderer_copies_p1_and_composites_only_effects(self):
+        from PIL import Image, ImageChops
+
+        folder = PROJECT_ROOT / ".director_cache" / "immutable_plate_renderer_test"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            source = folder / "p1.png"
+            original = Image.new("RGB", (320, 180), (12, 28, 55))
+            for x in range(135, 185):
+                for y in range(28, 170):
+                    original.putpixel((x, y), (205, 212, 220))
+            original.save(source)
+
+            copied = folder / "copy.png"
+            copy_meta = render_immutable_source_plate({
+                "source_plate_local_path": str(source),
+                "source_plate_effect_profile": "preserve_existing",
+            }, copied, 42)
+            self.assertIsNone(ImageChops.difference(original, Image.open(copied).convert("RGB")).getbbox())
+            self.assertEqual(copy_meta["mode"], "immutable_copy")
+
+            fireworks = folder / "fireworks.png"
+            effect_meta = render_immutable_source_plate({
+                "source_plate_local_path": str(source),
+                "source_plate_effect_profile": "fireworks",
+            }, fireworks, 42)
+            rendered = Image.open(fireworks).convert("RGB")
+            self.assertEqual(rendered.size, original.size)
+            self.assertIsNotNone(ImageChops.difference(original, rendered).getbbox())
+            self.assertEqual(effect_meta["mode"], "immutable_effect_composite")
+            self.assertEqual(effect_meta["geometry_source"], "unchanged P1 pixels")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
     def test_drone_still_reference_removes_motion_trajectory_priming(self):
         request = sanitize_drone_still_image_request({

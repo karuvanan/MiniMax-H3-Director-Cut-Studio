@@ -16,6 +16,9 @@ Every user-visible correction receives an application version and a dated entry 
 - Added a per-Shot fireworks continuity ledger covering launch and burst position, gold/white/deep-red particle phase, smoke drift, façade/wet-street reflections, exposure response and distance-delayed native firework sound.
 - Added fireworks-aware Z-Image still isolation. Static references retain discrete chrysanthemum bursts and smoke while camera-orbit clauses are removed; an additional request-scoped negative contract rejects continuous firework rings, tower-wrapping effects, fused landmarks and solid neon fireworks.
 - Added English/Chinese Skill instructions, an editable 15-second Petronas Twin Towers Design Requirement template, common Scene Keyframe Chain support and regression coverage for Design normalization, H3 motion retention and right-click Z-Image regeneration.
+- Replaced the generative terminal-reference rule in both drone Skills with an immutable P1 Scene Plate contract. The ordinary Skill copies P1 without T2I reinterpretation; the fireworks Skill composites only discrete firework particles, thin smoke and physically plausible illumination over the unchanged P1 pixels.
+- Both single-scene and multi-scene plans now reserve one terminal range, return the moving camera to P1's exact composition, and mark the final plate with explicit `source_plate_*` metadata. Local P1 paths are bound only after planning and are removed from the LM context.
+- Preview, native renders and Smart Long Render masters now enforce the last one-second freeze during local FFmpeg output assembly while stream-copying the original audio. Partial ranges ending before the terminal plate are not modified.
 
 ### Live-action arcade fighter Special Skill
 

@@ -1,5 +1,7 @@
 import json
 import sys
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +17,7 @@ from smart_render_worker import (
     queue_segment,
 )
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
+from final_hold_engine import apply_final_hold_plate, build_final_hold_command
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
@@ -347,6 +350,65 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertIn("afade=t=in:st=0:d=0.040000", filters)
         self.assertIn("concat=n=3:v=1:a=1", filters)
         self.assertIn("43.000000", command)
+
+    def test_final_hold_command_preserves_audio_and_freezes_plate(self):
+        from PIL import Image
+
+        runtime = load_runtime_paths()
+        root = PROJECT_ROOT / ".director_cache" / "final_hold_video_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "source.mp4"
+        plate = root / "plate.png"
+        Image.new("RGB", (160, 90), (20, 80, 220)).save(plate)
+        try:
+            created = subprocess.run(
+                [
+                    str(runtime.ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "color=c=red:s=160x90:r=24:d=2",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                    "-shortest", str(source),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            command = build_final_hold_command(
+                runtime.ffmpeg, runtime.ffprobe, source, plate, root / "out.mp4",
+                hold_seconds=0.5, target_duration=2.0,
+            )
+            graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("gte(t,1.500000)", graph)
+            self.assertIn("0:a?", command)
+
+            apply_final_hold_plate(
+                runtime.ffmpeg, runtime.ffprobe, source, plate,
+                hold_seconds=0.5, target_duration=2.0,
+            )
+            audio_probe = subprocess.run(
+                [
+                    str(runtime.ffprobe), "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=index", "-of", "csv=p=0", str(source),
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertTrue(audio_probe.stdout.strip())
+            frame = root / "tail.png"
+            extracted = subprocess.run(
+                [
+                    str(runtime.ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", "1.75", "-i", str(source), "-frames:v", "1", str(frame),
+                ],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(extracted.returncode, 0, extracted.stderr)
+            pixel = Image.open(frame).convert("RGB").getpixel((80, 45))
+            self.assertGreater(pixel[2], 180)
+            self.assertLess(pixel[0], 80)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_worker_emits_running_and_failed_segment_status(self):
         events = []

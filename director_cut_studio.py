@@ -115,6 +115,7 @@ from design_engine import (
     automatic_background_music,
     automatic_background_soundscape,
     authored_text_layers_with_plan_assignments,
+    bind_design_source_plate_paths,
     build_design_system_prompt,
     collect_design_preflight_blockers,
     enforce_design_dialogue_language,
@@ -6750,6 +6751,10 @@ class DesignPageDialog(QDialog):
                 "request_index": image_index,
                 "local_path": str(concept_root / f"picture_{image_index + 1:02d}.png"),
             })
+        bind_design_source_plate_paths(
+            materials,
+            (self.active_design_context or self.context).get("existing_media") or [],
+        )
         job_path = CACHE_ROOT / f"z_image_design_job_{time.time_ns()}.json"
         job_path.write_text(json.dumps({
             "server": str(self.context.get("comfyui_server", "")).strip(),
@@ -9818,6 +9823,7 @@ class DirectorCutStudio(QMainWindow):
                     "media_type": asset.media_type,
                     "type": asset.media_type,
                     "filename": Path(local_path).name,
+                    "local_path": str(Path(local_path).resolve()),
                     "loaded": True,
                     "locally_available": True,
                     "timeline_placed": bool(timeline_uses),
@@ -11381,6 +11387,10 @@ class DirectorCutStudio(QMainWindow):
                 design_dir=design_revision,
                 media_dir=media_revision,
                 audio_dir=audio_revision,
+            )
+            bind_design_source_plate_paths(
+                materials,
+                self._design_context().get("existing_media") or [],
             )
             before = self._design_workspace_state()
             settings = load_design_settings(DESIGN_SETTINGS_ENV)
@@ -14551,6 +14561,29 @@ class DirectorCutStudio(QMainWindow):
                 "previous_sidecar": str(sidecar or ""),
             },
         }
+        for key in (
+            "source_plate_media_id",
+            "source_plate_mode",
+            "source_plate_effect_profile",
+            "final_hold_seconds",
+            "immutable_scene_plate",
+        ):
+            if key in metadata:
+                request[key] = metadata[key]
+        source_plate_id = str(request.get("source_plate_media_id", "")).strip().upper()
+        if source_plate_id and self.scan:
+            source_plate = next(
+                (
+                    item for item in self.scan.assets
+                    if media_shortcut(item).upper() == source_plate_id
+                    and item.media_type == "image"
+                ),
+                None,
+            )
+            if source_plate and Path(str(source_plate.local_path or "")).is_file():
+                request["source_plate_local_path"] = str(
+                    Path(source_plate.local_path).resolve()
+                )
         special_key = str(self.special_combo.currentData() or "")
         if is_drone_special_skill(special_key):
             request = sanitize_drone_still_image_request(
@@ -19920,9 +19953,57 @@ class DirectorCutStudio(QMainWindow):
             "master_output": str(render_root / "master.mp4"),
             "manifest_path": str(manifest_path),
         }
+        job.update(self._immutable_final_hold_spec(start, end))
         job_path.parent.mkdir(parents=True, exist_ok=True)
         job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         return job_path, len(segment_rows)
+
+    def _immutable_final_hold_spec(self, start: float, end: float) -> dict:
+        """Return an end-of-range hold only for an approved immutable plate.
+
+        This metadata is intentionally read from the local request sidecar,
+        never inferred from prompt prose. Partial renders that end before the
+        terminal plate are therefore unaffected.
+        """
+
+        if not self.scan or end <= start:
+            return {}
+        candidates: list[tuple[float, Path, dict]] = []
+        for asset in self.scan.timeline_assets():
+            if asset.media_type != "image" or not asset.timeline_placed:
+                continue
+            if abs(float(asset.end_seconds) - float(end)) > 0.01:
+                continue
+            local_path = Path(str(asset.local_path or ""))
+            if not local_path.is_file():
+                continue
+            sidecar = local_path.with_suffix(local_path.suffix + ".request.json")
+            if not sidecar.is_file():
+                continue
+            try:
+                metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not bool(metadata.get("immutable_scene_plate", False)):
+                continue
+            if str(metadata.get("source_plate_media_id", "")).strip().upper() != "P1":
+                continue
+            hold = float(metadata.get("final_hold_seconds", 1.0) or 1.0)
+            if hold <= 0.0:
+                continue
+            candidates.append((float(asset.start_seconds), local_path.resolve(), metadata))
+        if not candidates:
+            return {}
+        _asset_start, plate, metadata = max(candidates, key=lambda row: row[0])
+        return {
+            "final_hold_plate": str(plate),
+            "final_hold_seconds": min(
+                float(end) - float(start),
+                float(metadata.get("final_hold_seconds", 1.0) or 1.0),
+            ),
+            "final_hold_source_media_id": "P1",
+            "final_hold_source_mode": str(metadata.get("source_plate_mode", "")),
+        }
 
     def _prepare_windowed_tts_audio(
         self,
@@ -20394,7 +20475,14 @@ class DirectorCutStudio(QMainWindow):
                     "progress_shots": self._progress_shot_rows(
                         self.clip_start.value(), self.clip_end.value()
                     ),
+                    "ffmpeg": str(self.runtime.ffmpeg),
+                    "ffprobe": str(self.runtime.ffprobe),
                 }
+                job.update(
+                    self._immutable_final_hold_spec(
+                        self.clip_start.value(), self.clip_end.value()
+                    )
+                )
                 job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             QMessageBox.critical(self, "Queue error", str(exc))

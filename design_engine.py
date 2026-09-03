@@ -3032,6 +3032,33 @@ def is_drone_special_skill(value: object) -> bool:
     return str(value or "").strip().casefold() in DRONE_SPECIAL_SKILL_KEYS
 
 
+def bind_design_source_plate_paths(
+    materials: list[dict],
+    existing_media: list[dict] | None,
+) -> list[dict]:
+    """Attach a verified local plate path without asking the LM to invent one."""
+
+    local_by_id = {
+        str(row.get("media_id", "")).strip().upper(): str(
+            row.get("local_path", "") or ""
+        ).strip()
+        for row in existing_media or []
+        if isinstance(row, dict)
+    }
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        media_id = str(material.get("source_plate_media_id", "")).strip().upper()
+        if not media_id:
+            continue
+        source = local_by_id.get(media_id, "")
+        if source and Path(source).is_file():
+            material["source_plate_local_path"] = str(Path(source).resolve())
+        else:
+            material.pop("source_plate_local_path", None)
+    return materials
+
+
 def sanitize_drone_still_image_request(
     request: dict,
     *,
@@ -3264,6 +3291,7 @@ def enforce_drone_scene_keyframe_chain(
     plan: dict,
     existing_media: list[dict] | None,
     selected_media_ids: list[str] | None = None,
+    special_skill_key: str = "drone-fly-on-city",
 ) -> dict:
     """Build an isolated user-anchor chain plus one generated terminal frame.
 
@@ -3377,9 +3405,17 @@ def enforce_drone_scene_keyframe_chain(
             continue
         authored_anchors.append(row)
         anchor_ids_seen.add(media_id)
-    # P1 alone remains the ordinary scene-master workflow. The chain activates
-    # only after the user supplies at least one additional visual scene.
-    if len(authored_anchors) < 2:
+    # The terminal frame is now an immutable P1 scene plate for both drone
+    # Skills, even when P1 is the only visual anchor.  The route Picture P2 is
+    # analysis-only and therefore never joins this visual chain.
+    p1_anchor = next(
+        (
+            row for row in authored_anchors
+            if str(row.get("media_id", "")).strip().upper() == "P1"
+        ),
+        None,
+    )
+    if p1_anchor is None:
         return result
     if duration + 1e-6 < (len(authored_anchors) + 1) * 0.5:
         result.setdefault("design_warnings", []).append(
@@ -3388,10 +3424,13 @@ def enforce_drone_scene_keyframe_chain(
         )
         return result
 
+    terminal_window = min(4.0, max(1.0, duration * 0.25))
+    authored_duration = max(0.5 * len(authored_anchors), duration - terminal_window)
+    authored_duration = min(duration - 0.5, authored_duration)
     boundaries = [0.0]
     for index in range(1, len(authored_anchors) + 1):
         boundary = snap_half_second(
-            duration * index / (len(authored_anchors) + 1), duration
+            authored_duration * index / len(authored_anchors), duration
         )
         boundary = max(boundaries[-1] + 0.5, boundary)
         boundaries.append(min(duration - 0.5, boundary))
@@ -3447,14 +3486,42 @@ def enforce_drone_scene_keyframe_chain(
     evidence = _remove_control_artifact_priming(
         _replace_analysis_only_media_mentions(evidence, ["P2"])
     )[:1800].strip()
+    p1_inventory = inventory.get("P1", {})
+    p1_evidence = str(
+        p1_inventory.get("semantic_enrichment")
+        or p1_inventory.get("caption")
+        or p1_inventory.get("analysis_summary")
+        or p1_inventory.get("raw_analysis_summary")
+        or p1_anchor.get("instruction")
+        or result.get("creative_brief", "")
+    )
+    p1_evidence = _remove_control_artifact_priming(
+        _replace_analysis_only_media_mentions(p1_evidence, ["P2"])
+    )[:1800].strip()
+    fireworks = str(special_skill_key).strip().casefold() == "drone-fly-on-city-fireworks"
+    effect_contract = (
+        "Add only several discrete gold, white and deep-red firework particle bursts in the sky "
+        "behind and above the landmark, thin laterally drifting firework smoke, and physically "
+        "plausible temporary warm reflections on the existing glass, rooftops, wet streets and "
+        "low clouds. No burst touches, covers or wraps around a building silhouette."
+        if fireworks
+        else
+        "Preserve every visual effect already present in P1 without inventing a new effect, object, "
+        "building, light source or atmosphere change."
+    )
     terminal_start = boundaries[-2]
     terminal_prompt = (
-        "AUTO TERMINAL KEYFRAME. ENVIRONMENT-ONLY FINAL FRAME. Create one photoreal settled "
-        "closing view continuing the latest user-authored city scene and its exact architecture, "
-        "landmark layout, weather, time of day, lighting direction, colour grade, exposure, "
-        "atmosphere and lens character. The drone has completed its planned movement, decelerated "
-        "naturally and now holds a stable level horizon with coherent aerial parallax. Do not "
-        "introduce a person, face, figure, statue-like portrait or rooftop character. Scene evidence: "
+        "AUTO TERMINAL KEYFRAME. IMMUTABLE P1 SCENE PLATE. The closing camera returns to the exact "
+        "P1 base composition. Preserve P1 pixel geometry as the non-regenerated plate: identical "
+        "camera position, altitude, focal length, framing, horizon height, landmark size and spacing, "
+        "skyline geometry, road layout, building placement, weather, base colour grade, exposure, "
+        "contrast and original city lights. Do not move, rotate, raise, reframe, redesign, duplicate, "
+        "distort, remove or replace any P1 scene element. "
+        + effect_contract
+        + " The final second is a perfectly static hold of this P1-based plate. Do not introduce a "
+          "person, face, figure, text, logo, watermark or rooftop character. P1 scene evidence: "
+        + p1_evidence
+        + " Outgoing motion context before the return to P1: "
         + evidence
     )
     non_image_requests = [
@@ -3471,17 +3538,24 @@ def enforce_drone_scene_keyframe_chain(
         "track": "V1",
         "subject_keywords": [
             "automatic terminal keyframe",
-            "environment-only closing view",
-            "stable drone final hold",
+            "immutable P1 scene plate",
+            "exact P1 composition return",
+            "one-second static final hold",
         ],
         "prompt": terminal_prompt,
+        "source_plate_media_id": "P1",
+        "source_plate_mode": "immutable_effect_composite" if fireworks else "immutable_copy",
+        "source_plate_effect_profile": "fireworks" if fireworks else "preserve_existing",
+        "final_hold_seconds": 1.0,
+        "immutable_scene_plate": True,
     })
     result["media_requests"] = non_image_requests
     warning = (
         "Drone scene keyframe chain: "
         + " -> ".join(str(row.get("media_id", "")) for row in authored_anchors)
-        + " -> AUTO TERMINAL. User scene anchors were isolated into disjoint native render ranges; "
-        "the terminal frame will use the next empty Virtual Media Pool Picture ID."
+        + " -> AUTO TERMINAL FROM IMMUTABLE P1 PLATE. User scene anchors were isolated into disjoint "
+        "native render ranges; the terminal frame will use the next empty Virtual Media Pool Picture "
+        "ID while preserving P1 geometry."
     )
     warnings = result.setdefault("design_warnings", [])
     if warning not in warnings:
@@ -4351,7 +4425,10 @@ def normalize_design_plan(
     if is_drone_special_skill(special_skill_key):
         fireworks = str(special_skill_key).strip().casefold() == "drone-fly-on-city-fireworks"
         enforce_drone_scene_keyframe_chain(
-            plan, existing_media, selected_media_ids=selected_media_ids
+            plan,
+            existing_media,
+            selected_media_ids=selected_media_ids,
+            special_skill_key=str(special_skill_key),
         )
         plan["media_requests"] = [
             sanitize_drone_still_image_request(row, fireworks=fireworks)
@@ -4366,6 +4443,14 @@ def normalize_design_plan(
 
 
 def build_design_system_prompt(context: dict) -> str:
+    # Local source paths are execution-only data used after planning (for
+    # immutable P1 plate copies/composites).  Never expose workstation paths
+    # to either a local or remote Design model.
+    prompt_context = deepcopy(context)
+    for media in prompt_context.get("existing_media") or []:
+        if isinstance(media, dict):
+            media.pop("local_path", None)
+            media.pop("source_plate_local_path", None)
     bound_skills = context.get("bound_h3_skills") or {}
     if bound_skills.get("binding_mode") == "standalone_special":
         skill_direction = (
@@ -4579,7 +4664,7 @@ def build_design_system_prompt(context: dict) -> str:
         "do not add indentation for readability, and keep directions concise while preserving every required Shot, "
         "text layer, continuity state and media range. Close every string, array and object. "
         "Do not include markdown or commentary. Available workspace context: "
-        + json.dumps(context, ensure_ascii=False)
+        + json.dumps(prompt_context, ensure_ascii=False)
     )
 
 

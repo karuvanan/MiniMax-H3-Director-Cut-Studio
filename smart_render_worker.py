@@ -28,6 +28,7 @@ from comfy_submit_worker import (
     wait_for_history,
 )
 from workflow_engine import validate_portable_media_manifest
+from final_hold_engine import apply_final_hold_plate
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
@@ -342,6 +343,12 @@ def preflight_smart_render(job: dict) -> dict:
             "Reference media is missing before ComfyUI upload. Re-link the "
             "Media Pool source or reopen the portable project folder:\n" + preview
         )
+    final_hold_plate = str(job.get("final_hold_plate", "")).strip()
+    if final_hold_plate and not Path(final_hold_plate).is_file():
+        raise FileNotFoundError(
+            "Immutable P1 final-hold plate is missing before render: "
+            + final_hold_plate
+        )
 
     manifest_rows = [
         item for item in (job.get("media") or []) if isinstance(item, dict)
@@ -636,6 +643,17 @@ def assemble_master(job: dict, segments: list[dict]) -> Path:
     completed = subprocess.run(command, capture_output=True, text=True, timeout=1800)
     if completed.returncode:
         raise RuntimeError("FFmpeg master assembly failed: " + completed.stderr[-1200:])
+    final_hold_plate = Path(str(job.get("final_hold_plate", "")))
+    if final_hold_plate.is_file():
+        emit({"progress": "Applying immutable P1 final-frame hold…"})
+        apply_final_hold_plate(
+            Path(job["ffmpeg"]),
+            Path(job["ffprobe"]),
+            destination,
+            final_hold_plate,
+            hold_seconds=float(job.get("final_hold_seconds", 1.0) or 1.0),
+            target_duration=float(job["target_duration_seconds"]),
+        )
     return destination.resolve()
 
 

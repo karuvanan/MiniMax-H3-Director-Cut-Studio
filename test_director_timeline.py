@@ -2435,7 +2435,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         segments = window._planned_render_segments()
         self.assertEqual(
             [(row.start_seconds, row.end_seconds) for row in segments],
-            [(0.0, 2.5), (2.5, 5.0), (5.0, 7.0), (7.0, 9.5), (9.5, 12.0)],
+            [(0.0, 2.5), (2.5, 4.5), (4.5, 7.0), (7.0, 9.0), (9.0, 12.0)],
         )
         self.assertEqual(
             [row.continuity_mode for row in segments],
@@ -2651,6 +2651,39 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
         shutil.rmtree(root, ignore_errors=True)
+
+    def test_render_job_uses_only_a_metadata_verified_immutable_end_plate(self):
+        root = PROJECT_ROOT / ".director_cache" / "immutable_final_hold_spec_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        image_path = root / "terminal.png"
+        Image.new("RGB", (96, 64), (20, 60, 120)).save(image_path)
+        sidecar = image_path.with_suffix(image_path.suffix + ".request.json")
+        sidecar.write_text(json.dumps({
+            "source_plate_media_id": "P1",
+            "source_plate_mode": "immutable_effect_composite",
+            "source_plate_effect_profile": "fireworks",
+            "immutable_scene_plate": True,
+            "final_hold_seconds": 1.0,
+        }), encoding="utf-8")
+        window = DirectorCutStudio()
+        picture = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        assign_local_media(window.scan, picture, image_path)
+        picture.timeline_placed = True
+        picture.timeline_track_id = "V1"
+        picture.start_seconds = 9.0
+        picture.end_seconds = 12.0
+        try:
+            spec = window._immutable_final_hold_spec(0.0, 12.0)
+            self.assertEqual(Path(spec["final_hold_plate"]), image_path.resolve())
+            self.assertEqual(spec["final_hold_seconds"], 1.0)
+            self.assertEqual(spec["final_hold_source_media_id"], "P1")
+            self.assertEqual(spec["final_hold_source_mode"], "immutable_effect_composite")
+            self.assertEqual(window._immutable_final_hold_spec(0.0, 8.0), {})
+        finally:
+            window.project_dirty = False
+            window.close()
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_z_image_regeneration_preserves_p_mapping_prompt_and_dirty_range(self):
         root = PROJECT_ROOT / ".director_cache" / "z_image_regeneration_test"

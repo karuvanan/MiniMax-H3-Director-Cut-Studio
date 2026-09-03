@@ -85,7 +85,10 @@ class SkillEngineTests(unittest.TestCase):
         )
         self.assertIn("visible flight path, orbit ring, circular light trail", skill_text)
         self.assertIn("Still-reference Isolation", skill_text)
+        self.assertIn('source_plate_mode="immutable_copy"', skill_text)
+        self.assertIn("immutable P1 scene plate", skill_text)
         self.assertIn("专用Z-Image负面提示词", special.design_requirement_template)
+        self.assertIn("P1 不可变尾帧", special.design_requirement_template)
         prompt = build_ref2va_prompt(
             PromptSpec(
                 brief="A clean city flyover.",
@@ -110,8 +113,11 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("Fireworks Physics and Continuity Ledger", special.instruction)
         self.assertIn("separate radial particle bursts", special.instruction)
         self.assertIn("usage=\"analysis_only\"", special.instruction)
+        self.assertIn('source_plate_mode="immutable_effect_composite"', special.instruction)
+        self.assertIn("return to P1's exact original framing", special.instruction)
         self.assertIn("专用Z-Image负面提示词", special.design_requirement_template)
         self.assertIn("金色菊花烟花", special.design_requirement_template)
+        self.assertIn("P1不可变特效尾帧", special.design_requirement_template)
         prompt = build_ref2va_prompt(
             PromptSpec(
                 brief="A photoreal night skyline celebration.",
