@@ -53,23 +53,25 @@ Whenever the output is a Design JSON, its `existing_media_uses` array must expli
 ```
 Replace <DURATION> with the requested numerical video duration (e.g., 15.0).
 
-## 3. Scene Keyframe Chain and Automatic Terminal Frame
+## 3. Scene Keyframe Chain and Immutable P1 Terminal Frame
 
 Treat user-supplied visual Pictures as an ordered scene-keyframe chain. `@P1` is always the first anchor and `@P2` is never part of the visual chain. Any additional user-supplied Pictures explicitly selected for the Design, such as `@P3`, `@P4` and `@P5`, are later authoritative scene anchors in Picture-number order unless the user supplies a different chronology.
 
-When the chain contains `@P1` plus at least one later user scene:
+Whether P1 is the only visual scene or the chain contains later user scenes, create one terminal Picture for the closing return to P1. When later scenes exist:
 
 - Give every user scene anchor one disjoint `time_scoped` ownership interval. Do not keep `@P1` or a later anchor active for the whole Design. A later Picture must never be loaded into the same native H3 request that renders an earlier anchor's interval.
 - Translate each scene change into an explicit incoming/outgoing physical state. Studio renders the ownership intervals separately and uses only the preceding generated segment's last 24 visual frames as motion context; never carry its audio or load a future scene Picture early.
-- Create exactly one unlabeled Z-Image `media_request` named `auto_terminal_keyframe_after_<last-anchor>` for the final ownership interval. It is an environment-only settled closing frame derived from the latest user scene's analysed environment and outgoing state. Do not create automatic midpoint or per-Shot Pictures when user scene anchors already exist.
+- Create exactly one unlabeled image `media_request` named `auto_terminal_keyframe_after_<last-anchor>` for the final ownership interval. It is an immutable P1 scene plate, not a newly interpreted closing view. Do not create automatic midpoint or per-Shot Pictures.
 - Leave `preferred_media_id` unset. Studio must allocate the next genuinely empty Virtual Media Pool label: P4 when P1/P2/P3 are occupied, or P6 when P1 through P5 are occupied.
 - On a later Design pass, an older `AI DESIGN GENERATED REFERENCE` or `AUTO TERMINAL KEYFRAME` remains inactive planning history; it is not a new user-authored scene anchor unless the user replaces or explicitly promotes it.
 
-The automatic terminal request must never set `identity_anchor=true`. For city, building, road, skyline or other environment-only references, prohibit all people, faces, figures, portraits, mannequins, statue-like humans and rooftop characters. Its prompt must not cite any Picture label or control-image appearance; restate the latest scene's observed environment, lighting, composition and final camera state in self-contained language.
+The terminal request must set `source_plate_media_id="P1"`, `source_plate_mode="immutable_copy"`, `source_plate_effect_profile="preserve_existing"`, `immutable_scene_plate=true` and `final_hold_seconds=1.0`. Copy P1's visible pixels as the closing plate: identical camera position, altitude, focal length, framing, horizon height, landmark size and spacing, skyline geometry, road layout, building placement, weather, colour grade, baseline exposure, contrast and original city lights. Never move, rotate, raise, reframe, redesign, duplicate, distort, remove or replace any P1 element. Preserve visual effects already present in P1, but do not invent new effects in the ordinary drone Skill. The final second displays this P1 plate perfectly still.
+
+The automatic terminal request must never set `identity_anchor=true`. For city, building, road, skyline or other environment-only references, prohibit all people, faces, figures, portraits, mannequins, statue-like humans and rooftop characters. P2 is never a source plate or visual parent. The outgoing state of the preceding scene may describe the return transition, but it cannot redefine the terminal composition.
 
 Every Z-Image/T2I request is a frozen still, not a camera-motion diagram. Remove `360-degree`, `orbit`, `orbital yaw`, `circle`, `trajectory`, `route`, `waypoint` and equivalent motion-planning phrases from its ordinary prompt sentences and `subject_keywords`; retain only city architecture, composition, weather, light, colour, exposure, lens and the single frozen camera position. Then append exactly: `The drone flight path is implied only through camera motion and must never be visible in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory line, no HUD, no graphic overlay around the towers.` Store this dedicated Z-Image negative prompt: `visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings`. Never copy that negative list into an H3 video prompt.
 
-When only `@P1` and control-only `@P2` exist, retain the ordinary single-scene workflow. Optional camera-position references may be requested only when the user explicitly asks for them and they materially improve continuity. Every such image must use @P1 as its sole visual source and preserve the exact location, layout, landmarks, buildings, objects, weather, time, lighting, colour, grade, exposure, atmosphere, lens character and effects. @P2 remains forbidden as a visual parent.
+When only `@P1` and control-only `@P2` exist, keep P1 as the moving scene master and still create the single immutable P1 terminal plate. Optional camera-position references may be requested only when the user explicitly asks for them and they materially improve continuity. Every such image must use @P1 as its sole visual source and preserve the exact location, layout, landmarks, buildings, objects, weather, time, lighting, colour, grade, exposure, atmosphere, lens character and effects. @P2 remains forbidden as a visual parent.
 
 ## 4. Choose the Rotation Mode
 Do not treat aircraft body spin and camera orbit as the same action. Use one mode unless the user explicitly asks for both.
@@ -137,8 +139,8 @@ Specify the rotation mode clearly:
 
 Orbit Mode: "While translating along the path, the camera completes one seamless full 360-degree orbital yaw around [Target Landmark], keeping the target continuously readable and the horizon stable."
 Yaw-Spin Mode: "While translating along the path, the drone body completes one controlled full 360-degree yaw rotation around its own vertical axis, with no barrel roll and a stable horizon."
-### 7.4 Final Framing & Hold
-Describe the final composition: "The shot settles on [Final Target], holding steady for the last second to ensure a clean ending frame."
+### 7.4 Exact P1 Return & Hold
+Complete the planned move, decelerate, then return to P1's exact original camera position and composition. The last second is not a regenerated city view: it directly displays the immutable P1 scene plate with no camera motion and no changed city geometry.
 
 ### 7.5 Clean Frame Contract
 MiniMax H3 receives a single video prompt, so do not append the Z-Image negative-prompt catalogue to H3: repeating those visual terms can prime the video model to draw them. End the H3 prompt with this positive instruction instead: `The photoreal city image remains clean and unobstructed; all navigation control stays non-visual and entirely off-screen, with a stable horizon and physically continuous aerial parallax.` The exact still-image exclusion sentence and artifact list belong only to Z-Image reference generation; Studio removes them before H3 compilation.
@@ -228,7 +230,7 @@ If the user asks only for a video prompt, output only the finished English H3 pr
 If the user asks for a plan, design, JSON, or route explanation, output the editable trajectory JSON first, then H3 Prompt: and the final English prompt.
 Require both loaded @P1 and @P2. If either is missing, return only the hard block for the missing reference; never invent or pre-cite an unloaded label. @P1 is the required scene master; @P2 supplies route data only.
 Every Design JSON must include both loaded images in existing_media_uses: P1 with usage: h3_reference, and P2 with usage: analysis_only. Studio must retain P2 for planning while excluding it from Timeline placement, Segment capacity, ComfyUI upload and every H3 reference slot.
-With multiple user-supplied scene Pictures, build the disjoint scene-keyframe chain from section 3 and request exactly one unlabeled automatic terminal frame after the last anchor. Never preselect its Picture number; normal Virtual Media Pool allocation chooses the next empty P label. With only P1 and P2, do not invent a multi-scene chain.
+With multiple user-supplied scene Pictures, build the disjoint scene-keyframe chain from section 3 and request exactly one unlabeled immutable P1 terminal frame after the last anchor. Never preselect its Picture number; normal Virtual Media Pool allocation chooses the next empty P label. With only P1 and P2, do not invent later scene anchors, but still create the one P1 terminal plate.
 Treat the red-route image as non-visual control-only: extract waypoint data, then exclude it entirely from H3 and Z-Image visual references. The red control path, arrows, labels, colours, and overlay graphics from @P2 must not be copied or visible in the final video under any circumstance.
 Do not state that the model has executed a real drone flight, collected GPS data, or performed physical mission control.
 
@@ -242,8 +244,9 @@ Mode Clarity: Rotation mode (Orbit vs. Spin) is unambiguous and matches user int
 Physical Plausibility: The move avoids scene geometry (buildings, trees). Stable horizon, realistic parallax/inertia.
 Language: Final prompt is English-only, no implementation explanation.
 JSON Integrity: @P1 and @P2 are correctly registered in existing_media_uses. Normalized screen-space controls used (no real-world telemetry claims).
-Keyframe Isolation: When later user scene Pictures exist, each owns a disjoint time range, exactly one environment-only automatic terminal request follows the last anchor, and no future Picture is loaded while an earlier anchor is being rendered.
+Keyframe Isolation: When later user scene Pictures exist, each owns a disjoint time range, exactly one immutable P1 terminal request follows the last anchor, and no future Picture is loaded while an earlier anchor is being rendered.
 Still-reference Isolation: Every generated city Picture is a frozen environment frame. Its ordinary prompt and keywords contain no orbit/yaw/trajectory instruction, it includes the exact clean-frame sentence, and its dedicated negative prompt includes the orbit-ring/light-trail artifact list.
+Terminal Plate Fidelity: the terminal request points to P1 as an immutable local source plate, preserves existing P1 pixels instead of re-generating the city, and reserves the final second for a static exact-P1 hold.
 
 ## 11. Control-Data Hygiene
 Keep detailed route-artifact vocabulary inside P2's `analysis_only` registration and the dedicated Z-Image `negative_prompt` only. The single exact clean-frame exclusion sentence is the sole permitted appearance in a positive generated-image prompt. Never copy the negative catalogue into creative_brief, Shot fields, constraints, markers, transitions or the final H3 prompt. Express H3 motion quality positively: stable horizon, continuous inertia, clean photoreal frame, collision-free path and coherent city geometry.

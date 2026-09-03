@@ -53,23 +53,23 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 
 将 `<DURATION>` 替换成用户要求的数值时长。
 
-## 3. 场景关键帧链与自动收尾帧
+## 3. 场景关键帧链与 P1 不可变尾帧
 
 把用户提供的视觉图片视为有先后顺序的场景关键帧链。`@P1` 永远是第一锚点，`@P2` 永远不属于视觉链。Design 明确选用的其他用户图片，例如 `@P3`、`@P4`、`@P5`，默认按 Picture 编号成为后续权威场景锚点；用户明确提供其他时间顺序时，以用户顺序为准。
 
-当视觉链包含 `@P1` 及至少一个后续用户场景时：
+不论只有 P1/P2，还是视觉链包含 `@P1` 及后续用户场景，都必须在链尾建立一次 P1 返回段：
 
 - 每张用户场景图只拥有一个互不重叠的 `time_scoped` 时间区间。不得让 P1 或后续锚点覆盖整个 Design；渲染较早场景时，不得在同一个原生 H3 请求中加载未来场景图片。
 - 每次场景变化都必须写明 Incoming／Outgoing 物理状态。Studio 将每个所有权区间独立渲染，只把前段最后 24 个视频帧作为无声运动上下文；不得复制前段音频，也不得提前加载下一场景。
-- 只在最后一个用户锚点之后建立一张未命名 Z-Image 请求，`requirement_id` 使用 `auto_terminal_keyframe_after_<last-anchor>`。它是根据最后场景环境和 Outgoing State 建立的稳定收尾画面。已有用户场景锚点时，不得再机械创建中点图或逐 Shot 补图。
+- 只在最后一个用户锚点之后建立一张未命名终点请求，`requirement_id` 使用 `auto_terminal_keyframe_after_<last-anchor>`。它不是新的 T2I 解释图，而是从已加载的 P1 本地像素生成的不可变 Scene Plate。普通版使用 `source_plate_media_id="P1"`、`source_plate_mode="immutable_copy"`、`source_plate_effect_profile="preserve_existing"`、`immutable_scene_plate=true`、`final_hold_seconds=1.0`。
 - 不得填写 `preferred_media_id`。由 Studio 自动选择真正空置的下一个 Virtual Media Pool 编号：P1/P2/P3 已占用时成为 P4；P1 至 P5 已占用时成为 P6。
 - 下一次重新 Design 时，旧的 `AI DESIGN GENERATED REFERENCE` 或 `AUTO TERMINAL KEYFRAME` 只是不再启用的历史资料，不得自动升级为用户场景锚点；只有用户替换或明确提升它时才可使用。
 
-自动收尾请求绝不得设置 `identity_anchor=true`。城市、建筑、道路、天际线等纯环境图禁止人物、人脸、人形、肖像、假人、雕像式人物和楼顶人物。提示词不得引用任何 Picture 标签或控制图外观，而要用自包含文字重述最后场景的已观察环境、光线、构图与最终机位状态。
+自动尾帧请求绝不得设置 `identity_anchor=true`。尾帧必须逐像素以 P1 为唯一底图，完全保持 P1 的摄影机位置、高度、焦段、构图、水平线、地标大小与间距、天际线几何、道路、建筑、天气、基础曝光、色调、对比度和原有城市灯光；不得移动、旋转、升高、重新取景、重设计、复制、扭曲、移除或替换任何元素。普通版不得自行增加新的烟花、烟雾、光源、建筑或人物。
 
 所有Z-Image／T2I请求都是冻结静态画面，不是摄影机运动图解。从普通图片提示词和 `subject_keywords` 删除 `360-degree`、`orbit`、`orbital yaw`、圆形、轨迹、路线、航点及同类运动规划短语，只保留城市建筑、构图、天气、光线、色彩、曝光、镜头与唯一冻结机位。随后准确追加：`The drone flight path is implied only through camera motion and must never be visible in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory line, no HUD, no graphic overlay around the towers.` 并设置专用Z-Image负面提示词：`visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings`。这份负面词表绝不能复制进H3视频提示词。
 
-只有 `@P1` 与控制用 `@P2` 时，保持普通单场景流程。只有用户明确要求且确实有助连续性时才可创建其他机位参考，而且每张图仍只能继承 P1 的地点、布局、地标、建筑、物件、天气、时间、光线、色彩、曝光、氛围、镜头和特效；P2 始终不得成为视觉母版。
+只有 `@P1` 与控制用 `@P2` 时，运动过程保持普通单场景流程，但结尾仍须回到 P1 原始构图并冻结展示 P1 一秒。只有用户明确要求且确实有助连续性时才可创建其他机位参考；P2 始终不得成为视觉母版。
 
 ## 4. 旋转模式
 
@@ -115,7 +115,7 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 1. 开头明确描述 `@P1` 的地点、布局、地标、光线与时间、天气与氛围、调色、曝光和镜头特性。
 2. 只描述物理路线运动；不得在正文提及 “red line”、“map” 或 “route graphic”。说明连续运动、真实惯性、加速与减速。
 3. 明确写出环绕或偏航自旋模式及稳定目标锁定。环绕可用：`While translating along the path, the camera completes one seamless full 360-degree orbital yaw around [target], keeping the target continuously readable and the horizon stable.`
-4. 写出最终构图与短暂稳定停留。
+4. 写出飞行减速、回到 P1 精确原始构图，并在最后一秒直接冻结不可变 P1 Scene Plate。该尾帧不是 H3 或 Z-Image 重新想象的城市画面。
 5. H3 只有一个视频生成提示词，不要把Z-Image负面词表附加到H3；反复写出这些图形反而可能诱导视频模型画出来。结尾只加入正向约束：`写实城市画面保持干净无遮挡，所有导航控制均为非视觉数据并完全位于画外；水平线稳定，航拍视差与惯性连续可信。` 精确的静态图排除句和负面词表只属于Z-Image参考图生成，Studio会在H3编译前排除它们。
 
 若启用音频生成，只追加与场景相符的环境音描述；除非用户要求，否则不要加对白。
@@ -220,7 +220,8 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 - **物理可信**：避开建筑与树木等几何体；水平线稳定，视差与惯性自然。
 - **语言**：最终提示词只用英文，不含实现说明。
 - **JSON 完整**：`@P1` 与 `@P2` 均正确登记于 `existing_media_uses`；只使用归一化屏幕坐标，不声称真实世界遥测。
-- **关键帧隔离**：后续用户场景图各自拥有独立区间；自动收尾图只位于链尾；渲染前一场景时没有加载任何未来 Picture。
+- **关键帧隔离**：后续用户场景图各自拥有独立区间；P1 不可变尾帧只位于链尾；渲染前一场景时没有加载任何未来 Picture。
+- **P1 像素锁定**：普通版尾帧的可见像素与 P1 一致，元数据明确使用 `immutable_copy`，不经纯文字 T2I 重绘。
 - **静态参考图隔离**：每张生成城市Picture都是冻结环境画面；普通提示词及关键词没有orbit／yaw／trajectory运动指令，包含精确Clean Frame句，并在专用负面提示词保存光环／光带伪影词表。
 
 ## 10. 控制数据卫生
