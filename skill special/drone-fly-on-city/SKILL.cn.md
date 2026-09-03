@@ -41,7 +41,7 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
     "requirement_id": "route_control_nonvisual",
     "media_id": "P2",
     "media_type": "image",
-    "usage": "route_control_analysis_only",
+    "usage": "analysis_only",
     "reuse_policy": "whole_design",
     "start_seconds": 0.0,
     "end_seconds": "<DURATION>",
@@ -104,9 +104,7 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 2. 只描述物理路线运动；不得在正文提及 “red line”、“map” 或 “route graphic”。说明连续运动、真实惯性、加速与减速。
 3. 明确写出环绕或偏航自旋模式及稳定目标锁定。环绕可用：`While translating along the path, the camera completes one seamless full 360-degree orbital yaw around [target], keeping the target continuously readable and the horizon stable.`
 4. 写出最终构图与短暂稳定停留。
-5. 每个最终 H3 提示词必须附加以下完整负面提示词：
-
-`Negative prompt: red waypoint, red route line, route path overlay, flight path line, map line, red arrow, waypoint marker, navigation marker, HUD, UI overlay, annotation, graphic overlay, red scribble, red stroke, visible control path, visible route guide, jerky camera, sudden teleportation, broken horizon, barrel roll, random spin, camera collision, flying through buildings, warped architecture, unstable parallax, extreme fisheye distortion, flicker, stutter, motion smear, duplicated vehicles, malformed city geometry, unreadable signage, watermark.`
+5. H3 只有一个生成提示词，不要附加一整串禁用路线图形词汇；反复写出这些图形反而可能诱导模型画出来。结尾只加入正向约束：`写实城市画面保持干净无遮挡，所有导航控制均为非视觉数据并完全位于画外；水平线稳定，航拍视差与惯性连续可信。` 具体控制图形名称只保留在 P2 的 `analysis_only` 登记说明内，Studio 会在 H3 编译前排除该行。
 
 若启用音频生成，只追加与场景相符的环境音描述；除非用户要求，否则不要加对白。
 
@@ -133,7 +131,7 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
       "requirement_id": "route_control_nonvisual",
       "media_id": "P2",
       "media_type": "image",
-      "usage": "route_control_analysis_only",
+      "usage": "analysis_only",
       "reuse_policy": "whole_design",
       "start_seconds": 0.0,
       "end_seconds": 15.0,
@@ -192,7 +190,7 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 
 - 用户只要视频提示词时，只输出最终英文 H3 提示词。
 - 用户要求 Design、计划、JSON 或路线说明时，先输出可编辑 JSON，再输出 `H3 Prompt:` 和最终英文提示词。
-- 每个 Design JSON 均将 `P1` 登记为 `h3_reference`，将 `P2` 登记为 `route_control_analysis_only`。
+- 每个 Design JSON 均将 `P1` 登记为 `h3_reference`，将 `P2` 登记为 `analysis_only`；P2 只参与规划，不进入 Timeline、Segment 容量、上传清单或 H3 图片槽。
 - 所有航点必须贴合路线形状，不得出现无解释捷径。
 - 最终 H3 提示词必须为英文、只含一次 360 度循环、保持 `@P1` 场景连续性，并对 `@P2` 保持零视觉使用与零文字引用。
 - 成片绝不得出现红色 waypoint、红线、路线叠层、箭头、标记、HUD、UI、注释、涂鸦或其他控制图形。
@@ -203,17 +201,13 @@ description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点�
 返回前逐项确认：
 
 - **路径保真**：JSON 与提示词的航点严格描摹红线形状、转弯与曲线；除非用户要求直接飞行，否则不得走直线捷径。
-- **视觉隔离**：最终 H3 提示词不得提及 “red line”、“map overlay” 或 `@P2`；负面提示词必须含所有路线相关术语。
+- **视觉隔离**：最终 H3 提示词不得出现 P2 标签或描述其可见控制图形，只使用第 7 节的正向干净画面约束。
 - **旋转准确**：一次旋转的最终累积偏航严格等于 360°。
 - **模式清晰**：环绕与机身自旋不可混淆，必须符合用户意图。
 - **物理可信**：避开建筑与树木等几何体；水平线稳定，视差与惯性自然。
 - **语言**：最终提示词只用英文，不含实现说明。
 - **JSON 完整**：`@P1` 与 `@P2` 均正确登记于 `existing_media_uses`；只使用归一化屏幕坐标，不声称真实世界遥测。
 
-## 10. 负面提示词分类参考
+## 10. 控制数据卫生
 
-目标工作流支持负面提示词时，使用第 7 节的完整清单。分类如下：
-
-- **路线伪影**：`red waypoint`, `red route line`, `route path overlay`, `flight path line`, `map line`, `red arrow`, `waypoint marker`, `navigation marker`, `HUD`, `UI overlay`, `annotation`, `graphic overlay`, `red scribble`, `red stroke`, `visible control path`, `visible route guide`。
-- **运动伪影**：`jerky camera`, `sudden teleportation`, `broken horizon`, `barrel roll`, `random spin`, `camera collision`, `flying through buildings`, `warped architecture`, `unstable parallax`, `extreme fisheye distortion`。
-- **视频质量伪影**：`flicker`, `stutter`, `motion smear`, `duplicated vehicles`, `malformed city geometry`, `unreadable signage`, `watermark`。
+具体路线伪影词汇只允许出现在 P2 的 `analysis_only` 登记说明中供规划质检，不得复制进 creative_brief、Shot、constraints、marker、transition、补图提示词或最终 H3 Prompt。最终生成指令只用正向语言描述稳定水平线、连续惯性、干净写实画面、避碰航线和一致的城市几何。

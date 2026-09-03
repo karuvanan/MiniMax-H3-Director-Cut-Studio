@@ -42,7 +42,7 @@ Whenever the output is a Design JSON, its `existing_media_uses` array must expli
     "requirement_id": "route_control_nonvisual",
     "media_id": "P2",
     "media_type": "image",
-    "usage": "route_control_analysis_only",
+    "usage": "analysis_only",
     "reuse_policy": "whole_design",
     "start_seconds": 0.0,
     "end_seconds": "<DURATION>",
@@ -125,10 +125,8 @@ Yaw-Spin Mode: "While translating along the path, the drone body completes one c
 ### 7.4 Final Framing & Hold
 Describe the final composition: "The shot settles on [Final Target], holding steady for the last second to ensure a clean ending frame."
 
-### 7.5 Mandatory Negative Prompt
-Append this EXACT negative prompt string to every final H3 prompt to enforce visual isolation and quality control. This list is non-negotiable:
-
-Negative prompt: red waypoint, red route line, route path overlay, flight path line, map line, red arrow, waypoint marker, navigation marker, HUD, UI overlay, annotation, graphic overlay, red scribble, red stroke, visible control path, visible route guide, jerky camera, sudden teleportation, broken horizon, barrel roll (unless requested), random spin, camera collision, flying through buildings, warped architecture, unstable parallax, extreme fisheye distortion, flicker, stutter, motion smear, duplicated vehicles, malformed city geometry, unreadable signage, watermark
+### 7.5 Clean Frame Contract
+MiniMax H3 receives a single generative prompt, so do not append a catalogue of forbidden route graphics: repeating those visual terms can prime the model to draw them. End with this positive instruction instead: `The photoreal city image remains clean and unobstructed; all navigation control stays non-visual and entirely off-screen, with a stable horizon and physically continuous aerial parallax.` Keep specific artifact names only inside the `analysis_only` P2 registration, which Studio removes before H3 compilation.
 
 ### 7.6 Audio Description (Optional)
 If audio generation is enabled, append a brief description of the ambient sound matching the scene (e.g., "soft wind, distant city hum") to ensure the native audio aligns with the visual atmosphere. Do not include dialogue unless explicitly requested.
@@ -155,7 +153,7 @@ When the user asks for Design, a plan, JSON, or editable controls, return this J
       "requirement_id": "route_control_nonvisual",
       "media_id": "P2",
       "media_type": "image",
-      "usage": "route_control_analysis_only",
+      "usage": "analysis_only",
       "reuse_policy": "whole_design",
       "start_seconds": 0.0,
       "end_seconds": 15.0,
@@ -214,7 +212,7 @@ When the user asks for Design, a plan, JSON, or editable controls, return this J
 If the user asks only for a video prompt, output only the finished English H3 prompt.
 If the user asks for a plan, design, JSON, or route explanation, output the editable trajectory JSON first, then H3 Prompt: and the final English prompt.
 Require both loaded @P1 and @P2. If either is missing, return only the hard block for the missing reference; never invent or pre-cite an unloaded label. @P1 is the required scene master; @P2 supplies route data only.
-Every Design JSON must include both loaded images in existing_media_uses: P1 with usage: h3_reference, and P2 with usage: route_control_analysis_only. This is a preflight registration, not permission to use P2 visually.
+Every Design JSON must include both loaded images in existing_media_uses: P1 with usage: h3_reference, and P2 with usage: analysis_only. Studio must retain P2 for planning while excluding it from Timeline placement, Segment capacity, ComfyUI upload and every H3 reference slot.
 The skill may create optional continuation images for the next available labels from @P3 through @P9, but it must first issue unlabeled media requests and wait for the results to be loaded. Each optional image must be derived visually from @P1 alone, preserving every scene, grading, lighting, mood, exposure, atmosphere, lens, and effect attribute except the route-consistent view change.
 Treat the red-route image as non-visual control-only: extract waypoint data, then exclude it entirely from H3 and Z-Image visual references. The red control path, arrows, labels, colours, and overlay graphics from @P2 must not be copied or visible in the final video under any circumstance.
 Do not state that the model has executed a real drone flight, collected GPS data, or performed physical mission control.
@@ -223,16 +221,12 @@ Do not state that the model has executed a real drone flight, collected GPS data
 Before returning, verify:
 
 Path Fidelity: The waypoints in the JSON and prompt strictly trace the red line's shape (curves, turns). No straight-line shortcuts unless requested.
-Visual Isolation: The final H3 prompt contains NO mention of "red line", "map overlay", or "@P2". The negative prompt includes all route-related terms.
+Visual Isolation: The final H3 prompt contains no P2 label and no description of its visible control graphics. It uses only the clean-frame sentence from section 7.5.
 Rotation Accuracy: Final accumulated yaw is exactly 360° for one requested rotation.
 Mode Clarity: Rotation mode (Orbit vs. Spin) is unambiguous and matches user intent.
 Physical Plausibility: The move avoids scene geometry (buildings, trees). Stable horizon, realistic parallax/inertia.
 Language: Final prompt is English-only, no implementation explanation.
 JSON Integrity: @P1 and @P2 are correctly registered in existing_media_uses. Normalized screen-space controls used (no real-world telemetry claims).
 
-## 11. Negative Prompt Terms Reference
-Use the full list defined in "Required H3 Prompt Construction" when the target workflow supports a negative prompt. Key categories:
-
-Route Artifacts: red waypoint, red route line, route path overlay, flight path line, map line, red arrow, waypoint marker, navigation marker, HUD, UI overlay, annotation, graphic overlay, red scribble, red stroke, visible control path, visible route guide.
-Motion Artifacts: jerky camera, sudden teleportation, broken horizon, barrel roll (unless requested), random spin, camera collision, flying through buildings, warped architecture, unstable parallax, extreme fisheye distortion.
-Video Quality Artifacts: flicker, stutter, motion smear, duplicated vehicles, malformed city geometry, unreadable signage, watermark.
+## 11. Control-Data Hygiene
+Keep the detailed route-artifact vocabulary inside P2's `analysis_only` registration for planning QA only. Never copy that vocabulary into creative_brief, Shot fields, constraints, markers, transitions, generated-image prompts or the final H3 prompt. Express motion quality positively: stable horizon, continuous inertia, clean photoreal frame, collision-free path and coherent city geometry.
