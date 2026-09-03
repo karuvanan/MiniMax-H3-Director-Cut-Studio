@@ -53,8 +53,21 @@ Whenever the output is a Design JSON, its `existing_media_uses` array must expli
 ```
 Replace <DURATION> with the requested numerical video duration (e.g., 15.0).
 
-## 3. Optional Continuation References (@P3–@P9)
-The Skill may create route midpoint, orbit-target, or final-frame references only when they improve continuity. Create them as unlabeled Z-Image media requests first; after each image is actually loaded, use the next available label from @P3 through @P9. Every continuation image must use @P1 as its sole visual parent and preserve the exact same location, layout, landmarks, buildings, objects, weather, time, lighting direction and intensity, colour palette, grade, exposure, contrast, atmosphere, lens character, and visual effects. Only the route-consistent camera position, framing, or target view may change. @P2 must never be used as a visual parent. The final H3 reference bundle may contain @P1 plus loaded @P3–@P9, and must contain zero visual uses of @P2.
+## 3. Scene Keyframe Chain and Automatic Terminal Frame
+
+Treat user-supplied visual Pictures as an ordered scene-keyframe chain. `@P1` is always the first anchor and `@P2` is never part of the visual chain. Any additional user-supplied Pictures explicitly selected for the Design, such as `@P3`, `@P4` and `@P5`, are later authoritative scene anchors in Picture-number order unless the user supplies a different chronology.
+
+When the chain contains `@P1` plus at least one later user scene:
+
+- Give every user scene anchor one disjoint `time_scoped` ownership interval. Do not keep `@P1` or a later anchor active for the whole Design. A later Picture must never be loaded into the same native H3 request that renders an earlier anchor's interval.
+- Translate each scene change into an explicit incoming/outgoing physical state. Studio renders the ownership intervals separately and uses only the preceding generated segment's last 24 visual frames as motion context; never carry its audio or load a future scene Picture early.
+- Create exactly one unlabeled Z-Image `media_request` named `auto_terminal_keyframe_after_<last-anchor>` for the final ownership interval. It is an environment-only settled closing frame derived from the latest user scene's analysed environment and outgoing state. Do not create automatic midpoint or per-Shot Pictures when user scene anchors already exist.
+- Leave `preferred_media_id` unset. Studio must allocate the next genuinely empty Virtual Media Pool label: P4 when P1/P2/P3 are occupied, or P6 when P1 through P5 are occupied.
+- On a later Design pass, an older `AI DESIGN GENERATED REFERENCE` or `AUTO TERMINAL KEYFRAME` remains inactive planning history; it is not a new user-authored scene anchor unless the user replaces or explicitly promotes it.
+
+The automatic terminal request must never set `identity_anchor=true`. For city, building, road, skyline or other environment-only references, prohibit all people, faces, figures, portraits, mannequins, statue-like humans and rooftop characters. Its prompt must not cite any Picture label or control-image appearance; restate the latest scene's observed environment, lighting, composition and final camera state in self-contained language.
+
+When only `@P1` and control-only `@P2` exist, retain the ordinary single-scene workflow. Optional camera-position references may be requested only when the user explicitly asks for them and they materially improve continuity. Every such image must use @P1 as its sole visual source and preserve the exact location, layout, landmarks, buildings, objects, weather, time, lighting, colour, grade, exposure, atmosphere, lens character and effects. @P2 remains forbidden as a visual parent.
 
 ## 4. Choose the Rotation Mode
 Do not treat aircraft body spin and camera orbit as the same action. Use one mode unless the user explicitly asks for both.
@@ -213,7 +226,7 @@ If the user asks only for a video prompt, output only the finished English H3 pr
 If the user asks for a plan, design, JSON, or route explanation, output the editable trajectory JSON first, then H3 Prompt: and the final English prompt.
 Require both loaded @P1 and @P2. If either is missing, return only the hard block for the missing reference; never invent or pre-cite an unloaded label. @P1 is the required scene master; @P2 supplies route data only.
 Every Design JSON must include both loaded images in existing_media_uses: P1 with usage: h3_reference, and P2 with usage: analysis_only. Studio must retain P2 for planning while excluding it from Timeline placement, Segment capacity, ComfyUI upload and every H3 reference slot.
-The skill may create optional continuation images for the next available labels from @P3 through @P9, but it must first issue unlabeled media requests and wait for the results to be loaded. Each optional image must be derived visually from @P1 alone, preserving every scene, grading, lighting, mood, exposure, atmosphere, lens, and effect attribute except the route-consistent view change.
+With multiple user-supplied scene Pictures, build the disjoint scene-keyframe chain from section 3 and request exactly one unlabeled automatic terminal frame after the last anchor. Never preselect its Picture number; normal Virtual Media Pool allocation chooses the next empty P label. With only P1 and P2, do not invent a multi-scene chain.
 Treat the red-route image as non-visual control-only: extract waypoint data, then exclude it entirely from H3 and Z-Image visual references. The red control path, arrows, labels, colours, and overlay graphics from @P2 must not be copied or visible in the final video under any circumstance.
 Do not state that the model has executed a real drone flight, collected GPS data, or performed physical mission control.
 
@@ -227,6 +240,7 @@ Mode Clarity: Rotation mode (Orbit vs. Spin) is unambiguous and matches user int
 Physical Plausibility: The move avoids scene geometry (buildings, trees). Stable horizon, realistic parallax/inertia.
 Language: Final prompt is English-only, no implementation explanation.
 JSON Integrity: @P1 and @P2 are correctly registered in existing_media_uses. Normalized screen-space controls used (no real-world telemetry claims).
+Keyframe Isolation: When later user scene Pictures exist, each owns a disjoint time range, exactly one environment-only automatic terminal request follows the last anchor, and no future Picture is loaded while an earlier anchor is being rendered.
 
 ## 11. Control-Data Hygiene
 Keep the detailed route-artifact vocabulary inside P2's `analysis_only` registration for planning QA only. Never copy that vocabulary into creative_brief, Shot fields, constraints, markers, transitions, generated-image prompts or the final H3 prompt. Express motion quality positively: stable horizon, continuous inertia, clean photoreal frame, collision-free path and coherent city geometry.
