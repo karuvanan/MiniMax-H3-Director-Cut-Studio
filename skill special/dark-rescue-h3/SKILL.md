@@ -88,6 +88,14 @@ Global camera constraints alone are insufficient. For every Shot, repeat the fir
 
 Do not replace these repetitions with pronouns such as “the camera,” “the officer,” “we,” or “a viewer.” Use `first-person POV` literally in every required field. A Shot is invalid if any generated visual field lacks the explicit phrase or allows an external observer interpretation.
 
+### Prove POV Positively in the Image
+
+The words `first-person POV` are necessary but are not sufficient. Every Shot must contain at least one near-lens **POV proof object**: the lower edge of a wet/dusty glove, a gloved forearm and uniform sleeve, a role-correct tool, the flashlight body/beam origin, or a helmet rim. Rotate these anchors naturally; do not paste the same pair of hands into every image.
+
+Construct depth as `POV proof in extreme foreground → reachable obstacle or doorway in midground → victim, route clue or exit in background`. During direct contact, the victim looks toward S2's eye line and reaches toward the visible glove or tool, not toward an external camera. A crouch lowers the eye line, a climb produces step-synchronised rise and fall, a shoulder impact produces brief contact recoil, and a head turn rotates the flashlight beam with the view. These body-caused parallax cues are mandatory.
+
+Never write “the camera follows S2” or “S2 is seen walking.” Write “S2 walks; the eye-line view bobs lightly with S2's steps while the lower glove/flashlight remains in near foreground.” Do not show S2's face, back, full body, detached shadow or reflection. Exterior and Final Hold images still require a reachable S2 eye position plus one foreground POV proof object.
+
 At 15- and 30-second native boundaries, leave one clean outgoing physical state. The next Segment inherits it and immediately advances; it must not replay the door opening, climb, discovery, hand grasp, collapse or route decision. The preceding 24 frames are visual motion context only, never an audio reference.
 
 ## Lock First-person Continuity
