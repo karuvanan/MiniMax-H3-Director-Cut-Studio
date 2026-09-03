@@ -123,6 +123,7 @@ from design_engine import (
     extract_explicit_timed_text_layers,
     infer_design_dialogue_language,
     infer_explicit_design_duration,
+    is_analysis_only_media_use,
     materialize_design_media,
     normalize_shot_action_budget,
     normalize_design_plan,
@@ -7870,7 +7871,11 @@ class DesignPageDialog(QDialog):
             counts[request["media_type"]] += 1
         reused = {kind: 0 for kind in ("image", "video", "audio")}
         reused_ids: list[str] = []
+        analysis_only_ids: list[str] = []
         for use in plan.get("existing_media_uses") or []:
+            if is_analysis_only_media_use(use):
+                analysis_only_ids.append(str(use.get("media_id", "")))
+                continue
             media_type = str(use.get("media_type", ""))
             if media_type in reused:
                 reused[media_type] += 1
@@ -7913,6 +7918,9 @@ class DesignPageDialog(QDialog):
                 f"TRANSITIONS: {len(plan['transitions'])}",
                 f"MARKERS: {len(plan['markers'])}",
                 "MEDIA POOL REUSE: " + (", ".join(reused_ids) if reused_ids else "none"),
+                "ANALYSIS-ONLY CONTROL: " + (
+                    ", ".join(analysis_only_ids) if analysis_only_ids else "none"
+                ),
                 f"REUSED: {reused['image']} image / {reused['video']} video / {reused['audio']} audio",
                 f"TO GENERATE: {counts['image']} image / {counts['video']} video / {counts['audio']} audio",
                 (
@@ -10287,10 +10295,14 @@ class DirectorCutStudio(QMainWindow):
         assets_by_media_id = {
             media_shortcut(asset).upper(): asset for asset in self.scan.assets
         }
-        reuse_rows = [dict(item) for item in plan.get("existing_media_uses") or []]
+        all_reuse_rows = [dict(item) for item in plan.get("existing_media_uses") or []]
+        reuse_rows = [
+            item for item in all_reuse_rows
+            if not is_analysis_only_media_use(item)
+        ]
         reused_node_ids = {
             assets_by_media_id[media_id].node_id
-            for item in reuse_rows
+            for item in all_reuse_rows
             if (media_id := str(item.get("media_id", "")).upper()) in assets_by_media_id
         }
         if reused_node_ids:
@@ -11422,6 +11434,8 @@ class DirectorCutStudio(QMainWindow):
         duration = float(plan.get("duration_seconds", self.scan.duration_seconds))
         rows: list[tuple[str, str, float, float]] = []
         for index, item in enumerate(plan.get("existing_media_uses") or [], 1):
+            if is_analysis_only_media_use(item):
+                continue
             media_type = str(item.get("media_type", "")).lower()
             identity = str(item.get("media_id") or f"existing-{index}").upper()
             rows.append((

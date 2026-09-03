@@ -26,6 +26,7 @@ from design_engine import (
     extract_explicit_timed_text_layers,
     infer_design_dialogue_language,
     infer_explicit_design_duration,
+    is_analysis_only_media_use,
     materialize_design_media,
     normalize_design_music_mode,
     normalize_shot_action_budget,
@@ -1444,6 +1445,61 @@ On-screen text: "EXACT TITLE"'''
         media_request = DESIGN_JSON_SCHEMA["properties"]["media_requests"]["items"]
         self.assertIn("requirement_id", media_request["required"])
         self.assertIn("reuse_policy", media_request["required"])
+
+    def test_analysis_only_control_picture_never_becomes_h3_reference(self):
+        payload = sample_design()
+        payload["media_requests"] = []
+        payload["creative_brief"] = "Follow the route extracted from @P2 without showing it."
+        payload["constraints"] = "Negative prompt: red route line, red waypoint, UI overlay."
+        payload["shots"][0]["additional_direction"] = (
+            "Use <Picture 2> only as control data and follow its extracted waypoints."
+        )
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "scene_master", "media_id": "P1",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V1", "subject_keywords": ["city"],
+                "instruction": "Preserve @P1 as the city scene master.",
+            },
+            {
+                "requirement_id": "route_control", "media_id": "P2",
+                "media_type": "image", "usage": "route_control_analysis_only",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V1", "subject_keywords": ["route control"],
+                "instruction": "Read @P2 only to extract abstract waypoints.",
+            },
+        ]
+        inventory = [
+            {"media_id": "P1", "media_type": "image", "loaded": True},
+            {"media_id": "P2", "media_type": "image", "loaded": True},
+        ]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+        )
+
+        control = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P2")
+        self.assertTrue(is_analysis_only_media_use(control))
+        self.assertEqual(control["usage"], "analysis_only")
+        renderable = " ".join([
+            plan["creative_brief"],
+            plan["constraints"],
+            *[row["additional_direction"] for row in plan["shots"]],
+        ])
+        self.assertNotIn("@P2", renderable)
+        self.assertNotIn("<Picture 2>", renderable)
+        self.assertIn("pre-analysed non-visual control instructions", renderable)
+        self.assertNotIn("red route line", renderable.lower())
+        self.assertNotIn("red waypoint", renderable.lower())
+        self.assertIn("all planning controls remain non-visual", renderable)
+        usage_enum = (
+            DESIGN_JSON_SCHEMA["properties"]["existing_media_uses"]["items"]
+            ["properties"]["usage"]["enum"]
+        )
+        self.assertIn("analysis_only", usage_enum)
+        self.assertIn("route_control_analysis_only", usage_enum)
 
     def test_shot_schema_separates_core_state_and_optional_flourish(self):
         shot = DESIGN_JSON_SCHEMA["properties"]["shots"]["items"]

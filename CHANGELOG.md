@@ -2,7 +2,15 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
-## [0.3.2-alpha.2] - 2026-09-02
+## [0.3.2-alpha.2] - 2026-09-03
+
+### Analysis-only route controls
+
+- Added a real `analysis_only` Media Pool usage for planning maps, route drawings, masks and other control images. The compatibility alias `route_control_analysis_only` is accepted and normalized automatically.
+- Analysis-only sources remain available to Design intelligence but are never placed on the Timeline, counted against per-Segment H3 capacity, uploaded to ComfyUI/MiniMax, treated as identity anchors or assigned an H3 Picture slot. Reapplying a Design also removes a control image that an older build mistakenly placed on a V track.
+- Removed analysis-only `@P/@V/@A` labels from every H3-renderable Shot, cue and creative field, replacing them with the already extracted abstract control instruction so reference-token parsing cannot reactivate the source.
+- Updated `drone-fly-on-city` in English, Chinese and its Design Requirement template. The former long negative-prompt catalogue repeated route-artifact vocabulary inside H3's single prompt and could visually prime the model; it is now replaced by a positive clean-frame/off-screen-control contract.
+- Added Design normalization and end-to-end workflow regressions proving a loaded P2 route-control picture remains in the Media Pool while its filename, loader and pixels are absent from the compiled H3 job.
 
 ### Design JSON completion reliability
 

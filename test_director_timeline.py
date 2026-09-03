@@ -2275,6 +2275,67 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_analysis_only_route_picture_is_removed_from_timeline_and_h3_slots(self):
+        window = DirectorCutStudio()
+        media_root = PROJECT_ROOT / ".director_cache" / "analysis_only_route_test"
+        media_root.mkdir(parents=True, exist_ok=True)
+        scene_path = media_root / "scene.png"
+        route_path = media_root / "route_control.png"
+        Image.new("RGB", (48, 48), (40, 70, 100)).save(scene_path)
+        Image.new("RGB", (48, 48), (255, 0, 0)).save(route_path)
+        self.addCleanup(lambda: scene_path.unlink(missing_ok=True))
+        self.addCleanup(lambda: route_path.unlink(missing_ok=True))
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        scene, route = pictures[:2]
+        assign_local_media(window.scan, scene, scene_path)
+        assign_local_media(window.scan, route, route_path)
+        route.timeline_placed = True
+        route.timeline_track_id = "V2"
+        route.start_seconds = 0.0
+        route.end_seconds = 12.0
+
+        payload = sample_design()
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": "scene_master", "media_id": "P1",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V1", "subject_keywords": ["city"],
+                "instruction": "Use @P1 as the clean city scene master.",
+            },
+            {
+                "requirement_id": "route_control", "media_id": "P2",
+                "media_type": "image", "usage": "analysis_only",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 12.0, "track": "V2", "subject_keywords": ["route"],
+                "instruction": "Extract abstract waypoints from @P2 only.",
+            },
+        ]
+        plan = normalize_design_plan(
+            payload,
+            window.scan.counts,
+            existing_media=window._design_context()["existing_media"],
+        )
+        window._validate_design_segment_capacity(plan)
+        window._apply_ai_design_direct(plan, [], replace=True)
+
+        self.assertTrue(scene.timeline_placed)
+        self.assertFalse(route.timeline_placed)
+        self.assertFalse(any(
+            (clip.source_node_id or clip.node_id) == route.node_id
+            for clip in window.scan.timeline_clips
+        ))
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(12.0)
+        compiled, compiled_assets = window._compiled_job(
+            megapixels=0.2, seed=12345, enable_rtx_vsr=False
+        )
+        self.assertNotIn(route.node_id, {asset.node_id for asset in compiled_assets})
+        self.assertNotIn(route_path.name, json.dumps(compiled, ensure_ascii=False))
+        window.project_dirty = False
+        window.close()
+
     def test_media_card_drag_is_accepted_through_timeline_viewport(self):
         window = DirectorCutStudio()
         window.resize(1400, 900)

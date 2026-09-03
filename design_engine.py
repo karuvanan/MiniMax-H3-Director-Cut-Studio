@@ -20,6 +20,10 @@ MAX_REQUIRED_RESPONSES_PER_WINDOW = 2
 MAX_OPTIONAL_ACTIONS_PER_WINDOW = 2
 DEFAULT_SPEECH_CHARACTERS_PER_SECOND = 3.6
 DEFAULT_SPEECH_WORDS_PER_SECOND = 2.7
+ANALYSIS_ONLY_MEDIA_USAGES = frozenset({
+    "analysis_only",
+    "route_control_analysis_only",
+})
 
 H3_STABLE_DIALOGUE_LANGUAGES = (
     "Arabic",
@@ -56,6 +60,13 @@ class DesignJSONDecodeError(ValueError):
         self.line = int(line)
         self.column = int(column)
         self.position = int(position)
+
+
+def is_analysis_only_media_use(value: object) -> bool:
+    """Return True when a Media Pool row is planning evidence, never H3 input."""
+
+    row = value if isinstance(value, dict) else {}
+    return str(row.get("usage", "")).strip().casefold() in ANALYSIS_ONLY_MEDIA_USAGES
 
 
 def speech_timing_budget(
@@ -423,7 +434,9 @@ def _existing_identity_anchor(plan: dict) -> dict | None:
     """Prefer a loaded user Picture whenever it is declared as the face source."""
     image_uses = [
         row for row in plan.get("existing_media_uses") or []
-        if isinstance(row, dict) and row.get("media_type") == "image"
+        if isinstance(row, dict)
+        and row.get("media_type") == "image"
+        and not is_analysis_only_media_use(row)
     ]
     return next(
         (row for row in image_uses if bool(row.get("identity_anchor", False))),
@@ -2131,7 +2144,12 @@ DESIGN_JSON_SCHEMA = {
                     "media_type": {"type": "string", "enum": ["image", "video", "audio"]},
                     "usage": {
                         "type": "string",
-                        "enum": ["h3_reference", "timeline_visual"],
+                        "enum": [
+                            "h3_reference",
+                            "timeline_visual",
+                            "analysis_only",
+                            "route_control_analysis_only",
+                        ],
                     },
                     "reuse_policy": {
                         "type": "string",
@@ -2464,9 +2482,16 @@ def repair_design_media_plan(
         ),
     )
     inventory = _media_inventory(existing_media)
+    analysis_only_media_ids = {
+        _normalized_media_id(row.get("media_id", ""))
+        for row in source.get("existing_media_uses") or []
+        if isinstance(row, dict) and is_analysis_only_media_use(row)
+    }
     loaded_image_count = sum(
-        bool(row.get("loaded", False)) and row.get("media_type") == "image"
-        for row in inventory.values()
+        bool(row.get("loaded", False))
+        and row.get("media_type") == "image"
+        and media_id not in analysis_only_media_ids
+        for media_id, row in inventory.items()
     )
     free_image_slots = max(
         0, int(capacities.get("image", 0)) - loaded_image_count
@@ -2650,6 +2675,7 @@ def repair_design_media_plan(
         _normalized_media_id(row.get("media_id", ""))
         for row in valid_uses
         if _media_type_for_id(_normalized_media_id(row.get("media_id", ""))) == "image"
+        and not is_analysis_only_media_use(row)
     }
     image_requests = [row for row in requests if row.get("media_type") == "image"]
     shot_count = len(shots)
@@ -2666,6 +2692,7 @@ def repair_design_media_plan(
     coverage_rows = [
         row for row in (*valid_uses, *image_requests)
         if str(row.get("media_type", "")) == "image"
+        and not is_analysis_only_media_use(row)
     ]
     for row in coverage_rows:
         row_start, row_end = _interval(row, duration)
@@ -2884,6 +2911,55 @@ def _canonicalize_design_media_mentions(text: object, media_ids: list[str]) -> s
             flags=re.I,
         )
     return result
+
+
+def _replace_analysis_only_media_mentions(text: object, media_ids: list[str]) -> str:
+    """Remove control-image labels from prose that will be compiled for H3.
+
+    Analysis-only images may guide planning, but naming their stable ID inside
+    a Shot can cause later reference-token parsing to reactivate that source.
+    Replace the ID with its already extracted abstract instruction instead.
+    """
+
+    result = str(text or "")
+    for media_id in sorted(set(media_ids), key=len, reverse=True):
+        match = re.fullmatch(r"([PVA])(\d+)", media_id, flags=re.I)
+        if not match:
+            continue
+        family = {"P": "Picture", "V": "Video", "A": "Audio"}[match.group(1).upper()]
+        ordinal = match.group(2)
+        for pattern in (
+            rf"(?<![A-Za-z0-9_])@?{re.escape(media_id)}\b",
+            rf"<\s*{family}\s+{ordinal}\s*>",
+        ):
+            result = re.sub(
+                pattern,
+                "the pre-analysed non-visual control instructions",
+                result,
+                flags=re.I,
+            )
+    return " ".join(result.split())
+
+
+def _remove_control_artifact_priming(text: object) -> str:
+    """Keep control-image artifact vocabulary out of a single H3 prompt field."""
+
+    result = str(text or "")
+    result = re.sub(
+        r"\b(?:red\s+(?:route\s+)?line|red\s+waypoint|route\s+path\s+overlay|"
+        r"flight\s+path\s+line|map\s+(?:line|overlay)|visible\s+(?:control\s+path|route\s+guide))\b",
+        "the planned camera trajectory",
+        result,
+        flags=re.I,
+    )
+    result = re.sub(
+        r"\b(?:red\s+arrow|waypoint\s+marker|navigation\s+marker|HUD|UI\s+overlay|"
+        r"graphic\s+overlay|red\s+scribble|red\s+stroke)\b",
+        "editing-only data",
+        result,
+        flags=re.I,
+    )
+    return " ".join(result.split())
 
 
 def split_action_beats(value: object) -> list[str]:
@@ -3470,13 +3546,16 @@ def normalize_design_plan(
                 or inventory_row.get("analysis_summary")
                 or ""
             ).strip()
+        raw_usage = str(raw.get("usage", "h3_reference")).strip().casefold()
         normalized_use = {
             "requirement_id": requirement_id,
             "media_id": media_id,
             "media_type": media_type,
             "usage": (
-                str(raw.get("usage", "h3_reference"))
-                if str(raw.get("usage", "h3_reference")) in {"h3_reference", "timeline_visual"}
+                "analysis_only"
+                if raw_usage in ANALYSIS_ONLY_MEDIA_USAGES
+                else raw_usage
+                if raw_usage in {"h3_reference", "timeline_visual"}
                 else "h3_reference"
             ),
             "reuse_policy": reuse_policy,
@@ -3552,7 +3631,10 @@ def normalize_design_plan(
                 + identity_contract
             )
     plan["existing_media_uses"] = existing_media_uses
-    reused_media_ids = sorted({row["media_id"] for row in existing_media_uses})
+    reused_media_ids = sorted({
+        row["media_id"] for row in existing_media_uses
+        if not is_analysis_only_media_use(row)
+    })
     if reused_media_ids:
         for field_name in (
             "creative_brief", "global_visual_style", "overall_soundscape",
@@ -3582,6 +3664,54 @@ def normalize_design_plan(
             row["instruction"] = _canonicalize_design_media_mentions(
                 row.get("instruction", ""), reused_media_ids
             )
+
+    analysis_only_ids = sorted({
+        row["media_id"] for row in existing_media_uses
+        if is_analysis_only_media_use(row)
+    })
+    if analysis_only_ids:
+        for field_name in (
+            "creative_brief", "global_visual_style", "overall_soundscape",
+            "non_diegetic_music", "constraints",
+        ):
+            plan[field_name] = _remove_control_artifact_priming(
+                _replace_analysis_only_media_mentions(
+                    plan.get(field_name, ""), analysis_only_ids
+                )
+            )
+        for row in plan.get("shots") or []:
+            for field_name in (
+                "framing", "camera_angle", "camera_movement", "subject_action",
+                "environment_response", "continuity_state", "optional_flourish",
+                "additional_direction",
+            ):
+                row[field_name] = _remove_control_artifact_priming(
+                    _replace_analysis_only_media_mentions(
+                        row.get(field_name, ""), analysis_only_ids
+                    )
+                )
+        for family in ("transitions", "markers"):
+            for row in plan.get(family) or []:
+                row["direction"] = _remove_control_artifact_priming(
+                    _replace_analysis_only_media_mentions(
+                        row.get("direction", ""), analysis_only_ids
+                    )
+                )
+        clean_frame_contract = (
+            "Keep the photoreal scene clean and unobstructed; all planning controls remain "
+            "non-visual and entirely off-screen."
+        )
+        if clean_frame_contract not in plan["constraints"]:
+            plan["constraints"] = (
+                plan["constraints"].rstrip(" .")
+                + (". " if plan["constraints"].strip() else "")
+                + clean_frame_contract
+            )
+        design_warnings.append(
+            "Analysis-only Media Pool control sources "
+            + ", ".join(analysis_only_ids)
+            + " were retained for planning but removed from all H3-renderable prose and reference slots."
+        )
 
     budgeted_shots: list[dict] = []
     for shot in plan["shots"]:
@@ -3810,6 +3940,11 @@ def build_design_system_prompt(context: dict) -> str:
         "Media Pool asset may appear in multiple existing_media_uses rows when it returns in separate non-contiguous intervals; "
         "give every occurrence a unique requirement_id, exact range, track and instruction. Do not widen across an interval where "
         "the reference should be inactive. Repeated uses share one physical H3 reference slot. "
+        "When a loaded image is only a map, route drawing, mask, depth guide, annotation or other planning control, set its "
+        "existing_media_uses.usage to analysis_only (route_control_analysis_only is accepted as a compatibility alias). The "
+        "application exposes its analysed information to Design but never places it on the Timeline, counts it against an "
+        "H3 Segment reference slot, or uploads it to MiniMax H3. Never cite that control asset ID or its visible graphics in "
+        "Shot prose; describe only the abstract motion or staging extracted from it. "
         "media_requests must contain only genuinely missing assets after this reuse audit. Choose that missing count dynamically from "
         "the concept and the time-local Segment budget; never duplicate a requirement already fulfilled by @P1/@V1/@A1. "
         "For media_requests, use h3_reference when an asset supplies subject, product, wardrobe, environment or composition guidance; "
