@@ -13,6 +13,8 @@ import textwrap
 import wave
 
 from drone_route_engine import analyse_red_route, route_span_language
+from combat_environment_engine import apply_environmental_combat_physics
+from combat_action_engine import apply_combat_action_continuity
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
@@ -26,6 +28,575 @@ ANALYSIS_ONLY_MEDIA_USAGES = frozenset({
     "analysis_only",
     "route_control_analysis_only",
 })
+
+STREET_FIGHTER_SPECIAL_SKILL = "street-fighter-live-action-h3"
+STREET_FIGHTER_CAST_TEMPLATE_TOKEN = "{{STREET_FIGHTER_CAST_BINDINGS}}"
+STREET_FIGHTER_FPV_COMBAT_CONTRACT = (
+    "CONTINUOUS FPV COMBAT ORBIT: the camera physically flies clockwise around the shared "
+    "midpoint of S1 and S2 with visible parallax and changing occlusion; constant close "
+    "combat distance, stable subject scale, no in-place rotation, no zoom-out, no pull-back, "
+    "no slow motion, and no non-combat walking. FULL-SPEED FIGHT ONLY: every technique, contact "
+    "and recoil is active real-time combat; no entrance, exit, neutral travel, idle pose, bullet "
+    "time, impact freeze, speed ramp or replay. Only after the final recoil completes, settle both "
+    "fighters and the camera into a stable supported composition for the last 0.75-1.00 second. "
+    "2X ACTION CADENCE: execute every body "
+    "load, strike or defence, contact and recoil in roughly half the previous screen time, with "
+    "continuous explosive acceleration and no artificial fast-forward artifact."
+)
+STREET_FIGHTER_MARKET_CONTRACT = (
+    "HONG KONG KOWLOON WET-MARKET ARENA: the entire fight remains inside a dense Hong Kong "
+    "Kowloon Walled City-style fish, seafood and vegetable wet market with cramped tiled aisles, "
+    "aged concrete, overhead pipes and cables, hanging practical lamps, fish tanks, crushed ice, "
+    "wet produce crates, metal stalls, drainage channels and a continuously wet slippery floor. "
+    "Background spectators and vendors form a readable perimeter around the fight lane but never "
+    "enter the combat space, cover P1/P2 or become additional fighters."
+)
+STREET_FIGHTER_P1_P2_PIXEL_LOCK = (
+    "P1/P2 ABSOLUTE CAST LOCK: S1 is exactly the real uploaded P1 pixels and S2 is exactly the "
+    "real uploaded P2 pixels. Preserve 100% of each reference's recognizable face, facial geometry, "
+    "apparent age, skin tone, hairstyle, hair colour, body proportions, complete upper and lower "
+    "wardrobe, garment colours and materials, shoes and accessories in every frame. P1/P2 order "
+    "overrides every generic male/female S1/S2 convention. BLIP or AI Enrich text is descriptive "
+    "metadata only; it never replaces the uploaded pixels. Never synthesize substitute fighters, "
+    "swap identities or clothes, blend faces, change gender presentation, duplicate P1/P2 or let "
+    "any Z-Image person redefine either fighter."
+)
+
+
+def _compact_character_evidence(value: object, limit: int = 320) -> str:
+    """Return one safe, compact character-description line for Design seeding."""
+
+    text = " ".join(str(value or "").replace("\x00", " ").split()).strip(" ;；")
+    if len(text) > limit:
+        text = text[: max(1, limit - 1)].rstrip(" ,，;；:：") + "…"
+    return text
+
+
+def _blip_overview_from_media_row(row: dict) -> str:
+    """Prefer the authored compact BLIP Overview over lower-value region captions."""
+
+    raw = str(
+        row.get("raw_analysis_summary")
+        or row.get("recognition")
+        or row.get("analysis_summary")
+        or ""
+    )
+    patterns = (
+        r"^BLIP\s*[·-]?\s*Overview\s*[:：]\s*(.+)$",
+        r"^BLIP\s+visual\s+caption\s*[·-]?\s*full\s+frame\s*[:：]\s*(.+)$",
+        r"^Overview\s*[:：]\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, re.I | re.M)
+        if match:
+            return _compact_character_evidence(match.group(1))
+    return ""
+
+
+def _semantic_character_summary_from_media_row(row: dict) -> str:
+    """Extract the most useful person description from rendered or JSON AI Enrich."""
+
+    raw = str(row.get("semantic_enrichment") or "").strip()
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        subjects = payload.get("subjects") or []
+        if isinstance(subjects, list) and subjects and isinstance(subjects[0], dict):
+            subject = subjects[0]
+            parts = [
+                str(subject.get(key, "")).strip()
+                for key in ("appearance", "wardrobe")
+                if str(subject.get(key, "")).strip()
+            ]
+            if parts:
+                return _compact_character_evidence("; ".join(parts))
+        summary = _compact_character_evidence(payload.get("summary", ""))
+        if summary:
+            return summary
+
+    subject_match = re.search(
+        r"^SUBJECTS\s*\n\s*-\s*(.+?)(?=\n\s*(?:-|[A-Z][A-Z /_-]{2,})\s*(?:\n|$)|\Z)",
+        raw,
+        re.I | re.M | re.S,
+    )
+    if subject_match:
+        subject = _compact_character_evidence(subject_match.group(1))
+        if subject and "none established" not in subject.casefold():
+            return subject
+    summary_match = re.search(
+        r"^SUMMARY\s*\n(.+?)(?=\n\s*[A-Z][A-Z /_-]{2,}\s*(?:\n|$)|\Z)",
+        raw,
+        re.I | re.M | re.S,
+    )
+    if summary_match:
+        summary = _compact_character_evidence(summary_match.group(1))
+        if summary and "not established" not in summary.casefold():
+            return summary
+    return ""
+
+
+def street_fighter_character_bindings(existing_media: list[dict] | None) -> list[dict]:
+    """Build deterministic S1→P1 / S2→P2 bindings from loaded Picture evidence."""
+
+    inventory: dict[str, dict] = {}
+    for raw in existing_media or []:
+        if not isinstance(raw, dict) or not bool(raw.get("loaded", False)):
+            continue
+        media_id = str(raw.get("media_id") or "").strip().upper().lstrip("@")
+        media_type = str(raw.get("media_type") or raw.get("type") or "").lower()
+        if media_id in {"P1", "P2"} and media_type == "image":
+            inventory[media_id] = raw
+    bindings: list[dict] = []
+    for speaker, media_id in (("S1", "P1"), ("S2", "P2")):
+        row = inventory.get(media_id)
+        if row is None:
+            continue
+        description = _blip_overview_from_media_row(row)
+        evidence_source = "BLIP · Overview"
+        if not description:
+            description = _semantic_character_summary_from_media_row(row)
+            evidence_source = "AI Enrich"
+        if not description:
+            description = "已加载人物参考；视觉描述待分析"
+            evidence_source = "Loaded reference"
+        bindings.append({
+            "speaker": speaker,
+            "media_id": media_id,
+            "description": description,
+            "evidence_source": evidence_source,
+        })
+    return bindings
+
+
+def render_special_design_requirement_template(
+    template: object,
+    special_skill_key: object,
+    existing_media: list[dict] | None,
+) -> str:
+    """Resolve media-aware placeholders without modifying the reusable Skill file."""
+
+    text = str(template or "")
+    if STREET_FIGHTER_CAST_TEMPLATE_TOKEN not in text:
+        return text
+    bindings = {
+        row["speaker"]: row
+        for row in street_fighter_character_bindings(existing_media)
+    } if str(special_skill_key or "").strip().casefold() == STREET_FIGHTER_SPECIAL_SKILL else {}
+
+    def cast_line(speaker: str) -> str:
+        binding = bindings.get(speaker)
+        if binding:
+            style = "空手道与柔道" if speaker == "S1" else "截拳道、咏春与MMA地面战"
+            return (
+                f"{speaker}是@{binding['media_id']}（{binding['evidence_source']}："
+                f"{binding['description']}）格斗者，固定使用{style}"
+            )
+        if speaker == "S1":
+            return "S1是穿旧白色无袖武道服的沉稳亚洲男格斗者，固定使用空手道与柔道"
+        return "S2是穿深红运动夹克、黑色格斗裤的敏捷女格斗者，固定使用截拳道、咏春与MMA地面战"
+
+    resolved = cast_line("S1") + "；" + cast_line("S2") + "。"
+    if len(bindings) == 2:
+        resolved += (
+            " @P1只定义S1，@P2只定义S2；两张图都是全片人物身份与外观参考，"
+            "所有出现对应人物的Shot都必须引用正确图片，禁止交换、混脸、复制或转移服装。"
+        )
+    return text.replace(STREET_FIGHTER_CAST_TEMPLATE_TOKEN, resolved)
+
+
+def enforce_street_fighter_character_bindings(
+    plan: dict,
+    existing_media: list[dict] | None,
+    special_skill_key: object,
+) -> dict:
+    """Make the two loaded fighter Pictures authoritative throughout the H3 plan."""
+
+    if str(special_skill_key or "").strip().casefold() != STREET_FIGHTER_SPECIAL_SKILL:
+        return plan
+    bindings = street_fighter_character_bindings(existing_media)
+    if not bindings:
+        return plan
+    duration = float(plan.get("duration_seconds", 0.5) or 0.5)
+    uses = [row for row in plan.get("existing_media_uses") or [] if isinstance(row, dict)]
+    for binding in bindings:
+        speaker = binding["speaker"]
+        media_id = binding["media_id"]
+        use = next((row for row in uses if row.get("media_id") == media_id), None)
+        if use is None:
+            use = {
+                "requirement_id": f"street_fighter_{speaker.lower()}_{media_id.lower()}_identity",
+                "media_id": media_id,
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "whole_design",
+                "start_seconds": 0.0,
+                "end_seconds": duration,
+                "track": "V1" if speaker == "S1" else "V2",
+                "subject_keywords": [],
+                "instruction": "",
+            }
+            uses.append(use)
+        use.update({
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "identity_anchor": True,
+        })
+        keywords = [str(value) for value in use.get("subject_keywords") or []]
+        for value in (speaker, f"{speaker} identity", binding["description"]):
+            if value and value not in keywords:
+                keywords.append(value)
+        use["subject_keywords"] = keywords
+        identity_direction = (
+            f"CAST IDENTITY LOCK: {speaker} is exclusively @{media_id}. Use @{media_id} as "
+            f"{speaker}'s authoritative face, hair, skin tone, age, body proportions, complete "
+            "wardrobe, footwear and accessory reference in every appearance. Never assign this "
+            f"identity to {'S2' if speaker == 'S1' else 'S1'}, blend the two faces, or duplicate "
+            f"the fighter. Evidence: {binding['evidence_source']}: {binding['description']}"
+        )
+        if identity_direction not in str(use.get("instruction", "")):
+            use["instruction"] = (
+                str(use.get("instruction", "")).rstrip(" .")
+                + (". " if str(use.get("instruction", "")).strip() else "")
+                + identity_direction
+            )
+    plan["existing_media_uses"] = uses
+
+    mapping = {row["speaker"]: row["media_id"] for row in bindings}
+    lock_parts = [
+        f"{speaker} is exclusively @{media_id}"
+        for speaker, media_id in (("S1", mapping.get("S1")), ("S2", mapping.get("S2")))
+        if media_id
+    ]
+    shot_lock = (
+        "CAST REFERENCE LOCK: " + "; ".join(lock_parts)
+        + ". Preserve each assigned face, hair, body, wardrobe and footwear; never swap, blend, "
+          "duplicate or transfer either identity between fighters."
+    )
+    for shot in plan.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        current = str(shot.get("additional_direction", "")).strip()
+        if "CAST REFERENCE LOCK:" not in current:
+            shot["additional_direction"] = current.rstrip(" .") + (". " if current else "") + shot_lock
+    constraints = str(plan.get("constraints", "")).strip()
+    if "CAST REFERENCE LOCK:" not in constraints:
+        plan["constraints"] = constraints.rstrip(" .") + (". " if constraints else "") + shot_lock
+    return plan
+
+
+def _street_fighter_realtime_action_text(value: object) -> str:
+    """Remove positive slow/walking staging from executable fighter action text."""
+
+    text = str(value or "").strip()
+    substitutions = (
+        (r"(?i)\b(?:in\s+)?(?:extreme\s+)?slow[- ]motion\b", "in real time"),
+        (r"(?i)\bbullet[- ]time\b", "real-time"),
+        (r"(?i)\bimpact[- ]freeze(?:\s+frame)?\b", "real-time impact"),
+        (r"(?i)\bspeed[- ]ramp(?:ing)?\b", "continuous full speed"),
+        (r"(?i)\bslowly\b", "at full speed"),
+        (r"(?i)\b(?:walks?|walking|strolls?|strolling)\b", "uses explosive combat footwork"),
+        (r"慢动作|慢動作|子弹时间|子彈時間|冲击定格|衝擊定格|速度渐变|速度漸變", "实时全速"),
+        (r"走路|步行|缓慢走|緩慢走|慢慢走|走进|走進|走入|走出|走向", "以爆发格斗步法切入"),
+    )
+    for pattern, replacement in substitutions:
+        text = re.sub(pattern, replacement, text)
+    return " ".join(text.split())
+
+
+def enforce_street_fighter_fpv_combat_direction(
+    plan: dict,
+    special_skill_key: object,
+) -> dict:
+    """Keep the Street Fighter render on full-speed combat and a physical FPV orbit.
+
+    This is deliberately deterministic.  It prevents an otherwise valid Design response
+    from restoring legacy pull-backs, slow-motion finishing shots or walking coverage after
+    the Special Skill prompt has already asked the model not to use them.
+    """
+
+    if str(special_skill_key or "").strip().casefold() != STREET_FIGHTER_SPECIAL_SKILL:
+        return plan
+
+    sector_cycle = (
+        ("front three-quarter at eye level", "low side profile"),
+        ("low side profile", "rear three-quarter at hip level"),
+        ("rear three-quarter at hip level", "high rear oblique"),
+        ("high rear oblique", "opposite side profile at eye level"),
+        ("opposite side profile at eye level", "opposite front three-quarter"),
+        ("opposite front three-quarter", "low front three-quarter"),
+        ("low front three-quarter", "side profile at shin level"),
+        ("side profile at shin level", "front three-quarter at eye level"),
+    )
+    combat_terms = re.compile(
+        r"(?i)\b(?:attack|block|parry|counter|kick|strike|punch|palm|elbow|knee|clinch|grip|"
+        r"throw|takedown|grapple|guard|evade|dodge|slip|pivot|submission|combat|fight)\b|"
+        r"攻|防|挡|擋|拨|撥|踢|击|擊|拳|掌|肘|膝|摔|抱|抓|锁|鎖|绞|絞|压制|壓制|闪|閃"
+    )
+    for index, shot in enumerate(plan.get("shots") or []):
+        if not isinstance(shot, dict):
+            continue
+        start_sector, end_sector = sector_cycle[index % len(sector_cycle)]
+        shot["camera_movement"] = (
+            "Full-speed physical FPV clockwise orbital translation around the shared midpoint "
+            f"of S1 and S2, travelling from {start_sector} to {end_sector} while both fighters "
+            "execute the assigned attack-and-defence exchange; genuine foreground occlusion and "
+            "background parallax, constant close combat distance, stable subject scale and a "
+            "readable horizon."
+        )
+        shot["movement_speed"] = "Very fast"
+        shot["movement_amplitude"] = "Large"
+
+        raw_action = str(shot.get("subject_action", ""))
+        has_noncombat_walk = bool(re.search(
+            r"(?i)\b(?:walks?|walking|strolls?|strolling|walks?\s+into|"
+            r"enters?\s+(?:the\s+)?(?:room|arena|scene|corridor)|exits?)\b|"
+            r"走路|步行|缓慢走|緩慢走|慢慢走|走进|走進|走入|走出|走向",
+            raw_action,
+        ))
+        action = _street_fighter_realtime_action_text(raw_action)
+        if has_noncombat_walk or not combat_terms.search(action):
+            action = (
+                "S1 and S2 are already within arm's reach and execute an immediate full-speed "
+                "attack, defence and counter exchange; their combat footwork carries forward "
+                "the incoming guard and contact state."
+            )
+        shot["subject_action"] = action
+        shot["optional_flourish"] = _street_fighter_realtime_action_text(
+            shot.get("optional_flourish", "")
+        )
+        direction = _street_fighter_realtime_action_text(
+            shot.get("additional_direction", "")
+        )
+        if "CONTINUOUS FPV COMBAT ORBIT:" not in direction:
+            direction = direction.rstrip(" .") + (". " if direction else "")
+            direction += STREET_FIGHTER_FPV_COMBAT_CONTRACT
+        shot["additional_direction"] = direction
+
+    constraints = str(plan.get("constraints", "")).strip()
+    if "CONTINUOUS FPV COMBAT ORBIT:" not in constraints:
+        constraints = constraints.rstrip(" .") + (". " if constraints else "")
+        constraints += STREET_FIGHTER_FPV_COMBAT_CONTRACT
+    plan["constraints"] = constraints
+
+    markers = [row for row in plan.get("markers") or [] if isinstance(row, dict)]
+    converted_final_marker = False
+    for marker in markers:
+        if not isinstance(marker, dict):
+            continue
+        marker_text = " ".join((
+            str(marker.get("preset", "")), str(marker.get("direction", ""))
+        )).casefold()
+        if any(term in marker_text for term in ("final hold", "ending hold", "stable hold")):
+            marker["preset"] = "Final Combat Resolve"
+            marker["direction"] = (
+                "Complete the final contact and recoil at full speed, then settle both fighters on "
+                "readable support while the physical FPV camera decelerates into a stable eye-level "
+                "three-quarter composition for the last 0.75-1.00 second."
+            )
+            converted_final_marker = True
+        else:
+            marker["direction"] = _street_fighter_realtime_action_text(
+                marker.get("direction", "")
+            )
+            if any(
+                token in str(marker.get("preset", "")).casefold()
+                for token in ("final", "ending")
+            ):
+                marker["preset"] = "Final Combat Resolve"
+                marker["direction"] = (
+                    "Complete the final contact and recoil at full speed, then settle both fighters on "
+                    "readable support while the physical FPV camera decelerates into a stable eye-level "
+                    "three-quarter composition for the last 0.75-1.00 second."
+                )
+                converted_final_marker = True
+    if not converted_final_marker:
+        markers.append({
+            "time_seconds": snap_half_second(
+                max(0.0, float(plan.get("duration_seconds", 0.5) or 0.5) - 0.5),
+                float(plan.get("duration_seconds", 0.5) or 0.5),
+            ),
+            "preset": "Final Combat Resolve",
+            "direction": (
+                "Complete the final contact and recoil at full speed, then settle both fighters on "
+                "readable support while the physical FPV camera decelerates into a stable eye-level "
+                "three-quarter composition for the last 0.75-1.00 second."
+            ),
+        })
+    plan["markers"] = markers
+    for transition in plan.get("transitions") or []:
+        if isinstance(transition, dict):
+            transition["direction"] = _street_fighter_realtime_action_text(
+                transition.get("direction", "")
+            )
+    return plan
+
+
+def enforce_street_fighter_cast_market_and_spectators(
+    plan: dict,
+    existing_media: list[dict] | None,
+    special_skill_key: object,
+) -> dict:
+    """Lock P1/P2 while giving Z-Image only the market/audience plate.
+
+    Independent T2I fighter stills compete with the uploaded P1/P2 pixels and
+    are the main source of generic male/female substitutions.  In P1/P2 cast
+    mode, this pass removes those competing person-bearing requests and adds
+    one reusable environment-only audience plate for H3.
+    """
+
+    if str(special_skill_key or "").strip().casefold() != STREET_FIGHTER_SPECIAL_SKILL:
+        return plan
+
+    def append_contract(value: object, contract: str) -> str:
+        text = str(value or "").strip()
+        if contract.split(":", 1)[0] + ":" in text:
+            return text
+        return text.rstrip(" .") + (". " if text else "") + contract
+
+    plan["global_visual_style"] = append_contract(
+        plan.get("global_visual_style", ""), STREET_FIGHTER_MARKET_CONTRACT
+    )
+    plan["constraints"] = append_contract(
+        plan.get("constraints", ""), STREET_FIGHTER_MARKET_CONTRACT
+    )
+    for shot in plan.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        shot["additional_direction"] = append_contract(
+            shot.get("additional_direction", ""), STREET_FIGHTER_MARKET_CONTRACT
+        )
+        environment = str(shot.get("environment_response", "")).strip()
+        market_state = (
+            "The ongoing contact affects only the established Kowloon-style wet seafood and "
+            "vegetable market: nearby puddles, crushed ice, hanging lamps, fish tanks, produce "
+            "crates and perimeter spectators react after the physical impact."
+        )
+        if "established Kowloon-style wet seafood" not in environment:
+            shot["environment_response"] = (
+                environment.rstrip(" .") + (". " if environment else "") + market_state
+            )
+
+    bindings = street_fighter_character_bindings(existing_media)
+    bound_ids = {row["media_id"] for row in bindings}
+    has_complete_cast = {"P1", "P2"}.issubset(bound_ids)
+    if has_complete_cast:
+        plan["constraints"] = append_contract(
+            plan.get("constraints", ""), STREET_FIGHTER_P1_P2_PIXEL_LOCK
+        )
+        for shot in plan.get("shots") or []:
+            if isinstance(shot, dict):
+                shot["additional_direction"] = append_contract(
+                    shot.get("additional_direction", ""), STREET_FIGHTER_P1_P2_PIXEL_LOCK
+                )
+        for use in plan.get("existing_media_uses") or []:
+            if not isinstance(use, dict) or str(use.get("media_id", "")).upper() not in {"P1", "P2"}:
+                continue
+            use["usage"] = "h3_reference"
+            use["reuse_policy"] = "whole_design"
+            use["start_seconds"] = 0.0
+            use["end_seconds"] = float(plan.get("duration_seconds", 0.5) or 0.5)
+            use["identity_anchor"] = True
+            use["instruction"] = append_contract(
+                use.get("instruction", ""), STREET_FIGHTER_P1_P2_PIXEL_LOCK
+            )
+
+    filtered_requests: list[dict] = []
+    omitted: list[str] = []
+    fighter_request_re = re.compile(
+        r"(?i)(?:\bS[12]\b|\b(?:fighters?|combatants?|warriors?)\b|karate|judo|wing chun|"
+        r"jeet kune do|street fighter|格斗者|格鬥者|武者|空手道|柔道|咏春|詠春|截拳道)"
+    )
+    audience_requirement_id = "street_fighter_kowloon_market_spectators"
+    for request in plan.get("media_requests") or []:
+        if not isinstance(request, dict):
+            continue
+        requirement_id = str(request.get("requirement_id", ""))
+        if requirement_id == audience_requirement_id:
+            continue
+        if has_complete_cast and str(request.get("media_type", "")).lower() == "image":
+            request_text = " ".join(
+                [str(request.get("prompt", ""))]
+                + [str(value) for value in request.get("subject_keywords") or []]
+            )
+            if bool(request.get("identity_anchor", False)) or fighter_request_re.search(request_text):
+                omitted.append(requirement_id or "generated_fighter_reference")
+                continue
+        filtered_requests.append(request)
+
+    existing_audience_use = next(
+        (
+            row for row in plan.get("existing_media_uses") or []
+            if isinstance(row, dict)
+            and str(row.get("requirement_id", "")) == audience_requirement_id
+        ),
+        None,
+    )
+    duration = float(plan.get("duration_seconds", 0.5) or 0.5)
+    if existing_audience_use is not None:
+        existing_audience_use.update({
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+        })
+    else:
+        filtered_requests.append({
+            "requirement_id": audience_requirement_id,
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "track": "V3",
+            "subject_keywords": [
+                "Hong Kong Kowloon Walled City-style wet market arena",
+                "fish seafood vegetable stalls",
+                "background spectators and vendors",
+            ],
+            "prompt": (
+                "Cinematic photoreal live-action environment reference, Hong Kong Kowloon Walled "
+                "City-style enclosed fish, seafood and vegetable wet market at night. One coherent "
+                "cramped fight arena with aged tiled and concrete stalls, hanging practical lamps, "
+                "dense overhead pipes and cables, fish tanks, crushed ice, seafood trays, wet produce "
+                "crates, metal counters, drainage channels, steam and a wet slippery reflective floor. "
+                "Twelve to eighteen distinct adult local market vendors and spectators stand only at "
+                "the far perimeter, reacting toward the empty central fight lane; varied faces, ages, "
+                "wardrobe and poses, no duplicate person, no one entering the central lane. Environment "
+                "and background-audience plate only: do not depict either principal fighter and do not "
+                "invent substitutes for P1 or P2. Clean readable central combat space, practical cyan, "
+                "yellow-green and warm stall lighting, humid air, subtle steam, physically correct wet "
+                "reflections, stable architecture, no readable signs, no text, no logos, no watermark."
+            ),
+            "negative_prompt": (
+                "principal fighter, foreground fighter, two central fighters, duplicate person, cloned "
+                "crowd face, crowd inside fight lane, boxing ring, clean supermarket, dry floor, empty "
+                "market, stage spotlight, readable sign, subtitle, text, logo, watermark"
+            ),
+        })
+    plan["media_requests"] = filtered_requests
+
+    warnings = [str(value) for value in plan.get("design_warnings") or []]
+    if omitted:
+        warnings.append(
+            "Removed competing Z-Image fighter reference request(s) "
+            + ", ".join(omitted)
+            + "; uploaded P1 and P2 remain the only principal-fighter identity sources."
+        )
+    audience_notice = (
+        "Reserved one reusable Z-Image environment plate for the Kowloon-style wet seafood and "
+        "vegetable market spectators; the plate may not redefine P1 or P2."
+    )
+    if audience_notice not in warnings:
+        warnings.append(audience_notice)
+    plan["design_warnings"] = list(dict.fromkeys(warnings))
+    return plan
 
 H3_STABLE_DIALOGUE_LANGUAGES = (
     "Arabic",
@@ -1375,7 +1946,11 @@ _NON_STORY_BACKGROUND_RE = re.compile(
 )
 
 _ACTION_BEAT_SPLIT_RE = re.compile(
-    r"(?:[.!?;:\u3002\uff01\uff1f\uff1b\uff1a]+|"
+    # A decimal timestamp such as ``0.5-1.5s`` and a clock time such as
+    # ``00:01.500`` are metadata inside one beat, not sentence boundaries.
+    # Splitting their dots/colons used to fragment numbered action beats and
+    # demote half of a fight into optional flourish text.
+    r"(?:(?<!\d)\.(?!\d)|[!?;\u3002\uff01\uff1f\uff1b]+|(?<!\d)[:\uff1a](?!\d)|"
     r",\s*(?=(?:then|next|after(?:ward)?|immediately|simultaneously)\b)|"
     r"\b(?:and\s+then|then|next|afterwards?|simultaneously)\b|"
     r"\s*(?:\u7136\u540e|\u968f\u540e|\u7d27\u63a5\u7740|\u7acb\u5373|\u540c\u65f6|\u4e0e\u6b64\u540c\u65f6)\s*)",
@@ -2153,6 +2728,12 @@ DESIGN_JSON_SCHEMA = {
         "overall_soundscape": {"type": "string"},
         "non_diegetic_music": {"type": "string"},
         "constraints": {"type": "string"},
+        "environment_physics_schema_version": {"type": "integer"},
+        "environment_transition_time_seconds": {"type": "number"},
+        "combat_action_schema_version": {"type": "integer"},
+        "combat_baseline_duration_seconds": {"type": "number"},
+        "combat_fact_ledger_schema_version": {"type": "integer"},
+        "combat_fact_ledger": {"type": "object"},
         "shots": {
             "type": "array",
             "minItems": 1,
@@ -2180,6 +2761,49 @@ DESIGN_JSON_SCHEMA = {
                     "continuity_state": {"type": "string"},
                     "optional_flourish": {"type": "string"},
                     "additional_direction": {"type": "string"},
+                    "environment_interaction": {"type": "string"},
+                    "incoming_environment_state": {"type": "string"},
+                    "outgoing_environment_state": {"type": "string"},
+                    "crowd_reaction": {"type": "string"},
+                    "location_transition": {"type": "string"},
+                    "environment_state_status": {"type": "string"},
+                    "combat_action_chain": {"type": "string"},
+                    "incoming_combat_state": {"type": "string"},
+                    "outgoing_combat_state": {"type": "string"},
+                    "next_action_trigger": {"type": "string"},
+                    "combat_continuity_status": {"type": "string"},
+                    "combat_continuity_notes": {"type": "string"},
+                    "combat_action_schema_version": {"type": "integer"},
+                    "combat_fact_context": {"type": "string"},
+                    "combat_story_duty_index": {"type": "integer"},
+                    "combat_story_duty": {"type": "string"},
+                    "combat_story_duty_instruction": {"type": "string"},
+                    "combat_action_beats": {"type": "array"},
+                    "combat_action_carrier": {"type": "string"},
+                    "combat_force_vector": {"type": "object"},
+                    "incoming_combat_state_vector": {"type": "object"},
+                    "outgoing_combat_state_vector": {"type": "object"},
+                    "camera_position_sector": {"type": "string"},
+                    "camera_motion_relation": {"type": "string"},
+                    "camera_action_trigger": {"type": "string"},
+                    "dynamic_camera_direction": {"type": "string"},
+                    "contact_material": {"type": "string"},
+                    "environment_force_vector": {"type": "object"},
+                    "causal_validation_status": {"type": "string"},
+                    "causal_validation_issues": {"type": "array"},
+                    "causal_validation_inherited_fields": {"type": "array"},
+                    "final_action_resolution": {"type": "string"},
+                    "final_camera_resolution": {"type": "string"},
+                    "final_action_stable": {"type": "boolean"},
+                    "combat_action_chain_user_edited": {"type": "boolean"},
+                    "incoming_combat_state_user_edited": {"type": "boolean"},
+                    "outgoing_combat_state_user_edited": {"type": "boolean"},
+                    "next_action_trigger_user_edited": {"type": "boolean"},
+                    "environment_interaction_user_edited": {"type": "boolean"},
+                    "incoming_environment_state_user_edited": {"type": "boolean"},
+                    "outgoing_environment_state_user_edited": {"type": "boolean"},
+                    "crowd_reaction_user_edited": {"type": "boolean"},
+                    "location_transition_user_edited": {"type": "boolean"},
                 },
             },
         },
@@ -4245,6 +4869,56 @@ def normalize_design_plan(
             "continuity_state": str(raw.get("continuity_state", "")).strip(),
             "optional_flourish": str(raw.get("optional_flourish", "")).strip(),
             "additional_direction": str(raw.get("additional_direction", "")).strip(),
+            "environment_interaction": str(raw.get("environment_interaction", "")).strip(),
+            "incoming_environment_state": str(raw.get("incoming_environment_state", "")).strip(),
+            "outgoing_environment_state": str(raw.get("outgoing_environment_state", "")).strip(),
+            "crowd_reaction": str(raw.get("crowd_reaction", "")).strip(),
+            "location_transition": str(raw.get("location_transition", "")).strip(),
+            "environment_state_status": str(raw.get("environment_state_status", "")).strip(),
+            "combat_action_chain": str(raw.get("combat_action_chain", "")).strip(),
+            "incoming_combat_state": str(raw.get("incoming_combat_state", "")).strip(),
+            "outgoing_combat_state": str(raw.get("outgoing_combat_state", "")).strip(),
+            "next_action_trigger": str(raw.get("next_action_trigger", "")).strip(),
+            "event_causality_chain": str(raw.get("event_causality_chain", "")).strip(),
+            "physical_feedback_chain": str(raw.get("physical_feedback_chain", "")).strip(),
+            "causal_risk_original_action": str(raw.get("causal_risk_original_action", "")).strip(),
+            "causal_risk_repair_status": str(raw.get("causal_risk_repair_status", "")).strip(),
+            "causal_risk_repair_notes": str(raw.get("causal_risk_repair_notes", "")).strip(),
+            "combat_continuity_status": str(raw.get("combat_continuity_status", "")).strip(),
+            "combat_continuity_notes": str(raw.get("combat_continuity_notes", "")).strip(),
+            "combat_action_schema_version": int(raw.get("combat_action_schema_version", 0) or 0),
+            "combat_fact_context": str(raw.get("combat_fact_context", "")).strip(),
+            "combat_story_duty_index": int(raw.get("combat_story_duty_index", 0) or 0),
+            "combat_story_duty": str(raw.get("combat_story_duty", "")).strip(),
+            "combat_story_duty_instruction": str(raw.get("combat_story_duty_instruction", "")).strip(),
+            "combat_action_beats": list(raw.get("combat_action_beats") or []),
+            "combat_action_carrier": str(raw.get("combat_action_carrier", "")).strip(),
+            "combat_force_vector": dict(raw.get("combat_force_vector") or {}),
+            "incoming_combat_state_vector": dict(raw.get("incoming_combat_state_vector") or {}),
+            "outgoing_combat_state_vector": dict(raw.get("outgoing_combat_state_vector") or {}),
+            "camera_position_sector": str(raw.get("camera_position_sector", "")).strip(),
+            "camera_motion_relation": str(raw.get("camera_motion_relation", "")).strip(),
+            "camera_action_trigger": str(raw.get("camera_action_trigger", "")).strip(),
+            "dynamic_camera_direction": str(raw.get("dynamic_camera_direction", "")).strip(),
+            "contact_material": str(raw.get("contact_material", "")).strip(),
+            "environment_force_vector": dict(raw.get("environment_force_vector") or {}),
+            "causal_validation_status": str(raw.get("causal_validation_status", "")).strip(),
+            "causal_validation_issues": list(raw.get("causal_validation_issues") or []),
+            "causal_validation_inherited_fields": list(
+                raw.get("causal_validation_inherited_fields") or []
+            ),
+            "final_action_resolution": str(raw.get("final_action_resolution", "")).strip(),
+            "final_camera_resolution": str(raw.get("final_camera_resolution", "")).strip(),
+            "final_action_stable": bool(raw.get("final_action_stable", False)),
+            "combat_action_chain_user_edited": bool(raw.get("combat_action_chain_user_edited", False)),
+            "incoming_combat_state_user_edited": bool(raw.get("incoming_combat_state_user_edited", False)),
+            "outgoing_combat_state_user_edited": bool(raw.get("outgoing_combat_state_user_edited", False)),
+            "next_action_trigger_user_edited": bool(raw.get("next_action_trigger_user_edited", False)),
+            "environment_interaction_user_edited": bool(raw.get("environment_interaction_user_edited", False)),
+            "incoming_environment_state_user_edited": bool(raw.get("incoming_environment_state_user_edited", False)),
+            "outgoing_environment_state_user_edited": bool(raw.get("outgoing_environment_state_user_edited", False)),
+            "crowd_reaction_user_edited": bool(raw.get("crowd_reaction_user_edited", False)),
+            "location_transition_user_edited": bool(raw.get("location_transition_user_edited", False)),
         })
     if not shots:
         raise ValueError("Design JSON must contain at least one shot")
@@ -4347,11 +5021,18 @@ def normalize_design_plan(
         for item in plan["markers"]
     )
     if not has_final_hold and not is_drone_special_skill(special_skill_key):
+        is_combat_skill = (
+            str(special_skill_key or "").strip().casefold() == STREET_FIGHTER_SPECIAL_SKILL
+        )
         plan["markers"].append({
             "time_seconds": snap_half_second(max(0.0, duration - 1.0), duration),
-            "preset": "Final Hold",
+            "preset": "Final Combat Resolve" if is_combat_skill else "Final Hold",
             "direction": (
-                "Settle all camera motion and hold the final hero composition through the last frame."
+                "Complete the final authored technique at real-time speed, visibly dissipate momentum, "
+                "settle both fighters on readable support, and decelerate the FPV camera into one stable "
+                "three-quarter composition through the last frame; no new attack, zoom, spin or slow motion."
+                if is_combat_skill
+                else "Settle all camera motion and hold the final hero composition through the last frame."
             ),
         })
 
@@ -4501,6 +5182,16 @@ def normalize_design_plan(
                 + identity_contract
             )
     plan["existing_media_uses"] = existing_media_uses
+    enforce_street_fighter_character_bindings(
+        plan,
+        existing_media,
+        special_skill_key,
+    )
+    enforce_street_fighter_fpv_combat_direction(plan, special_skill_key)
+    existing_media_uses = [
+        row for row in plan.get("existing_media_uses") or []
+        if isinstance(row, dict)
+    ]
     reused_media_ids = sorted({
         row["media_id"] for row in existing_media_uses
         if not is_analysis_only_media_use(row)
@@ -4707,7 +5398,22 @@ def normalize_design_plan(
     if str(special_skill_key).strip().casefold() == "dark-rescue-h3":
         enforce_dark_rescue_first_person(plan)
     stabilize_generated_identity_references(plan)
-    return auto_adjust_speech_shot_timing(plan)
+    enforce_street_fighter_cast_market_and_spectators(
+        plan,
+        existing_media,
+        special_skill_key,
+    )
+    plan = auto_adjust_speech_shot_timing(plan)
+    plan = apply_combat_action_continuity(
+        plan,
+        special_skill_key=special_skill_key,
+        existing_media=existing_media,
+        authored_requirement=authored_requirement,
+    )
+    return apply_environmental_combat_physics(
+        plan,
+        special_skill_key=special_skill_key,
+    )
 
 
 def build_design_system_prompt(context: dict) -> str:
@@ -4788,6 +5494,94 @@ def build_design_system_prompt(context: dict) -> str:
             "let it rise naturally between spoken lines, and use no vocals unless authored Lyrics "
             "explicitly require them. "
         )
+    special_profile = bound_skills.get("special") or {}
+    selected_special_key = str(special_profile.get("key", "")).strip().casefold()
+    character_bindings = [
+        row for row in context.get("character_reference_bindings") or []
+        if isinstance(row, dict)
+        and str(row.get("speaker", "")) in {"S1", "S2"}
+        and re.fullmatch(r"P[1-9]\d*", str(row.get("media_id", "")).strip(), re.I)
+    ]
+    character_binding_contract = ""
+    if character_bindings:
+        assignments = "; ".join(
+            f"{row['speaker']} is exclusively @{str(row['media_id']).upper()} "
+            f"({row.get('evidence_source', 'media evidence')}: {row.get('description', '')})"
+            for row in character_bindings
+        )
+        character_binding_contract = (
+            "CHARACTER REFERENCE BINDING CONTRACT: " + assignments + ". Register every assigned "
+            "Picture in existing_media_uses as a whole-design h3_reference identity anchor. Cite the "
+            "correct @Picture in every Shot where that fighter appears. Never swap S1/S2, blend faces, "
+            "transfer wardrobe, create a substitute face or let a generated action-state image override "
+            "either loaded identity. "
+        )
+        if selected_special_key == STREET_FIGHTER_SPECIAL_SKILL:
+            character_binding_contract += (
+                "STREET FIGHTER CAST PRIORITY: S1 is P1 and S2 is P2 regardless of either "
+                "Picture's apparent gender. This P1/P2 ordering overrides the generic dialogue "
+                "speaker-gender convention. Use the uploaded Picture pixels, complete wardrobe "
+                "and appearance directly; BLIP/AI descriptions are metadata only. Do not generate "
+                "a substitute man/woman pair or person-bearing Z-Image action reference. "
+            )
+    if selected_special_key == STREET_FIGHTER_SPECIAL_SKILL:
+        ending_contract = (
+            "STREET FIGHTER ENDING CONTRACT: complete the last authored technique at real-time full "
+            "speed, show its recoil and displacement, then settle both fighters into one readable, "
+            "physically supported end state for the last 0.75-1.00 second. Add a Final Combat Resolve "
+            "marker, not a replay or new attack. The physical FPV camera may follow the final contact, "
+            "then must decelerate into a stable eye-level three-quarter composition with a level horizon. "
+            "No slow-motion contact, walk-away, pull-back, zoom-out, in-place spin or sudden cut. "
+        )
+        speaker_gender_contract = (
+            "STREET FIGHTER SPEAKER ID CONTRACT: preserve S1=P1 and S2=P2 regardless of apparent "
+            "gender. Infer voice characteristics from each uploaded Picture and authored character, "
+            "but never remap, replace or swap P1/P2 to satisfy a generic gender convention. "
+        )
+        environmental_combat_contract = (
+            "ENVIRONMENTAL COMBAT PHYSICS CONTRACT: for every Shot, plan one visible fighter "
+            "cause followed by no more than one primary and one secondary physical response. "
+            "Objects react only after contact; persistent displacement, dents, leaks, open gates, "
+            "wetness and debris carry into every later Shot. Crowd reaction begins shortly after "
+            "the impact, remains at the perimeter and never creates an extra fighter. For a 45-second "
+            "fight, active combat moves from the connected indoor seafood aisle through the visible "
+            "loading-gate threshold at about 30 seconds into the rainy Hong Kong alley. The transition "
+            "must be caused by attack, defence, clinch, throw or evasive momentum—never walking, an "
+            "establishing cut or teleportation. Do not repair damage, reset crowd positions, change "
+            "architecture or introduce outdoor elements before the threshold. The application will "
+            "derive editable environment_interaction, incoming_environment_state, "
+            "outgoing_environment_state, crowd_reaction and location_transition fields and compile "
+            "them into each real H3 Segment prompt. "
+        )
+    elif is_drone_special_skill(selected_special_key):
+        ending_contract = (
+            "For drone-fly-on-city and drone-fly-on-city-fireworks, keep a natural generated ending: "
+            "do not add an automatic Final Hold, terminal picture, P1 return or fixed last-second freeze. "
+        )
+        speaker_gender_contract = (
+            "For every dialogue text_layer, infer the gender of the speaking on-screen character from "
+            "the user's story, Shot action and reference-media evidence. Assign S1 to a female speaker "
+            "and S2 to a male speaker, keep the assignment consistent across every Shot, and never use "
+            "the narrator's gender when the visible character is speaking. If the user explicitly writes "
+            "S1 or S2, preserve that explicit assignment. Put the intended emotion and pace in delivery "
+            "without changing the authored words. "
+        )
+        environmental_combat_contract = ""
+    else:
+        ending_contract = (
+            "Include a Final Hold marker before the final frame; cue timestamps must be earlier than "
+            "duration_seconds. The Final Hold must resolve the last Shot's outgoing physical state "
+            "rather than introduce a new action. "
+        )
+        speaker_gender_contract = (
+            "For every dialogue text_layer, infer the gender of the speaking on-screen character from "
+            "the user's story, Shot action and reference-media evidence. Assign S1 to a female speaker "
+            "and S2 to a male speaker, keep the assignment consistent across every Shot, and never use "
+            "the narrator's gender when the visible character is speaking. If the user explicitly writes "
+            "S1 or S2, preserve that explicit assignment. Put the intended emotion and pace in delivery "
+            "without changing the authored words. "
+        )
+        environmental_combat_contract = ""
     return (
         "You are the AI Design Planner inside a MiniMax H3 Director Cut application. "
         "Convert the user's concept into one production-ready JSON object that exactly matches the supplied schema. "
@@ -4796,6 +5590,10 @@ def build_design_system_prompt(context: dict) -> str:
         + language_contract
         + subtitle_contract
         + music_contract
+        + character_binding_contract
+        + ending_contract
+        + speaker_gender_contract
+        + environmental_combat_contract
         + "the application will compile this JSON into the final H3 Ref2VA prompt. "
         "Use 0.5-second boundaries. Build chronological Shot Blocks with explicit framing, camera angle, camera movement, "
         "subject action, environmental response, continuity state, optional flourish and additional direction. "
@@ -4909,10 +5707,6 @@ def build_design_system_prompt(context: dict) -> str:
         "omitting or paraphrasing authored words. "
         "Only create a text_layer or theme_text when the user explicitly requests visible text, dialogue, voice-over or lyrics, and set "
         "explicit_user_requested=true only in that case. Never turn the creative brief or scene description into on-screen text. "
-        "For every dialogue text_layer, infer the gender of the speaking on-screen character from the user's story, Shot action and "
-        "reference-media evidence. Assign S1 to a female speaker and S2 to a male speaker, keep the assignment consistent across every "
-        "Shot, and never use the narrator's gender when the visible character is speaking. If the user explicitly writes S1 or S2, "
-        "preserve that explicit assignment. Put the intended emotion and pace in delivery without changing the authored words. "
         "Always design a useful overall_soundscape with three audible layers: continuous diegetic location ambience, exact-frame "
         "contact-synchronized Foley/one-shot SFX, and foreground speech. On-screen Dialogue must sound like live production audio "
         "captured in the visible location, with natural breath, conversational micro-pauses, camera-distance perspective, subtle room "
@@ -4922,12 +5716,8 @@ def build_design_system_prompt(context: dict) -> str:
         "reflections for covered semi-outdoor spaces, and almost no reverb with reduced low-mid fullness for open exteriors. Never carry "
         "a previous room's tail across a location change. Keep "
         "dialogue in the foreground, duck ambience beneath speech without muting it, and never replace or echo authored dialogue. "
-        "For drone-fly-on-city and drone-fly-on-city-fireworks, keep a natural generated ending: do not add an automatic "
-        "Final Hold, terminal picture, P1 return or fixed last-second freeze. For other Skills include a Final Hold marker "
-        "before the final frame; cue timestamps must be earlier than duration_seconds. "
         "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
-        "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. The Final Hold must resolve "
-        "the last Shot's outgoing physical state rather than introduce a new action. "
+        "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. "
         "Media requests are reference requirements, not final generated media. "
         "Keep exact product/subject continuity, realistic object interaction and H3-friendly concise directions. "
         "OUTPUT SIZE CONTRACT: Return one compact but complete JSON object. Do not repeat the same prose across fields, "

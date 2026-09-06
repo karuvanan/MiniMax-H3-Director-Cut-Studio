@@ -2,6 +2,42 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.2-alpha.5] - 2026-09-06
+
+### High-density Combat Action Continuity
+
+- Added the structured v2 combat ledger: authority-ranked P1/P2 facts with BLIP/AI Enrich provenance, five duty labels per 15-second window, strict physical action-carrier routing, action-triggered FPV camera directions and screen-space force vectors. The new fields are additive and remain compatible with existing Director Project files.
+- Material responses now consume the force vector and a material response table (water, ice, plastic, metal, hanging hardware, tank frames and carts), so splash, skid, dent, swing and roll directions follow the visible contact instead of a generic round-robin effect.
+
+- Fused the useful causal/state ideas from the reviewed high-density fight reference into the existing Studio JSON workflow without importing its unrelated BUNNY wrapper, dual-format output, weapon/creature/giant routing or third-party platform contracts.
+- Added a Street-Fighter-only Combat Action Continuity engine. Each Shot now carries two numbered executable Beats plus editable Combat Action Chain, Incoming Combat State, Outgoing Combat State and Next Action Trigger data; clear self-defence actor errors are corrected, while repeated exchanges and unexplained ground-position reversals are flagged.
+- Standardized the proven 45-second baseline at six executable action Shots per 15-second Segment: 18 Shots and 36 non-repeating Beats. Dialogue may still extend the final Timeline, but combat timing and the indoor-to-outdoor threshold remain anchored to the authored 45.00-second baseline.
+- Added red `ACTION RISK` visibility in Timeline and Storyboard, along with full Combat state editing in the Shot inspector. Storyboard reorder/trim reruns Combat state before Environmental state in the same Undoable transaction.
+- Compacted actual H3 Segment prompts so FPV, P1/P2, market and causality invariants appear once at Segment level; Shot descriptions retain only executable action and local state deltas. Timeline source text remains intact and editable.
+- Improved environment-target causality: authored stall, gate, tank, ice, crate, scale, puddle, awning, cart or bin contact now overrides round-robin prop selection. A dialogue extension no longer shifts the 30.0-second market-gate transition.
+- Raised Director Project format to `23` for persisted Combat Action Continuity fields. Older projects load with safe defaults and can acquire the new state through a fresh Design Apply or Street-Fighter Storyboard Apply.
+- Verified the completed integration with 508/508 bundled tests and all 13 Standard Pipeline Release Gates, including Storyboard/Segment Mapping and project save/reload coverage.
+
+### Environmental Combat Physics
+
+- Added a deterministic, Timeline-owned environment state engine for `street-fighter-live-action-h3`. Each Shot now carries an editable cause/contact record, one primary response, at most one secondary response, delayed perimeter-crowd reaction, incoming state, outgoing state and location transition.
+- Assigned stable environment object IDs and persistent damage/displacement history. Missing contact produces a warning instead of spontaneous destruction; critical collapse and unrelated explosions are never authored automatically.
+- Compiled the structured environment fields into every real H3 Segment prompt, in addition to the existing visual action and continuity text. User-edited environment fields are protected from later automatic reconciliation.
+- Added Timeline warning/transition colours, Storyboard interaction/crowd/route badges and a scrollable Shot editor for the new fields. Storyboard and Smart Cut Apply recalculate the chronological state chain inside their existing single Undo transaction.
+
+### Indoor-to-outdoor combat continuity
+
+- Reworked the 45-second Street Fighter route into one connected Hong Kong Kowloon-style wet market: indoor seafood aisle, fish/vegetable junction, loading threshold, then the rainy exterior service alley beyond the same visibly forced-open gate.
+- Time-isolated Z-Image into one indoor environment/spectator plate for the first two thirds and one matching exterior plate for the final third. P1 and P2 remain the only principal fighter identity anchors; each Segment receives only its currently relevant background plate.
+- Added distinct H3-native acoustic profiles for the cramped indoor market and open rainy alley, including a doorway transition from pumps, drainage and short stall reflections into rain, traffic and reduced enclosure. No TTS replacement, FFmpeg reverb or post-generated remix was added.
+- Updated the English/Chinese Skill and its editable `DESIGN_REQUIREMENT.txt` with causal object/crowd response, persistent state and active-combat route rules.
+
+### Compatibility and cache safety
+
+- Raised Director Project format to `22` for persisted environmental fields at the original alpha.5 checkpoint; the later Combat Action Continuity addition above advances the current format to `23`. Older Projects load with dataclass defaults, while unknown future Director Cue metadata is safely ignored instead of causing an `unexpected keyword argument` load failure.
+- Kept Smart Render policy at `16`: the new environment fields are part of the per-Segment prompt fingerprint, so affected Street Fighter Segments invalidate precisely without discarding reusable cache from unrelated projects or Skills.
+- Added focused environment-engine, native-acoustic, real-H3-prompt and Storyboard/Undo regressions. The original checkpoint passed 493/493 bundled tests; the current Combat Action Continuity checkpoint passes 508/508 bundled tests, 13/13 Standard Pipeline Release Gates and the UTF-8 Skill Creator validator. Full acceptance evidence is tracked in `V0.3.2-ALPHA.5_ENVIRONMENTAL_COMBAT_ACCEPTANCE_CHECKLIST.md`.
+
 ## [0.3.2-alpha.4] - 2026-09-05
 
 ### Global Design duration safety and image-generation regression release

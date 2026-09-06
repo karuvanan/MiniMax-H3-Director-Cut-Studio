@@ -1779,6 +1779,25 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("Red leaves swirl", budgeted["optional_flourish"])
         self.assertIn("omit", budget["notes"].lower())
 
+    def test_action_budget_preserves_decimal_timing_inside_numbered_beats(self):
+        budgeted = normalize_shot_action_budget({
+            "start_seconds": 0.5,
+            "end_seconds": 2.5,
+            "subject_action": (
+                "[BEAT 01 | 0.5-1.5s] S2 drives a low side kick into range; "
+                "[BEAT 02 | 1.5-2.5s] S1 checks the shin and pivots outside."
+            ),
+            "optional_flourish": "Dust drifts.",
+        })
+        budget = budgeted["action_budget"]
+        self.assertEqual(budget["core_action_count"], 2)
+        self.assertEqual(budget["status"], "within_budget")
+        self.assertIn("0.5-1.5s", budgeted["h3_executable_action"])
+        self.assertIn("1.5-2.5s", budgeted["h3_executable_action"])
+        self.assertIn("low side kick", budgeted["h3_executable_action"])
+        self.assertIn("checks the shin", budgeted["h3_executable_action"])
+        self.assertNotIn("BEAT", budgeted["h3_optional_flourish"])
+
     def test_action_budget_survives_normalizing_an_already_normalized_plan(self):
         payload = sample_design()
         payload["shots"][0]["end_seconds"] = 5.0

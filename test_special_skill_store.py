@@ -116,6 +116,37 @@ class SpecialSkillStoreTests(unittest.TestCase):
                 validate_special_skill_document(document)
                 self.assertTrue(document.design_requirement_template.strip())
 
+    def test_street_fighter_skill_enforces_full_speed_and_visible_camera_displacement(self):
+        root = Path(__file__).parent / "skill special" / "street-fighter-live-action-h3"
+        english = (root / "SKILL.md").read_text(encoding="utf-8")
+        chinese = (root / "SKILL.cn.md").read_text(encoding="utf-8")
+        template = (root / "DESIGN_REQUIREMENT.txt").read_text(encoding="utf-8")
+
+        self.assertIn("physical FPV", english)
+        self.assertIn("实体FPV", chinese)
+        self.assertIn("实体飞行", template)
+        self.assertIn("very fast", english)
+        self.assertIn("very fast", chinese)
+        self.assertIn("very fast", template)
+        self.assertIn("0.5", english)
+        self.assertIn("0.5", chinese)
+        self.assertIn("0.45", template)
+        self.assertIn("FULL-SPEED FIGHT ONLY", english)
+        self.assertIn("FULL-SPEED FIGHT ONLY", chinese)
+        self.assertIn("Dialogue-aware timing", english)
+        self.assertIn("Dialogue Track", template)
+        self.assertIn("18 executable action Shots", english)
+        self.assertIn("18个可执行动作Shot", chinese)
+        self.assertIn("全片18个Shot", template)
+        self.assertIn("bare-handed by default", english)
+        self.assertIn("no more than **two closed-fist punches**", english)
+        self.assertIn("默认**完全徒手**", chinese)
+        self.assertIn("闭拳Punch总数最多**两次**", chinese)
+        self.assertIn("严禁拳套", template)
+        self.assertIn("每15秒闭拳Punch最多两次", template)
+        self.assertIn("at least five orbital camera sectors", english)
+        self.assertIn("五种肉眼可分的摄影角度", chinese)
+
 
 if __name__ == "__main__":
     unittest.main()

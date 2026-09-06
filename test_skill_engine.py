@@ -3,7 +3,12 @@ from copy import deepcopy
 import re
 import unittest
 
-from design_engine import normalize_design_plan
+from design_engine import (
+    build_design_system_prompt,
+    normalize_design_plan,
+    render_special_design_requirement_template,
+    street_fighter_character_bindings,
+)
 
 from media_semantic_enrichment import enrichment_fingerprint
 from prompt_engine import PromptSpec
@@ -183,7 +188,6 @@ class SkillEngineTests(unittest.TestCase):
             "one frozen instant",
         ):
             self.assertIn(phrase, system)
-
     def test_short_drama_special_has_chinese_mirror_and_upstream_license(self):
         folder = self.profiles["short-drama-h3-director"].path.parent
         chinese = (folder / "SKILL.cn.md").read_text(encoding="utf-8-sig")
@@ -253,18 +257,21 @@ class SkillEngineTests(unittest.TestCase):
         self.assertTrue(profile.special)
         self.assertFalse(profile.standalone)
         self.assertIn("准确45.00秒的电影级真人街机格斗短片", profile.design_requirement_template)
-        self.assertIn("12个编号近身攻防动作", profile.design_requirement_template)
-        self.assertIn("36个编号且不重复的Combat Beat", profile.design_requirement_template)
-        self.assertIn("单腿抱摔", profile.design_requirement_template)
-        self.assertIn("切换双腿抱摔", profile.design_requirement_template)
-        self.assertIn("上位压制", profile.design_requirement_template)
-        self.assertIn("MMA露指拳套", profile.design_requirement_template)
-        self.assertIn("三个Segment沿同一条可见路线", profile.design_requirement_template)
-        self.assertIn("IES工业灯管", profile.design_requirement_template)
-        self.assertIn("建立全局Camera Ledger", profile.design_requirement_template)
-        self.assertIn("禁止全程使用单一正面角度", profile.design_requirement_template)
-        self.assertIn("三种街机标志性摄影职责", profile.design_requirement_template)
-        self.assertIn("实体360° Bullet-time环绕", profile.design_requirement_template)
+        self.assertIn("12个编号近身攻防Beat", profile.design_requirement_template)
+        self.assertIn("36个编号动作且不得重复", profile.design_requirement_template)
+        self.assertIn("MMA抱摔", profile.design_requirement_template)
+        self.assertIn("受控降服", profile.design_requirement_template)
+        self.assertIn("两人全程完全徒手", profile.design_requirement_template)
+        self.assertIn("每15秒闭拳Punch最多两次", profile.design_requirement_template)
+        self.assertIn("三个连续15秒Segment", profile.design_requirement_template)
+        self.assertIn("香港九龙城寨风格的湿滑鱼类／海鲜／蔬菜市场", profile.design_requirement_template)
+        self.assertIn("动作节奏为之前全速设定的2倍", profile.design_requirement_template)
+        self.assertIn("Z-Image只生成两张", profile.design_requirement_template)
+        self.assertIn("围绕S1与S2共同中点持续实体飞行", profile.design_requirement_template)
+        self.assertIn("每个Shot都必须是正在发生的格斗", profile.design_requirement_template)
+        self.assertIn("每15秒累计完成一次", profile.design_requirement_template)
+        self.assertIn("Environmental Combat Physics", profile.design_requirement_template)
+        self.assertIn("室外雨夜后巷", profile.design_requirement_template)
         self.assertIn("舞台Spot Light", profile.design_requirement_template)
         system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
         for phrase in (
@@ -273,10 +280,11 @@ class SkillEngineTests(unittest.TestCase):
             "30-second structure",
             "45-second structure — three different phases, 36 non-repeating beats",
             "Action Ledger",
-            "open-finger MMA gloves",
-            "Sealed industrial vertical-maze environment",
+            "bare-handed by default",
+            "Action-variety contract",
+            "Hong Kong Kowloon wet-market arena",
             "Environment Ledger",
-            "IES-profiled industrial tubes",
+            "fish, seafood and vegetable wet market",
             "exactly 12 numbered combat beats",
             "Four-style Close-combat Grammar",
             "Karate",
@@ -292,18 +300,14 @@ class SkillEngineTests(unittest.TestCase):
             "At least 80%",
             "no more than 1.0 second",
             "Camera Ledger",
-            "Following pan or tilt",
-            "Counter-motion camera",
-            "Lateral tracking / dolly",
-            "Brief fighter POV",
-            "Controlled handheld with impact feedback",
-            "Whip pan",
+            "Visible continuous FPV-orbit contract",
+            "Full 360-degree fight orbit",
+            "physically flies clockwise",
             "same straight-on frontal angle in consecutive Shots",
-            "Three iconic arcade-camera modes",
-            "Classic side-axis exchange",
-            "Signature-move launch",
-            "Decisive finish",
-            "translated 360-degree bullet-time orbit",
+            "Arcade combat coverage inside the FPV orbit",
+            "Side-axis exchange",
+            "Signature-move detail",
+            "Full 360-degree fight orbit",
             "Do not use a theatre spotlight",
             "body load → release trajectory → contact point → recovery/result",
             "Projectile palm burst",
@@ -317,45 +321,223 @@ class SkillEngineTests(unittest.TestCase):
         folder = profile.path.parent
         chinese = (folder / "SKILL.cn.md").read_text(encoding="utf-8-sig")
         for phrase in (
-            "15秒",
-            "30秒",
-            "45秒——三个不同阶段、36个不重复Beat",
-            "Action Ledger",
-            "露指MMA拳套",
-            "上锁工业垂直迷宫环境",
-            "Environment Ledger",
-            "IES工业灯管",
-            "准确12个",
-            "四种近身攻防语法",
-            "空手道",
-            "柔道",
-            "截拳道",
-            "咏春",
-            "MMA地面战变体",
-            "抱摔（Takedown）",
-            "地面压制（Grappling Control）",
-            "地面打击（Ground and Pound）",
-            "关节／绞技（Submission）",
-            "至少80%",
-            "Camera Ledger",
-            "顺势Pan／Tilt",
-            "逆势迎摇／Push-Pull",
-            "侧面平行Tracking／Dolly",
-            "短暂格斗者POV",
-            "受控Handheld与撞击反馈",
-            "Whip Pan／闪摇",
-            "三种街机标志性运镜模式",
-            "经典街机侧轴对拆",
-            "必杀技释放",
-            "决定性终结",
-            "实体360° Bullet-time环绕",
-            "舞台Spot Light",
-            "身体蓄力",
-            "掌心能量弹",
-            "旋转踢",
-            "Virtual Media Pool",
+            "15秒", "30秒", "45秒——三个不同阶段、36个不重复Beat",
+            "Action Ledger", "默认**完全徒手**", "动作多样性合约",
+            "香港九龙城寨湿货市场格斗场", "Environment Ledger", "海鲜通道",
+            "准确12个", "四种近身攻防语法", "空手道", "柔道", "截拳道", "咏春",
+            "MMA地面战变体", "抱摔（Takedown）", "地面压制（Grappling Control）",
+            "地面打击（Ground and Pound）", "关节／绞技（Submission）", "至少80%",
+            "Camera Ledger", "持续可见的FPV实体环绕合约", "每个15秒Segment至少依次经过五个机位区域",
+            "FPV环绕中的街机格斗覆盖", "侧轴对拆", "招牌技局部",
+            "全速360度格斗环绕",
+            "舞台Spot Light", "身体蓄力", "掌心能量弹", "旋转踢", "Virtual Media Pool",
         ):
             self.assertIn(phrase, chinese)
+
+    def test_street_fighter_template_binds_p1_p2_from_blip_then_ai_enrich(self):
+        profile = self.profiles["street-fighter-live-action-h3"]
+        media = [
+            {
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": (
+                    "BLIP VISUAL SUMMARY · CUDA\n"
+                    "BLIP · Overview: a focused woman with braided black hair in a white gi"
+                ),
+                "semantic_enrichment": "SUMMARY\nThis fallback must not replace BLIP.",
+            },
+            {
+                "media_id": "P2", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": "MEDIA\nNo BLIP overview yet.",
+                "semantic_enrichment": (
+                    "MEDIA: P2 (image)\n\nSUMMARY\nA muscular man in a red jacket.\n\n"
+                    "SUBJECTS\n- fighter | appearance: muscular man with cropped hair | "
+                    "wardrobe: red jacket and black trousers\n\nOBJECTS / PROPS\nNone established."
+                ),
+            },
+        ]
+        bindings = street_fighter_character_bindings(media)
+        self.assertEqual([row["media_id"] for row in bindings], ["P1", "P2"])
+        self.assertEqual(bindings[0]["evidence_source"], "BLIP · Overview")
+        self.assertEqual(bindings[1]["evidence_source"], "AI Enrich")
+        rendered = render_special_design_requirement_template(
+            profile.design_requirement_template,
+            profile.key,
+            media,
+        )
+        self.assertNotIn("{{STREET_FIGHTER_CAST_BINDINGS}}", rendered)
+        self.assertIn("S1是@P1（BLIP · Overview：a focused woman", rendered)
+        self.assertIn("S2是@P2（AI Enrich：fighter | appearance: muscular man", rendered)
+        self.assertIn("@P1只定义S1，@P2只定义S2", rendered)
+
+    def test_street_fighter_normalization_forces_whole_design_cast_references(self):
+        media = [
+            {
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": "BLIP · Overview: a woman in a white sleeveless gi",
+            },
+            {
+                "media_id": "P2", "media_type": "image", "loaded": True,
+                "semantic_enrichment": "SUMMARY\nA man in a dark red jacket and black trousers.",
+            },
+        ]
+        source = {
+            "title": "Reference fighters",
+            "creative_brief": "S1 and S2 exchange one close-range technique.",
+            "global_visual_style": "Photoreal live-action fight.",
+            "overall_soundscape": "Diegetic room tone and contact Foley.",
+            "non_diegetic_music": "N/A",
+            "constraints": "Two fighters only.",
+            "duration_seconds": 5.0,
+            "shots": [{
+                "start_seconds": 0.0, "end_seconds": 5.0, "track": "V1",
+                "preset": "Fight", "framing": "Close-up", "camera_angle": "Side",
+                "camera_movement": "Lateral track", "movement_speed": "Fast",
+                "movement_amplitude": "Medium", "subject_action": "S1 parries S2.",
+                "environment_response": "Cloth snaps once.",
+                "continuity_state": "S1 left, S2 right.", "optional_flourish": "",
+                "additional_direction": "Keep the fight axis clear.",
+            }],
+            "text_layers": [], "transitions": [], "markers": [],
+            "existing_media_uses": [], "media_requests": [{
+                "requirement_id": "generic_male_female_fighters",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 5.0, "track": "V3",
+                "subject_keywords": ["two generic fighters"],
+                "prompt": "Two generic fighters, one man and one woman, in a fighting pose.",
+            }],
+        }
+        plan = normalize_design_plan(
+            source,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=media,
+            special_skill_key="street-fighter-live-action-h3",
+        )
+        uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
+        self.assertEqual(set(uses), {"P1", "P2"})
+        for media_id in ("P1", "P2"):
+            self.assertEqual(uses[media_id]["reuse_policy"], "whole_design")
+            self.assertEqual((uses[media_id]["start_seconds"], uses[media_id]["end_seconds"]), (0.0, 5.0))
+            self.assertTrue(uses[media_id]["identity_anchor"])
+        self.assertIn("S1 is exclusively @P1", plan["shots"][0]["additional_direction"])
+        self.assertIn("S2 is exclusively @P2", plan["shots"][0]["additional_direction"])
+        self.assertIn("P1/P2 ABSOLUTE CAST LOCK", plan["shots"][0]["additional_direction"])
+        self.assertIn("HONG KONG KOWLOON WET-MARKET ARENA", plan["shots"][0]["additional_direction"])
+        self.assertIn("2X ACTION CADENCE", plan["shots"][0]["additional_direction"])
+        self.assertEqual(
+            [row["requirement_id"] for row in plan["media_requests"]],
+            [
+                "street_fighter_kowloon_market_indoor_spectators",
+                "street_fighter_kowloon_alley_outdoor_spectators",
+            ],
+        )
+        indoor, outdoor = plan["media_requests"]
+        self.assertEqual(indoor["reuse_policy"], "time_scoped")
+        self.assertEqual((indoor["start_seconds"], indoor["end_seconds"]), (0.0, 3.5))
+        self.assertIn("Twelve to eighteen", indoor["prompt"])
+        self.assertIn("no principal fighter", indoor["prompt"])
+        self.assertEqual(outdoor["reuse_policy"], "time_scoped")
+        self.assertEqual((outdoor["start_seconds"], outdoor["end_seconds"]), (3.5, 5.0))
+        self.assertIn("rainy Hong Kong", outdoor["prompt"])
+        self.assertNotIn("generic_male_female_fighters", str(plan["media_requests"]))
+        self.assertEqual(plan["environment_physics_schema_version"], 1)
+        self.assertIn("environment_interaction", plan["shots"][0])
+        self.assertIn("contact_target_id=env_", plan["shots"][0]["environment_interaction"])
+        self.assertEqual(plan["markers"][-1]["preset"], "Final Combat Resolve")
+        self.assertIn("settle both fighters", plan["markers"][-1]["direction"])
+        system = build_design_system_prompt({
+            "character_reference_bindings": street_fighter_character_bindings(media),
+        })
+        self.assertIn("CHARACTER REFERENCE BINDING CONTRACT", system)
+        self.assertIn("S1 is exclusively @P1", system)
+        self.assertIn("S2 is exclusively @P2", system)
+
+    def test_street_fighter_normalization_forces_full_speed_fpv_combat_only(self):
+        source = {
+            "title": "Legacy camera repair",
+            "creative_brief": "Two fighters in one arena.",
+            "global_visual_style": "Photoreal live-action fight.",
+            "overall_soundscape": "Diegetic contact Foley.",
+            "non_diegetic_music": "N/A",
+            "constraints": "Two fighters only.",
+            "duration_seconds": 5.0,
+            "shots": [{
+                "start_seconds": 0.0, "end_seconds": 5.0, "track": "V1",
+                "preset": "Fight", "framing": "Medium", "camera_angle": "Front",
+                "camera_movement": "Slow pull-back zoom out", "movement_speed": "Slow",
+                "movement_amplitude": "Small", "subject_action": "S1 walks slowly into frame.",
+                "environment_response": "Room tone.", "continuity_state": "S1 left, S2 right.",
+                "optional_flourish": "Bullet-time impact freeze.",
+                "additional_direction": "Use slow motion and then walk away.",
+            }],
+            "text_layers": [], "transitions": [],
+            "markers": [{
+                "time_seconds": 4.0, "preset": "Final Hold",
+                "direction": "Settle into a stable hold.",
+            }],
+            "existing_media_uses": [], "media_requests": [],
+        }
+        plan = normalize_design_plan(
+            source,
+            {"image": 9, "video": 3, "audio": 3},
+            special_skill_key="street-fighter-live-action-h3",
+        )
+        shot = plan["shots"][0]
+        self.assertEqual(shot["movement_speed"], "Very fast")
+        self.assertEqual(shot["movement_amplitude"], "Large")
+        self.assertIn("physical FPV clockwise orbital translation", shot["camera_movement"])
+        self.assertNotIn("pull-back", shot["camera_movement"].casefold())
+        self.assertNotIn("zoom out", shot["camera_movement"].casefold())
+        self.assertIn("immediate full-speed attack", shot["subject_action"])
+        self.assertNotIn("walk", shot["subject_action"].casefold())
+        self.assertNotIn("slowly", shot["subject_action"].casefold())
+        self.assertIn("CONTINUOUS FPV COMBAT ORBIT:", shot["additional_direction"])
+        self.assertEqual(plan["markers"][0]["preset"], "Final Combat Resolve")
+        self.assertNotIn("Final Hold", [row["preset"] for row in plan["markers"]])
+        system = build_design_system_prompt({
+            "bound_h3_skills": {
+                "binding_mode": "default_plus_special",
+                "special": {"key": "street-fighter-live-action-h3"},
+            }
+        })
+        self.assertIn("STREET FIGHTER ENDING CONTRACT", system)
+        self.assertIn("Add a Final Combat Resolve marker", system)
+        self.assertIn("stable eye-level three-quarter composition", system)
+
+    def test_ref2va_prompt_emits_two_exclusive_subject_definitions_for_fighters(self):
+        p1 = MediaAsset(
+            "137", "LoadImage", "image", "p1.png", "<Picture 1>",
+            reference_id="P1", end_seconds=15.0,
+            clip_prompt=(
+                "CAST IDENTITY LOCK: S1 is exclusively @P1. Use @P1 as S1's authoritative "
+                "face, hair, body, complete wardrobe, footwear and accessory reference."
+            ),
+        )
+        p2 = MediaAsset(
+            "139", "LoadImage", "image", "p2.png", "<Picture 2>",
+            reference_id="P2", end_seconds=15.0,
+            clip_prompt=(
+                "CAST IDENTITY LOCK: S2 is exclusively @P2. Use @P2 as S2's authoritative "
+                "face, hair, body, complete wardrobe, footwear and accessory reference."
+            ),
+        )
+        prompt = build_ref2va_prompt(
+            PromptSpec(
+                brief="S1 and S2 perform one close-range exchange.",
+                shots=["S1 parries S2 while both identities remain stable."],
+            ),
+            [p1, p2],
+            15.0,
+            self.profiles[DEFAULT_SKILL],
+            self.profiles["street-fighter-live-action-h3"],
+        )
+        self.assertIn("<Subject 1> is the fighter", prompt)
+        self.assertIn("come exclusively from <Picture 1>", prompt)
+        self.assertIn("<Subject 2> is the fighter", prompt)
+        self.assertIn("come exclusively from <Picture 2>", prompt)
+        self.assertIn("Never assign this identity to <Subject 2>", prompt)
+        self.assertIn("Never assign this identity to <Subject 1>", prompt)
+        self.assertIn("never swap or blend the assigned fighters", prompt)
 
     def test_long_form_special_is_default_bound_and_batch_boundary_safe(self):
         profile = self.profiles["long-form-h3-director"]

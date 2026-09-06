@@ -209,7 +209,7 @@ class MediaSemanticEnrichmentTests(unittest.TestCase):
                 "timeout": 30,
             })
         request_payload = request.call_args.kwargs["payload"]
-        self.assertEqual(request_payload["max_tokens"], 12000)
+        self.assertEqual(request_payload["max_tokens"], 32768)
         self.assertEqual(
             request_payload["response_format"]["json_schema"]["name"],
             "media_semantic_enrichment_",

@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     QEvent, QEasingCurve, QMimeData, QObject, QPoint, QRectF, QSize, Qt,
     QTimer, QUrl, QVariantAnimation, Signal,
 )
-from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack
+from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -98,6 +98,25 @@ from native_audio_engine import (
     environment_continuity_text,
     native_audio_direction_text,
 )
+from combat_environment_engine import (
+    CAUSALITY_CONTRACT,
+    ENVIRONMENT_PHYSICS_SCHEMA_VERSION,
+    STREET_FIGHTER_SKILL as ENVIRONMENT_COMBAT_SPECIAL_SKILL,
+    environmental_combat_prompt_clause,
+    reconcile_environmental_combat_rows,
+)
+from combat_action_engine import (
+    ACTION_CAUSALITY_CONTRACT,
+    ACTION_CARRIER_CONTRACT,
+    COMBAT_ACTION_SCHEMA_VERSION,
+    DYNAMIC_CAMERA_CONTRACT,
+    FACT_LEDGER_CONTRACT,
+    FIVE_DUTY_CONTRACT,
+    combat_action_prompt_clause,
+    compact_street_fighter_prompt_field,
+    reconcile_combat_action_rows,
+    reconcile_final_combat_markers,
+)
 from media_semantic_enrichment import (
     MEDIA_SEMANTIC_ENRICHMENT_SCHEMA,
     build_enrichment_job_context,
@@ -133,12 +152,17 @@ from design_engine import (
     normalize_design_music_mode,
     protect_explicit_timed_text_layers,
     reconcile_requested_speech_layer_contract,
+    render_special_design_requirement_template,
     requested_speech_roles,
     sanitize_drone_still_image_request,
     SPEECH_TIMELINE_MARKER_PREFIX,
     SPEECH_TIMELINE_REMINDER_PREFIX,
+    STREET_FIGHTER_FPV_COMBAT_CONTRACT,
+    STREET_FIGHTER_MARKET_CONTRACT,
+    STREET_FIGHTER_P1_P2_PIXEL_LOCK,
     speech_timing_budget,
     spatial_acoustics_profile,
+    street_fighter_character_bindings,
     validate_drone_image_request_budget,
     validate_explicit_timed_text_contract,
     validate_requested_speech_layer_contract,
@@ -1099,6 +1123,55 @@ class DirectorCue:
     action_budget_notes: str = ""
     authored_subject_action: str = ""
     authored_environment_response: str = ""
+    environment_interaction: str = ""
+    incoming_environment_state: str = ""
+    outgoing_environment_state: str = ""
+    crowd_reaction: str = ""
+    location_transition: str = ""
+    environment_state_status: str = ""
+    environment_physics_schema_version: int = 0
+    combat_action_chain: str = ""
+    incoming_combat_state: str = ""
+    outgoing_combat_state: str = ""
+    next_action_trigger: str = ""
+    event_causality_chain: str = ""
+    physical_feedback_chain: str = ""
+    causal_risk_original_action: str = ""
+    causal_risk_repair_status: str = ""
+    causal_risk_repair_notes: str = ""
+    causal_validation_status: str = ""
+    causal_validation_issues: list[str] = field(default_factory=list)
+    causal_validation_inherited_fields: list[str] = field(default_factory=list)
+    final_action_resolution: str = ""
+    final_camera_resolution: str = ""
+    final_action_stable: bool = False
+    combat_continuity_status: str = ""
+    combat_continuity_notes: str = ""
+    combat_action_schema_version: int = 0
+    combat_fact_context: str = ""
+    combat_story_duty_index: int = 0
+    combat_story_duty: str = ""
+    combat_story_duty_instruction: str = ""
+    combat_action_beats: list[dict] = field(default_factory=list)
+    combat_action_carrier: str = ""
+    combat_force_vector: dict[str, str] = field(default_factory=dict)
+    incoming_combat_state_vector: dict[str, str] = field(default_factory=dict)
+    outgoing_combat_state_vector: dict[str, str] = field(default_factory=dict)
+    camera_position_sector: str = ""
+    camera_motion_relation: str = ""
+    camera_action_trigger: str = ""
+    dynamic_camera_direction: str = ""
+    contact_material: str = ""
+    environment_force_vector: dict[str, str] = field(default_factory=dict)
+    combat_action_chain_user_edited: bool = False
+    incoming_combat_state_user_edited: bool = False
+    outgoing_combat_state_user_edited: bool = False
+    next_action_trigger_user_edited: bool = False
+    environment_interaction_user_edited: bool = False
+    incoming_environment_state_user_edited: bool = False
+    outgoing_environment_state_user_edited: bool = False
+    crowd_reaction_user_edited: bool = False
+    location_transition_user_edited: bool = False
     native_audio_direction: str = ""
     environment_continuity: str = ""
     audio_reference_intent: str = ""
@@ -1149,6 +1222,13 @@ class DirectorCue:
             self.authored_environment_response = (
                 self.authored_environment_response or self.environment_response
             )
+
+
+def director_cue_from_mapping(value: dict) -> DirectorCue:
+    """Load current or future Director Cue JSON without rejecting extra metadata."""
+
+    allowed = DirectorCue.__dataclass_fields__.keys()
+    return DirectorCue(**{key: value[key] for key in allowed if key in value})
 
 
 def default_timeline_tracks() -> list[TimelineTrack]:
@@ -2455,8 +2535,25 @@ class TimelineCueItem(QGraphicsRectItem):
         super().__init__(0, 0, width, DIRECTOR_LANE_HEIGHT - 2)
         self.setPos(cue.start_seconds * pixels_per_second, lane_y + 1)
         speech_reminder = cue.preset.startswith(SPEECH_TIMELINE_MARKER_PREFIX)
-        self.setBrush(QColor("#c43d4b" if speech_reminder else self.COLORS.get(cue.cue_type, "#5f6670")))
-        self.setPen(QPen(QColor("#ffd7dc" if speech_reminder else "#d7dde4"), 1))
+        environment_warning = (
+            cue.cue_type == "shot" and cue.environment_state_status == "warning"
+        )
+        environment_transition = (
+            cue.cue_type == "shot" and cue.environment_state_status == "transition"
+        )
+        combat_warning = (
+            cue.cue_type == "shot" and cue.combat_continuity_status == "warning"
+        )
+        causal_warning = (
+            cue.cue_type == "shot" and cue.causal_validation_status == "warning"
+        )
+        cue_color = (
+            "#c43d4b" if speech_reminder or environment_warning or combat_warning or causal_warning
+            else "#b57537" if environment_transition
+            else self.COLORS.get(cue.cue_type, "#5f6670")
+        )
+        self.setBrush(QColor(cue_color))
+        self.setPen(QPen(QColor("#ffd7dc" if speech_reminder or environment_warning or combat_warning or causal_warning else "#d7dde4"), 1))
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         shot_number = cue.cue_id[1:] if cue.cue_id.startswith("S") else cue.cue_id
         label = (
@@ -2481,6 +2578,30 @@ class TimelineCueItem(QGraphicsRectItem):
                         f"{cue.camera_movement} · {cue.movement_speed} · {cue.movement_amplitude} amplitude",
                         cue.subject_action,
                         cue.environment_response,
+                        (
+                            "ENVIRONMENT STATE WARNING: repair the cause/state chain before render."
+                            if environment_warning else ""
+                        ),
+                        (
+                            "COMBAT CONTINUITY WARNING: " + cue.combat_continuity_notes
+                            if combat_warning else ""
+                        ),
+                        (
+                            "CAUSAL REPAIR: " + cue.causal_risk_repair_notes
+                            if cue.causal_risk_repair_status == "auto_fixed" and cue.causal_risk_repair_notes else ""
+                        ),
+                        (
+                            "CAUSAL VALIDATION WARNING: "
+                            + "; ".join(cue.causal_validation_issues)
+                            if causal_warning else ""
+                        ),
+                        (
+                            "FINAL ACTION: " + cue.final_action_resolution
+                            if cue.final_action_resolution else ""
+                        ),
+                        cue.environment_interaction,
+                        cue.crowd_reaction,
+                        cue.location_transition,
                         *(
                             f"AI media reference: {direction}"
                             for direction in cue.semantic_reference_directions.values()
@@ -5147,6 +5268,35 @@ class StoryboardEditorDialog(QDialog):
                 "preset": cue.preset or cue.cue_id,
                 "subject_action": cue.authored_subject_action or cue.subject_action,
                 "environment_response": cue.authored_environment_response or cue.environment_response,
+                "environment_interaction": cue.environment_interaction,
+                "incoming_environment_state": cue.incoming_environment_state,
+                "outgoing_environment_state": cue.outgoing_environment_state,
+                "crowd_reaction": cue.crowd_reaction,
+                "location_transition": cue.location_transition,
+                "environment_state_status": cue.environment_state_status,
+                "environment_physics_schema_version": cue.environment_physics_schema_version,
+                "combat_action_chain": cue.combat_action_chain,
+                "incoming_combat_state": cue.incoming_combat_state,
+                "outgoing_combat_state": cue.outgoing_combat_state,
+                "next_action_trigger": cue.next_action_trigger,
+                "event_causality_chain": cue.event_causality_chain,
+                "physical_feedback_chain": cue.physical_feedback_chain,
+                "causal_risk_original_action": cue.causal_risk_original_action,
+                "causal_risk_repair_status": cue.causal_risk_repair_status,
+                "causal_risk_repair_notes": cue.causal_risk_repair_notes,
+                "causal_validation_status": cue.causal_validation_status,
+                "causal_validation_issues": list(cue.causal_validation_issues),
+                "causal_validation_inherited_fields": list(cue.causal_validation_inherited_fields),
+                "final_action_resolution": cue.final_action_resolution,
+                "final_camera_resolution": cue.final_camera_resolution,
+                "final_action_stable": cue.final_action_stable,
+                "combat_continuity_status": cue.combat_continuity_status,
+                "combat_continuity_notes": cue.combat_continuity_notes,
+                "combat_action_schema_version": cue.combat_action_schema_version,
+                "combat_story_duty": cue.combat_story_duty,
+                "combat_action_carrier": cue.combat_action_carrier,
+                "camera_action_trigger": cue.camera_action_trigger,
+                "combat_force_vector": cue.combat_force_vector,
                 "framing": cue.framing,
                 "dialogue_count": len(dialogue),
                 "media_refs": refs,
@@ -5324,6 +5474,34 @@ class StoryboardEditorDialog(QDialog):
                 f"FRAME {entry.get('preview_ref') or '—'}  ·  "
                 f"SPEECH {int(entry.get('dialogue_count', 0))}  ·  MEDIA {refs}"
             )
+            environment_badges: list[str] = []
+            if str(entry.get("environment_interaction", "")).strip():
+                environment_badges.append("INTERACTION")
+            if str(entry.get("crowd_reaction", "")).strip():
+                environment_badges.append("CROWD")
+            if "INDOOR→OUTDOOR" in str(entry.get("location_transition", "")):
+                environment_badges.append("INDOOR→OUTDOOR")
+            if str(entry.get("environment_state_status", "")) == "warning":
+                environment_badges.append("STATE CONFLICT")
+                item.setBackground(QBrush(QColor("#4b1e24")))
+            combat_status = str(entry.get("combat_continuity_status", ""))
+            if combat_status == "auto_fixed":
+                environment_badges.append("ACTION AUTO-FIX")
+            elif combat_status == "warning":
+                environment_badges.append("ACTION RISK")
+                item.setBackground(QBrush(QColor("#5b2026")))
+            if str(entry.get("causal_risk_repair_status", "")) == "auto_fixed":
+                environment_badges.append("CAUSAL AUTO-FIX")
+            causal_status = str(entry.get("causal_validation_status", ""))
+            if causal_status == "warning":
+                environment_badges.append("CAUSAL RISK")
+                item.setBackground(QBrush(QColor("#5b2026")))
+            elif causal_status == "auto_fixed" and "CAUSAL AUTO-FIX" not in environment_badges:
+                environment_badges.append("CAUSAL AUTO-FIX")
+            if bool(entry.get("final_action_stable", False)):
+                environment_badges.append("STABLE FINAL")
+            if environment_badges:
+                footer += "  ·  " + " · ".join(environment_badges)
             mode = self.view_mode
             if mode == "details":
                 card_text = f"{heading}  |  {preset}  |  {footer}"
@@ -5345,7 +5523,12 @@ class StoryboardEditorDialog(QDialog):
             item.setText(card_text)
             item.setToolTip(
                 f"Drag and drop to reorder SHOT {index + 1}\n"
-                f"{cursor:.1f}–{cursor + duration:.1f}s · {refs}"
+                f"{cursor:.1f}–{cursor + duration:.1f}s · {refs}\n"
+                f"{entry.get('environment_interaction', '')}\n"
+                f"{entry.get('crowd_reaction', '')}\n"
+                f"{entry.get('location_transition', '')}\n"
+                f"Combat: {entry.get('combat_continuity_status') or 'not tracked'}\n"
+                f"{entry.get('combat_continuity_notes', '')}"
             )
             cursor += duration
         self._refresh_duration_summary()
@@ -5399,7 +5582,11 @@ class StoryboardEditorDialog(QDialog):
                 f"Original: {float(entry.get('original_start', 0.0)):.1f}–"
                 f"{float(entry.get('original_end', 0.0)):.1f}s\n"
                 f"Speech layers: {int(entry.get('dialogue_count', 0))}\n"
-                f"Media: {', '.join(entry.get('media_refs') or []) or 'none'}"
+                f"Media: {', '.join(entry.get('media_refs') or []) or 'none'}\n"
+                f"Environment: {entry.get('environment_state_status') or 'not tracked'}\n"
+                f"Combat: {entry.get('combat_continuity_status') or 'not tracked'}\n"
+                f"{entry.get('combat_continuity_notes') or ''}\n"
+                f"{entry.get('location_transition') or ''}"
             )
         self._loading_inspector = False
 
@@ -5428,6 +5615,20 @@ class StoryboardEditorDialog(QDialog):
             "preset": "New Story Beat",
             "subject_action": "",
             "environment_response": "",
+            "environment_interaction": "",
+            "incoming_environment_state": "",
+            "outgoing_environment_state": "",
+            "crowd_reaction": "",
+            "location_transition": "",
+            "environment_state_status": "",
+            "environment_physics_schema_version": 0,
+            "combat_action_chain": "",
+            "incoming_combat_state": "",
+            "outgoing_combat_state": "",
+            "next_action_trigger": "",
+            "combat_continuity_status": "",
+            "combat_continuity_notes": "",
+            "combat_action_schema_version": 0,
             "framing": "Medium-wide",
             "dialogue_count": 0,
             "media_refs": [],
@@ -5499,6 +5700,37 @@ class DirectorCueDialog(QDialog):
         self._environment_continuity_original = cue.environment_continuity
         self._audio_reference_intent_original = cue.audio_reference_intent
         self._native_audio_qc_original = cue.native_audio_qc_status
+        self._environment_physics_originals = {
+            "environment_interaction": cue.environment_interaction,
+            "incoming_environment_state": cue.incoming_environment_state,
+            "outgoing_environment_state": cue.outgoing_environment_state,
+            "crowd_reaction": cue.crowd_reaction,
+            "location_transition": cue.location_transition,
+        }
+        self._environment_state_original = cue.environment_state_status
+        self._environment_physics_schema_version = cue.environment_physics_schema_version
+        self._combat_action_originals = {
+            "combat_action_chain": cue.combat_action_chain,
+            "incoming_combat_state": cue.incoming_combat_state,
+            "outgoing_combat_state": cue.outgoing_combat_state,
+            "next_action_trigger": cue.next_action_trigger,
+        }
+        self._combat_continuity_status_original = cue.combat_continuity_status
+        self._combat_continuity_notes_original = cue.combat_continuity_notes
+        self._combat_action_schema_version = cue.combat_action_schema_version
+        self._combat_action_override_flags = {
+            "combat_action_chain": cue.combat_action_chain_user_edited,
+            "incoming_combat_state": cue.incoming_combat_state_user_edited,
+            "outgoing_combat_state": cue.outgoing_combat_state_user_edited,
+            "next_action_trigger": cue.next_action_trigger_user_edited,
+        }
+        self._environment_physics_override_flags = {
+            "environment_interaction": cue.environment_interaction_user_edited,
+            "incoming_environment_state": cue.incoming_environment_state_user_edited,
+            "outgoing_environment_state": cue.outgoing_environment_state_user_edited,
+            "crowd_reaction": cue.crowd_reaction_user_edited,
+            "location_transition": cue.location_transition_user_edited,
+        }
         self._native_audio_override_flags = {
             "native_audio_direction": cue.native_audio_direction_user_edited,
             "environment_continuity": cue.environment_continuity_user_edited,
@@ -5507,6 +5739,7 @@ class DirectorCueDialog(QDialog):
         }
         self.setWindowTitle(f"{cue.cue_type.title()} Tool · {cue.cue_id}")
         self.setMinimumWidth(460)
+        self.resize(760, 860)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.preset_combo = QComboBox()
@@ -5587,6 +5820,88 @@ class DirectorCueDialog(QDialog):
             form.addRow("State to preserve", self.continuity_state_edit)
             form.addRow("Optional flourish", self.optional_flourish_edit)
             form.addRow("Additional direction", self.detail_edit)
+            self.environment_interaction_edit = QPlainTextEdit(cue.environment_interaction)
+            self.environment_interaction_edit.setPlaceholderText(
+                "Auto: visible fighter cause → contact target → primary response → optional secondary response"
+            )
+            self.environment_interaction_edit.setFixedHeight(74)
+            self.incoming_environment_state_edit = QPlainTextEdit(cue.incoming_environment_state)
+            self.incoming_environment_state_edit.setPlaceholderText(
+                "Auto: location and persistent damage/displacement inherited from the previous Shot"
+            )
+            self.incoming_environment_state_edit.setFixedHeight(58)
+            self.outgoing_environment_state_edit = QPlainTextEdit(cue.outgoing_environment_state)
+            self.outgoing_environment_state_edit.setPlaceholderText(
+                "Auto: persistent environment state handed to the following Shot"
+            )
+            self.outgoing_environment_state_edit.setFixedHeight(58)
+            self.crowd_reaction_edit = QPlainTextEdit(cue.crowd_reaction)
+            self.crowd_reaction_edit.setPlaceholderText(
+                "Auto: delayed perimeter-spectator reaction; never an extra combatant"
+            )
+            self.crowd_reaction_edit.setFixedHeight(58)
+            self.location_transition_edit = QPlainTextEdit(cue.location_transition)
+            self.location_transition_edit.setPlaceholderText(
+                "Auto: indoor, threshold or outdoor route continuity driven by active combat"
+            )
+            self.location_transition_edit.setFixedHeight(68)
+            physics_status = cue.environment_state_status or "Not tracked"
+            self.environment_state_label = QLabel(physics_status.replace("_", " ").title())
+            self.environment_state_label.setWordWrap(True)
+            form.addRow("Environment Interaction", self.environment_interaction_edit)
+            form.addRow("Incoming Environment State", self.incoming_environment_state_edit)
+            form.addRow("Outgoing Environment State", self.outgoing_environment_state_edit)
+            form.addRow("Crowd Reaction", self.crowd_reaction_edit)
+            form.addRow("Location Transition", self.location_transition_edit)
+            form.addRow("Environment State", self.environment_state_label)
+            self.combat_action_chain_edit = QPlainTextEdit(cue.combat_action_chain)
+            self.combat_action_chain_edit.setPlaceholderText(
+                "Auto: two chronological attack/defence beats executed inside this Shot"
+            )
+            self.combat_action_chain_edit.setFixedHeight(74)
+            self.incoming_combat_state_edit = QPlainTextEdit(cue.incoming_combat_state)
+            self.incoming_combat_state_edit.setPlaceholderText(
+                "Auto: inherited positions, facing, velocity, support and guard/grip state"
+            )
+            self.incoming_combat_state_edit.setFixedHeight(58)
+            self.outgoing_combat_state_edit = QPlainTextEdit(cue.outgoing_combat_state)
+            self.outgoing_combat_state_edit.setPlaceholderText(
+                "Auto: exact fighter state handed to the following Shot"
+            )
+            self.outgoing_combat_state_edit.setFixedHeight(58)
+            self.next_action_trigger_edit = QPlainTextEdit(cue.next_action_trigger)
+            self.next_action_trigger_edit.setPlaceholderText(
+                "Auto: contact, recoil or displacement that triggers the next Beat"
+            )
+            self.next_action_trigger_edit.setFixedHeight(58)
+            combat_status = cue.combat_continuity_status or "Not tracked"
+            self.combat_continuity_label = QLabel(
+                combat_status.replace("_", " ").title()
+                + ((" · " + cue.combat_continuity_notes) if cue.combat_continuity_notes else "")
+            )
+            self.combat_continuity_label.setWordWrap(True)
+            ledger_text = cue.combat_fact_context or "Not tracked"
+            self.combat_fact_label = QLabel(ledger_text)
+            self.combat_fact_label.setWordWrap(True)
+            self.combat_duty_label = QLabel(
+                (cue.combat_story_duty or "Not tracked")
+                + (f" · {cue.combat_story_duty_instruction}" if cue.combat_story_duty_instruction else "")
+            )
+            self.combat_duty_label.setWordWrap(True)
+            self.combat_route_label = QLabel(
+                f"Carrier: {cue.combat_action_carrier or 'not tracked'} · "
+                f"Force: {(cue.combat_force_vector or {}).get('label', 'not tracked')} · "
+                f"Camera: {cue.camera_position_sector or 'not tracked'}"
+            )
+            self.combat_route_label.setWordWrap(True)
+            form.addRow("Combat Fact Ledger", self.combat_fact_label)
+            form.addRow("Five-Duty Role", self.combat_duty_label)
+            form.addRow("Action / Force / Camera", self.combat_route_label)
+            form.addRow("Combat Action Chain", self.combat_action_chain_edit)
+            form.addRow("Incoming Combat State", self.incoming_combat_state_edit)
+            form.addRow("Outgoing Combat State", self.outgoing_combat_state_edit)
+            form.addRow("Next Action Trigger", self.next_action_trigger_edit)
+            form.addRow("Combat Continuity", self.combat_continuity_label)
             self.native_audio_direction_edit = QPlainTextEdit(cue.native_audio_direction)
             self.native_audio_direction_edit.setPlaceholderText(
                 "Auto: acoustic space, camera distance, position, speaking state, ambience, Foley and diegetic-source rules"
@@ -5653,7 +5968,14 @@ class DirectorCueDialog(QDialog):
         )
         self._apply_recommendation(force=False)
         self._refresh_action_budget_preview()
-        layout.addLayout(form)
+        form_host = QWidget()
+        form_host.setLayout(form)
+        form_scroll = QScrollArea()
+        form_scroll.setObjectName("directorCueScroll")
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QFrame.NoFrame)
+        form_scroll.setWidget(form_host)
+        layout.addWidget(form_scroll, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._validate)
         buttons.rejected.connect(self.reject)
@@ -5750,6 +6072,70 @@ class DirectorCueDialog(QDialog):
                 environment_continuity=self.environment_continuity_edit.toPlainText().strip(),
                 audio_reference_intent=self.audio_reference_intent_edit.toPlainText().strip(),
                 native_audio_qc_status=self.native_audio_qc_edit.toPlainText().strip(),
+                environment_interaction=self.environment_interaction_edit.toPlainText().strip(),
+                incoming_environment_state=self.incoming_environment_state_edit.toPlainText().strip(),
+                outgoing_environment_state=self.outgoing_environment_state_edit.toPlainText().strip(),
+                crowd_reaction=self.crowd_reaction_edit.toPlainText().strip(),
+                location_transition=self.location_transition_edit.toPlainText().strip(),
+                combat_action_chain=self.combat_action_chain_edit.toPlainText().strip(),
+                incoming_combat_state=self.incoming_combat_state_edit.toPlainText().strip(),
+                outgoing_combat_state=self.outgoing_combat_state_edit.toPlainText().strip(),
+                next_action_trigger=self.next_action_trigger_edit.toPlainText().strip(),
+                combat_continuity_status=self._combat_continuity_status_original,
+                combat_continuity_notes=self._combat_continuity_notes_original,
+                combat_action_schema_version=self._combat_action_schema_version,
+                environment_state_status=(
+                    "warning"
+                    if not self.environment_interaction_edit.toPlainText().strip()
+                    and bool(self._environment_physics_schema_version)
+                    else self._environment_state_original
+                ),
+                environment_physics_schema_version=self._environment_physics_schema_version,
+                environment_interaction_user_edited=(
+                    self._environment_physics_override_flags["environment_interaction"]
+                    or self.environment_interaction_edit.toPlainText().strip()
+                    != self._environment_physics_originals["environment_interaction"].strip()
+                ),
+                incoming_environment_state_user_edited=(
+                    self._environment_physics_override_flags["incoming_environment_state"]
+                    or self.incoming_environment_state_edit.toPlainText().strip()
+                    != self._environment_physics_originals["incoming_environment_state"].strip()
+                ),
+                outgoing_environment_state_user_edited=(
+                    self._environment_physics_override_flags["outgoing_environment_state"]
+                    or self.outgoing_environment_state_edit.toPlainText().strip()
+                    != self._environment_physics_originals["outgoing_environment_state"].strip()
+                ),
+                crowd_reaction_user_edited=(
+                    self._environment_physics_override_flags["crowd_reaction"]
+                    or self.crowd_reaction_edit.toPlainText().strip()
+                    != self._environment_physics_originals["crowd_reaction"].strip()
+                ),
+                location_transition_user_edited=(
+                    self._environment_physics_override_flags["location_transition"]
+                    or self.location_transition_edit.toPlainText().strip()
+                    != self._environment_physics_originals["location_transition"].strip()
+                ),
+                combat_action_chain_user_edited=(
+                    self._combat_action_override_flags["combat_action_chain"]
+                    or self.combat_action_chain_edit.toPlainText().strip()
+                    != self._combat_action_originals["combat_action_chain"].strip()
+                ),
+                incoming_combat_state_user_edited=(
+                    self._combat_action_override_flags["incoming_combat_state"]
+                    or self.incoming_combat_state_edit.toPlainText().strip()
+                    != self._combat_action_originals["incoming_combat_state"].strip()
+                ),
+                outgoing_combat_state_user_edited=(
+                    self._combat_action_override_flags["outgoing_combat_state"]
+                    or self.outgoing_combat_state_edit.toPlainText().strip()
+                    != self._combat_action_originals["outgoing_combat_state"].strip()
+                ),
+                next_action_trigger_user_edited=(
+                    self._combat_action_override_flags["next_action_trigger"]
+                    or self.next_action_trigger_edit.toPlainText().strip()
+                    != self._combat_action_originals["next_action_trigger"].strip()
+                ),
                 native_audio_direction_user_edited=(
                     self._native_audio_override_flags["native_audio_direction"]
                     or self.native_audio_direction_edit.toPlainText().strip()
@@ -5771,6 +6157,38 @@ class DirectorCueDialog(QDialog):
                     != self._native_audio_qc_original.strip()
                 ),
             )
+            if self._environment_physics_schema_version:
+                def replace_engine_line(value: str, marker: str, content: str) -> str:
+                    prefix = f"[{marker}]"
+                    rows = [
+                        row.rstrip() for row in str(value or "").splitlines()
+                        if not row.strip().startswith(prefix)
+                    ]
+                    if content.strip():
+                        rows.append(prefix + " " + content.strip())
+                    return "\n".join(row for row in rows if row.strip()).strip()
+
+                state["environment_response"] = replace_engine_line(
+                    state["environment_response"],
+                    "ENV-PHYSICS",
+                    state["environment_interaction"]
+                    + (" CROWD RESPONSE - " + state["crowd_reaction"] if state["crowd_reaction"] else ""),
+                )
+                state["continuity_state"] = replace_engine_line(
+                    state["continuity_state"], "ENV-IN", state["incoming_environment_state"]
+                )
+                state["continuity_state"] = replace_engine_line(
+                    state["continuity_state"], "ENV-OUT", state["outgoing_environment_state"]
+                )
+                state["detail"] = replace_engine_line(
+                    state["detail"], "LOCATION", state["location_transition"]
+                )
+            if (
+                self._combat_action_schema_version
+                and state["combat_action_chain_user_edited"]
+                and state["combat_action_chain"]
+            ):
+                state["subject_action"] = state["combat_action_chain"]
             budgeted = normalize_shot_action_budget({
                 "start_seconds": start,
                 "end_seconds": end,
@@ -6395,6 +6813,11 @@ class DesignPageDialog(QDialog):
         context["selected_existing_media_ids"] = [
             self._inventory_media_id(row) for row in selected
         ]
+        context["character_reference_bindings"] = (
+            street_fighter_character_bindings(selected)
+            if _bound_special_skill_key(context) == "street-fighter-live-action-h3"
+            else []
+        )
         selected_language = self.dialogue_language_combo.currentData()
         requirement = self.requirement_edit.toPlainText().strip()
         context["dialogue_language_policy"] = str(selected_language or "auto")
@@ -8267,11 +8690,40 @@ class DirectorCutStudio(QMainWindow):
         )
         self.unload_all_button.clicked.connect(self.unload_all_resources)
         bar.addWidget(self.unload_all_button)
-        undo_action = self.undo_stack.createUndoAction(self, "UNDO")
-        undo_action.setShortcut(QKeySequence.Undo)
+        # QUndoStack.createUndoAction() appends the current command text to
+        # its prefix (for example, "UNDO Apply Storyboard Editor").  The main
+        # toolbar deliberately uses a compact, stable label instead.
+        self.undo_action = QAction("UNDO", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action.triggered.connect(self.undo_stack.undo)
+
+        def refresh_undo_action_status(*_args) -> None:
+            # QUndoStack can emit a final state change while Qt is tearing its
+            # C++ children down.  The compact toolbar help must not dereference
+            # an object that has already been deleted during test/app shutdown.
+            try:
+                can_undo = self.undo_stack.canUndo()
+                self.undo_action.setEnabled(can_undo)
+                shortcut = self.undo_action.shortcut().toString(QKeySequence.NativeText) or "Ctrl+Z"
+                command = self.undo_stack.undoText().strip()
+            except RuntimeError:
+                return
+            if can_undo and command:
+                state = f"Ready to undo: {command}"
+            elif can_undo:
+                state = "Ready to undo the latest edit"
+            else:
+                state = "No action is currently available to undo"
+            help_text = f"Undo the latest Timeline or workspace edit · Shortcut: {shortcut} · {state}"
+            self.undo_action.setToolTip(help_text)
+            self.undo_action.setStatusTip(help_text)
+
+        self.undo_stack.canUndoChanged.connect(refresh_undo_action_status)
+        self.undo_stack.undoTextChanged.connect(refresh_undo_action_status)
+        refresh_undo_action_status()
         redo_action = self.undo_stack.createRedoAction(self, "REDO")
         redo_action.setShortcut(QKeySequence.Redo)
-        bar.addAction(undo_action)
+        bar.addAction(self.undo_action)
         bar.addAction(redo_action)
         bar.addSeparator()
         self.default_skill_label = QLabel("Default Skill")
@@ -9904,6 +10356,21 @@ class DirectorCutStudio(QMainWindow):
             None if special_key == NONE_SPECIAL else self.profiles.get(special_key)
         )
         standalone_special = bool(special_profile and special_profile.standalone)
+        special_character_bindings = (
+            street_fighter_character_bindings(media)
+            if special_profile is not None
+            and special_profile.key == "street-fighter-live-action-h3"
+            else []
+        )
+        rendered_requirement_template = (
+            render_special_design_requirement_template(
+                special_profile.design_requirement_template,
+                special_profile.key,
+                media,
+            )
+            if special_profile is not None
+            else ""
+        )
         return {
             "current_duration_seconds": scan.duration_seconds if scan else 5.0,
             "comfyui_server": self.server_url.text().strip(),
@@ -9922,6 +10389,7 @@ class DirectorCutStudio(QMainWindow):
             "loaded_media_counts": loaded_counts,
             "available_new_media_capacity": free_capacity,
             "existing_media": media,
+            "character_reference_bindings": special_character_bindings,
             "existing_shots_and_cues": [asdict(cue) for cue in self.director_cues],
             "existing_text_layers": [asdict(layer) for layer in self.text_layers],
             "current_prompt_fields": {
@@ -9951,7 +10419,7 @@ class DirectorCutStudio(QMainWindow):
                     "instruction": special_profile.instruction,
                     "standalone": special_profile.standalone,
                     "design_requirement_template": (
-                        special_profile.design_requirement_template
+                        rendered_requirement_template
                     ),
                 },
             },
@@ -10129,7 +10597,11 @@ class DirectorCutStudio(QMainWindow):
         self.authored_text_requirements = deepcopy(
             state.get("authored_text_requirements") or []
         )
-        self.director_cues = [DirectorCue(**values) for values in state.get("director_cues", [])]
+        self.director_cues = [
+            director_cue_from_mapping(values)
+            for values in state.get("director_cues", [])
+            if isinstance(values, dict)
+        ]
         self.preview_paths = {
             key: Path(value) for key, value in state.get("preview_paths", {}).items()
             if Path(value).is_file()
@@ -10531,6 +11003,79 @@ class DirectorCutStudio(QMainWindow):
                         "original_environment_response",
                         shot.get("environment_response", ""),
                     )
+                ),
+                environment_interaction=str(shot.get("environment_interaction", "")),
+                incoming_environment_state=str(shot.get("incoming_environment_state", "")),
+                outgoing_environment_state=str(shot.get("outgoing_environment_state", "")),
+                crowd_reaction=str(shot.get("crowd_reaction", "")),
+                location_transition=str(shot.get("location_transition", "")),
+                environment_state_status=str(shot.get("environment_state_status", "")),
+                environment_physics_schema_version=int(
+                    shot.get("environment_physics_schema_version", 0) or 0
+                ),
+                combat_action_chain=str(shot.get("combat_action_chain", "")),
+                incoming_combat_state=str(shot.get("incoming_combat_state", "")),
+                outgoing_combat_state=str(shot.get("outgoing_combat_state", "")),
+                next_action_trigger=str(shot.get("next_action_trigger", "")),
+                event_causality_chain=str(shot.get("event_causality_chain", "")),
+                physical_feedback_chain=str(shot.get("physical_feedback_chain", "")),
+                causal_risk_original_action=str(shot.get("causal_risk_original_action", "")),
+                causal_risk_repair_status=str(shot.get("causal_risk_repair_status", "")),
+                causal_risk_repair_notes=str(shot.get("causal_risk_repair_notes", "")),
+                causal_validation_status=str(shot.get("causal_validation_status", "")),
+                causal_validation_issues=list(shot.get("causal_validation_issues") or []),
+                causal_validation_inherited_fields=list(
+                    shot.get("causal_validation_inherited_fields") or []
+                ),
+                final_action_resolution=str(shot.get("final_action_resolution", "")),
+                final_camera_resolution=str(shot.get("final_camera_resolution", "")),
+                final_action_stable=bool(shot.get("final_action_stable", False)),
+                combat_continuity_status=str(shot.get("combat_continuity_status", "")),
+                combat_continuity_notes=str(shot.get("combat_continuity_notes", "")),
+                combat_action_schema_version=int(
+                    shot.get("combat_action_schema_version", 0) or 0
+                ),
+                combat_fact_context=str(shot.get("combat_fact_context", "")),
+                combat_story_duty_index=int(shot.get("combat_story_duty_index", 0) or 0),
+                combat_story_duty=str(shot.get("combat_story_duty", "")),
+                combat_story_duty_instruction=str(shot.get("combat_story_duty_instruction", "")),
+                combat_action_beats=list(shot.get("combat_action_beats") or []),
+                combat_action_carrier=str(shot.get("combat_action_carrier", "")),
+                combat_force_vector=dict(shot.get("combat_force_vector") or {}),
+                incoming_combat_state_vector=dict(shot.get("incoming_combat_state_vector") or {}),
+                outgoing_combat_state_vector=dict(shot.get("outgoing_combat_state_vector") or {}),
+                camera_position_sector=str(shot.get("camera_position_sector", "")),
+                camera_motion_relation=str(shot.get("camera_motion_relation", "")),
+                camera_action_trigger=str(shot.get("camera_action_trigger", "")),
+                dynamic_camera_direction=str(shot.get("dynamic_camera_direction", "")),
+                contact_material=str(shot.get("contact_material", "")),
+                environment_force_vector=dict(shot.get("environment_force_vector") or {}),
+                combat_action_chain_user_edited=bool(
+                    shot.get("combat_action_chain_user_edited", False)
+                ),
+                incoming_combat_state_user_edited=bool(
+                    shot.get("incoming_combat_state_user_edited", False)
+                ),
+                outgoing_combat_state_user_edited=bool(
+                    shot.get("outgoing_combat_state_user_edited", False)
+                ),
+                next_action_trigger_user_edited=bool(
+                    shot.get("next_action_trigger_user_edited", False)
+                ),
+                environment_interaction_user_edited=bool(
+                    shot.get("environment_interaction_user_edited", False)
+                ),
+                incoming_environment_state_user_edited=bool(
+                    shot.get("incoming_environment_state_user_edited", False)
+                ),
+                outgoing_environment_state_user_edited=bool(
+                    shot.get("outgoing_environment_state_user_edited", False)
+                ),
+                crowd_reaction_user_edited=bool(
+                    shot.get("crowd_reaction_user_edited", False)
+                ),
+                location_transition_user_edited=bool(
+                    shot.get("location_transition_user_edited", False)
                 ),
             ))
         for index, transition in enumerate(plan["transitions"], 1):
@@ -12783,6 +13328,18 @@ class DirectorCutStudio(QMainWindow):
                 cue = DirectorCue(**values)
             new_shots.append(cue)
 
+        if self.special_combo.currentData() == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+            reconciled_combat_rows, _combat_warnings = reconcile_combat_action_rows(
+                [asdict(cue) for cue in new_shots],
+                new_duration,
+            )
+            reconciled_rows, _environment_warnings = reconcile_environmental_combat_rows(
+                reconciled_combat_rows,
+                new_duration,
+                transition_basis_seconds=min(new_duration, max(0.5, target_duration)),
+            )
+            new_shots = [director_cue_from_mapping(row) for row in reconciled_rows]
+
         def owner_entry(start: float, end: float, shot_id: str = "") -> tuple[DirectorCue, dict] | None:
             if shot_id and shot_id in old_by_id and shot_id in mapping:
                 return old_by_id[shot_id], mapping[shot_id]
@@ -14063,7 +14620,9 @@ class DirectorCutStudio(QMainWindow):
             )
             self.timeline.set_text_layers(self.text_layers)
             self.director_cues = [
-                DirectorCue(**row) for row in payload.get("director_cues", [])
+                director_cue_from_mapping(row)
+                for row in payload.get("director_cues", [])
+                if isinstance(row, dict)
             ]
             self.timeline.set_director_cues(self.director_cues)
             asset_map = {asset.node_id: asset for asset in self.scan.assets}  # type: ignore[union-attr]
@@ -16548,6 +17107,64 @@ class DirectorCutStudio(QMainWindow):
             cue.h3_optional_flourish = budgeted["h3_optional_flourish"]
             cue.action_budget_status = budgeted["action_budget"]["status"]
             cue.action_budget_notes = budgeted["action_budget"]["notes"]
+        special_key = (
+            self.special_combo.currentData()
+            if getattr(self, "special_combo", None) is not None
+            else ""
+        )
+        if self.scan and special_key == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+            shot_cues = [cue for cue in self.director_cues if cue.cue_type == "shot"]
+            reconciled, _combat_warnings = reconcile_combat_action_rows(
+                [asdict(cue) for cue in shot_cues],
+                self.scan.duration_seconds,
+            )
+            reconciled, _environment_warnings = reconcile_environmental_combat_rows(
+                reconciled,
+                self.scan.duration_seconds,
+                transition_basis_seconds=min(
+                    self.scan.duration_seconds,
+                    max(0.5, float(getattr(self, "storyboard_target_duration_seconds", self.scan.duration_seconds))),
+                ),
+            )
+            cue_by_id = {cue.cue_id: cue for cue in shot_cues}
+            allowed_fields = DirectorCue.__dataclass_fields__.keys()
+            for row in reconciled:
+                cue = cue_by_id.get(str(row.get("cue_id") or row.get("id") or ""))
+                if cue is None:
+                    continue
+                for field_name in allowed_fields:
+                    if field_name in row:
+                        setattr(cue, field_name, deepcopy(row[field_name]))
+            marker_cues = [cue for cue in self.director_cues if cue.cue_type == "marker"]
+            migrated_markers = reconcile_final_combat_markers(
+                [
+                    {
+                        "time_seconds": cue.start_seconds,
+                        "preset": cue.preset,
+                        "direction": cue.detail,
+                    }
+                    for cue in marker_cues
+                ],
+                self.scan.duration_seconds,
+            )
+            for marker, cue in zip(migrated_markers, marker_cues):
+                cue.start_seconds = float(marker.get("time_seconds", cue.start_seconds))
+                cue.end_seconds = min(self.scan.duration_seconds, cue.start_seconds + 0.5)
+                cue.preset = str(marker.get("preset", cue.preset))
+                cue.detail = str(marker.get("direction", cue.detail))
+            if len(migrated_markers) > len(marker_cues):
+                for marker in migrated_markers[len(marker_cues):]:
+                    start = float(marker.get("time_seconds", 0.0))
+                    self.director_cues.append(DirectorCue(
+                        f"M{len(marker_cues) + 1}", "marker", start,
+                        min(self.scan.duration_seconds, start + 0.5),
+                        str(marker.get("preset", "Final Combat Resolve")),
+                        str(marker.get("direction", "")),
+                    ))
+                    marker_cues.append(self.director_cues[-1])
+            self.director_cues.sort(
+                key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id)
+            )
         self.timeline.set_director_cues(self.director_cues)
         self._sync_prompt_panel_from_timeline(reconcile_brief=True)
 
@@ -17757,6 +18374,18 @@ class DirectorCutStudio(QMainWindow):
         if hasattr(self, "play_button"):
             self.play_button.setText("▶")
 
+    def _release_all_media_sources(self) -> None:
+        """Release Windows/FFmpeg file handles without changing project state."""
+
+        for player in (
+            self.player,
+            self.generated_player,
+            *self.composite_video_players.values(),
+            *self.timeline_audio_players.values(),
+        ):
+            player.stop()
+            player.setSource(QUrl())
+
     def recognize_selected(self) -> None:
         if not self.selected_asset:
             return
@@ -18295,6 +18924,7 @@ class DirectorCutStudio(QMainWindow):
                 event.ignore()
                 return
         self._stop_all_timeline_media()
+        self._release_all_media_sources()
         self._closing = True
         self.media_runner.stop()
         self.blip_runner.stop()
@@ -18958,6 +19588,36 @@ class DirectorCutStudio(QMainWindow):
         marker_cues = [cue for cue in ordered if cue.cue_type == "marker"]
 
         if shot_cues:
+            street_fighter_prompt = (
+                self.special_combo.currentData() == ENVIRONMENT_COMBAT_SPECIAL_SKILL
+            )
+            if street_fighter_prompt:
+                must_keep = str(state.get("must_keep", "")).strip()
+                for contract in (
+                    STREET_FIGHTER_FPV_COMBAT_CONTRACT,
+                    STREET_FIGHTER_MARKET_CONTRACT,
+                    STREET_FIGHTER_P1_P2_PIXEL_LOCK,
+                    FACT_LEDGER_CONTRACT,
+                    FIVE_DUTY_CONTRACT,
+                    ACTION_CARRIER_CONTRACT,
+                    DYNAMIC_CAMERA_CONTRACT,
+                    ACTION_CAUSALITY_CONTRACT,
+                    CAUSALITY_CONTRACT,
+                ):
+                    if contract.split(":", 1)[0].casefold() not in must_keep.casefold():
+                        must_keep = must_keep.rstrip(" .") + (". " if must_keep else "") + contract
+                state["must_keep"] = must_keep
+            compact_global_contracts = (
+                STREET_FIGHTER_FPV_COMBAT_CONTRACT,
+                STREET_FIGHTER_MARKET_CONTRACT,
+                STREET_FIGHTER_P1_P2_PIXEL_LOCK,
+                FACT_LEDGER_CONTRACT,
+                FIVE_DUTY_CONTRACT,
+                ACTION_CARRIER_CONTRACT,
+                DYNAMIC_CAMERA_CONTRACT,
+                ACTION_CAUSALITY_CONTRACT,
+                CAUSALITY_CONTRACT,
+            )
             shots: list[str] = []
             shot_ranges: list[dict] = []
             native_audio_ranges: list[dict] = []
@@ -18973,6 +19633,10 @@ class DirectorCutStudio(QMainWindow):
                     movement,
                 ]
                 executable_action = cue.h3_executable_action or cue.subject_action
+                if street_fighter_prompt:
+                    executable_action = compact_street_fighter_prompt_field(
+                        executable_action, global_contracts=compact_global_contracts
+                    )
                 if executable_action:
                     parts.append(
                         "MANDATORY CORE ACTION - complete before any flourish: "
@@ -18980,18 +19644,28 @@ class DirectorCutStudio(QMainWindow):
                             executable_action, cue.semantic_reference_directions
                         )
                     )
-                if cue.continuity_state:
+                continuity_state = cue.continuity_state
+                if street_fighter_prompt:
+                    continuity_state = compact_street_fighter_prompt_field(
+                        continuity_state, global_contracts=compact_global_contracts
+                    )
+                if continuity_state:
                     parts.append(
                         "CONTINUITY STATE - preserve exactly: "
                         + canonicalize_cue_reference_ids(
-                            cue.continuity_state, cue.semantic_reference_directions
+                            continuity_state, cue.semantic_reference_directions
                         )
                     )
-                if cue.environment_response:
+                environment_response = cue.environment_response
+                if street_fighter_prompt:
+                    environment_response = compact_street_fighter_prompt_field(
+                        environment_response, global_contracts=compact_global_contracts
+                    )
+                if environment_response:
                     parts.append(
                         "Environment response: "
                         + canonicalize_cue_reference_ids(
-                            cue.environment_response,
+                            environment_response,
                             cue.semantic_reference_directions,
                     )
                 )
@@ -19002,13 +19676,27 @@ class DirectorCutStudio(QMainWindow):
                             cue.h3_optional_flourish, cue.semantic_reference_directions
                         )
                     )
+                environment_physics_clause = environmental_combat_prompt_clause(
+                    asdict(cue),
+                    include_global_contract=not street_fighter_prompt,
+                )
+                if environment_physics_clause:
+                    parts.append(environment_physics_clause)
+                combat_clause = combat_action_prompt_clause(asdict(cue))
+                if combat_clause:
+                    parts.append(combat_clause)
                 parts.append("NATIVE AUDIO DIRECTION - " + cue.native_audio_direction)
                 parts.append("ENVIRONMENT CONTINUITY - " + cue.environment_continuity)
                 parts.append("AUDIO REFERENCE INTENT - " + cue.audio_reference_intent)
-                if cue.detail:
+                cue_detail = cue.detail
+                if street_fighter_prompt:
+                    cue_detail = compact_street_fighter_prompt_field(
+                        cue_detail, global_contracts=compact_global_contracts
+                    )
+                if cue_detail:
                     parts.append(
                         canonicalize_cue_reference_ids(
-                            cue.detail, cue.semantic_reference_directions
+                            cue_detail, cue.semantic_reference_directions
                         )
                     )
                 for media_id, direction in cue.semantic_reference_directions.items():
@@ -19418,20 +20106,41 @@ class DirectorCutStudio(QMainWindow):
                 "S1": female_identity.tag if female_identity is not None else "the female character",
                 "S2": male_identity.tag if male_identity is not None else "the male character",
             }
+            street_fighter_cast_mode = (
+                self.special_combo.currentData() == ENVIRONMENT_COMBAT_SPECIAL_SKILL
+            )
+            if street_fighter_cast_mode:
+                stable_images = {
+                    stable_reference_id(asset): asset.tag for asset in image_assets
+                }
+                speaker_references = {
+                    "S1": stable_images.get("P1", "<Subject 1> from permanent P1"),
+                    "S2": stable_images.get("P2", "<Subject 2> from permanent P2"),
+                }
             local_dialogue_layers = [
                 layer for layer in local_speech_layers
                 if layer.content_role == "dialogue"
             ]
             if local_dialogue_layers:
-                brief_parts.append(
-                    "SPEAKER-TO-FACE IDENTITY LOCK: S1 always means the female voice/character "
-                    f"defined by {speaker_references['S1']}; S2 always means the male "
-                    f"voice/character defined by {speaker_references['S2']}. These assignments "
-                    "never swap with screen position, shot order or camera angle. During each "
-                    "Dialogue Text Range, only the assigned speaker moves lips and jaw; every "
-                    "listener keeps a fully closed, still mouth and only reacts silently. "
-                    "Voice-over never causes any visible character to lip-sync."
-                )
+                if street_fighter_cast_mode:
+                    brief_parts.append(
+                        "SPEAKER-TO-FACE IDENTITY LOCK: S1 is exclusively permanent P1, currently "
+                        f"mapped to {speaker_references['S1']}; S2 is exclusively permanent P2, "
+                        f"currently mapped to {speaker_references['S2']}. This P1/P2 order overrides "
+                        "every generic female/male convention and never swaps with screen position, "
+                        "Shot order or camera angle. During each Dialogue Text Range only the assigned "
+                        "fighter moves lips and jaw; the opponent reacts with a closed, still mouth."
+                    )
+                else:
+                    brief_parts.append(
+                        "SPEAKER-TO-FACE IDENTITY LOCK: S1 always means the female voice/character "
+                        f"defined by {speaker_references['S1']}; S2 always means the male "
+                        f"voice/character defined by {speaker_references['S2']}. These assignments "
+                        "never swap with screen position, shot order or camera angle. During each "
+                        "Dialogue Text Range, only the assigned speaker moves lips and jaw; every "
+                        "listener keeps a fully closed, still mouth and only reacts silently. "
+                        "Voice-over never causes any visible character to lip-sync."
+                    )
                 brief_parts.append(
                     "Dialogue face schedule: "
                     + "; ".join(

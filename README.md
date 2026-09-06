@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.3.2-alpha.4`](VERSION)
+- 当前应用版本：[`v0.3.2-alpha.5`](VERSION)
 - v0.3.2 重点功能、长片流程与验收说明：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
@@ -727,7 +727,7 @@ skill special/
 - `drone-fly-on-city`：P1为全程场景母版；P3是0–5秒的低重绘开场锚点，P4起每5秒读取P1实际像素建立场景状态图（35秒为P3–P9，45秒继续至P11）。所有图锁定P1主题建筑、构图、场景、道路、天空、天气、颜色、色温与曝光；BLIP／AI只作补充。H3以P1主题建筑为中心，沿白底红线、绿色起点、蓝色终点验证成功的P2路线完成一圈360度；P2顺序不明确则提示 `ROUTE NEEDS REVIEW` 并暂用静止镜头。静态图不会写入环绕或轨迹词，避免生成发光圆环。图生图只属近似场景保持，不保证隐藏视角像素准确；已取消自动尾图和末秒覆盖。
 - `drone-fly-on-city-fireworks` 继承同一套P1五秒场景链与P2路线受控360度环绕，并加入烟花连续性：离散粒子爆发、烟雾漂移、现有表面反射、曝光响应和距离延迟的原生爆炸声会按Shot保存状态。它不再预设任何城市或地标；烟花与摄影机运动由H3原生生成，已取消本地烟花尾图合成、强制返回P1与末秒冻结。
 - `dark-rescue-h3-no-pov` 是独立的外部摄影机版本：救援者会作为稳定角色出现在画面中，使用中远景双人构图、侧面走廊或三分之四救援机位，不会注入救援者眼睛、头盔摄影机或只见双手的构图规则。两个Skill各有自己的英文/中文规则及Design Requirement模板。
-- `street-fighter-live-action-h3` 用于15至45秒真人街机格斗电影。每个15秒Segment准确安排12个编号近身攻防Beat：先用一个不超过1秒的Eye-level Wide建立轴线，再由六个Close-up／Extreme close-up Shot各完成两个动作。45秒模式建立覆盖21个Shot、36个动作的全局Action Ledger，按照站立流派碰撞、MMA抱摔／上位打击、逃脱反转／降服三个阶段推进，并拒绝以换镜头或特效伪装重复动作。两人使用可抓握的露指MMA拳套，固定外露手指、加厚指节、圆弧外壳、腕带颜色和下缘湿污。环境沿同一座上锁工业垂直迷宫的维修走廊、积水平台和上层栈桥连续前进，保持线缆、裸管、门锁、霉锈、水渍、IES工业灯、警报及蒸汽状态。水花只在接触后出现、烟雾必须有可见来源，并明确禁止舞台Spot Light。人物身份、服装、拳套、流派、上下位、格斗轴线、H3原生声音和Virtual Media Pool范围均保持可检查。
+- `street-fighter-live-action-h3` 用于15至45秒真人街机格斗电影。每个15秒Segment准确安排12个编号近身攻防Beat；45秒模式建立36个动作的全局Action Ledger，并拒绝以换镜头或特效伪装重复动作。P1固定为S1、P2固定为S2，两人默认完全徒手。`v0.3.2-alpha.5` 新增环境格斗状态账本：每个Shot明确记录人物动作、接触物件、主要／次要反馈、延迟观众反应、Incoming／Outgoing Environment State及Location Transition。格斗从同一座香港九龙城寨风格湿货市场持续冲出已打开铁闸，进入相连的室外雨夜后巷；档口凹陷、菜箱位移、碎冰、水迹、铁闸与观众位置跨Shot及Segment延续。室内与室外各使用一张按时间隔离的Z-Image环境／观众图，每段仍直接装入真实P1、P2，不让背景人物替代主角。所有状态会进入实际H3 Segment Prompt，并可在Shot编辑器中修改。
 - 该短剧 Skill 参考并重新设计自 MIT 授权的 [POUND0423/AI-drama-pound](https://github.com/POUND0423/AI-drama-pound)。上游侧重剧本创作；Studio 版本另外加入 H3 Director Design JSON、Timeline、素材映射、对白、音景和可执行 Shot 预算规则。
 - `wuxia-blade-film` 使用标准 `Default + Special` 绑定：`h3-prompt-writing` 负责官方 H3 Ref2VA 结构，它会先诊断并自动改写不适合 H3 的武侠输入，再建立物理连续、武器因果、每 5 秒动作预算、15 秒无重播边界、人物／武器／空间／消耗品账本、写实轻功、碎片式镜头和环境同步。输入修正会自动重新分配缺失或不均匀的 Shot 时间，压缩同镜多招，把气劲捷径、无支点飞行、长时间 Bullet-time、完整 360 度环绕及多个竞争镜头运动改写成可执行的接触、动量和镜头重构，并在输出前以零预算警告为目标再次编译。最新版亦包含断刀内圈贴身流、链索张力轴心、凌空双刀掠食流、“一秒生死”距离判定、肢体／刀身几何／累积伤势锁定，以及单一冻结动作参考图规则。选择此 Skill 后打开 Design，会从 `DESIGN_REQUIREMENT.txt` 自动载入可编辑的45秒唐朝庭院刺杀模板。英文主文件为 `SKILL.md`，中文对照版为 `SKILL.cn.md`。旧版《一叶杀》V2 保留于 `example/one_leaf_kill_45s_design_requirement.txt`；推荐的长枪将军对双短剑刺客 V3 同时提供可贴入 Design 的 `example/one_leaf_kill_45s_design_requirement_v3.txt` 与可直接 Load JSON 的 `example/one_leaf_kill_45s_design_plan_v3.json`。
 
@@ -874,6 +874,18 @@ findstr /s /i /m "dghs-imgutils" custom_nodes\*.txt custom_nodes\*.toml custom_n
 - 重新打开的项目会继续保存到当前 project folder，不会写回旧电脑的工作目录。
 
 升级后完全关闭并重新启动 Studio，再重新 Open Project 后执行 Preview／Run。无需重新拖入仍然存在于 project folder 的素材。
+
+### 怎样只重新生成 Timeline 的最后一个 Segment？
+
+如果只修改了结尾 Shot，Studio 会自动把与该 Shot 相交的内部 Segment 标记为待重算；前面没有变化且仍有有效 Take／Manifest 的 Segment 会继续使用缓存。建议先保存 Project，再按以下方式操作：
+
+1. 在 Timeline 编辑最后一个 Shot 的动作、Prompt、时长或其他需要修正的内容。即使只改一处，也会令对应的最后 Segment 失效，不会连带清空整条长片缓存。
+2. 若只想快速检查结尾，把 Generation Work Area 设为最后 Segment 的实际起止时间，例如 `42.5s → 50.0s`，再点 `PREVIEW 0.2M`。这个结果只是局部预览，不是完整 Master。
+3. 局部预览不满意时才点 `REJECT`；它会丢弃当前 Preview seed，并以新 seed 重新生成同一工作区间。`REJECT` 本身不是“标记 Segment 待重算”的按钮。
+4. 要输出完整影片时，把 Generation Work Area 恢复为 `0s → Timeline 总时长`，再点 `RUN+QUEUE`。长片生产会复用未改变的已完成 Segment，只生成被标记为 dirty 的结尾 Segment，然后重新拼接完整 `generated_output.mp4`。
+5. 完成后播放结尾，检查对白是否说完、Final Combat Resolve／Final Hold 是否稳定，以及跨 Segment 的人物位置、环境余波与声音是否连续，再保存 Project。
+
+如果旧 Segment Take、生产 Manifest 或缓存文件已经被删除，Studio 无法凭空复用它们，对应范围会自动重新生成。不要在只选择最后几秒的情况下把局部 `ACCEPT 1.0M` 误当作完整 Master；严格使用 Preview seed 的正式验收流程，应先恢复完整工作区间，再执行 `PREVIEW 0.2M → ACCEPT 1.0M`。
 
 ### 删除或更换 LM Studio 模型后出现 `model_not_found`／无法 unload
 

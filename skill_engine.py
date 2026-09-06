@@ -77,6 +77,17 @@ def _picture_face_role(clip_prompt: str) -> str:
     return "unspecified"
 
 
+def _picture_subject_number(clip_prompt: str) -> int | None:
+    """Return an explicit Studio cast role embedded in a Picture instruction."""
+
+    match = re.search(
+        r"CAST IDENTITY LOCK:\s*S([12])\s+is\s+exclusively\s+(?:@?P\d+|<Picture\s+\d+>)",
+        str(clip_prompt or ""),
+        re.I,
+    )
+    return int(match.group(1)) if match else None
+
+
 @dataclass(slots=True)
 class SkillProfile:
     key: str
@@ -483,8 +494,15 @@ def _asset_definition(
         analysis += f" Director clip instruction: {director_prompt[:1200]}."
     if asset.media_type == "image":
         identity_role = ""
+        subject_number = _picture_subject_number(director_prompt)
         face_role = _picture_face_role(director_prompt)
-        if face_role == "authoritative":
+        if subject_number is not None:
+            identity_role = (
+                f" It is the exclusive authoritative face, hair, body, complete wardrobe, footwear "
+                f"and accessory reference for <Subject {subject_number}>; it must never define, "
+                "blend with or replace the other fighter."
+            )
+        elif face_role == "authoritative":
             identity_role = (
                 " It is the authoritative recurring face-identity source; preserve its exact facial "
                 "geometry, age, hair and recognizable identity in every appearance."
@@ -561,7 +579,14 @@ def build_ref2va_prompt(
     else:
         task_types = "reference generation"
 
-    authoritative_face = next(
+    subject_faces: dict[int, MediaAsset] = {}
+    for asset in visual_assets:
+        if asset.media_type != "image":
+            continue
+        subject_number = _picture_subject_number(asset.clip_prompt)
+        if subject_number is not None and subject_number not in subject_faces:
+            subject_faces[subject_number] = asset
+    authoritative_face = subject_faces.get(1) or next(
         (
             asset for asset in visual_assets
             if asset.media_type == "image"
@@ -575,7 +600,19 @@ def build_ref2va_prompt(
         and _picture_face_role(asset.clip_prompt) == "support"
     ]
     definition_rows: list[str] = []
-    if authoritative_face is not None:
+    if subject_faces:
+        for subject_number in sorted(subject_faces):
+            face = subject_faces[subject_number]
+            other = 2 if subject_number == 1 else 1
+            definition_rows.append(
+                f"<Subject {subject_number}> is the fighter whose exact recognizable face identity, "
+                f"facial geometry, age, skin tone, hairstyle, hair color, body proportions, complete "
+                f"upper and lower wardrobe, shoes and accessory ownership come exclusively from "
+                f"{face.tag}. Expressions, poses, arm and leg angles, gait and physically caused "
+                f"hair or clothing motion may vary. Never assign this identity to <Subject {other}>, "
+                "blend the two fighters or let a support Picture redefine this identity."
+            )
+    elif authoritative_face is not None:
         support_labels = ", ".join(asset.tag for asset in support_pictures)
         support_clause = (
             f" {support_labels} may provide environment, prop, body-pose or composition guidance "
@@ -631,7 +668,12 @@ def build_ref2va_prompt(
         f"[{task_types}] The target is a {duration:.2f}-second {profile_phrase}. "
         f"{spec.brief.strip()}"
     )
-    if authoritative_face is not None:
+    if subject_faces:
+        summary += " " + " ".join(
+            f"<Subject {subject_number}>'s identity comes exclusively from {face.tag};"
+            for subject_number, face in sorted(subject_faces.items())
+        ) + " never swap or blend the assigned fighters."
+    elif authoritative_face is not None:
         summary += (
             f" <Subject 1>'s recognizable face comes exclusively from {authoritative_face.tag}; "
             "all support Pictures are non-identity references."
@@ -644,8 +686,15 @@ def build_ref2va_prompt(
             f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s" for item in instances
         )
         face_role = _picture_face_role(asset.clip_prompt)
+        subject_number = _picture_subject_number(asset.clip_prompt)
         role = "visual identity, composition, and referenced attributes are retained"
-        if asset.media_type == "image" and face_role == "authoritative":
+        if asset.media_type == "image" and subject_number is not None:
+            other = 2 if subject_number == 1 else 1
+            role = (
+                f"this is the exclusive authoritative identity source for <Subject {subject_number}>; "
+                f"its face, hair, body, wardrobe and footwear never transfer to <Subject {other}>"
+            )
+        elif asset.media_type == "image" and face_role == "authoritative":
             role = (
                 "this is the authoritative recurring face-identity source; exact facial geometry, "
                 "age, hair and recognizable identity are preserved in every appearance"
@@ -726,7 +775,18 @@ def build_ref2va_prompt(
     detailed_rows: list[str] = []
     style = spec.style.strip() or "The target uses a coherent, concrete visual style."
     detailed_rows.append(style.rstrip(".。") + ".")
-    if authoritative_face is not None:
+    if subject_faces:
+        for subject_number, face in sorted(subject_faces.items()):
+            other = 2 if subject_number == 1 else 1
+            detailed_rows.append(
+                f"CHARACTER CONTINUITY CONTRACT - Keep <Subject {subject_number}> exclusively "
+                f"anchored to {face.tag}: face, age, skin tone, hairstyle, hair color, body "
+                "proportions, upper and lower wardrobe style/color, shoes and accessory ownership "
+                f"remain fixed. Never transfer, blend or duplicate these traits onto <Subject {other}>. "
+                "Expression, pose, arm/leg angles, gait phase and physical cloth/hair movement may "
+                "change; appearance changes require an explicit authored cause and persistent state."
+            )
+    elif authoritative_face is not None:
         detailed_rows.append(
             "CHARACTER CONTINUITY CONTRACT - Keep <Subject 1>'s face, age, skin tone, hairstyle, "
             "hair color, body proportions, upper and lower wardrobe style/color, shoes and accessory "

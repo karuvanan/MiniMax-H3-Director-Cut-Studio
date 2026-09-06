@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QPixmap, QWheelEvent
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QPixmap, QUndoCommand, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -27,6 +27,7 @@ from director_cut_studio import (
     DirectorCutStudio,
     DirectorCue,
     DirectorCueDialog,
+    director_cue_from_mapping,
     JsonLineProcess,
     MediaCard,
     MIME_SLOT,
@@ -51,7 +52,11 @@ from project_integrity import (
     rebase_project_workspace_metadata,
 )
 from runtime_paths import PROJECT_ROOT
-from design_engine import normalize_design_plan
+from design_engine import (
+    STREET_FIGHTER_MARKET_CONTRACT,
+    STREET_FIGHTER_P1_P2_PIXEL_LOCK,
+    normalize_design_plan,
+)
 from design_settings import DesignAISettings
 from prompt_presets import (
     CONSTRAINT_PRESETS,
@@ -69,6 +74,186 @@ from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_timeline_causal_risk_auto_repairs_and_final_shot_settles(self):
+        window = DirectorCutStudio()
+        skill_index = window.special_combo.findData("street-fighter-live-action-h3")
+        self.assertGreaterEqual(skill_index, 0)
+        window.special_combo.setCurrentIndex(skill_index)
+        window.scan.duration_seconds = 5.0
+        window.storyboard_target_duration_seconds = 5.0
+        action = "S1 attacks S2. S2 blocks and counters."
+        window.director_cues = [
+            DirectorCue(
+                "S1", "shot", 0.0, 2.5, "Combat",
+                subject_action=action, authored_subject_action=action,
+            ),
+            DirectorCue(
+                "S2", "shot", 2.5, 5.0, "Combat",
+                subject_action=action, authored_subject_action=action,
+                combat_action_chain_user_edited=True,
+            ),
+        ]
+        window._refresh_director_cues()
+        second = next(cue for cue in window.director_cues if cue.cue_id == "S2")
+        self.assertEqual(second.causal_validation_status, "warning")
+        warning_item = TimelineCueItem(second, 30.0, 0.0)
+        self.assertEqual(warning_item.brush().color().name(), "#c43d4b")
+
+        second.combat_action_chain_user_edited = False
+        window._refresh_director_cues()
+        self.assertEqual(second.causal_validation_status, "auto_fixed")
+        self.assertTrue(second.final_action_stable)
+        self.assertIn("FINAL SETTLE", second.subject_action)
+        repaired_item = TimelineCueItem(second, 30.0, 0.0)
+        self.assertNotEqual(repaired_item.brush().color().name(), "#c43d4b")
+        window.project_dirty = False
+        window.close()
+
+    def test_street_fighter_prompt_compacts_global_contracts_and_keeps_combat_state(self):
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 2.5, "Combat",
+            detail=(
+                "User close-range direction. "
+                + STREET_FIGHTER_MARKET_CONTRACT + " "
+                + STREET_FIGHTER_P1_P2_PIXEL_LOCK
+            ),
+            subject_action="[BEAT 01 | 0.00-1.25s] S1 kicks S2. [BEAT 02 | 1.25-2.50s] S2 checks the kick.",
+            h3_executable_action="[BEAT 01 | 0.00-1.25s] S1 kicks S2. [BEAT 02 | 1.25-2.50s] S2 checks the kick.",
+            combat_action_chain="[BEAT 01] S1 kicks. [BEAT 02] S2 checks.",
+            incoming_combat_state="S1 left, S2 right, close range.",
+            outgoing_combat_state="S1 outside angle, S2 checked stance.",
+            next_action_trigger="The checked shin triggers BEAT 03.",
+            combat_continuity_status="continuous",
+            combat_action_schema_version=1,
+            environment_interaction="cause_actor=S1; contact_target=shallow floor puddle",
+            crowd_reaction="vendors flinch after contact",
+            incoming_environment_state="Location=indoor_seafood_aisle",
+            outgoing_environment_state="Location=indoor_seafood_aisle; puddle displaced",
+            location_transition="INDOOR CONTINUITY",
+            environment_physics_schema_version=1,
+        )
+        window = DirectorCutStudio()
+        index = window.special_combo.findData("street-fighter-live-action-h3")
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        window.director_cues = [cue]
+        spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        rendered = " ".join(spec.shots)
+        self.assertIn("[BEAT 01", rendered)
+        self.assertIn("INCOMING COMBAT STATE", rendered)
+        self.assertIn("User close-range direction", rendered)
+        self.assertNotIn(STREET_FIGHTER_MARKET_CONTRACT, rendered)
+        self.assertNotIn(STREET_FIGHTER_P1_P2_PIXEL_LOCK, rendered)
+        self.assertEqual(spec.must_keep.count("COMBAT ACTION CONTINUITY:"), 1)
+        self.assertEqual(spec.must_keep.count("ENVIRONMENTAL COMBAT CAUSALITY:"), 1)
+        self.assertEqual(spec.must_keep.count("HONG KONG KOWLOON WET-MARKET ARENA:"), 1)
+        window.project_dirty = False
+        window.close()
+
+    def test_environmental_combat_fields_reach_real_h3_prompt_and_future_fields_load(self):
+        future = director_cue_from_mapping({
+            "cue_id": "S1",
+            "cue_type": "shot",
+            "start_seconds": 0.0,
+            "end_seconds": 5.0,
+            "preset": "Market clinch",
+            "subject_action": "S1 clinches and throws S2.",
+            "environment_interaction": "cause_actor=S1; contact_target_id=env_crate",
+            "incoming_environment_state": "Location=indoor_seafood_aisle; crate intact",
+            "outgoing_environment_state": "Location=indoor_seafood_aisle; crate displaced",
+            "crowd_reaction": "0.35s after contact, vendors recoil.",
+            "location_transition": "INDOOR CONTINUITY",
+            "environment_state_status": "continuous",
+            "environment_physics_schema_version": 1,
+            "combat_action_chain": "[BEAT 01] S1 enters the clinch. [BEAT 02] S2 frames and pivots.",
+            "incoming_combat_state": "S1 outside grip; S2 framed guard.",
+            "outgoing_combat_state": "S1 overhook; S2 outside pivot.",
+            "next_action_trigger": "The overhook triggers BEAT 03.",
+            "combat_continuity_status": "continuous",
+            "combat_action_schema_version": 1,
+            "future_environment_solver_hint": "safe to ignore",
+        })
+        self.assertEqual(future.cue_id, "S1")
+        self.assertEqual(future.outgoing_environment_state.split("; ")[-1], "crate displaced")
+        self.assertEqual(future.combat_action_schema_version, 1)
+        self.assertIn("overhook", future.outgoing_combat_state)
+
+        window = DirectorCutStudio()
+        window.director_cues = [future]
+        spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        rendered = " ".join(spec.shots)
+        for phrase in (
+            "ENVIRONMENT INTERACTION",
+            "contact_target_id=env_crate",
+            "CROWD REACTION",
+            "INCOMING ENVIRONMENT STATE",
+            "OUTGOING ENVIRONMENT STATE",
+            "LOCATION TRANSITION",
+            "No spontaneous damage",
+        ):
+            self.assertIn(phrase, rendered)
+        window.project_dirty = False
+        window.close()
+
+    def test_storyboard_reorder_reconciles_environment_route_in_one_undo_step(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData("street-fighter-live-action-h3")
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        window._set_design_duration(45.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 15.0, "Indoor", subject_action="S1 blocks and kicks S2."),
+            DirectorCue("S2", "shot", 15.0, 30.0, "Threshold", subject_action="S2 clinches and throws S1."),
+            DirectorCue("S3", "shot", 30.0, 45.0, "Outdoor", subject_action="S1 sweeps and controls S2."),
+        ]
+        window._apply_storyboard_entries(
+            [
+                {"cue_id": "S3", "duration": 15.0, "preset": "Outdoor", "subject_action": "S1 sweeps and controls S2."},
+                {"cue_id": "S2", "duration": 15.0, "preset": "Threshold", "subject_action": "S2 clinches and throws S1."},
+                {"cue_id": "S1", "duration": 15.0, "preset": "Indoor", "subject_action": "S1 blocks and kicks S2."},
+            ],
+            45.0,
+        )
+        shots = sorted(
+            (cue for cue in window.director_cues if cue.cue_type == "shot"),
+            key=lambda cue: cue.start_seconds,
+        )
+        self.assertEqual([cue.cue_id for cue in shots], ["S3", "S2", "S1"])
+        self.assertIn("Location=indoor_seafood_aisle", shots[0].incoming_environment_state)
+        self.assertIn("INDOOR→OUTDOOR ROUTE", shots[1].location_transition)
+        self.assertIn("Location=outdoor_rain_alley", shots[2].outgoing_environment_state)
+        window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        self.assertIn("cramped indoor wet market", shots[0].native_audio_direction)
+        self.assertIn("open rainy market alley", shots[2].native_audio_direction)
+        self.assertIn("Acoustic-space transition", shots[2].environment_continuity)
+        self.assertEqual(window.undo_stack.count(), 1)
+        window.undo_stack.undo()
+        restored = sorted(
+            (cue for cue in window.director_cues if cue.cue_type == "shot"),
+            key=lambda cue: cue.start_seconds,
+        )
+        self.assertEqual([cue.cue_id for cue in restored], ["S1", "S2", "S3"])
+        window.project_dirty = False
+        window.close()
+
+    def test_main_toolbar_undo_label_stays_plain_after_a_command_is_added(self):
+        window = DirectorCutStudio()
+        self.assertEqual(window.undo_action.text(), "UNDO")
+        self.assertIn("Ctrl+Z", window.undo_action.toolTip())
+        self.assertIn("No action", window.undo_action.toolTip())
+        window.undo_stack.push(QUndoCommand("Edit text layer"))
+        self.app.processEvents()
+        self.assertTrue(window.undo_action.isEnabled())
+        self.assertEqual(window.undo_action.text(), "UNDO")
+        self.assertIn("Ready to undo: Edit text layer", window.undo_action.toolTip())
+        window.undo_action.trigger()
+        self.app.processEvents()
+        self.assertFalse(window.undo_action.isEnabled())
+        self.assertEqual(window.undo_action.text(), "UNDO")
+        self.assertIn("No action", window.undo_action.toolTip())
+        window.close()
+        window.deleteLater()
+
     def test_historical_dark_rescue_no_pov_key_migrates_to_lowercase_profile(self):
         self.assertEqual(
             _canonical_special_skill_key("dark-rescue-h3-no-POV"),
@@ -97,6 +282,45 @@ class DirectorTimelineDragTests(unittest.TestCase):
         dialog.deleteLater()
         window.close()
         window.deleteLater()
+
+    def test_live_action_arcade_fighter_seeds_loaded_p1_p2_character_evidence(self):
+        cache = PROJECT_ROOT / ".director_cache" / "street_fighter_cast_seed_test"
+        if cache.is_dir():
+            shutil.rmtree(cache)
+        cache.mkdir(parents=True)
+        p1_path = cache / "p1.png"
+        p2_path = cache / "p2.png"
+        Image.new("RGB", (64, 64), (100, 60, 40)).save(p1_path)
+        Image.new("RGB", (64, 64), (40, 60, 100)).save(p2_path)
+        window = DirectorCutStudio()
+        pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
+        assign_local_media(window.scan, pictures[0], p1_path)
+        assign_local_media(window.scan, pictures[1], p2_path)
+        pictures[0].recognition = "BLIP · Overview: a young woman with a short black bob"
+        pictures[1].recognition = "BLIP · Overview: a broad-shouldered man with cropped hair"
+        index = window.special_combo.findData("street-fighter-live-action-h3")
+        window.special_combo.setCurrentIndex(index)
+        context = window._design_context()
+        template = context["bound_h3_skills"]["special"]["design_requirement_template"]
+        self.assertIn("S1是@P1（BLIP · Overview：a young woman", template)
+        self.assertIn("S2是@P2（BLIP · Overview：a broad-shouldered man", template)
+        self.assertEqual(
+            [(row["speaker"], row["media_id"]) for row in context["character_reference_bindings"]],
+            [("S1", "P1"), ("S2", "P2")],
+        )
+        dialog = DesignPageDialog(window.runtime, context, context["media_capacity"], window)
+        self.assertEqual(dialog.requirement_edit.toPlainText().strip(), template)
+        selected = dialog._selected_design_context()
+        self.assertEqual(
+            [(row["speaker"], row["media_id"]) for row in selected["character_reference_bindings"]],
+            [("S1", "P1"), ("S2", "P2")],
+        )
+        dialog.close()
+        dialog.deleteLater()
+        window.project_dirty = False
+        window.close()
+        window.deleteLater()
+        shutil.rmtree(cache)
 
     @classmethod
     def setUpClass(cls):
@@ -2442,14 +2666,16 @@ class DirectorTimelineDragTests(unittest.TestCase):
         segments = window._planned_render_segments()
         self.assertEqual(
             [(row.start_seconds, row.end_seconds) for row in segments],
-            [(0.0, 12.0)],
+            [(0.0, 5.0), (5.0, 10.0), (10.0, 12.0)],
         )
         self.assertEqual(
             [row.continuity_mode for row in segments],
-            ["none"],
+            ["none", "motion_reference", "motion_reference"],
         )
         expected = [
-            ["P1", "P6", "P7", "P8"],
+            ["P6"],
+            ["P7"],
+            ["P8"],
         ]
         for segment, expected_picture_ids in zip(segments, expected):
             window.clip_start.setValue(segment.start_seconds)
@@ -5983,7 +6209,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         video = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
         if not video.is_file():
             self.skipTest("runtime smoke video is not present")
-        workspace = PROJECT_ROOT / ".director_cache" / "alpha1_shot_take_test"
+        # Use a process-scoped workspace so a media handle held by an already-open
+        # Studio instance cannot make this independent regression test flaky on Windows.
+        workspace = PROJECT_ROOT / ".director_cache" / f"alpha1_shot_take_test_{os.getpid()}"
         if workspace.is_dir():
             shutil.rmtree(workspace)
         window = DirectorCutStudio()
@@ -6035,6 +6263,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         project.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         window.project_dirty = False
         window.close()
+        QApplication.processEvents()
 
         restored = DirectorCutStudio()
         with patch.object(restored, "queue_media_preparation"):
@@ -6048,6 +6277,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(len(restored.segment_take_states), 1)
         restored.project_dirty = False
         restored.close()
+        QApplication.processEvents()
+        shutil.rmtree(workspace)
 
     def test_alpha1_legacy_open_preserves_source_and_redirects_future_save(self):
         root = PROJECT_ROOT / ".director_cache" / "alpha1_legacy_migration_test"

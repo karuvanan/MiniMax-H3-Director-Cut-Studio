@@ -69,6 +69,25 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertIn("open exterior", continuity)
         self.assertIn("do not carry the earlier room tail", continuity)
 
+    def test_wet_market_to_rain_alley_uses_distinct_native_spaces(self):
+        indoor = build_native_audio_profile({
+            "framing": "Close-up",
+            "subject_action": "S1 blocks a kick in the indoor seafood aisle.",
+            "environment_response": "Fish-tank pumps and market drainage continue.",
+        })
+        outdoor = build_native_audio_profile({
+            "framing": "Close-up",
+            "subject_action": "S2 counters in the outdoor rainy Hong Kong alley.",
+            "additional_direction": "OUTDOOR CONTINUATION beyond the same market gate.",
+        })
+        self.assertEqual(indoor.acoustic_space, "cramped indoor wet market")
+        self.assertIn("fish-tank pumps", indoor.ambience)
+        self.assertEqual(outdoor.acoustic_space, "open rainy market alley")
+        self.assertIn("open-air rain", outdoor.ambience)
+        continuity = environment_continuity_text(indoor, outdoor)
+        self.assertIn("Acoustic-space transition", continuity)
+        self.assertIn("do not carry the earlier room tail", continuity)
+
     def test_reference_intent_never_copies_dialogue_or_voice_identity(self):
         direction = audio_reference_intent_text(True)
         self.assertIn("spatial acoustics", direction)

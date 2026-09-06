@@ -29,6 +29,8 @@ def _evidence(shot: Mapping[str, object]) -> str:
             "preset", "framing", "camera_angle", "camera_movement",
             "subject_action", "environment_response", "continuity_state",
             "optional_flourish", "detail", "additional_direction",
+            "environment_interaction", "incoming_environment_state",
+            "outgoing_environment_state", "crowd_reaction", "location_transition",
         )
     ).lower()
 
@@ -48,6 +50,26 @@ def infer_acoustic_space(evidence: str) -> tuple[str, str]:
         return (
             "small elevator interior",
             "continuous ventilation and lift-motor hum with restrained hard-surface reflections",
+        )
+    if has(
+        "outdoor_rain_alley", "outdoor continuation", "rainy exterior alley",
+        "rainy hong kong alley", "service alley immediately outside", "室外雨夜后巷",
+        "室外后巷", "室外後巷",
+    ):
+        return (
+            "open rainy market alley",
+            "continuous open-air rain, drain runoff and distant vehicle activity with reduced enclosure, "
+            "while nearby market-gate and awning sounds retain their visible direction",
+        )
+    if has(
+        "wet market", "indoor_seafood_aisle", "fish_vegetable_junction",
+        "market_loading_threshold", "seafood aisle", "fish-to-vegetable", "fish tank", "market loading",
+        "湿滑鱼", "濕滑魚", "海鲜通道", "海鮮通道", "鱼档", "魚檔", "菜档", "菜檔",
+    ):
+        return (
+            "cramped indoor wet market",
+            "continuous fish-tank pumps, drainage, restrained vendor murmur and short hard-surface "
+            "reflections from the visible stalls, tiles and overhead pipes",
         )
     if has("corridor", "hallway", "stairwell", "passage", "走廊", "楼梯间", "樓梯間", "通道"):
         return (
