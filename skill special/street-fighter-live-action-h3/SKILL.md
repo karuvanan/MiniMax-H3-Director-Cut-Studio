@@ -1,7 +1,7 @@
 ---
 name: street-fighter-live-action-h3
 description: |
-  Design 15-45 second MiniMax H3 live-action arcade martial-arts movie scenes with two readable fighters, grounded striking and MMA ground-game choreography, non-repeating multi-Segment action, selectively heightened signature attacks, editable speech, native impact sound and dense industrial cyberpunk environments. Use when the user asks for a Street Fighter-like live-action fight, world-warrior tournament, arcade combat film or stylized one-on-one martial-arts showdown; do not use for ordinary realistic fights without signature-move spectacle.
+  Design 15-45 second MiniMax H3 live-action arcade martial-arts movie scenes with two readable fighters, grounded striking and MMA ground-game choreography, non-repeating multi-Segment action, classic lateral arcade-axis coverage, action-motivated pan/tilt, tracking, dolly, POV, handheld impact, whip pan, signature-move push-ins and a selective bullet-time finishing orbit. Use when the user asks for a Street Fighter-like live-action fight, world-warrior tournament, arcade combat film or stylized one-on-one martial-arts showdown; do not use for ordinary realistic fights without signature-move spectacle.
 ---
 
 # Live-action Arcade Fighter H3 Director
@@ -116,19 +116,40 @@ If H3 cannot execute every requested technique inside the budget, keep the techn
 
 ## Camera and Edit Grammar
 
-Keep a clear fight axis and stable screen direction: S1 begins on one side, S2 on the other, and an axis crossing requires a visible motivated move. Each Shot has one principal camera movement.
+Keep a clear fight axis and stable screen direction: S1 begins on one side, S2 on the other, and an axis crossing requires a visible motivated move. Each Shot has exactly one principal camera movement. Camera movement must be caused by the combat beat and must finish on the resulting guard, grip, landing or contact state; it cannot be generic decoration.
 
-At least 80% of each 15-second Segment uses close-up, extreme close-up or eye-level close-up framing. Use a compact sequence of:
+Maintain a **Camera Ledger** across the complete film with: `shot_id`, `camera_position_sector`, `framing`, `principal_camera_movement`, `motion_relation` (`follow`, `counter` or `neutral`), `action_trigger`, `screen_direction`, and `end_frame`. Write the chosen movement into the Shot's `camera_movement`; write its trigger and end-frame duty into `additional_direction`. Do not create unsupported root JSON fields. Before returning the Design, reject these patterns:
 
-- one eye-level wide two-shot lasting no more than 1.0 second to establish distance and footwork;
-- eye-level close-ups of faces, shoulders and guard interaction;
-- extreme close-ups of eyes choosing a counter, fingers securing/releasing a grip, planted wet footwear, sweat, forearm contact and the final collision;
-- short lateral close-up movement for a committed advance;
-- a controlled close-up settle for the final positions.
+- the same straight-on frontal angle in consecutive Shots;
+- more than two frontal views among the seven Shots of one Segment;
+- the same principal movement in consecutive Shots;
+- a moving camera with no named fighter action to trigger it;
+- an axis crossing, screen-side swap or reverse strike direction without a visible motivated passage around a fighter.
 
-Favour hard cuts, match-on-action and sound bridges. Avoid constant orbiting, impossible overhead cameras, excessive whip pans, long slow motion, repeated neutral poses and cuts that hide whether an attack connected. Slow motion may occupy only the decisive contact moment, then immediately return to real-time recovery.
+Each 15-second Segment must use at least four distinct camera-position sectors—front three-quarter, side profile, rear three-quarter/over-shoulder, low mat/foot level or brief fighter POV—and at least five of the following six foundational action-camera families. A 30- or 45-second film must use all six across the complete Timeline. Their order follows the choreography rather than a fixed visual gimmick:
 
-Every wide or medium-wide image, including a boundary re-anchor, is capped at 1.0 second. Never use a wide master as the main fight coverage. Maintain the eye-level axis across close-ups so rapid cutting does not swap S1/S2 or reverse the strike direction.
+1. **Following pan or tilt:** pan in the attack's travel direction for a hook, forearm redirect or lateral throw; tilt with a rising knee, falling body or level change. Begin on the load, follow the limb/body once and stop on contact/recovery. Never pan an empty room.
+2. **Counter-motion camera:** meet a forward strike with a short opposing push-in, or pull back as an aggressor drives the defender. The camera and attacker visibly close distance to create collision pressure without passing through either body.
+3. **Lateral tracking / dolly:** travel parallel beside both fighters during a multi-beat exchange or visible relocation. Preserve both profiles, footwork, spacing, architecture parallax and fight-axis readability; do not arc into another frontal view.
+4. **Brief fighter POV:** for no longer than one combat beat, occupy the assigned fighter's eye line as the opponent's guarded fist/face approaches, or drop/roll toward the floor with that fighter after a hit. Clearly name whose POV it is. The following Shot exits to an external close-up so POV never becomes the whole fight and never creates an invisible third fighter.
+5. **Controlled handheld with impact feedback:** use subtle breathing/body-follow drift during approach, then one sharp two-to-four-frame shake exactly at confirmed contact or landing. Immediately re-stabilize on the result. Never shake continuously, before contact or hard enough to hide faces, hands or limb ownership.
+6. **Whip pan:** at most once per 15-second Segment, begin from a visible action leaving frame, cross with brief directional motion blur and resolve sharply on the next fighter/action point. Use it for a rapid counter or relocation, not to disguise teleportation, replace required body mechanics or cross the axis invisibly.
+
+### Three iconic arcade-camera modes
+
+Use these modes only where their story function occurs. They are not three generic establishing shots and never override the one-principal-movement rule.
+
+1. **Classic side-axis exchange — charge and tactical parry:** during a readable standing exchange, keep both fighters in a cinematic profile medium-to-medium-close two-shot while the camera translates laterally with their feet. Maintain a 2D arcade combat axis with real foreground/background depth and architectural parallax. The camera may pan slightly to retain composition, but it cannot orbit, cut to frontal symmetry or flatten the fighters into a game screenshot. Show stance, confrontation, parry and counter as physical live-action motion. A medium portion may last at most 2.0 seconds before tightening back to close coverage.
+2. **Signature-move launch — aggressive push and local detail:** when a fighter visibly charges a palm energy sphere, flaming strike, electric contact or rising uppercut, start on the planted body load and execute one aggressive rapid push-in to the hands and face. For a rising uppercut, use a dynamic low-angle upward tilt instead of a second movement. The release/contact may enter a very brief slow-motion impact-freeze sensation; immediately pull out only in the next Shot to reveal the opponent's physical result. The push cannot begin after the projectile already exists, and camera shake occurs only on release/contact.
+3. **Decisive finish — translated 360-degree bullet-time orbit:** only for the final outcome-changing hit, and at most once in the complete film, slow the contact moment and physically translate the camera in one full circle around the shared midpoint of both fighters. Prove a real orbit with front → side → rear → opposite side → front camera positions, stable subject scale and continuous background parallax. The camera may rise slightly but must not spin in place, roll the horizon, duplicate either fighter or turn the environment around them. Water, grit, cloth and sparks travel slowly from the confirmed impact while body identity, contact geometry and flight direction remain readable. Apply one two-to-four-frame collision impulse, then stabilize through the orbit and end on the defeated/standing result. Do not generate literal `KO` text unless the Timeline requests editable on-screen text.
+
+For a 15-second fight with a signature finish, preserve the classic side-axis pass and the rapid-push signature launch, then let the final orbit replace the least useful POV or whip-pan family. For 30/45 seconds, distribute these modes across different Segments rather than repeating them: side-axis tactical exchange early, signature push at escalation, one finishing orbit at the climax. If there is no supernatural signature move or no decisive finish, do not invent one merely to activate a camera mode.
+
+The one 0–1 second geography Shot uses an eye-level lateral reveal, short forward drift or controlled static hold selected to contrast with the next Shot. It must not establish a permanent frontal master. For an ordinary seven-Shot Segment, rotate coverage deliberately: geography from a three-quarter/side position; following pan/tilt; counter push/pull; lateral track; handheld impact close-up; assigned-fighter POV; whip-pan-to-result. Substitute an iconic arcade-camera mode only for the Shot that performs its matching combat function. Across later Segments, reverse the tracking side or change height and POV ownership while preserving screen direction; never simply replay the first Segment's camera list.
+
+At least 80% of each 15-second Segment uses close-up, extreme close-up or eye-level close-up framing. Use eye-level face/shoulder and guard-interaction close-ups, extreme close-ups of eyes choosing a counter, fingers securing/releasing a grip, planted wet footwear, sweat, forearm contact and the final collision, plus mat-level close-ups for takedowns. Every wide or medium-wide image, including a boundary re-anchor, lasts no more than 1.0 second and cannot serve as the main fight coverage.
+
+Favour hard cuts, match-on-action and sound bridges. Preserve readable load, trajectory, contact and recovery even during vigorous motion. Avoid constant orbiting, impossible overhead cameras, unmotivated crane shots, excessive whip pans, continuous shaky cam, long slow motion, repeated neutral poses and cuts that hide whether an attack connected. Slow motion may occupy only the decisive contact moment, then immediately return to real-time recovery.
 
 Do not render game HUD, health bars, button prompts, “KO”, “FIGHT”, subtitles or logos unless the user explicitly requests editable on-screen text. Never bake uncontrolled text into generated images.
 
@@ -143,6 +164,8 @@ Water and smoke obey contact physics. Every forceful foot plant, skid or throw e
 Use only two or three deliberate practical-light changes per 15 seconds: a brief power dip may darken the architecture during a block, and neon/fluorescent sources may snap back brighter on a decisive collision. Exposure recovers quickly enough to keep hands and identity readable. This is a motivated electrical failure, not rapid strobing and not stage lighting.
 
 Heightened energy is selective. One move owns one colour, source and trajectory. Light from the effect must illuminate nearby skin, clothing and surfaces; dust, sparks, cloth and debris respond after contact. The environment cannot break before the hit, rebuild itself between Shots or produce unrelated explosions.
+
+Use an arcade effect palette only around assigned signature techniques: a compact clean energy sphere between visible palms, a body-bound flaming trail on one committed kick, a restrained glowing aura during the visible load, one directional contact flash and sparks flying away from the collision point. Effects must preserve hand anatomy and never become a full-screen aura wall, endless beam, detached random fire, duplicate projectile or decorative sparks before contact.
 
 ### Sealed industrial vertical-maze environment
 
@@ -202,6 +225,9 @@ Before returning, verify:
 - the Action Ledger contains no duplicate mechanic/target/outcome combination across 45 seconds;
 - every signature technique has load, trajectory, contact and recovery;
 - no Shot exceeds the action budget or uses more than one main camera move;
+- every 15-second Segment uses at least five foundational action-camera families and four camera-position sectors; the complete 30/45-second Timeline covers all six without consecutive frontal angles or repeated principal movements;
+- every pan/tilt, track, push/pull, POV, impact shake and whip pan names its action trigger and resolves on a readable physical result;
+- a classic lateral arcade-axis exchange appears without flattening the location; a signature move uses a timed rapid push-in; only the final decisive hit may use one translated 360-degree bullet-time orbit with real background parallax and no in-place spin;
 - at least 80% close-up/eye-level/extreme close-up coverage and no wide Shot longer than 1.0 second;
 - water follows foot/body contact, smoke has a visible source, and practical cyberpunk lights change only two or three times without any stage spotlight;
 - the three industrial zones remain one connected route, and every gate, cable/pipe landmark, wet patch, light failure, alarm, steam source and displaced debris state persists until visibly changed;
