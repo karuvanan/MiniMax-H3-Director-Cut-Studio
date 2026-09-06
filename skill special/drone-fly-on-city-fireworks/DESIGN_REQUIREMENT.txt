@@ -1,57 +1,26 @@
-帮我创作一段15秒、16:9、电影级写实吉隆坡夜间城市无人机烟花视频。`@P1` 是双子塔夜景场景母版，`@P2` 是我绘制的飞行路线控制图。无人机从双子塔左前方低位开始，平稳向前并逐渐升高，围绕双子塔完成一次宽阔、顺时针360度环绕。到达侧面时，金色、白色和深红色烟花从远处屋顶区域升空，在双塔后方和上方分批绽放；玻璃幕墙与湿街反射烟花，烟雾随风连续飘移。环绕结束后，运动中的烟花完全结束、运动烟雾逐渐消散，摄影机平滑返回P1的精确原始机位与构图。最后1秒直接冻结并展示以P1原图为不可变底图、只增加烟花、薄烟和受烟花影响之真实光效的尾帧。不要对白或旁白；加入真实高空风、远处城市底噪、烟花升空声、按距离延迟的爆炸声和噼啪尾音。音乐服从主页MUSIC设置。
+帮我创作一段15秒、16:9、电影级写实第一人称FPV无人机烟花视频。`@P1` 是唯一场景母版；`@P2` 是白底红色路线图，绿色圆点标记起点，蓝色圆点标记终点。动作严格依序分成三个阶段：0–2秒在P1场景内从安全近地位置起飞并贴地加速；2–10秒以固定安全半径围绕P1主题建筑／主要场景完成一整圈平滑宽幅顺时针实体飞行，无人机位置依次经过主体前方／起始侧、右侧、后方、左侧并回到接近前方／起始侧。刚性FPV镜头始终朝向机头及当前飞行切线，严禁独立朝主建筑偏航、摇摄或云台锁定；主题建筑随飞行自然沿画面内侧边缘移动，在几何需要时移到镜头后方，再随着无人机前进重新出现。周围建筑和背景以强烈自然视差证明实体位移。只有画面清楚证明整圈完成，10秒后才从P2绿色起点进入路线，经过全部弯位并飞到蓝色终点。环绕完成前P2路线必须锁定。环绕不是对着建筑发生镜头旋转、原地旋转、全景摇摄、桶滚、光学旋转或背景转动；禁止把环绕与P2路线同时执行，或用通用圆周替代P2。
 
-你可以修改时长、比例、城市、地标、天气、烟花颜色、环绕方向和最终机位。以下固定制作合约不得删除：
+全程模拟穿越机刚性连接的沉浸式FPV镜头：轻微GoPro超广角鱼眼、速度动态模糊和符合物理的侧倾。P1环绕阶段只准适度协调侧倾并保持水平线可读，禁止倒飞、桶滚或镜头自转；完成整圈并进入P2路线或FPV后备阶段后，才允许俯冲和最多180度翻滚。P2无法辨识时显示ROUTE NEEDS REVIEW，但保留起飞与实体环绕；随后依序低空掠地冲刺、向左大角度侧倾拉起进入圆弧、短暂倒飞后俯冲、向右反向翻滚绕开障碍、完成紧凑8字交叉，再恢复水平冲向安全狭窄通道或远方地平线，不虚构P2终点。画面必须连续丝滑，建筑、树木及烟花不得AI变形，不得画格撕裂，不使用平稳机械上帝视角。
 
-## 1. 素材职责
+P3读取P1实际图片像素，作为0–5秒近地起飞场景锚点；P4起每5秒生成一张P1低重绘场景状态图。所有图片必须保持P1主题建筑、地点、建筑与道路几何、周围场景、天空、天气、时段、光线、颜色、色调、色温与曝光，不套用任何范例城市，也不因为烟花强行改成冷蓝夜景。烟花以金、白、深红离散粒子出现在原有建筑后方或上方，加入薄烟、对现有表面的反射和短暂光照，不改变建筑轮廓。不要对白或旁白；加入连续现场风声、环境底噪、烟花升空声、距离延迟爆炸声与噼啪尾音。音乐服从主页MUSIC设置。
 
-- 必须真实载入 `@P1` 与 `@P2`；缺少时明确提示，不得虚构编号。
-- P1登记为 `media_type="image"`、`usage="h3_reference"`，是开场和城市视觉母版。锁定地标数量、间距、建筑几何、道路、天气、夜景光线、曝光、色调、空气感和镜头质感。
-- P2登记为覆盖全程的 `media_type="image"`、`usage="analysis_only"`。它只提供起点、转弯、曲线与终点，不进入Timeline、H3／Z-Image视觉Loader、首尾帧、构图、风格或图片父级。
+每个五秒区间独立渲染且只加载当前P1衍生状态图，严禁把P1、P3、P4、P5同时送入同一个H3请求。所有状态图代表同一个P1场景实例，一个画面只能出现一份P1主题建筑／地标组合；P1若本身是双塔，只保留原有双塔一次，绝不能再生成第二组双塔、镜像建筑、克隆地标或重复主体。
 
-## 2. 运镜与Shot
+固定合约：
 
-- 从P2提取3–6个规划航点，再在所有可渲染字段中转换成自然摄影机运动；不得出现P2、WP、坐标、红线、地图或导航图形。
-- 全片只完成一次顺时针360度环绕；稳定水平线，保持真实惯性、自然视差、平滑升高与曝光适应，禁止重复环绕、倒转、瞬移、穿楼、碰撞或城市几何闪烁。
-- Shot在0.5秒网格连续覆盖完整时长，无空隙、无重叠；约每4–6秒一个Shot，每个Shot只有一个主运镜，并写明must-complete action、environment response、incoming/outgoing state及optional flourish。
+- P1覆盖全片每个Segment，是首帧及唯一视觉母版；P2为覆盖全片的analysis_only，不进入Timeline、上传或视觉Loader。
+- P3设置source_plate_media_id=P1、source_plate_mode=p1_img2img并使用最低重绘，作为0–5秒静态开场锚点；P4起每5秒建立一张同样源自P1的time-scoped场景状态图。15秒通常为P3、P4、P5；35秒为P3至P9；更长影片继续P10、P11等。
+- Shot必须明确属于近地起飞、P1主题360度环绕、P2路线至终点或识别失败FPV后备；跨阶段Shot严格按先后衔接，并记录侧倾角、机头方向、高度、速度、惯性和连续性状态。
+- 烟花遵循升空、离散粒子绽放、延迟爆炸、余烬、烟雾漂移及反射消退；不得形成环形轨迹或遮盖／改变建筑。
+- 自动图追加：`Clean photographic scene with unobstructed architecture, natural sky and physically plausible lighting. Preserve the source image's scene, colour palette and exposure.`
+- 烟花图追加：`Fireworks are separate radial particle bursts located behind and above the skyline, with individual sparks, natural smoke and physically plausible reflections. Keep architectural silhouettes clearly readable.`
 
-## 3. 烟花状态账本
+P2画法与能力边界：
+- 用与P1相同比例的白底图，画一条纯红色连续线（#FF0000；1000px宽时约6–10px粗），3–6个清楚弯位。不要箭头、交叉、分岔或其他彩色装饰。
+- 在起点旁放绿色圆点（#00FF00），终点旁放蓝色圆点（#0000FF）。靠近端点但不要覆盖红线。闭合路线留小缺口，让起终点分开。
+- 上下方向仅表达接近／远离，不代表升降。高度、看向哪里请在Requirement另写。
+- 顺序无法验证时显示ROUTE NEEDS REVIEW，保留近地起飞与360度环绕，随后使用建筑周边高速FPV后备；不得虚构P2坐标、方向或终点。
+- P3及P4以后的每5秒场景图读取P1真实像素；低重绘图生图只属尽力保持，不保证100%像素一致，也不能恢复P1看不到的建筑背面。先检查参考图再Preview。
+- P1已有圆环时先换干净P1；图生图可能继承原图瑕疵。P2永远不参与视觉生成。
 
-- 每个Shot记录烟花相对地标的位置、颜色、点燃／扩散／坠落／熄灭阶段、烟雾量与风向、玻璃和湿地反射、曝光变化，以及边界处仍持续的爆炸／噼啪尾音。
-- 烟花遵循升空火花→空中爆发→离散粒子扩散→延迟爆炸声→余烬坠落→烟雾飘移→反射消退。不得切镜重置烟花或让烟雾突然消失。
-- 烟花只能在地标后方和上方，不得触碰、包围、从建筑射出、取代或扭曲建筑。最终金色菊花烟花是离散径向粒子花朵，不是光环、实心圆、霓虹圈、能量环或运镜轨迹。
-
-## 4. 场景关键帧链与P1不可变特效尾帧
-
-- 只有P1/P2时运动段保持单场景，但仍建立一个P1不可变特效尾帧。
-- 若用户另外选择P3/P4/P5等城市图，跳过P2并按编号建立互不重叠的time-scoped场景链；未来图不得提前装入前段Job。
-- 边界只传递上一段最后24个无声视频帧，不传旧音频。最后一个用户锚点后只建立一张未指定P编号的environment-only尾帧。
-- 尾帧设置 `source_plate_media_id="P1"`、`source_plate_mode="immutable_effect_composite"`、`source_plate_effect_profile="fireworks"`、`immutable_scene_plate=true`、`final_hold_seconds=1.0`。Studio必须直接读取P1本地像素，不能调用纯文字T2I重画城市。
-- 尾帧的建筑、构图、镜头位置、镜头高度、焦段、水平线、双塔大小与间距、城市几何、道路、建筑、天气、冷蓝夜景、基础曝光、对比度与原有城市灯光100%以P1为底图不变。只可叠加金／白／深红离散烟花粒子、横向漂移的薄烟，以及对现有玻璃幕墙、屋顶、湿街与低云造成的暖金／柔红光效。烟花不得覆盖、触碰、缠绕或改变双塔轮廓。
-- 尾帧必须看起来是“P1加上烟花”，不是重新生成或重新解释的城市画面；精确静止一秒。
-
-## 5. Z-Image静态图隔离
-
-- 所有自动Picture都是一个冻结摄影瞬间。从普通Prompt和subject_keywords删除360-degree、orbit、orbital yaw、circle path、trajectory、route和waypoint运镜内容，只保留城市、建筑、烟花状态、烟雾、反射、光线、曝光、镜头和单一冻结机位。
-- 正向提示词准确追加：`The drone flight path is implied only through camera motion and must never be visible in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory line, no HUD, no graphic overlay around the towers.`
-- 同时追加：`Fireworks are separate radial particle bursts located behind and above the skyline, with individual sparks, natural smoke and physically plausible reflections; they never form a continuous ring, ribbon, ellipse or flight path around any building.`
-- 专用Z-Image负面提示词：`visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings, continuous firework ring around buildings, fireworks forming a flight path, fireworks wrapped around towers, solid neon fireworks, duplicated landmark, fused towers`
-- 负面词表不得进入最终H3 Prompt；P2不得成为任何自动图的视觉父级。
-
-## 6. H3与声音
-
-- 每段H3 Prompt只使用当前场景锚点，按同一时间顺序描述城市、连续航拍、烟花、烟雾、反射、曝光和原生声音。
-- 最终H3 Prompt保留真正的一次360度环绕，但不得包含P2、红线、航点图形、负面词表或可见控制层。
-- 禁止人物、字幕、文字、Logo、水印、重复双塔、融合建筑、卡通效果、无来源Spot Light和额外地标。
-- 环境声属于画内真实声源：连续高空风、远处交通、烟花升空嘶声、按距离延迟的低频爆炸与噼啪尾音。不得在Shot边界截断或重新开始。
-- 音乐严格服从 `MUSIC: OFF / AUTO / TIMELINE`；Timeline没有对白／旁白时不得新增人声。
-
-## 7. Apply前检查
-
-1. P1是视觉母版，P2只为analysis_only并且没有视觉Loader。
-2. Shot完整覆盖时长且无重叠，只有一次360度环绕；随后回到P1精确原构图并冻结P1特效尾帧一秒。
-3. 地标数量、间距与城市结构稳定，无穿楼、碰撞或闪烁。
-4. 烟花是后方／上方的离散粒子，烟雾、反射、曝光及声音跨Shot连续。
-5. 自动图已移除运镜轨迹词并带两条静态图合约和专用negative_prompt。
-6. 最终H3 Prompt仍包含真实环绕运镜，但绝不出现轨迹圆环、HUD或负面词表。
-7. 多场景Picture各自拥有互不重叠区间，未来图和旧音频不跨错Segment。
-8. 尾帧元数据为 `immutable_effect_composite`；P1像素不被重绘，只新增烟花、薄烟和物理光效。
+结尾处理：在P2路线终点自然收束运镜，保留H3原生生成的最后画面和环境变化。不自动生成尾图、不强制切回P1、不冻结最后一秒、不进行本地烟花叠加。用户若另有明确的镜头停留要求，只作为H3镜头提示词，不启用旧的输出覆盖链。
