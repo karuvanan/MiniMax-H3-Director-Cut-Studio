@@ -125,7 +125,16 @@ def unload_lm_studio(base_url: str, selected_model: str, timeout: float) -> list
 
 def cleanup(job: dict) -> dict:
     timeout = float(job.get("timeout", 30))
-    result = {"completed": True, "comfyui_unloaded": False, "lm_unloaded": [], "warnings": []}
+    result = {
+        "completed": True,
+        "operation": str(job.get("operation", "post_apply")),
+        "local_gc_collected": int(job.get("local_gc_collected", 0) or 0),
+        "local_cache_cleared": bool(job.get("local_cache_cleared", False)),
+        "comfyui_unloaded": False,
+        "comfyui_cache_cleared": False,
+        "lm_unloaded": [],
+        "warnings": [],
+    }
     comfy_url = str(job.get("comfyui_server", "")).strip().rstrip("/")
     if comfy_url:
         try:
@@ -135,13 +144,17 @@ def cleanup(job: dict) -> dict:
                 {"unload_models": True, "free_memory": True},
             )
             result["comfyui_unloaded"] = True
+            result["comfyui_cache_cleared"] = True
         except Exception as exc:
             result["warnings"].append(f"ComfyUI unload failed: {exc}")
-    if str(job.get("provider", "")).lower() == "lm_studio":
+    if (
+        str(job.get("provider", "")).lower() == "lm_studio"
+        or bool(job.get("unload_all_lm_models", False))
+    ):
         try:
             result["lm_unloaded"] = unload_lm_studio(
                 str(job.get("base_url", "")),
-                str(job.get("model", "")),
+                "" if job.get("unload_all_lm_models", False) else str(job.get("model", "")),
                 timeout,
             )
         except Exception as exc:

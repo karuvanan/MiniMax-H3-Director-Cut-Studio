@@ -1025,6 +1025,46 @@ class StandardPipelineRegressions(unittest.TestCase):
         dialog.mark_apply_succeeded()
         self.assertEqual(dialog.result(), QDialog.Accepted)
 
+    def test_apply_cleanup_is_queued_until_commit_and_cancelled_on_failure(self):
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        job = {
+            "provider": "openai",
+            "comfyui_server": "http://127.0.0.1:8188",
+            "timeout": 10,
+        }
+
+        with patch.object(window, "start_design_cleanup") as cleanup:
+            window.queue_design_cleanup(job)
+            cleanup.assert_not_called()
+            window.start_queued_design_cleanup()
+            cleanup.assert_called_once_with(job)
+            self.assertEqual(window.pending_design_cleanup_job, {})
+
+        window.queue_design_cleanup(job)
+        window._notify_design_apply_failed("simulated commit failure")
+        self.assertEqual(window.pending_design_cleanup_job, {})
+
+    def test_toolbar_unload_all_targets_comfy_and_every_loaded_lm_model(self):
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        self.assertEqual(window.unload_all_button.text(), "UNLOAD ALL")
+        toolbar = window.project_storage_button.parentWidget()
+        widgets = [toolbar.widgetForAction(action) for action in toolbar.actions()]
+        self.assertEqual(
+            widgets.index(window.unload_all_button),
+            widgets.index(window.project_storage_button) + 1,
+        )
+        with patch.object(window, "start_design_cleanup") as cleanup:
+            window.unload_all_resources()
+        cleanup.assert_called_once()
+        job = cleanup.call_args.args[0]
+        self.assertEqual(job["operation"], "manual_unload_all")
+        self.assertTrue(job["clear_local_cache"])
+        self.assertTrue(job["unload_all_lm_models"])
+        self.assertEqual(job["model"], "")
+        self.assertEqual(job["comfyui_server"], window.server_url.text().strip())
+
     def test_09_reference_mapping_is_segment_local_with_unlimited_virtual_pool(self):
         """P10+ is legal project-wide and inactive references never leak into a Segment."""
 

@@ -76,9 +76,22 @@ def _time_token_seconds(token: str, unit: str = "") -> float:
     return seconds
 
 
-def _is_prompt_time_range(match: re.Match[str]) -> bool:
-    """Reject bare year/number ranges while accepting normal timeline notation."""
+def _is_prompt_time_range(match: re.Match[str], source: str = "") -> bool:
+    """Reject geometry/count ranges while accepting normal Timeline notation."""
     raw = match.group(0)
+    tail = str(source or "")[match.end():match.end() + 24]
+    # The closing bracket is optional in the regex, so account for a match that
+    # stops immediately before it during backtracking.  Camera degrees, pixel
+    # sizes and other numeric specifications are visual instructions, not a
+    # Segment-local schedule.
+    tail = re.sub(r"^[\]\)]\s*", "", tail.lstrip()).lstrip()
+    if re.match(
+        r"^(?:°|degrees?(?![A-Za-z])|px(?![A-Za-z])|pixels?(?![A-Za-z])|"
+        r"%|fps(?![A-Za-z])|frames?(?![A-Za-z])|\u5e27|\u5e40|\u5ea6|\u500d|\u5708|\u4e2a|\u500b)",
+        tail,
+        flags=re.IGNORECASE,
+    ):
+        return False
     return bool(
         match.group("start_unit")
         or match.group("end_unit")
@@ -132,7 +145,7 @@ def scope_timed_prompt_text(
     for sentence in sentences:
         matches = [
             match for match in _TIMED_TEXT_RANGE_RE.finditer(sentence)
-            if _is_prompt_time_range(match)
+            if _is_prompt_time_range(match, sentence)
         ]
         point_matches = [] if matches else list(_TIMED_TEXT_POINT_RE.finditer(sentence))
         if not matches and not point_matches:

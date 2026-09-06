@@ -16,6 +16,7 @@ ENV_KEYS = {
     "history_poll_interval": "H3_HISTORY_POLL_INTERVAL",
     "generation_timeout": "H3_GENERATION_TIMEOUT",
     "http_request_timeout": "H3_HTTP_REQUEST_TIMEOUT",
+    "connection_recovery_timeout": "H3_CONNECTION_RECOVERY_TIMEOUT",
     "dialogue_tts_engine": "H3_DIALOGUE_TTS_ENGINE",
     "music_mode": "H3_MUSIC_MODE",
     "blip_device": "H3_BLIP_DEVICE",
@@ -34,6 +35,7 @@ class RenderSettings:
     history_poll_interval: float = 1.0
     generation_timeout: int = 1800
     http_request_timeout: int = 30
+    connection_recovery_timeout: int = 3600
     dialogue_tts_engine: str = "h3_native"
     music_mode: str = "auto"
     blip_device: str = "auto"
@@ -75,6 +77,9 @@ class RenderSettings:
             history_poll_interval=max(0.1, number("history_poll_interval", float)),
             generation_timeout=max(10, number("generation_timeout", int)),
             http_request_timeout=max(1, number("http_request_timeout", int)),
+            connection_recovery_timeout=max(
+                30, number("connection_recovery_timeout", int)
+            ),
             dialogue_tts_engine=dialogue_tts_engine,
             music_mode=music_mode,
             blip_device=blip_device,

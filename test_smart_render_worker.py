@@ -10,6 +10,7 @@ from smart_render_worker import (
     _patch_continuity,
     build_render_progress,
     build_assembly_command,
+    assemble_master,
     classify_generation_error,
     extract_tail_frames,
     main,
@@ -17,7 +18,6 @@ from smart_render_worker import (
     queue_segment,
 )
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
-from final_hold_engine import apply_final_hold_plate, build_final_hold_command
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
@@ -351,7 +351,7 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertIn("concat=n=3:v=1:a=1", filters)
         self.assertIn("43.000000", command)
 
-    def test_final_hold_command_preserves_audio_and_freezes_plate(self):
+    def test_assembly_ignores_legacy_plate_and_preserves_native_tail(self):
         from PIL import Image
 
         runtime = load_runtime_paths()
@@ -375,22 +375,18 @@ class SmartRenderWorkerTests(unittest.TestCase):
                 timeout=60,
             )
             self.assertEqual(created.returncode, 0, created.stderr)
-            command = build_final_hold_command(
-                runtime.ffmpeg, runtime.ffprobe, source, plate, root / "out.mp4",
-                hold_seconds=0.5, target_duration=2.0,
-            )
-            graph = command[command.index("-filter_complex") + 1]
-            self.assertIn("gte(t,1.500000)", graph)
-            self.assertIn("0:a?", command)
-
-            apply_final_hold_plate(
-                runtime.ffmpeg, runtime.ffprobe, source, plate,
-                hold_seconds=0.5, target_duration=2.0,
-            )
+            original_bytes = source.read_bytes()
+            result = assemble_master({
+                "master_output": str(root / "out.mp4"),
+                "ffmpeg": str(runtime.ffmpeg), "ffprobe": str(runtime.ffprobe),
+                "target_duration_seconds": 2.0,
+                "final_hold_plate": str(plate), "final_hold_seconds": .5,
+            }, [{"output_path": str(source), "start_seconds": 0.0, "end_seconds": 2.0}])
+            self.assertEqual(source.read_bytes(), original_bytes)
             audio_probe = subprocess.run(
                 [
                     str(runtime.ffprobe), "-v", "error", "-select_streams", "a:0",
-                    "-show_entries", "stream=index", "-of", "csv=p=0", str(source),
+                    "-show_entries", "stream=index", "-of", "csv=p=0", str(result),
                 ],
                 capture_output=True, text=True, timeout=30,
             )
@@ -399,14 +395,14 @@ class SmartRenderWorkerTests(unittest.TestCase):
             extracted = subprocess.run(
                 [
                     str(runtime.ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
-                    "-ss", "1.75", "-i", str(source), "-frames:v", "1", str(frame),
+                    "-ss", "1.75", "-i", str(result), "-frames:v", "1", str(frame),
                 ],
                 capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(extracted.returncode, 0, extracted.stderr)
             pixel = Image.open(frame).convert("RGB").getpixel((80, 45))
-            self.assertGreater(pixel[2], 180)
-            self.assertLess(pixel[0], 80)
+            self.assertGreater(pixel[0], 180)
+            self.assertLess(pixel[2], 80)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

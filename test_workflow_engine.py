@@ -148,6 +148,32 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertIn(anchor, active)
         self.assertNotIn(competing_pose, active)
 
+    def test_drone_p1_descendant_replaces_p1_in_one_h3_segment(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        pictures = [asset for asset in scan.assets if asset.media_type == "image"]
+        p1, current_state = pictures[0], pictures[2]
+        for asset in (p1, current_state):
+            asset.timeline_placed = True
+            asset.start_seconds = 0.0
+            asset.end_seconds = 5.0
+        p1.clip_prompt = "P1 SCENE MASTER LOCK."
+        current_state.clip_prompt = (
+            "SCENE KEYFRAME CHAIN ANCHOR. "
+            "EXCLUSIVE P1-DERIVED SCENE-STATE REPLACEMENT. "
+            "This is the same single P1 landmark instance."
+        )
+
+        compiled, active = compile_active_workflow(scan, 0.0, 5.0)
+
+        self.assertNotIn(p1, active)
+        self.assertEqual(active, [current_state])
+        h3_inputs = compiled[scan.h3_node_ids[0]]["inputs"]
+        image_inputs = [
+            name for name in h3_inputs if name.startswith("ref_images.ref_image_")
+        ]
+        self.assertEqual(image_inputs, ["ref_images.ref_image_0"])
+
     def test_effective_tags_follow_connected_r2v_order_not_pool_slot(self):
         path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
         scan = load_workflow(path)

@@ -745,6 +745,21 @@ def build_ref2va_prompt(
             f"Apply the approved {special_profile.display_name} Director cues already encoded "
             "in this Timeline; treat Skill discovery metadata as non-rendering context."
         )
+    if special_profile is not None and special_profile.key in {
+        "drone-fly-on-city", "drone-fly-on-city-fireworks"
+    }:
+        detailed_rows.append(
+            "DRONE SINGLE-SCENE INSTANCE CONTRACT - Every active Picture represents the same "
+            "single P1-established place and the same single primary landmark instance or landmark "
+            "group at its assigned time. Never arrange reference Pictures side by side and never "
+            "create an additional, mirrored, cloned or repeated copy of the primary building. If "
+            "the original subject is a paired landmark, preserve that original pair exactly once, "
+            "not two pairs. During the orbit, the rigid FPV camera faces the drone's instantaneous "
+            "forward tangent and never gimbal-locks, pans or independently yaws toward the landmark; "
+            "the landmark may move along the inside frame edge or briefly leave view. Ground launch "
+            "happens first; the full physical front-right-rear-left-front lap must visibly complete "
+            "before any route-exit movement begins."
+        )
     if special_profile is not None and special_profile.key == SPECIAL_SKILL:
         detailed_rows.append(
             "The product body color, material, silhouette, functional details, negative space, "

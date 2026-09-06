@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.3.2-alpha.3`](VERSION)
+- 当前应用版本：[`v0.3.2-alpha.4`](VERSION)
 - v0.3.2 重点功能、长片流程与验收说明：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
@@ -586,12 +586,15 @@ H3_RTX_VIDEO_SUPER_RESOLUTION=true
 H3_HISTORY_POLL_INTERVAL=1.0
 H3_GENERATION_TIMEOUT=1800
 H3_HTTP_REQUEST_TIMEOUT=30
+H3_CONNECTION_RECOVERY_TIMEOUT=3600
 H3_DIALOGUE_TTS_ENGINE=h3_native
 H3_BLIP_DEVICE=auto
 H3_WORKSPACE_FREE_DISK_RESERVE_GB=50.0
 ```
 
-请把 URL 改成自己的 ComfyUI 地址。`H3_DIALOGUE_TTS_ENGINE` 可设为 `h3_native`、`voxcpm2_local`、`qwen3_tts_local` 或 `edge_tts`；默认 `h3_native` 直接让 MiniMax H3 根据最新 Timeline Text Layer 生成对白，不建立 WAV。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
+请把 URL 改成自己的 ComfyUI 地址。`H3_CONNECTION_RECOVERY_TIMEOUT` 默认是 `3600` 秒；ComfyUI 接受任务并返回 `prompt_id` 后，如果远端网络暂时中断，Studio 会保留该 ID、显示橙色 Reconnecting 状态并持续查询同一个 Server Job，不会因为客户端失联而重复排队。网络恢复后会接回真实进度、下载原任务的输出，再继续其余 Segment 与 Master 拼接；输出下载使用 `.part` 临时文件并在完整取得后才发布。可以在 Settings 的 `Connection recovery window` 调整等待时间。
+
+这项恢复适用于“客户端／局域网断线，但远端 ComfyUI 进程和 Queue 仍然存在”的情况。如果 ComfyUI 本身重启并清空 `/history`，旧 `prompt_id` 无法在客户端凭空重建模型计算，必须重新生成该 Segment。`H3_DIALOGUE_TTS_ENGINE` 可设为 `h3_native`、`voxcpm2_local`、`qwen3_tts_local` 或 `edge_tts`；默认 `h3_native` 直接让 MiniMax H3 根据最新 Timeline Text Layer 生成对白，不建立 WAV。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
 
 ### Design AI 设置
 
@@ -716,13 +719,13 @@ skill special/
 - Default 固定为 `h3-prompt-writing`，负责 MiniMax H3 官方 Ref2VA 结构。
 - Special 提供场景/风格规则；选择 `None` 时只应用 Default。
 - 一般 Special 采用 `Default + Special`；在 `SKILL.md` 写入 `<!-- h3-studio-binding: standalone -->` 的 Special 会独立送入 Design，不会同时注入 `h3-prompt-writing`。
-- 顶部工具栏的 `SPECIAL SKILL CREATOR` 与 Default / Special 选择器位于同一排。它可以新建或编辑 Special Skill、选择 `Default + Special` 或 Standalone 绑定、维护英文 `SKILL.md`、可选中文 `SKILL.cn.md` 及 `DESIGN_REQUIREMENT.txt` 起始模板，并在 `SAVE + APPLY` 后立即刷新及选中该 Skill。选择带模板的 Special Skill 后点击 `DESIGN`，空白的 Design Requirement 会自动填入模板且仍可自由编辑；已有文字不会被覆盖。Folder/key 只允许小写英文字母、数字及单连字符；Default Skill 名称受保护，不能覆盖。
+- 顶部工具栏的 `CREATOR` 与 Default / Special 选择器位于同一排。它可以新建或编辑 Special Skill、选择 `Default + Special` 或 Standalone 绑定、维护英文 `SKILL.md`、可选中文 `SKILL.cn.md` 及 `DESIGN_REQUIREMENT.txt` 起始模板，并在 `SAVE + APPLY` 后立即刷新及选中该 Skill。选择带模板的 Special Skill 后点击 `DESIGN`，空白的 Design Requirement 会自动填入模板且仍可自由编辑；已有文字不会被覆盖。Folder/key 只允许小写英文字母、数字及单连字符；Default Skill 名称受保护，不能覆盖。
 - Studio 内置的每一个 Special Skill 都附带与自身工作流对应的 `DESIGN_REQUIREMENT.txt`，可作为直接测试的范例，也可以在生成前替换其中的人物、产品、主题、时长、画幅、对白和素材要求。
 - `short-drama-h3-director` 是适配 Studio 的短剧 Special Skill，默认采用 `Default + Special`。它把短剧冲突、人物因果、伏笔反转、集尾钩子及竖屏构图转换为完整时间范围的 Shot Blocks，同时逐字保护 `text_layers`，优先复用 `existing_media_uses`，仅为缺失证据建立 `media_requests`，并遵守每 5 秒动作预算、环境因果、声音层与 Final Hold 规则。英文主文件、中文对照版及第三方许可证均位于 `skill special/short-drama-h3-director/`。
 - `long-form-h3-director` 是长片 Default-bound Special Skill。它输出一份覆盖完整总时长的 Design JSON，而不是每批一份 JSON；默认按约 30 秒规划安全批准点，保持 15 秒原生 Segment 的 Incoming／Outgoing State、上一段最后 24 帧运动上下文、逐字对白、稳定 Reference ID 与唯一项目终点 Final Hold。选择它会让主页自动采用 Incremental production；不选择时仍保留 Full Range 一次过处理。
 - `dark-rescue-h3` 是严格第一人称暗场救援 Special Skill，默认采用 `Default + Special`。除了救援者双眼位置的文字锁定，每个Shot还必须出现近镜头手套、前臂/袖口、手电、头盔边缘或救援工具作为POV证明，并使用视线高度、身体运动视差与受困者看向救援者眼睛的互动防止镜头退化为第三人称。它会从五套已验证的场景语法中改编地点，自动建立普通话对白／克制旁白、九镜救援因果链、现场环境声、可解释光源与15秒边界连续性；没有明确 `@P/@V/@A` 时不会虚构Media Pool编号。
-- `drone-fly-on-city` 会隔离动态运镜与静态参考图：360度环绕、orbital yaw与路线逻辑只进入H3视频Shot；Z-Image补图会移除轨迹式语句并使用请求级Clean Frame合约及专用negative conditioning，防止把飞行路径生成成建筑周围的发光圆环。结尾不再由T2I重画城市，而是回到P1精确原构图并直接复制P1作为不可变尾帧，最终成片冻结一秒。旧图可在选择该Skill后通过Media Pool右键 `REGENERATE WITH Z-IMAGE` 原位重生，P编号、Timeline与Segment Mapping保持不变。
-- `drone-fly-on-city-fireworks` 继承同一套路线与静态图隔离引擎，并加入夜间烟花连续性：离散粒子爆发、烟雾漂移、玻璃／湿地反射、曝光响应和距离延迟的原生爆炸声会按Shot保存状态。尾帧以未重绘的P1像素为不可变底图，只叠加烟花、薄烟和物理光效；运动结束后回到P1原构图，Preview、单段输出与长片Master均直接冻结该尾帧一秒。
+- `drone-fly-on-city`：P1为全程场景母版；P3是0–5秒的低重绘开场锚点，P4起每5秒读取P1实际像素建立场景状态图（35秒为P3–P9，45秒继续至P11）。所有图锁定P1主题建筑、构图、场景、道路、天空、天气、颜色、色温与曝光；BLIP／AI只作补充。H3以P1主题建筑为中心，沿白底红线、绿色起点、蓝色终点验证成功的P2路线完成一圈360度；P2顺序不明确则提示 `ROUTE NEEDS REVIEW` 并暂用静止镜头。静态图不会写入环绕或轨迹词，避免生成发光圆环。图生图只属近似场景保持，不保证隐藏视角像素准确；已取消自动尾图和末秒覆盖。
+- `drone-fly-on-city-fireworks` 继承同一套P1五秒场景链与P2路线受控360度环绕，并加入烟花连续性：离散粒子爆发、烟雾漂移、现有表面反射、曝光响应和距离延迟的原生爆炸声会按Shot保存状态。它不再预设任何城市或地标；烟花与摄影机运动由H3原生生成，已取消本地烟花尾图合成、强制返回P1与末秒冻结。
 - `dark-rescue-h3-no-pov` 是独立的外部摄影机版本：救援者会作为稳定角色出现在画面中，使用中远景双人构图、侧面走廊或三分之四救援机位，不会注入救援者眼睛、头盔摄影机或只见双手的构图规则。两个Skill各有自己的英文/中文规则及Design Requirement模板。
 - `street-fighter-live-action-h3` 用于15至45秒真人街机格斗电影。每个15秒Segment准确安排12个编号近身攻防Beat：先用一个不超过1秒的Eye-level Wide建立轴线，再由六个Close-up／Extreme close-up Shot各完成两个动作。45秒模式建立覆盖21个Shot、36个动作的全局Action Ledger，按照站立流派碰撞、MMA抱摔／上位打击、逃脱反转／降服三个阶段推进，并拒绝以换镜头或特效伪装重复动作。两人使用可抓握的露指MMA拳套，固定外露手指、加厚指节、圆弧外壳、腕带颜色和下缘湿污。环境沿同一座上锁工业垂直迷宫的维修走廊、积水平台和上层栈桥连续前进，保持线缆、裸管、门锁、霉锈、水渍、IES工业灯、警报及蒸汽状态。水花只在接触后出现、烟雾必须有可见来源，并明确禁止舞台Spot Light。人物身份、服装、拳套、流派、上下位、格斗轴线、H3原生声音和Virtual Media Pool范围均保持可检查。
 - 该短剧 Skill 参考并重新设计自 MIT 授权的 [POUND0423/AI-drama-pound](https://github.com/POUND0423/AI-drama-pound)。上游侧重剧本创作；Studio 版本另外加入 H3 Director Design JSON、Timeline、素材映射、对白、音景和可执行 Shot 预算规则。

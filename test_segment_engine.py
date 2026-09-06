@@ -272,6 +272,31 @@ class SegmentEngineTests(unittest.TestCase):
         self.assertNotIn("day-to-night", scoped)
         self.assertNotIn("16s", scoped)
 
+    def test_timed_prompt_text_preserves_geometry_and_count_ranges(self):
+        source = (
+            "Camera follows [0-360] degrees around the building. "
+            "Keep a [6-10] px clean border and [24-30] frames of stable motion."
+        )
+        scoped = scope_timed_prompt_text(
+            source,
+            15.0,
+            30.0,
+            field_name="camera",
+        )
+        self.assertEqual(scoped, source)
+        self.assertNotIn("SEGMENT-LOCAL", scoped)
+
+    def test_timed_prompt_text_still_accepts_bracketed_seconds(self):
+        scoped = scope_timed_prompt_text(
+            "Office dialogue [0-5] then corridor action [5-10].",
+            5.0,
+            10.0,
+            field_name="story",
+        )
+        self.assertNotIn("Office dialogue", scoped)
+        self.assertIn("corridor action", scoped)
+        self.assertIn("segment-local 00:00.000", scoped)
+
     def test_cache_reuse_requires_matching_fingerprint(self):
         rows = plan_render_segments(0.0, 30.0)
         rows[0].fingerprint = content_fingerprint({"prompt": "same"})

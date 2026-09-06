@@ -2,7 +2,84 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.2-alpha.4] - 2026-09-05
+
+### Global Design duration safety and image-generation regression release
+
+- Applied the duration-range disambiguation globally to Design with no Special Skill and to every Special Skill, so camera angles, pixel ranges, percentages, frame counts and image dimensions cannot inflate the authored video duration or trigger runaway Picture generation.
+- Preserved the existing reference-planning policy: ordinary Design remains story-, dialogue- and Shot-aware with an approximate five-second fallback coverage floor; only the two Drone Skills enforce an exact P1-derived five-second Picture chain.
+- Kept the Virtual Media Pool unlimited at project scope. The physical 9 Image / 3 Video / 3 Audio limits remain Segment-local and are assigned dynamically during workflow compilation.
+- Fixed the equivalent Segment prompt-scoping collision: bracketed camera degrees, pixel ranges, percentages and frame counts now remain visual instructions instead of being rebased or deleted as if they were Timeline ranges.
+- Added this release checkpoint for focused Design-to-Timeline, Storyboard, Segment reference mapping, Workflow loader and Drone P1/P2/P3+ regression verification.
+
+### Transactional post-Apply RAM/VRAM cleanup
+
+- Moved Design cleanup behind the durable `APPLY TO H3 WORKSPACE` commit. The Design dialog now queues cleanup intent; Timeline, Mapping and Workspace persistence finish before any model is unloaded.
+- Added local Python garbage collection plus ComfyUI `/free` with `unload_models=true` and `free_memory=true`, followed by a deferred Qt-side collection pass. LM Studio unload remains limited to an actually loaded matching instance.
+- A failed Apply cancels its queued cleanup. Cleanup warnings never roll back a successful Apply, and temporary cleanup job files are removed after completion or worker-start failure.
+- Added regression coverage proving cleanup remains idle while queued, starts only after the success gate and is discarded after a simulated Apply failure.
+- Added a homepage `UNLOAD ALL` control beside `STORAGE` for safe manual Studio DRAM/cache cleanup, ComfyUI model/VRAM release, and unloading every LM Studio model instance actually reported as loaded.
+
+### Sequential ground-launch / orbit / route FPV mission
+
+- Updated both `drone-fly-on-city` profiles so the executable H3 camera instruction uses three ordered phases: near-ground P1 takeoff, one translated 360-degree orbit around P1's primary scene subject, then verified P2 route travel to its endpoint. Orbit and route movement are no longer issued simultaneously.
+- Replaced the ambiguous orbit sentence with a physical flight contract: one complete, smooth, wide clockwise lap at a constant safe radius, advancing through front, right, rear, left and front positional checkpoints while background parallax proves translation.
+- Removed the subject-centred look-at instruction that still made the camera appear to rotate around the landmark. The rigid FPV camera now follows the drone nose and instantaneous flight tangent; it cannot independently yaw, pan or gimbal-lock toward the landmark, which moves naturally along the inside frame edge and may pass behind the camera.
+- Explicitly rejected in-place camera rotation, panoramic yaw, optical spin, barrel roll and rotating-background interpretations during the orbit. The orbit permits moderate coordinated banking only; dives, inversion and up to 180-degree rolls are delayed until the later verified-route or FPV-fallback phase.
+- Expanded the 12-second orbit budget from the former 3.5 seconds to 7 seconds (0–2 launch, 2–9 orbit, 9–12 route) and added a hard phase-completion gate. The 15-second fireworks template uses 0–2, 2–10 and 10–15 seconds.
+- Restored the executable Scene Keyframe Chain marker so Drone renders split at each five-second boundary. Each interval now uses only its exclusive current P1-derived scene state instead of loading P1 plus P3/P4/P5 together, preventing Ref2VA from multiplying one landmark reference into repeated buildings.
+- Added a single-scene-instance contract and duplicate-building negative conditioning. A paired landmark such as twin towers is preserved exactly once, never as a second pair, mirrored clone or repeated landmark.
+- Replaced the old unverified-route camera hold. A failed P2 analysis now keeps the takeoff and orbit, then uses a bounded collision-safe FPV fallback: ground skim, left climbing arc, brief inverted dive, right counter-roll, figure-eight crossover and level exit. It never claims an unreadable P2 endpoint.
+- Changed P3 into the P1-derived near-ground takeoff anchor while retaining the exact five-second P1 scene-chain budget, P2 analysis-only isolation and ordinary/fireworks visual continuity contracts.
+- Updated English/Chinese Skills and both automatic Design Requirement templates, plus executable-plan regressions for phase order, verified endpoint travel, fallback behavior and repeated normalization.
+
 ## [0.3.2-alpha.3] - 2026-09-03
+
+### Design duration range disambiguation and mass-image guard — 2026-09-05
+
+- Fixed a duration-parser collision where camera angles such as `0-360 degrees` were accepted as a 360-second Timeline range. The 12-second `drone-fly-on-city` template consequently scheduled 72 five-second references (P3-P74).
+- Direct authored duration declarations now outrank later Skill examples and Timeline ranges. The ordinary Drone template resolves to 12 seconds and the Fireworks template to 15 seconds even though their documentation also mentions 35-second allocation examples.
+- Time-range recognition now excludes degrees, pixels, percentages, FPS, frame counts and ordinary numeric dimensions while retaining bracketed timecodes, `HH:MM:SS`, `0-5s` and `0-5秒` speech/Shot ranges.
+- Added a pre-generation Drone budget gate. Before any Z-Image request starts, the Plan must contain P1 as `h3_reference`, P2 as `analysis_only`, and exactly one uniquely timed P1-derived Picture per five-second interval. A malformed Plan remains editable but cannot launch mass generation.
+- Added regression coverage for both Drone Skills, erroneous 360-second model output, P3-P5 allocation, non-time numeric ranges, missing P2 and a simulated 72-request Plan.
+
+### Remote ComfyUI prompt-ID reconnect recovery — 2026-09-05
+
+- Separated client transport loss from server generation failure. After ComfyUI accepts a prompt, native and Smart Render workers keep polling the same `prompt_id` for up to the configurable recovery window instead of posting duplicate work.
+- Checkpointed accepted native prompts in the Job JSON and active Smart Render Segments in the project-scoped Manifest immediately after `/prompt` succeeds. A resumed worker reuses that persisted server Job when its server and Segment fingerprint still match.
+- Added orange reconnecting Timeline status, live disconnect/reconnect progress messages and the `Connection recovery window` setting (`H3_CONNECTION_RECOVERY_TIMEOUT`, default 3600 seconds).
+- Made output retrieval reconnect-safe with temporary `.part` files and atomic publication. A broken transfer retries the same ComfyUI output and cannot replace a valid MP4 with a partial file.
+- Added regression tests for history polling across LAN failure, interrupted downloads, prompt checkpoint/restart recovery and the no-duplicate-queue guarantee.
+
+### Route-controlled 360° drone scene chain — 2026-09-05
+
+- Replaced the fixed seven-reference allocation with a five-second scene chain: P3 is the 0–5 second P1-derived opening anchor, P4 starts at 5 seconds, and later Pictures continue every five seconds without a P9 cap. A 35-second mission uses P3–P9; a 45-second mission reaches P11.
+- Fixed the inverted orbit gate that disabled an explicit 360-degree request whenever P2 was loaded. A 360 mission now requires both an affirmative user request and a locally verified P2 start/direction/end; each Shot receives its proportional 0–360-degree phase plus the actual overlapping P2 path legs.
+- Strengthened every generated Picture prompt to preserve P1's primary building, scene and composition, roads, sky, weather, colour palette, colour temperature, exposure, atmosphere and lens. P3 uses lower denoise than later scene states.
+- Kept camera-motion language out of static Picture prompts and keywords, so the route-controlled orbit remains an H3 video instruction and cannot prime Z-Image to draw a glowing path or ring.
+- Updated the ordinary and fireworks Skills, Chinese counterparts and Design Requirement templates, plus regression coverage for 35-second P3–P9 allocation, route-controlled orbit phases, P1 pixel binding and Segment Mapping.
+
+### Withdraw automatic drone end-plate replacement — 2026-09-05
+
+- At the user's request after visual review, removed automatic P1 terminal-image requests, the reserved last-second range, and the native-render/master-assembly calls that overwrote the ending with a still plate.
+- Old `final_hold_*` render-job metadata no longer triggers output replacement. Legacy automatically marked immutable P1 tail assets are excluded from Timeline/render reference selection, while their Media Pool entries and files remain available.
+- Both drone Skills and Design Requirement templates now direct a natural H3-generated ending, not a forced P1 return, local fireworks composite or one-second image freeze. The earlier immutable-tail entries below describe withdrawn behavior, not the current pipeline.
+- Reference review used `generated_output_6.mp4` (12.256 s): low-to-high camera travel, shifting parallax and evolving fireworks are the visual target; automated test success is not a substitute for real-video acceptance.
+
+### Drone pixel conditioning and route verification — 2026-09-05 correction
+
+- Fixed a real data-flow gap: P3–P9 previously used only BLIP/AI text. They now upload the locally bound P1 image and connect `LoadImage → ImageScale → VAEEncode → KSampler` with low denoise. Missing P1 never silently falls back to text-to-image; scene backgrounds are not removed. Stage references retain source composition and are not claimed to reconstruct unseen camera views or preserve pixels exactly.
+- Removed orbit/ring/trajectory vocabulary from positive still prompts (including Chinese), keeping exclusions in the dedicated negative field. P2 remains analysis-only and is never uploaded as a scene image. Existing contaminated images must be regenerated; artifacts already in P1 require a clean source.
+- Added green-start/blue-end direction verification, bend-preserving path simplification and all-leg Shot motion clauses. Unreadable, ambiguous, branched or unmarked routes produce `ROUTE NEEDS REVIEW` and a camera hold, not an invented orbit. A loop needs a small gap and separate endpoint markers. Map Y no longer implies altitude.
+- Updated both drone Skills and Design Requirement templates with the supported drawing convention and fidelity limits. The previous caption-only/new-view and automatic closed-loop claims below are superseded by this correction. Pixel-derived reference conditioning and prompt routing still require real render acceptance; unit tests are not video-quality certification.
+- Added `test_drone_reference_pipeline.py` covering actual sampler source wiring, upload identity, background preservation, absent-source safety, route direction/bends, ambiguous-route handling and multilingual positive/negative isolation.
+
+### P1/P2 drone route authority correction
+
+- Replaced the example-biased drone plan with a deterministic P1/P2 contract: P1 remains the sole full-duration scene master, while P2 is locally analysed as non-visual red-path control data and never becomes an H3 or Z-Image Loader.
+- Added local red-stroke skeleton extraction and ordered camera-stage language. Open, S-shaped and point-to-point paths retain visible translation and are no longer converted into a default 360-degree orbit; an orbit is allowed only for a closed P2 path or an explicit user request.
+- Added seven time-scoped P1-derived route-stage references, normally P3-P9. Their prompts use only P1 BLIP/AI evidence and forbid example locations from replacing P1; Segment jobs retain P1 plus only the relevant stage reference.
+- Removed the fixed Kuala Lumpur/Petronas example from the fireworks Design Requirement and generalized both English/Chinese Skills and Clean Frame contracts to any P1 scene.
 
 ### Drone still-reference orbit-ring isolation
 

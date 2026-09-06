@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from comfy_submit_worker import _direct_urlopen, _request_json, wait_for_history
+from comfy_submit_worker import _direct_urlopen, _request_json, wait_for_history, upload_file
 from media_engine import remove_solid_background
 
 
@@ -225,12 +225,12 @@ def image_workflow(
         unet_nodes = nodes_of_type("UNETLoader")
         if unet_name and unet_nodes:
             unet_nodes[0][1]["inputs"]["unet_name"] = unet_name
-        return workflow
+        return condition_on_source_image(workflow, request, settings)
     positive += (
         " Professional commercial photography, coherent subject identity, realistic hands, "
         "cinematic natural lighting, production-ready reference frame."
     )
-    return {
+    workflow = {
         "1": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": settings["checkpoint"]},
@@ -275,6 +275,35 @@ def image_workflow(
             "inputs": {"images": ["6", 0], "filename_prefix": prefix},
         },
     }
+    return condition_on_source_image(workflow, request, settings)
+
+
+def condition_on_source_image(workflow: dict, request: dict, settings: dict) -> dict:
+    """Use real P1 pixels as the latent, never a caption-only substitute."""
+    if request.get("source_plate_mode") != "p1_img2img":
+        return workflow
+    uploaded = str(request.get("source_image_uploaded_name", "")).strip()
+    if not uploaded:
+        raise ValueError("P1 image conditioning requires a successful local-image upload")
+    samplers = [node for node in workflow.values() if node.get("class_type") == "KSampler"]
+    decoders = [node for node in workflow.values() if node.get("class_type") == "VAEDecode"]
+    if len(samplers) != 1 or len(decoders) != 1:
+        raise ValueError("P1 img2img requires one KSampler and one VAEDecode; cannot safely adapt this template")
+    vae = decoders[0]["inputs"]["vae"]
+    first = max((int(key) for key in workflow if str(key).isdigit()), default=0) + 1
+    loader, scale, encode = (str(first + offset) for offset in range(3))
+    workflow[loader] = {"class_type": "LoadImage", "inputs": {"image": uploaded}}
+    workflow[scale] = {"class_type": "ImageScale", "inputs": {
+        "image": [loader, 0], "upscale_method": "lanczos", "crop": "disabled",
+        "width": int(request["source_image_width"]), "height": int(request["source_image_height"]),
+    }}
+    workflow[encode] = {"class_type": "VAEEncode", "inputs": {
+        "pixels": [scale, 0], "vae": deepcopy(vae),
+    }}
+    strength = min(0.45, max(0.1, float(request.get("source_image_denoise", 0.25))))
+    samplers[0]["inputs"].update({"latent_image": [encode, 0], "denoise": strength,
+        "steps": max(int(settings["steps"]), math.ceil(int(settings["steps"]) / strength))})
+    return workflow
 
 
 def queue_workflow(server: str, workflow: dict, timeout: int) -> str:
@@ -340,6 +369,24 @@ def _generate_request(
             "background_removal": {},
             "immutable_source_plate_generation": plate_result,
         }
+    item = dict(item)
+    if source_plate_mode == "p1_img2img":
+        from PIL import Image, ImageOps
+        source = Path(str(item.get("source_plate_local_path", "")))
+        if not source.is_file():
+            raise FileNotFoundError("P1 is missing: refusing to replace image conditioning with text-to-image")
+        with Image.open(source) as opened:
+            size = ImageOps.exif_transpose(opened).size
+        ratio = min(int(settings["width"]) / size[0], int(settings["height"]) / size[1], 1.0)
+        item["source_image_width"] = max(16, round(size[0] * ratio / 16) * 16)
+        item["source_image_height"] = max(16, round(size[1] * ratio / 16) * 16)
+        upload = upload_file(server, source, int(job["http_timeout"]),
+                             upload_name="h3_p1_" + uuid.uuid4().hex + source.suffix.lower())
+        name = str(upload.get("name", "")).strip()
+        if not name:
+            raise RuntimeError("P1 upload returned no filename")
+        item["source_image_uploaded_name"] = "/".join(
+            part for part in (str(upload.get("subfolder", "")).strip("/"), name) if part)
     workflow = image_workflow(
         item,
         settings,
@@ -368,7 +415,9 @@ def _generate_request(
         raise RuntimeError("ComfyUI completed without an image output")
     download_image(server, image_output, destination, int(job["http_timeout"]))
     transparent_destination = destination.with_name(destination.stem + "_nobg.png")
-    background_removal = remove_solid_background(destination, transparent_destination)
+    # A sky/background is part of the scene master, not a removable backdrop.
+    background_removal = ({} if source_plate_mode == "p1_img2img" else
+                          remove_solid_background(destination, transparent_destination))
     effective_destination = transparent_destination if background_removal else destination
     sidecar = destination.with_suffix(destination.suffix + ".request.json")
     if sidecar.is_file():
@@ -378,10 +427,15 @@ def _generate_request(
             "seed": seed,
             "prompt_id": prompt_id,
             "checkpoint": settings["checkpoint"],
-            "width": int(settings["width"]),
-            "height": int(settings["height"]),
-            "steps": int(settings["steps"]),
+            "width": int(item.get("source_image_width", settings["width"])),
+            "height": int(item.get("source_image_height", settings["height"])),
+            "steps": next(node["inputs"]["steps"] for node in workflow.values()
+                          if node.get("class_type") == "KSampler"),
             "cfg": float(settings["cfg"]),
+            "source_plate_mode": source_plate_mode,
+            "source_plate_media_id": item.get("source_plate_media_id", ""),
+            "source_image_uploaded_name": item.get("source_image_uploaded_name", ""),
+            "source_image_denoise": item.get("source_image_denoise") if source_plate_mode == "p1_img2img" else None,
         }
         sidecar.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"

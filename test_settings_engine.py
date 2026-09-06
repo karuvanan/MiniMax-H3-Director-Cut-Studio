@@ -19,6 +19,7 @@ class SettingsEngineTests(unittest.TestCase):
             history_poll_interval=2.5,
             generation_timeout=900,
             http_request_timeout=45,
+            connection_recovery_timeout=2400,
             dialogue_tts_engine="voxcpm2_local",
             music_mode="timeline",
             blip_device="cuda",
@@ -34,6 +35,7 @@ class SettingsEngineTests(unittest.TestCase):
         self.assertEqual(restored.music_mode, "timeline")
         self.assertEqual(restored.blip_device, "cuda")
         self.assertEqual(restored.workspace_free_disk_reserve_gb, 75.0)
+        self.assertEqual(restored.connection_recovery_timeout, 2400)
         self.assertIn(
             "H3_DIALOGUE_TTS_ENGINE=voxcpm2_local",
             path.read_text(encoding="utf-8"),
@@ -42,6 +44,10 @@ class SettingsEngineTests(unittest.TestCase):
         self.assertIn("H3_BLIP_DEVICE=cuda", path.read_text(encoding="utf-8"))
         self.assertIn(
             "H3_WORKSPACE_FREE_DISK_RESERVE_GB=75.0",
+            path.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "H3_CONNECTION_RECOVERY_TIMEOUT=2400",
             path.read_text(encoding="utf-8"),
         )
         self.assertIn("UNRELATED=keep", path.read_text(encoding="utf-8"))
@@ -53,6 +59,11 @@ class SettingsEngineTests(unittest.TestCase):
         self.assertEqual(settings.megapixels, 0.1)
         self.assertEqual(settings.denoise, 1.0)
         self.assertEqual(settings.generation_timeout, 10)
+        self.assertEqual(
+            RenderSettings.from_mapping({"connection_recovery_timeout": 1})
+            .connection_recovery_timeout,
+            30,
+        )
 
     def test_unknown_tts_engine_returns_to_safe_default(self):
         settings = RenderSettings.from_mapping({"dialogue_tts_engine": "mystery"})

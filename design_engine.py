@@ -12,6 +12,8 @@ import subprocess
 import textwrap
 import wave
 
+from drone_route_engine import analyse_red_route, route_span_language
+
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
 ACTION_BUDGET_WINDOW_SECONDS = 5.0
@@ -1422,11 +1424,14 @@ _LEADING_OUTGOING_RE = re.compile(
 )
 
 _TIMED_TEXT_RANGE_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
     r"[\[【(（]?\s*"
     r"(?P<start>(?:\d{1,2}:){1,2}\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:s|秒)?\s*"
     r"(?:-|–|—|~|～|至|到)\s*"
-    r"(?P<end>(?:\d{1,2}:){1,2}\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:s|秒)?\s*"
-    r"[\]】)）]?",
+    r"(?P<end>(?:\d{1,2}:){1,2}\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)(?![\d:.])\s*(?:s|秒)?\s*"
+    r"[\]】)）]?"
+    r"(?!\s*(?:°|度|[- ]?degrees?(?![A-Za-z])|px(?![A-Za-z])|pixels?(?![A-Za-z])|"
+    r"%|％|fps(?![A-Za-z])|frames?(?![A-Za-z])|帧|幀|倍|圈|个|個))",
     flags=re.I,
 )
 _TIMED_TEXT_LABEL_RE = re.compile(
@@ -1452,6 +1457,59 @@ def _parse_design_timecode(value: str) -> float:
     return parts[-3] * 3600.0 + parts[-2] * 60.0 + parts[-1]
 
 
+def _is_authored_time_range(text: str, match: re.Match) -> bool:
+    """Reject geometry/count ranges that merely resemble Timeline ranges.
+
+    The shared range grammar intentionally accepts compact authoring such as
+    ``[0-5]``.  Camera angles (``0-360 degrees``), dimensions (``6-10 px``),
+    percentages and frame/count ranges must never become video duration or
+    speech timing authority.
+    """
+
+    raw = match.group(0)
+    tail = text[match.end():match.end() + 24]
+    # The closing bracket in the grammar is optional. Regex backtracking must
+    # not let ``[0-360] degrees`` escape the suffix exclusion by stopping just
+    # before ``]``.
+    tail = re.sub(r"^[\]】)）]\s*", "", tail.lstrip()).lstrip()
+    if re.match(
+        r"^(?:°|度|[- ]?degrees?(?![A-Za-z])|px(?![A-Za-z])|"
+        r"pixels?(?![A-Za-z])|%|％|fps(?![A-Za-z])|frames?(?![A-Za-z])|"
+        r"帧|幀|倍|圈|个|個)",
+        tail,
+        flags=re.I,
+    ):
+        return False
+    start = str(match.group("start") or "")
+    end = str(match.group("end") or "")
+    if ":" in start or ":" in end:
+        return True
+    if re.search(r"(?:秒(?:钟|鐘)?|(?<![A-Za-z])s\b)", raw, flags=re.I):
+        return True
+    stripped = raw.strip()
+    if (
+        stripped
+        and stripped[0] in "[【(（"
+        and stripped[-1] in "]】)）"
+    ):
+        return True
+    before = text[max(0, match.start() - 18):match.start()]
+    after = text[match.end():match.end() + 18]
+    return bool(re.search(
+        r"(?:时间|時間|时段|時段|时间轴|時間軸|镜头|鏡頭|画面|畫面|对白|對白|"
+        r"旁白|字幕|shot|scene|dialogue|timeline|timecode)",
+        before + " " + after,
+        flags=re.I,
+    ))
+
+
+def _authored_time_range_matches(text: str) -> list[re.Match]:
+    return [
+        match for match in _TIMED_TEXT_RANGE_RE.finditer(text)
+        if _is_authored_time_range(text, match)
+    ]
+
+
 _EXPLICIT_VIDEO_DURATION_PATTERNS = (
     re.compile(
         r"(?:时长|時長|片长|片長|总长|總長|总时长|總時長|"
@@ -1471,14 +1529,19 @@ _EXPLICIT_VIDEO_DURATION_PATTERNS = (
 
 
 def infer_explicit_design_duration(requirement: str) -> float | None:
-    """Return an explicit user duration, preferring the latest authored timecode.
+    """Return the explicit target duration using confidence-ranked evidence.
 
     Workspace Timeline duration is deliberately excluded: it is editing context, not
-    authority to shorten a newly requested Design.
+    authority to shorten a newly requested Design. A direct duration declaration
+    outranks illustrative Segment ranges and all later Timeline cues.
     """
     text = str(requirement or "")
-    candidates: list[float] = []
+    # Patterns are ordered from an authored request/label to a weaker
+    # ``12-second video`` construction. Stop at the first pattern family that
+    # produced evidence: documentation later in a Skill may legitimately say
+    # ``35 seconds uses P3-P9`` and must not replace the requested 12 seconds.
     for pattern in _EXPLICIT_VIDEO_DURATION_PATTERNS:
+        candidates: list[float] = []
         for match in pattern.finditer(text):
             value = float(match.group("value"))
             unit = match.group("unit").lower()
@@ -1486,7 +1549,12 @@ def infer_explicit_design_duration(requirement: str) -> float | None:
                 value *= 60.0
             if value > 0.0:
                 candidates.append(value)
-    for match in _TIMED_TEXT_RANGE_RE.finditer(text):
+        if candidates:
+            duration = min(MAX_DESIGN_DURATION_SECONDS, candidates[0])
+            return round(round(duration * 2.0) / 2.0, 6)
+
+    candidates = []
+    for match in _authored_time_range_matches(text):
         end = _parse_design_timecode(match.group("end"))
         if end > 0.0:
             candidates.append(end)
@@ -1554,7 +1622,8 @@ def extract_explicit_timed_text_layers(
         line = raw_line.strip()
         if not line:
             continue
-        range_match = _TIMED_TEXT_RANGE_RE.search(line)
+        range_matches = _authored_time_range_matches(line)
+        range_match = range_matches[0] if range_matches else None
         if range_match:
             start = _parse_design_timecode(range_match.group("start"))
             end = _parse_design_timecode(range_match.group("end"))
@@ -1564,7 +1633,13 @@ def extract_explicit_timed_text_layers(
                     end = min(max(start, end), float(duration_seconds))
                 active_range = (start, end) if end > start else None
                 active_context = [line]
-        label_line = _TIMED_TEXT_RANGE_RE.sub("", line).strip(" -–—[]【】()（）")
+        label_line = line
+        for timed_match in reversed(range_matches):
+            label_line = (
+                label_line[:timed_match.start()]
+                + label_line[timed_match.end():]
+            )
+        label_line = label_line.strip(" -–—[]【】()（）")
         label_match = _TIMED_TEXT_LABEL_RE.match(label_line)
         if not label_match:
             if active_range:
@@ -1576,7 +1651,7 @@ def extract_explicit_timed_text_layers(
         content = _strip_authored_text_quotes(label_match.group("content"))
         if not content and line_number + 1 < len(lines):
             candidate = _strip_authored_text_quotes(lines[line_number + 1])
-            if candidate and not _TIMED_TEXT_RANGE_RE.search(candidate):
+            if candidate and not _authored_time_range_matches(candidate):
                 content = candidate
         if not content or content.lower() in {"如下", "as follows"}:
             continue
@@ -2997,18 +3072,19 @@ def _remove_control_artifact_priming(text: object) -> str:
 
 
 DRONE_STILL_CLEAN_FRAME_CONTRACT = (
-    "The drone flight path is implied only through camera motion and must never be visible "
-    "in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory "
-    "line, no HUD, no graphic overlay around the towers."
+    "Clean photographic scene with unobstructed architecture, natural sky and physically "
+    "plausible lighting. Preserve the source image's scene, colour palette and exposure."
 )
 DRONE_STILL_NEGATIVE_PROMPT = (
     "visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, "
-    "trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings"
+    "trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings, "
+    "duplicated landmark, duplicate building, cloned architecture, repeated primary subject, "
+    "second copy of the same landmark"
 )
 DRONE_FIREWORKS_STILL_CONTRACT = (
     "Fireworks are separate radial particle bursts located behind and above the skyline, with "
-    "individual sparks, natural smoke and physically plausible reflections; they never form a "
-    "continuous ring, ribbon, ellipse or flight path around any building."
+    "individual sparks, natural smoke and physically plausible reflections. Keep architectural "
+    "silhouettes clearly readable."
 )
 DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT = (
     "continuous firework ring around buildings, fireworks forming a flight path, fireworks "
@@ -3023,13 +3099,87 @@ _DRONE_STILL_MOTION_PRIMING_RE = re.compile(
     r"orbit(?:al|ing)?|yaw(?:ing)?|waypoints?|"
     r"flight\s+path|camera\s+path|trajectory|route[- ]following|route\s+path|"
     r"(?:circle|circular)\s+(?:path|route|motion|track|arc|loop|ring)|"
-    r"light\s+(?:trail|ribbon)|glowing\s+ellipse|energy\s+ring|neon\s+loop)",
+    r"light\s+(?:trail|ribbon)|glowing\s+ellipse|energy\s+ring|neon\s+loop|"
+    r"环绕|環繞|轨迹|軌跡|路线|路線|圆环|圓環|光带|光帶|航点|航點|HUD)",
     flags=re.I,
 )
 
 
 def is_drone_special_skill(value: object) -> bool:
     return str(value or "").strip().casefold() in DRONE_SPECIAL_SKILL_KEYS
+
+
+def validate_drone_image_request_budget(
+    plan: dict,
+    special_skill_key: str,
+) -> None:
+    """Stop a malformed drone Plan before it can launch mass Z-Image work.
+
+    The Virtual Media Pool is intentionally unlimited, but one route-controlled
+    drone Design owns exactly one P1-derived still per five-second interval.
+    This execution-side invariant is independent of LM output and protects the
+    machine even if duration parsing or a future model response regresses.
+    """
+
+    if not is_drone_special_skill(special_skill_key):
+        return
+    duration = max(
+        0.5,
+        min(
+            MAX_DESIGN_DURATION_SECONDS,
+            float(plan.get("duration_seconds", 0.0) or 0.0),
+        ),
+    )
+    expected_count = max(1, int(math.ceil(duration / 5.0)))
+    uses = [
+        row for row in plan.get("existing_media_uses") or []
+        if isinstance(row, dict)
+    ]
+    use_ids = {
+        str(row.get("media_id", "")).strip().upper(): str(
+            row.get("usage", "")
+        ).strip().lower()
+        for row in uses
+    }
+    missing = [media_id for media_id in ("P1", "P2") if media_id not in use_ids]
+    if missing:
+        raise ValueError(
+            "Drone reference generation requires loaded "
+            + " and ".join("@" + media_id for media_id in missing)
+            + "; no Z-Image requests were started."
+        )
+    if use_ids.get("P1") != "h3_reference" or use_ids.get("P2") != "analysis_only":
+        raise ValueError(
+            "Drone reference mapping is invalid: @P1 must be h3_reference and "
+            "@P2 must be analysis_only; no Z-Image requests were started."
+        )
+    images = [
+        row for row in plan.get("media_requests") or []
+        if isinstance(row, dict) and str(row.get("media_type", "")).lower() == "image"
+    ]
+    valid_chain = bool(
+        len(images) == expected_count
+        and all(str(row.get("derived_from_media_id", "")).upper() == "P1" for row in images)
+        and len({str(row.get("requirement_id", "")) for row in images}) == len(images)
+    )
+    expected_ranges = [
+        (float(index * 5), min(duration, float((index + 1) * 5)))
+        for index in range(expected_count)
+    ]
+    actual_ranges = [
+        (
+            float(row.get("start_seconds", 0.0) or 0.0),
+            float(row.get("end_seconds", 0.0) or 0.0),
+        )
+        for row in images
+    ]
+    if not valid_chain or actual_ranges != expected_ranges:
+        raise ValueError(
+            "Drone image-generation budget rejected a malformed Plan: "
+            f"{duration:.2f}s permits exactly {expected_count} P1-derived Picture "
+            f"request(s), but the Plan supplied {len(images)}. No Z-Image requests "
+            "were started."
+        )
 
 
 def bind_design_source_plate_paths(
@@ -3079,7 +3229,7 @@ def sanitize_drone_still_image_request(
     original = " ".join(str(result.get("prompt", "") or "").split())
     sentences = [
         part.strip()
-        for part in re.split(r"(?<=[.!?。！？])\s+", original)
+        for part in re.split(r"(?<=[.!?])\s+|(?<=[。！？；;])\s*", original)
         if part.strip()
     ]
     kept = [part for part in sentences if not _DRONE_STILL_MOTION_PRIMING_RE.search(part)]
@@ -3292,19 +3442,15 @@ def enforce_drone_scene_keyframe_chain(
     existing_media: list[dict] | None,
     selected_media_ids: list[str] | None = None,
     special_skill_key: str = "drone-fly-on-city",
+    authored_requirement: str = "",
 ) -> dict:
-    """Build an isolated user-anchor chain plus one generated terminal frame.
+    """Enforce P1 visual truth, P2 motion truth and a P1-derived stage chain.
 
-    MiniMax sees every Picture supplied to one native request, even when the
-    Pictures occupy different Shot ranges. For the drone route Skill, multiple
-    user-authored scene Pictures must therefore own disjoint Timeline ranges;
-    the renderer can split those ranges into separate native requests and use
-    its visual-only 24-frame continuity handoff between them.
-
-    P2 remains analysis-only. Existing Design-generated Pictures are not
-    promoted into new user anchors. The one terminal request intentionally has
-    no preferred_media_id, so normal Virtual Media Pool allocation gives it
-    the next truly empty Picture number (P4 after P1/P2/P3, P6 after P1-P5).
+    P1 remains present in every Segment.  P2 is analysed locally and never
+    becomes a Loader.  P3 is the opening P1-derived scene anchor; P4 onward are
+    five-second P1-derived scene-state references.  Camera motion is compiled
+    separately for H3 as three ordered phases: near-ground launch, one complete
+    P1-subject orbit, then verified P2 route travel or a safe FPV fallback.
     """
 
     result = plan
@@ -3313,251 +3459,372 @@ def enforce_drone_scene_keyframe_chain(
         return result
     inventory = {
         str(row.get("media_id", "")).strip().upper(): row
-        for row in existing_media or []
-        if isinstance(row, dict)
+        for row in existing_media or [] if isinstance(row, dict)
     }
-
-    def ordinal(row: dict) -> int:
-        match = re.fullmatch(r"P(\d+)", str(row.get("media_id", "")).upper())
-        return int(match.group(1)) if match else 10**9
-
-    def is_generated(media_id: str) -> bool:
-        row = inventory.get(media_id, {})
-        evidence = " ".join(
-            str(row.get(key, ""))
-            for key in ("filename", "raw_analysis_summary", "analysis_summary", "clip_prompt")
-        ).casefold()
-        return bool(
-            "ai design generated reference" in evidence
-            or "auto terminal keyframe" in evidence
-            or "generated_references" in evidence
-            or "regenerated_references" in evidence
-        )
-
-    uses = [row for row in result.get("existing_media_uses") or [] if isinstance(row, dict)]
-    selected_ids = {
-        _normalized_media_id(value) for value in selected_media_ids or []
-        if _normalized_media_id(value)
-    }
-    if selected_media_ids is not None:
-        declared_ids = {
-            str(row.get("media_id", "")).strip().upper() for row in uses
-        }
-        if "P2" in selected_ids and "P2" not in declared_ids and "P2" in inventory:
-            uses.append({
-                "requirement_id": "route_control_p2",
-                "media_id": "P2",
-                "media_type": "image",
-                "usage": "analysis_only",
-                "reuse_policy": "whole_design",
-                "start_seconds": 0.0,
-                "end_seconds": duration,
-                "track": "V2",
-                "subject_keywords": ["off-screen route geometry"],
-                "instruction": "Use @P2 only to derive abstract camera motion; never render or upload it.",
-            })
-            declared_ids.add("P2")
-        for media_id in sorted(selected_ids, key=lambda value: int(value[1:]) if value[1:].isdigit() else 10**9):
-            if not media_id.startswith("P") or media_id == "P2" or media_id in declared_ids:
-                continue
-            row = inventory.get(media_id)
-            if not row or not bool(row.get("loaded", False)) or is_generated(media_id):
-                continue
-            evidence = str(
-                row.get("semantic_enrichment")
-                or row.get("caption")
-                or row.get("analysis_summary")
-                or row.get("raw_analysis_summary")
-                or row.get("filename")
-                or "the supplied city scene"
-            ).strip()
-            uses.append({
-                "requirement_id": f"authored_scene_{media_id.lower()}",
-                "media_id": media_id,
-                "media_type": "image",
-                "usage": "h3_reference",
-                "reuse_policy": "time_scoped",
-                "start_seconds": 0.0,
-                "end_seconds": duration,
-                "track": "V1",
-                "subject_keywords": ["user-authored scene keyframe", media_id],
-                "instruction": (
-                    f"Use @{media_id} as an authoritative user-authored scene keyframe. "
-                    f"Preserve its real environment: {evidence[:900]}"
-                ),
-            })
-            declared_ids.add(media_id)
-    result["existing_media_uses"] = uses
-
-    image_uses = [
-        row for row in result.get("existing_media_uses") or []
-        if isinstance(row, dict)
-        and row.get("media_type") == "image"
-        and not is_analysis_only_media_use(row)
-    ]
-    authored_anchors: list[dict] = []
-    anchor_ids_seen: set[str] = set()
-    for row in sorted(image_uses, key=ordinal):
-        media_id = str(row.get("media_id", "")).upper()
-        if media_id in anchor_ids_seen:
-            continue
-        if media_id != "P1" and is_generated(media_id):
-            continue
-        authored_anchors.append(row)
-        anchor_ids_seen.add(media_id)
-    # The terminal frame is now an immutable P1 scene plate for both drone
-    # Skills, even when P1 is the only visual anchor.  The route Picture P2 is
-    # analysis-only and therefore never joins this visual chain.
-    p1_anchor = next(
-        (
-            row for row in authored_anchors
-            if str(row.get("media_id", "")).strip().upper() == "P1"
-        ),
-        None,
-    )
-    if p1_anchor is None:
-        return result
-    if duration + 1e-6 < (len(authored_anchors) + 1) * 0.5:
-        result.setdefault("design_warnings", []).append(
-            "Drone keyframe chain needs at least 0.5s for every user scene and its terminal frame; "
-            "the current duration is too short, so automatic terminal generation was skipped."
-        )
-        return result
-
-    terminal_window = min(4.0, max(1.0, duration * 0.25))
-    authored_duration = max(0.5 * len(authored_anchors), duration - terminal_window)
-    authored_duration = min(duration - 0.5, authored_duration)
-    boundaries = [0.0]
-    for index in range(1, len(authored_anchors) + 1):
-        boundary = snap_half_second(
-            authored_duration * index / len(authored_anchors), duration
-        )
-        boundary = max(boundaries[-1] + 0.5, boundary)
-        boundaries.append(min(duration - 0.5, boundary))
-    boundaries.append(duration)
-
-    authored_ids = {
-        str(row.get("media_id", "")).upper() for row in authored_anchors
-    }
-    authored_row_objects = {id(row) for row in authored_anchors}
-    retained_uses: list[dict] = []
-    for row in result.get("existing_media_uses") or []:
-        if not isinstance(row, dict):
-            continue
-        media_id = str(row.get("media_id", "")).upper()
-        if row.get("media_type") == "image" and not is_analysis_only_media_use(row):
-            if media_id not in authored_ids or id(row) not in authored_row_objects:
-                continue
-        retained_uses.append(row)
-    result["existing_media_uses"] = retained_uses
-
-    for index, anchor in enumerate(authored_anchors):
-        start = boundaries[index]
-        end = boundaries[index + 1]
-        media_id = str(anchor.get("media_id", "")).upper()
-        anchor["reuse_policy"] = "time_scoped"
-        anchor["start_seconds"] = start
-        anchor["end_seconds"] = end
-        anchor["track"] = "V1"
-        anchor.pop("identity_anchor", None)
-        marker = (
-            f"SCENE KEYFRAME CHAIN ANCHOR {index + 1}/{len(authored_anchors)}. "
-            f"User-authored {media_id} owns only {start:.2f}-{end:.2f}s; reconstruct it as the "
-            "authoritative real scene for this interval and do not let later scene anchors alter "
-            "any earlier frame."
-        )
-        instruction = str(anchor.get("instruction", "")).strip()
-        if "SCENE KEYFRAME CHAIN ANCHOR" in instruction:
-            instruction = instruction.split("SCENE KEYFRAME CHAIN ANCHOR", 1)[0].rstrip(" .")
-        anchor["instruction"] = (
-            instruction.rstrip(" .") + (". " if instruction else "") + marker
-        )
-
-    last_anchor = authored_anchors[-1]
-    last_id = str(last_anchor.get("media_id", "")).upper()
-    last_inventory = inventory.get(last_id, {})
-    evidence = str(
-        last_inventory.get("semantic_enrichment")
-        or last_inventory.get("caption")
-        or last_inventory.get("analysis_summary")
-        or last_anchor.get("instruction")
-        or result.get("creative_brief", "")
-    )
-    evidence = _remove_control_artifact_priming(
-        _replace_analysis_only_media_mentions(evidence, ["P2"])
-    )[:1800].strip()
     p1_inventory = inventory.get("P1", {})
+    p2_inventory = inventory.get("P2", {})
+    uses = [row for row in result.get("existing_media_uses") or [] if isinstance(row, dict)]
+
+    def find_use(media_id: str) -> dict | None:
+        return next(
+            (row for row in uses if str(row.get("media_id", "")).strip().upper() == media_id),
+            None,
+        )
+
+    p1_use = find_use("P1")
+    if p1_use is None and bool(p1_inventory.get("loaded", False)):
+        p1_use = {
+            "requirement_id": "scene_master_p1",
+            "media_id": "P1", "media_type": "image", "usage": "h3_reference",
+            "reuse_policy": "whole_design", "start_seconds": 0.0,
+            "end_seconds": duration, "track": "V1", "subject_keywords": [],
+            "instruction": "Use @P1 as the sole visual scene master for the full video.",
+        }
+        uses.append(p1_use)
+    p2_use = find_use("P2")
+    if p2_use is None and bool(p2_inventory.get("loaded", False)):
+        p2_use = {
+            "requirement_id": "route_control_p2",
+            "media_id": "P2", "media_type": "image", "usage": "analysis_only",
+            "reuse_policy": "whole_design", "start_seconds": 0.0,
+            "end_seconds": duration, "track": "V2",
+            "subject_keywords": ["off-screen camera-path control"],
+            "instruction": "Use @P2 only to derive abstract camera motion; never render or upload it.",
+        }
+        uses.append(p2_use)
+    if p1_use is None:
+        return result
+
+    # Only P1 and P2 from the user's pool participate directly.  Later Pictures
+    # are derived references created below, never competing visual scene masters.
+    result["existing_media_uses"] = [
+        row for row in uses
+        if str(row.get("media_id", "")).strip().upper() in {"P1", "P2"}
+        or row.get("media_type") != "image"
+    ]
+    p1_use.update({
+        "media_type": "image", "usage": "h3_reference",
+        "reuse_policy": "whole_design", "start_seconds": 0.0,
+        "end_seconds": duration, "track": "V1",
+    })
+    p1_use.pop("identity_anchor", None)
     p1_evidence = str(
         p1_inventory.get("semantic_enrichment")
         or p1_inventory.get("caption")
         or p1_inventory.get("analysis_summary")
         or p1_inventory.get("raw_analysis_summary")
-        or p1_anchor.get("instruction")
+        or p1_use.get("instruction")
         or result.get("creative_brief", "")
-    )
+    ).strip()
     p1_evidence = _remove_control_artifact_priming(
         _replace_analysis_only_media_mentions(p1_evidence, ["P2"])
-    )[:1800].strip()
+    )[:2200].strip() or "the exact loaded P1 scene, architecture, weather, lighting and lens"
+    p1_use["instruction"] = (
+        "P1 SCENE MASTER LOCK. Begin the generated flight from a physically plausible near-ground "
+        "takeoff point within the P1-established world, preserving the primary subject and all "
+        "visible scene evidence. Keep P1 as the sole visual truth in every Segment: preserve "
+        "its actual place, architecture, object count, geometry, road layout, weather, time, "
+        "lighting, colour, exposure, atmosphere, horizon and lens character. Never substitute a "
+        "city, landmark or building named only in a Skill example. P1 evidence: " + p1_evidence
+    )
+    if p2_use is not None:
+        p2_use.update({
+            "media_type": "image", "usage": "analysis_only",
+            "reuse_policy": "whole_design", "start_seconds": 0.0,
+            "end_seconds": duration, "track": "V2",
+        })
+        p2_use["instruction"] = (
+            "P2 ROUTE CONTROL ONLY. Extract the red stroke's start, bends, direction and endpoint. "
+            "P2 supplies no pixels, place, landmark, colour, style, composition or scene content to "
+            "H3 or Z-Image and must never enter an upload or Loader."
+        )
+
+    route = analyse_red_route(str(p2_inventory.get("local_path", "")), waypoint_count=9)
+    result["_drone_route_analysis"] = route
+    moving_end = duration
+    route_verified = bool(route.get("direction_verified"))
+
+    # Both Drone Skills use one deterministic three-phase mission. The first
+    # two seconds establish a real near-ground launch; the middle phase owns the
+    # complete landmark orbit; only after that orbit is complete does P2 own the
+    # remaining travel to its endpoint. This avoids the previous contradictory
+    # instruction to orbit and follow a route at the same time.
+    takeoff_end = min(
+        moving_end,
+        max(0.5, min(2.0, round(moving_end * 0.2 * 2.0) / 2.0)),
+    )
+    # A full physical lap needs materially more screen time than an optical
+    # spin. Reserve at least three seconds for the later route when possible,
+    # and give the orbit up to eight seconds. A 12-second mission therefore
+    # uses 0-2s launch, 2-9s orbit, 9-12s route instead of squeezing the lap
+    # into the former 3.5-second interval.
+    available_after_takeoff = max(0.5, moving_end - takeoff_end)
+    route_reserve = min(3.0, max(0.5, available_after_takeoff * 0.3))
+    orbit_duration = min(8.0, max(0.5, available_after_takeoff - route_reserve))
+    orbit_end = round((takeoff_end + orbit_duration) * 2.0) / 2.0
+    orbit_end = min(max(takeoff_end, moving_end - 0.5), orbit_end)
+    if orbit_end <= takeoff_end:
+        orbit_end = min(moving_end, takeoff_end + 0.5)
+    result["_drone_motion_schedule"] = {
+        "mode": "ground_launch_then_360_orbit_then_route",
+        "phase_completion_gate": "route_must_not_begin_before_full_orbit_completion",
+        "takeoff_start_seconds": 0.0,
+        "takeoff_end_seconds": takeoff_end,
+        "orbit_start_seconds": takeoff_end,
+        "orbit_end_seconds": orbit_end,
+        "route_start_seconds": orbit_end,
+        "route_end_seconds": moving_end,
+        "route_mode": "verified_p2" if route_verified else "fpv_scene_fallback",
+    }
+
+    fallback_beats = (
+        (0.00, 0.28, "accelerate at very low altitude and skim above the established ground plane"),
+        (0.28, 0.55, "bank hard left, pitch the nose up and enter one broad climbing arc"),
+        (0.55, 0.78, "pass a brief inverted crest, dive, then counter-roll hard right around visible obstacles"),
+        (0.78, 1.00, "complete one tight figure-eight crossover, level the airframe and sprint through a safe narrow opening or toward the distant horizon"),
+    )
+
+    def fallback_fpv_span(start_fraction: float, end_fraction: float) -> str:
+        clauses = [
+            text for beat_start, beat_end, text in fallback_beats
+            if beat_end > start_fraction and beat_start < end_fraction
+        ]
+        return "; then ".join(clauses) + "."
+
+    def phase_intersects(
+        start: float,
+        end: float,
+        phase_start: float,
+        phase_end: float,
+    ) -> bool:
+        return min(end, phase_end) - max(start, phase_start) > 1e-6
+
+    orbit_checkpoints = (
+        (0.0, "the front starting side"),
+        (90.0, "the subject's right side"),
+        (180.0, "the rear side"),
+        (270.0, "the subject's left side"),
+        (360.0, "back near the front starting side"),
+    )
+
+    def orbit_span_language(start_degrees: float, end_degrees: float) -> str:
+        """Describe an orbital translation as positions, never an optical spin."""
+
+        reached = [
+            label for degrees, label in orbit_checkpoints
+            if start_degrees < degrees <= end_degrees + 1e-6
+        ]
+        if not reached:
+            nearest = min(
+                orbit_checkpoints,
+                key=lambda row: abs(row[0] - end_degrees),
+            )[1]
+            reached = [f"toward {nearest}"]
+        return ", then ".join(reached)
+
+    shots = [row for row in result.get("shots") or [] if isinstance(row, dict)]
+    for index, shot in enumerate(shots):
+        shot_start = max(
+            0.0, min(moving_end, float(shot.get("start_seconds", 0.0)))
+        )
+        shot_end = max(
+            shot_start, min(moving_end, float(shot.get("end_seconds", 0.0)))
+        )
+        motion_parts: list[str] = []
+        if phase_intersects(shot_start, shot_end, 0.0, takeoff_end):
+            motion_parts.append(
+                "GROUND-LAUNCH PHASE: begin at a physically safe near-ground takeoff point inside "
+                "the P1-established scene, surge forward just above the ground with visible speed, "
+                "then pitch the nose up into clear air without changing the scene identity"
+            )
+        if phase_intersects(shot_start, shot_end, takeoff_end, orbit_end):
+            phase_start = max(shot_start, takeoff_end)
+            phase_end = min(shot_end, orbit_end)
+            orbit_duration = max(0.5, orbit_end - takeoff_end)
+            start_degrees = round(
+                360.0 * (phase_start - takeoff_end) / orbit_duration, 1
+            )
+            end_degrees = round(
+                360.0 * (phase_end - takeoff_end) / orbit_duration, 1
+            )
+            motion_parts.append(
+                "LANDMARK-ORBIT PHASE: the FPV drone physically flies part of one complete, smooth, "
+                "wide clockwise lap around P1's primary scene subject at a constant safe radius. "
+                f"Advance the lap from {start_degrees:g} to {end_degrees:g} degrees, physically "
+                f"translating past {orbit_span_language(start_degrees, end_degrees)}. Keep the rigidly "
+                "mounted FPV camera aligned with the drone nose and the instantaneous forward tangent "
+                "of the flight path; it must never independently yaw, pan or gimbal-lock toward the "
+                "primary subject. Let the subject naturally travel along the inside edge of the frame, "
+                "move behind the camera when geometry requires it, and reappear as the aircraft advances, "
+                "while surrounding buildings and the background change continuously through strong "
+                "natural parallax. Use only moderate coordinated banking and keep the horizon readable. "
+                "This is a real flight path around the subject, not an in-place camera rotation, "
+                "continuous look-at shot, panoramic yaw, barrel roll, optical spin or rotating background. "
+                "Do not invert or roll "
+                "the aircraft during this orbit. Complete the full front-to-right-to-rear-to-left-to-front "
+                "lap before entering the route phase. The route phase is locked and must not begin until "
+                "the aircraft has visibly returned near the orbit's front starting side"
+            )
+        if phase_intersects(shot_start, shot_end, orbit_end, moving_end):
+            phase_start = max(shot_start, orbit_end)
+            phase_end = min(shot_end, moving_end)
+            route_duration = max(0.5, moving_end - orbit_end)
+            route_start = max(
+                0.0, min(1.0, (phase_start - orbit_end) / route_duration)
+            )
+            route_end = max(
+                route_start, min(1.0, (phase_end - orbit_end) / route_duration)
+            )
+            if route_verified:
+                motion_parts.append(
+                    "ROUTE-EXIT PHASE: after completing the orbit, follow the verified authored "
+                    "path from its marked start through every ordered bend to its marked endpoint. "
+                    + route_span_language(route, route_start, route_end)
+                    + " Maintain visible forward displacement; the final generated camera position "
+                      "must reach the authored route endpoint."
+                )
+            else:
+                motion_parts.append(
+                    "FPV FALLBACK PHASE: route direction could not be verified, so do not invent "
+                    "route coordinates. Continue a collision-safe flight around P1's primary scene: "
+                    + fallback_fpv_span(route_start, route_end)
+                )
+        shot["camera_movement"] = (
+            "P1 scene-anchored three-phase first-person FPV camera motion. "
+            + "; then ".join(motion_parts)
+            + " Preserve one physically continuous flight with no cut, teleport, geometry warp or frame tear."
+        )
+        continuity = str(shot.get("continuity_state") or "")
+        continuity = re.sub(r"Carry P1 geometry.*?(?:\.|$)", "", continuity).strip()
+        shot["continuity_state"] = (
+            continuity.rstrip(" .") + (". " if continuity else "")
+            + "Carry P1 geometry, FPV roll angle, heading, altitude, velocity and inertia continuously into the next Shot."
+        )
+        direction = str(shot.get("additional_direction") or "")
+        direction = re.sub(r"P1 remains the visual source[; ]+.*?(?:\.|$)", "", direction).strip()
+        direction = re.sub(
+            r"Fully immersive first-person FPV.*?(?:frame tearing|mechanical god-view camera)\.?",
+            "",
+            direction,
+            flags=re.I,
+        ).strip()
+        shot["additional_direction"] = (
+            direction.rstrip(" .") + (". " if direction else "")
+            + "Fully immersive first-person FPV with a rigidly mounted action camera, mild GoPro-like "
+              "ultra-wide fisheye, speed-driven motion blur, forceful inertia and banking. During the "
+              "LANDMARK-ORBIT PHASE, allow moderate coordinated banking only: no inversion, barrel "
+              "roll, camera spin, independent gimbal pan, subject-centred look-at or yaw-only panorama. "
+              "The camera stays rigidly forward along the flight tangent. Aggressive dives and up to "
+              "180-degree rolls are "
+              "allowed only after the orbit is complete and the ROUTE-EXIT or FPV FALLBACK PHASE has "
+              "begun. Keep every permitted roll spatially continuous, architecture and trees "
+              "geometrically stable, and motion smooth without frame tearing; never use a slow, "
+              "mechanical god-view camera. P1 remains the visual source; follow the timed physical "
+              "camera directions."
+        )
+
     fireworks = str(special_skill_key).strip().casefold() == "drone-fly-on-city-fireworks"
-    effect_contract = (
-        "Add only several discrete gold, white and deep-red firework particle bursts in the sky "
-        "behind and above the landmark, thin laterally drifting firework smoke, and physically "
-        "plausible temporary warm reflections on the existing glass, rooftops, wet streets and "
-        "low clouds. No burst touches, covers or wraps around a building silhouette."
-        if fireworks
-        else
-        "Preserve every visual effect already present in P1 without inventing a new effect, object, "
-        "building, light source or atmosphere change."
-    )
-    terminal_start = boundaries[-2]
-    terminal_prompt = (
-        "AUTO TERMINAL KEYFRAME. IMMUTABLE P1 SCENE PLATE. The closing camera returns to the exact "
-        "P1 base composition. Preserve P1 pixel geometry as the non-regenerated plate: identical "
-        "camera position, altitude, focal length, framing, horizon height, landmark size and spacing, "
-        "skyline geometry, road layout, building placement, weather, base colour grade, exposure, "
-        "contrast and original city lights. Do not move, rotate, raise, reframe, redesign, duplicate, "
-        "distort, remove or replace any P1 scene element. "
-        + effect_contract
-        + " The final second is a perfectly static hold of this P1-based plate. Do not introduce a "
-          "person, face, figure, text, logo, watermark or rooftop character. P1 scene evidence: "
-        + p1_evidence
-        + " Outgoing motion context before the return to P1: "
-        + evidence
-    )
+    moving_end = duration
+    # P3 owns 0-5 seconds; P4 onward advances at exact five-second intervals.
+    # Do not cap the chain at P9: longer videos continue P10, P11, ... so no
+    # Segment tail is left without a current scene-state reference.
+    stage_count = max(1, int(math.ceil(moving_end / 5.0)))
+
     non_image_requests = [
         row for row in result.get("media_requests") or []
         if isinstance(row, dict) and row.get("media_type") != "image"
     ]
-    non_image_requests.append({
-        "requirement_id": f"auto_terminal_keyframe_after_{last_id.lower()}",
-        "media_type": "image",
-        "usage": "h3_reference",
-        "reuse_policy": "time_scoped",
-        "start_seconds": terminal_start,
-        "end_seconds": duration,
-        "track": "V1",
-        "subject_keywords": [
-            "automatic terminal keyframe",
-            "immutable P1 scene plate",
-            "exact P1 composition return",
-            "one-second static final hold",
-        ],
-        "prompt": terminal_prompt,
-        "source_plate_media_id": "P1",
-        "source_plate_mode": "immutable_effect_composite" if fireworks else "immutable_copy",
-        "source_plate_effect_profile": "fireworks" if fireworks else "preserve_existing",
-        "final_hold_seconds": 1.0,
-        "immutable_scene_plate": True,
-    })
+    generated_ids: list[str] = []
+    occupied_picture_ids = {
+        media_id for media_id, row in inventory.items()
+        if media_id.startswith("P") and bool(row.get("loaded", False))
+    }
+    next_picture_number = 3
+    while len(generated_ids) < stage_count:
+        candidate = f"P{next_picture_number}"
+        next_picture_number += 1
+        if candidate in occupied_picture_ids:
+            continue
+        generated_ids.append(candidate)
+        occupied_picture_ids.add(candidate)
+    boundaries = [min(moving_end, float(index * 5)) for index in range(stage_count)]
+    boundaries.append(moving_end)
+    for index in range(stage_count):
+        preferred = generated_ids[index]
+        firework_state = ""
+        if fireworks:
+            intensity = "sparse early" if index < stage_count // 3 else "layered mid-sequence" if index < stage_count * 2 // 3 else "strong late-sequence"
+            firework_state = (
+                f" Add {intensity} discrete gold, white and deep-red firework particles behind "
+                "and above the existing skyline, with thin smoke and physically plausible warm "
+                "reflections; never alter or cover architecture."
+            )
+        anchor_label = (
+            "GROUND-TAKEOFF P1 SCENE ANCHOR"
+            if index == 0 else "P1 FIVE-SECOND SCENE STATE"
+        )
+        request = {
+            "requirement_id": f"p1_derived_camera_stage_{index + 1:02d}",
+            "media_type": "image", "usage": "h3_reference",
+            "reuse_policy": "time_scoped", "start_seconds": boundaries[index],
+            "end_seconds": boundaries[index + 1], "track": "V2",
+            "subject_keywords": [
+                "P1-derived environment continuity", f"scene state {index + 1} of {stage_count}",
+                "same primary building and scene identity", "frozen aerial photograph",
+            ],
+            "prompt": (
+                f"SCENE KEYFRAME CHAIN ANCHOR. EXCLUSIVE P1-DERIVED SCENE-STATE REPLACEMENT. "
+                f"{anchor_label} {index + 1}/{stage_count}. Use the supplied P1 pixels as the visual "
+                "source. Preserve P1's primary subject building, landmark identity and count, "
+                "architecture, composition, surrounding scene, street and road geometry, sky, "
+                "weather, time of day, colour palette, colour temperature, lighting direction, "
+                "exposure, atmosphere and lens character. Do not substitute any city, landmark, "
+                "building, sky or weather from an example or template. Render exactly one instance "
+                "of P1's primary subject or landmark group. If P1 contains a paired landmark such as "
+                "two connected towers, preserve that original pair exactly once; never add a second "
+                "pair, duplicate building, cloned landmark or repeated copy elsewhere in the frame. "
+                "This Picture is a later state of the same single P1 scene instance, not an additional "
+                "object beside P1. This is one frozen photographic scene-state reference. "
+                + (
+                    "Frame a physically plausible near-ground FPV takeoff position inside the "
+                    "P1-established scene without inventing a new location. "
+                    if index == 0 else ""
+                )
+                +
+                "P1 BLIP/AI scene evidence: "
+                + p1_evidence + firework_state
+            ),
+            "derived_from_media_id": "P1", "route_control_media_id": "P2",
+            "source_plate_media_id": "P1", "source_plate_mode": "p1_img2img",
+            "source_image_denoise": 0.15 if index == 0 else 0.25,
+            "scene_anchor_role": "p3_ground_takeoff_anchor" if index == 0 else "five_second_scene_state",
+            "exclusive_scene_source_media_id": "P1",
+            "single_scene_instance": True,
+            "reference_interval_seconds": 5.0,
+            "route_stage_index": index + 1, "route_stage_count": stage_count,
+        }
+        request["preferred_media_id"] = preferred
+        non_image_requests.append(request)
+
+    # No automatic terminal image: H3 owns the generated ending.
     result["media_requests"] = non_image_requests
-    warning = (
-        "Drone scene keyframe chain: "
-        + " -> ".join(str(row.get("media_id", "")) for row in authored_anchors)
-        + " -> AUTO TERMINAL FROM IMMUTABLE P1 PLATE. User scene anchors were isolated into disjoint "
-        "native render ranges; the terminal frame will use the next empty Virtual Media Pool Picture "
-        "ID while preserving P1 geometry."
-    )
+
     warnings = result.setdefault("design_warnings", [])
+    route_status = (
+        f"P2 path and green-start/blue-end direction verified: {len(route.get('waypoints') or [])} ordered points; "
+        "ground launch and full 360-degree orbit run first, then the verified route reaches its endpoint"
+        if route_verified else
+        "ROUTE NEEDS REVIEW: " + str(route.get("reason") or route.get("direction_basis"))
+        + "; mandatory ground launch and 360-degree orbit retained, followed by collision-safe FPV scene fallback; no route endpoint invented"
+    )
+    warning = (
+        f"Drone P1/P2 chain: P1 stays loaded for every Segment; {route_status}; "
+        f"{generated_ids[0]} is the near-ground P1 takeoff anchor and "
+        f"{', '.join(generated_ids[1:]) or 'no later Pictures'} "
+        "advance at five-second intervals; all generated Pictures use actual P1 pixels through low-denoise img2img "
+        "(not pixel-exact/new-view reconstruction); no automatic tail image or output freeze is added. "
+        "The flight always uses ground launch, translated 360-degree P1 orbit, then verified P2 route or FPV fallback."
+    )
     if warning not in warnings:
         warnings.append(warning)
     return result
@@ -4079,7 +4346,7 @@ def normalize_design_plan(
         any(word in item["preset"].lower() for word in ("final", "ending", "hold"))
         for item in plan["markers"]
     )
-    if not has_final_hold:
+    if not has_final_hold and not is_drone_special_skill(special_skill_key):
         plan["markers"].append({
             "time_seconds": snap_half_second(max(0.0, duration - 1.0), duration),
             "preset": "Final Hold",
@@ -4429,6 +4696,7 @@ def normalize_design_plan(
             existing_media,
             selected_media_ids=selected_media_ids,
             special_skill_key=str(special_skill_key),
+            authored_requirement=authored_requirement,
         )
         plan["media_requests"] = [
             sanitize_drone_still_image_request(row, fireworks=fireworks)
@@ -4444,7 +4712,7 @@ def normalize_design_plan(
 
 def build_design_system_prompt(context: dict) -> str:
     # Local source paths are execution-only data used after planning (for
-    # immutable P1 plate copies/composites).  Never expose workstation paths
+    # P1 image-conditioned reference generation). Never expose workstation paths
     # to either a local or remote Design model.
     prompt_context = deepcopy(context)
     for media in prompt_context.get("existing_media") or []:
@@ -4654,7 +4922,9 @@ def build_design_system_prompt(context: dict) -> str:
         "reflections for covered semi-outdoor spaces, and almost no reverb with reduced low-mid fullness for open exteriors. Never carry "
         "a previous room's tail across a location change. Keep "
         "dialogue in the foreground, duck ambience beneath speech without muting it, and never replace or echo authored dialogue. "
-        "Always include a Final Hold marker before the final frame; cue timestamps must be earlier than duration_seconds. "
+        "For drone-fly-on-city and drone-fly-on-city-fireworks, keep a natural generated ending: do not add an automatic "
+        "Final Hold, terminal picture, P1 return or fixed last-second freeze. For other Skills include a Final Hold marker "
+        "before the final frame; cue timestamps must be earlier than duration_seconds. "
         "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
         "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. The Final Hold must resolve "
         "the last Shot's outgoing physical state rather than introduce a new action. "

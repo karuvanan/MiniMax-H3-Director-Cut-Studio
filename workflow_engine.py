@@ -20,6 +20,7 @@ MEDIA_LOADERS = {
 
 _SUPPORT_IDENTITY_MARKER = "supporting environment or action-state reference only"
 _APPENDED_ANCHOR_MARKER = "the authoritative recurring face identity is the user-supplied"
+_EXCLUSIVE_P1_SCENE_STATE_MARKER = "exclusive p1-derived scene-state replacement"
 _IDENTITY_DEPENDENCY_RE = re.compile(
     r"(?:face|facial|identity|same\s+(?:person|character)|look\s+exactly|consistent|match(?:es|ing)?)",
     re.I,
@@ -153,7 +154,12 @@ class WorkflowScan:
 
     def timeline_assets(self) -> list[MediaAsset]:
         """Return legacy first uses plus independent repeated clip instances."""
-        return [*self.assets, *self.timeline_clips]
+        # Retired auto-generated P1 end plates remain in the pool/project, but
+        # must not become visual references when an older project is rendered.
+        return [asset for asset in [*self.assets, *self.timeline_clips]
+                if not (asset.media_type == "image"
+                        and "AUTO TERMINAL KEYFRAME" in str(asset.clip_prompt or "")
+                        and "IMMUTABLE P1 SCENE PLATE" in str(asset.clip_prompt or ""))]
 
 
 def load_workflow(path: str | Path) -> WorkflowScan:
@@ -612,6 +618,23 @@ def compile_active_workflow(
         asset for asset in scan.active_assets(clip_start, clip_end)
         if not _conflicting_generated_identity_support(asset)
     ]
+    # Drone scene-chain Pictures are low-denoise descendants of P1. Loading
+    # P1 together with the current descendant makes Ref2VA treat two views of
+    # the same landmark as two separate landmark instances. When a current
+    # interval owns an explicit P1-derived replacement, keep only that one
+    # scene plate in the executable request. P1 remains the lineage/source in
+    # the Project and Design data; it is not duplicated as a second H3 image.
+    exclusive_p1_scene_states = [
+        asset for asset in active_source_assets
+        if asset.media_type == "image"
+        and _EXCLUSIVE_P1_SCENE_STATE_MARKER in str(asset.clip_prompt or "").casefold()
+    ]
+    if exclusive_p1_scene_states:
+        active_source_assets = [
+            asset for asset in active_source_assets
+            if stable_reference_id(asset).upper() != "P1"
+            or asset in exclusive_p1_scene_states
+        ]
     # Preserve the editor objects in the return value for Timeline selection,
     # Undo/Redo and repeated-use compatibility. Request allocation metadata is
     # transient and excluded from equality/serialization semantics.

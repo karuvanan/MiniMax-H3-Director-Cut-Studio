@@ -7,6 +7,7 @@ import wave
 
 from design_cleanup_service import cleanup, lm_origin, unload_lm_studio
 from design_ai_service import handle as handle_design_ai_job, select_available_model
+from drone_route_engine import analyse_red_route
 from design_engine import (
     DESIGN_JSON_SCHEMA,
     DRONE_FIREWORKS_STILL_CONTRACT,
@@ -44,6 +45,7 @@ from design_engine import (
     spatial_acoustics_schedule,
     stabilize_generated_identity_references,
     validate_explicit_timed_text_contract,
+    validate_drone_image_request_budget,
     validate_requested_speech_layer_contract,
 )
 from design_media_service import (
@@ -626,6 +628,112 @@ class DesignEngineTests(unittest.TestCase):
             [(0.0, 7.0), (7.0, 15.0), (15.0, 23.0), (23.0, 30.0)],
         )
 
+    def test_duration_parser_rejects_camera_geometry_and_dimension_ranges(self):
+        self.assertIsNone(
+            infer_explicit_design_duration(
+                "镜头从0–360度完成环绕，[0–360]度也表示角度，路线宽6–10px，"
+                "[6–10] px仍是线宽，参考图为1920–1080。"
+            )
+        )
+        self.assertEqual(infer_explicit_design_duration("[0-5] 画面"), 5.0)
+        self.assertEqual(infer_explicit_design_duration("[00:00-00:07] 画面"), 7.0)
+        self.assertEqual(infer_explicit_design_duration("0-5秒 画面"), 5.0)
+        self.assertEqual(
+            extract_explicit_timed_text_layers(
+                "0–360度运镜进度\n普通话对白：「这不是一个时间范围。」"
+            ),
+            [],
+        )
+
+    def test_drone_skill_templates_keep_declared_duration_above_examples(self):
+        expectations = {
+            "drone-fly-on-city": (12.0, ["P3", "P4", "P5"]),
+            "drone-fly-on-city-fireworks": (15.0, ["P3", "P4", "P5"]),
+        }
+        inventory = [
+            {
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "filename": "p1.png", "analysis_summary": "user-authored city scene",
+            },
+            {
+                "media_id": "P2", "media_type": "image", "loaded": True,
+                "filename": "p2.png",
+            },
+        ]
+        for skill_key, (expected_duration, expected_ids) in expectations.items():
+            with self.subTest(skill=skill_key):
+                requirement = (
+                    PROJECT_ROOT / "skill special" / skill_key / "DESIGN_REQUIREMENT.txt"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(
+                    infer_explicit_design_duration(requirement), expected_duration
+                )
+                payload = sample_design()
+                payload["duration_seconds"] = 360.0
+                payload["shots"] = [{
+                    **payload["shots"][0],
+                    "start_seconds": 0.0,
+                    "end_seconds": 360.0,
+                }]
+                payload["media_requests"] = []
+                payload["existing_media_uses"] = []
+                plan = normalize_design_plan(
+                    payload,
+                    {"image": 10000, "video": 10000, "audio": 10000},
+                    existing_media=inventory,
+                    repair_media_plan=True,
+                    authored_requirement=requirement,
+                    special_skill_key=skill_key,
+                    selected_media_ids=["P1", "P2"],
+                )
+                images = [
+                    row for row in plan["media_requests"]
+                    if row["media_type"] == "image"
+                ]
+                self.assertEqual(plan["duration_seconds"], expected_duration)
+                self.assertEqual(
+                    [row["preferred_media_id"] for row in images], expected_ids
+                )
+                self.assertEqual(len(images), 3)
+                self.assertEqual(images[-1]["end_seconds"], expected_duration)
+                validate_drone_image_request_budget(plan, skill_key)
+
+    def test_drone_generation_guard_blocks_mass_or_unmapped_image_requests(self):
+        valid = {
+            "duration_seconds": 12.0,
+            "existing_media_uses": [
+                {"media_id": "P1", "usage": "h3_reference"},
+                {"media_id": "P2", "usage": "analysis_only"},
+            ],
+            "media_requests": [
+                {
+                    "requirement_id": f"p1_derived_camera_stage_{index + 1:02d}",
+                    "media_type": "image",
+                    "derived_from_media_id": "P1",
+                    "start_seconds": float(index * 5),
+                    "end_seconds": min(12.0, float((index + 1) * 5)),
+                }
+                for index in range(3)
+            ],
+        }
+        validate_drone_image_request_budget(valid, "drone-fly-on-city")
+
+        mass_plan = json.loads(json.dumps(valid))
+        mass_plan["media_requests"] *= 24
+        with self.assertRaisesRegex(ValueError, "permits exactly 3"):
+            validate_drone_image_request_budget(
+                mass_plan, "drone-fly-on-city-fireworks"
+            )
+
+        missing_route = json.loads(json.dumps(valid))
+        missing_route["existing_media_uses"] = [
+            {"media_id": "P1", "usage": "h3_reference"}
+        ]
+        with self.assertRaisesRegex(ValueError, "requires loaded @P2"):
+            validate_drone_image_request_budget(
+                missing_route, "drone-fly-on-city"
+            )
+
     def test_duration_contract_is_injected_into_design_system_prompt(self):
         prompt = build_design_system_prompt({
             "requested_duration_seconds": 30.0,
@@ -1177,6 +1285,43 @@ On-screen text: "EXACT TITLE"'''
             ),
         )
 
+    def test_cleanup_unload_all_releases_every_reported_lm_instance(self):
+        calls = []
+
+        def fake_request(url, timeout, payload=None):
+            calls.append((url, payload))
+            if url.endswith("/api/v1/models"):
+                return {
+                    "models": [
+                        {
+                            "key": "first/model.gguf",
+                            "loaded_instances": [{"id": "first:model:1"}],
+                        },
+                        {
+                            "key": "second/model.gguf",
+                            "loaded_instances": ["second:model:2"],
+                        },
+                        {"key": "idle/model.gguf", "loaded_instances": []},
+                    ]
+                }
+            return {}
+
+        with patch("design_cleanup_service.request", side_effect=fake_request):
+            result = cleanup({
+                "operation": "manual_unload_all",
+                "unload_all_lm_models": True,
+                "provider": "lm_studio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "comfyui_server": "",
+                "timeout": 10,
+            })
+        self.assertEqual(result["operation"], "manual_unload_all")
+        self.assertEqual(result["lm_unloaded"], ["first:model:1", "second:model:2"])
+        self.assertEqual(
+            [payload for url, payload in calls if url.endswith("/api/v1/models/unload")],
+            [{"instance_id": "first:model:1"}, {"instance_id": "second:model:2"}],
+        )
+
     def test_cleanup_does_not_guess_deleted_or_unloaded_model_instance(self):
         calls = []
 
@@ -1255,6 +1400,7 @@ On-screen text: "EXACT TITLE"'''
                 "timeout": 10,
             })
         self.assertTrue(result["comfyui_unloaded"])
+        self.assertTrue(result["comfyui_cache_cleared"])
         mocked.assert_called_once_with(
             "http://127.0.0.1:8188/free",
             10.0,
@@ -2267,7 +2413,7 @@ On-screen text: "EXACT TITLE"'''
             2,
         )
 
-    def test_drone_scene_keyframe_chain_isolates_user_anchors_and_adds_one_terminal(self):
+    def test_drone_scene_keyframe_chain_keeps_p1_and_builds_p1_derived_stages(self):
         payload = sample_design()
         payload["duration_seconds"] = 12.0
         payload["shots"][-1]["end_seconds"] = 12.0
@@ -2315,32 +2461,24 @@ On-screen text: "EXACT TITLE"'''
             special_skill_key="drone-fly-on-city",
         )
         uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
-        self.assertEqual((uses["P1"]["start_seconds"], uses["P1"]["end_seconds"]), (0.0, 4.5))
-        self.assertEqual((uses["P3"]["start_seconds"], uses["P3"]["end_seconds"]), (4.5, 9.0))
-        self.assertEqual(
-            sum(row.get("media_id") == "P3" for row in plan["existing_media_uses"]), 1
-        )
+        self.assertEqual((uses["P1"]["start_seconds"], uses["P1"]["end_seconds"]), (0.0, 12.0))
+        self.assertNotIn("P3", uses)
         self.assertEqual(uses["P2"]["usage"], "analysis_only")
-        self.assertIn("owns only 0.00-4.50s", uses["P1"]["instruction"])
+        self.assertIn("sole visual truth in every Segment", uses["P1"]["instruction"])
         image_requests = [
             row for row in plan["media_requests"] if row["media_type"] == "image"
         ]
-        self.assertEqual(len(image_requests), 1)
-        terminal = image_requests[0]
-        self.assertEqual(terminal["requirement_id"], "auto_terminal_keyframe_after_p3")
-        self.assertEqual((terminal["start_seconds"], terminal["end_seconds"]), (9.0, 12.0))
-        self.assertNotIn("preferred_media_id", terminal)
-        self.assertNotIn("identity_anchor", terminal)
-        self.assertIn("AUTO TERMINAL KEYFRAME", terminal["prompt"])
-        self.assertIn("harbour towers at blue hour", terminal["prompt"])
-        self.assertIn(DRONE_STILL_CLEAN_FRAME_CONTRACT, terminal["prompt"])
-        self.assertEqual(terminal["negative_prompt"], DRONE_STILL_NEGATIVE_PROMPT)
-        self.assertEqual(terminal["source_plate_media_id"], "P1")
-        self.assertEqual(terminal["source_plate_mode"], "immutable_copy")
-        self.assertTrue(terminal["immutable_scene_plate"])
-        self.assertEqual(terminal["final_hold_seconds"], 1.0)
+        self.assertEqual(len(image_requests), 3)
+        stages = image_requests
+        self.assertEqual([row.get("preferred_media_id") for row in stages], [
+            "P4", "P5", "P6",
+        ])
+        self.assertTrue(all(row["derived_from_media_id"] == "P1" for row in stages))
+        self.assertTrue(all("opening river skyline" in row["prompt"] for row in stages))
+        self.assertFalse(any(row.get("immutable_scene_plate") for row in image_requests))
+        self.assertEqual(stages[-1]["end_seconds"], 12.0)
 
-    def test_drone_single_p1_still_creates_one_immutable_terminal_plate(self):
+    def test_drone_single_p1_creates_five_second_stage_references_without_terminal_plate(self):
         payload = sample_design()
         payload["duration_seconds"] = 12.0
         payload["shots"][-1]["end_seconds"] = 12.0
@@ -2361,14 +2499,92 @@ On-screen text: "EXACT TITLE"'''
             }],
             special_skill_key="drone-fly-on-city",
         )
-        terminal = next(
-            row for row in plan["media_requests"] if row["media_type"] == "image"
+        images = [row for row in plan["media_requests"] if row["media_type"] == "image"]
+        self.assertEqual(len(images), 3)
+        self.assertEqual([row.get("preferred_media_id") for row in images], [
+            "P3", "P4", "P5",
+        ])
+        self.assertEqual(
+            [(row["start_seconds"], row["end_seconds"]) for row in images],
+            [(0.0, 5.0), (5.0, 10.0), (10.0, 12.0)],
         )
-        self.assertEqual((terminal["start_seconds"], terminal["end_seconds"]), (9.0, 12.0))
-        self.assertEqual(terminal["source_plate_mode"], "immutable_copy")
-        self.assertIn("exact P1 base composition", terminal["prompt"])
+        self.assertEqual(images[0]["scene_anchor_role"], "p3_ground_takeoff_anchor")
+        self.assertEqual(images[-1]["end_seconds"], 12.0)
+        self.assertFalse(any(row.get("immutable_scene_plate") for row in images))
 
-    def test_fireworks_terminal_is_p1_effect_only_composite(self):
+    def test_drone_open_p2_path_uses_p1_orbit_then_route_without_klcc(self):
+        from PIL import Image, ImageDraw
+
+        folder = PROJECT_ROOT / ".director_cache" / "drone_route_extract_test"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            route_path = folder / "p2_route.png"
+            route_image = Image.new("RGB", (320, 180), "white")
+            draw = ImageDraw.Draw(route_image)
+            draw.line([(20, 150), (90, 80), (170, 115), (295, 25)], fill=(245, 20, 30), width=7)
+            draw.ellipse((4, 146, 12, 154), fill=(0, 255, 0))
+            draw.ellipse((303, 21, 311, 29), fill=(0, 0, 255))
+            route_image.save(route_path)
+            route = analyse_red_route(route_path)
+            self.assertTrue(route["detected"])
+            self.assertFalse(route["closed_loop"])
+            self.assertGreaterEqual(len(route["waypoints"]), 3)
+
+            payload = sample_design()
+            payload["duration_seconds"] = 12.0
+            payload["shots"][-1]["end_seconds"] = 12.0
+            payload["shots"][0]["camera_movement"] = (
+                "One smooth clockwise 360-degree orbit around the Petronas Twin Towers"
+            )
+            payload["existing_media_uses"] = [
+                {
+                    "requirement_id": "scene", "media_id": "P1", "media_type": "image",
+                    "usage": "h3_reference", "reuse_policy": "whole_design",
+                    "start_seconds": 0.0, "end_seconds": 12.0, "track": "V1",
+                    "subject_keywords": [], "instruction": "Use @P1.",
+                },
+                {
+                    "requirement_id": "path", "media_id": "P2", "media_type": "image",
+                    "usage": "analysis_only", "reuse_policy": "whole_design",
+                    "start_seconds": 0.0, "end_seconds": 12.0, "track": "V2",
+                    "subject_keywords": [], "instruction": "Analyse @P2.",
+                },
+            ]
+            plan = normalize_design_plan(
+                payload, {"image": 9, "video": 3, "audio": 3},
+                existing_media=[
+                    {"media_id": "P1", "media_type": "image", "loaded": True,
+                     "filename": "canal.png", "semantic_enrichment": "Venice canal, stone bridge, amber dusk"},
+                    {"media_id": "P2", "media_type": "image", "loaded": True,
+                     "filename": "route.png", "local_path": str(route_path)},
+                ],
+                special_skill_key="drone-fly-on-city",
+                authored_requirement="沿P2路线飞行，不要自行改路线。",
+            )
+            renderable = json.dumps(plan["shots"], ensure_ascii=False)
+            self.assertNotIn("Petronas", renderable)
+            self.assertIn("GROUND-LAUNCH PHASE", renderable)
+            self.assertIn("one complete, smooth, wide clockwise lap", renderable)
+            self.assertIn("front-to-right-to-rear-to-left-to-front", renderable)
+            self.assertIn("not an in-place camera rotation", renderable)
+            self.assertIn("ROUTE-EXIT PHASE", renderable)
+            self.assertLess(
+                renderable.index("LANDMARK-ORBIT PHASE"),
+                renderable.index("ROUTE-EXIT PHASE"),
+            )
+            self.assertIn("visible forward displacement", renderable)
+            stage_prompts = "\n".join(
+                row["prompt"] for row in plan["media_requests"]
+                if row.get("derived_from_media_id") == "P1"
+            )
+            self.assertIn("Venice canal", stage_prompts)
+            self.assertNotIn("Kuala Lumpur", stage_prompts)
+            self.assertNotIn("Petronas", stage_prompts)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_fireworks_plan_has_no_automatic_terminal_composite(self):
         payload = sample_design()
         payload["duration_seconds"] = 15.0
         payload["shots"][-1]["end_seconds"] = 15.0
@@ -2389,11 +2605,10 @@ On-screen text: "EXACT TITLE"'''
             }],
             special_skill_key="drone-fly-on-city-fireworks",
         )
-        terminal = next(row for row in plan["media_requests"] if row["media_type"] == "image")
-        self.assertEqual(terminal["source_plate_mode"], "immutable_effect_composite")
-        self.assertEqual(terminal["source_plate_effect_profile"], "fireworks")
-        self.assertIn("Do not move, rotate, raise, reframe", terminal["prompt"])
-        self.assertIn("discrete gold, white and deep-red firework", terminal["prompt"])
+        images = [row for row in plan["media_requests"] if row["media_type"] == "image"]
+        self.assertEqual(len(images), 3)
+        self.assertEqual(images[-1]["end_seconds"], 15.0)
+        self.assertTrue(all(row["source_plate_mode"] == "p1_img2img" for row in images))
 
     def test_source_plate_path_is_bound_locally_and_not_sent_to_design_model(self):
         folder = PROJECT_ROOT / ".director_cache" / "immutable_path_binding_test"
@@ -2546,7 +2761,7 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("gold fireworks", still["prompt"].lower())
         self.assertIn(DRONE_FIREWORKS_STILL_CONTRACT, still["prompt"])
 
-    def test_old_generated_terminal_is_not_promoted_but_user_replacement_is(self):
+    def test_later_loaded_pictures_never_replace_drone_p1_scene_master(self):
         payload = sample_design()
         payload["duration_seconds"] = 12.0
         payload["shots"][-1]["end_seconds"] = 12.0
@@ -2575,14 +2790,15 @@ On-screen text: "EXACT TITLE"'''
             payload, {"image": 9, "video": 3, "audio": 3},
             existing_media=inventory, special_skill_key="drone-fly-on-city",
         )
-        self.assertNotIn("P4", {row["media_id"] for row in plan["existing_media_uses"]})
         self.assertEqual(
-            [row for row in plan["media_requests"] if row["media_type"] == "image"][0]["requirement_id"],
-            "auto_terminal_keyframe_after_p5",
+            {row["media_id"] for row in plan["existing_media_uses"]}, {"P1", "P2"}
         )
+        images = [row for row in plan["media_requests"] if row["media_type"] == "image"]
+        self.assertTrue(all(row.get("derived_from_media_id") == "P1" for row in images))
+        self.assertEqual(images[-1]["preferred_media_id"], "P8")
 
-        # A manually replaced P4 has no stale generated marker and therefore
-        # becomes a user-authored anchor in its proper numeric position.
+        # A manually replaced later Picture also cannot become a second scene
+        # master for these two route-controlled Skills.
         replaced_inventory = [dict(row) for row in inventory]
         replaced_p4 = next(row for row in replaced_inventory if row["media_id"] == "P4")
         replaced_p4.update(filename="user_replacement.png", analysis_summary="new riverside scene")
@@ -2590,9 +2806,11 @@ On-screen text: "EXACT TITLE"'''
             payload, {"image": 9, "video": 3, "audio": 3},
             existing_media=replaced_inventory, special_skill_key="drone-fly-on-city",
         )
-        self.assertIn("P4", {row["media_id"] for row in replaced["existing_media_uses"]})
+        self.assertEqual(
+            {row["media_id"] for row in replaced["existing_media_uses"]}, {"P1", "P2"}
+        )
 
-    def test_selected_drone_picture_becomes_anchor_even_if_model_omits_its_use(self):
+    def test_selected_later_drone_picture_does_not_override_p1(self):
         payload = sample_design()
         payload["duration_seconds"] = 12.0
         payload["shots"][-1]["end_seconds"] = 12.0
@@ -2618,13 +2836,11 @@ On-screen text: "EXACT TITLE"'''
             selected_media_ids=["P1", "P2", "P3"],
         )
         uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
-        self.assertEqual(set(uses), {"P1", "P2", "P3"})
+        self.assertEqual(set(uses), {"P1", "P2"})
         self.assertEqual(uses["P2"]["usage"], "analysis_only")
-        self.assertIn("new coastal skyline", uses["P3"]["instruction"])
-        self.assertEqual(
-            next(row for row in plan["media_requests"] if row["media_type"] == "image")["requirement_id"],
-            "auto_terminal_keyframe_after_p3",
-        )
+        self.assertIn("sole visual truth", uses["P1"]["instruction"])
+        images = [row for row in plan["media_requests"] if row["media_type"] == "image"]
+        self.assertEqual(images[-1]["preferred_media_id"], "P6")
 
     def test_dark_rescue_first_person_is_enforced_in_every_renderable_field(self):
         payload = sample_design()

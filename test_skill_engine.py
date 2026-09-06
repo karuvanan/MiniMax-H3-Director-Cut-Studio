@@ -80,15 +80,15 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("red route", special.description.lower())
         skill_text = special.path.read_text(encoding="utf-8-sig")
         self.assertIn(
-            "The drone flight path is implied only through camera motion",
+            "Clean photographic scene with unobstructed architecture",
             skill_text,
         )
         self.assertIn("visible flight path, orbit ring, circular light trail", skill_text)
         self.assertIn("Still-reference Isolation", skill_text)
-        self.assertIn('source_plate_mode="immutable_copy"', skill_text)
-        self.assertIn("immutable P1 scene plate", skill_text)
-        self.assertIn("专用Z-Image负面提示词", special.design_requirement_template)
-        self.assertIn("P1 不可变尾帧", special.design_requirement_template)
+        self.assertIn("专用Z-Image负面词", special.design_requirement_template)
+        self.assertIn("P3至P9", special.design_requirement_template)
+        self.assertNotIn("Kuala Lumpur", special.instruction)
+        self.assertNotIn("Petronas", special.instruction)
         prompt = build_ref2va_prompt(
             PromptSpec(
                 brief="A clean city flyover.",
@@ -112,12 +112,15 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("fireworks", special.description.lower())
         self.assertIn("Fireworks Physics and Continuity Ledger", special.instruction)
         self.assertIn("separate radial particle bursts", special.instruction)
-        self.assertIn("usage=\"analysis_only\"", special.instruction)
-        self.assertIn('source_plate_mode="immutable_effect_composite"', special.instruction)
-        self.assertIn("return to P1's exact original framing", special.instruction)
-        self.assertIn("专用Z-Image负面提示词", special.design_requirement_template)
-        self.assertIn("金色菊花烟花", special.design_requirement_template)
-        self.assertIn("P1不可变特效尾帧", special.design_requirement_template)
+        self.assertIn("analysis_only/whole_design", special.instruction)
+        self.assertIn("P3至P9", special.design_requirement_template)
+        self.assertRegex(special.design_requirement_template, r"离散(?:烟花|粒子)")
+        self.assertIn("绿色圆点标记起点", special.design_requirement_template)
+        self.assertIn("蓝色圆点标记终点", special.design_requirement_template)
+        self.assertIn("P1实际图片", special.design_requirement_template)
+        self.assertIn("ROUTE NEEDS REVIEW", special.design_requirement_template)
+        self.assertNotIn("Kuala Lumpur", special.instruction)
+        self.assertNotIn("Petronas", special.instruction)
         prompt = build_ref2va_prompt(
             PromptSpec(
                 brief="A photoreal night skyline celebration.",
@@ -258,6 +261,10 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("MMA露指拳套", profile.design_requirement_template)
         self.assertIn("三个Segment沿同一条可见路线", profile.design_requirement_template)
         self.assertIn("IES工业灯管", profile.design_requirement_template)
+        self.assertIn("建立全局Camera Ledger", profile.design_requirement_template)
+        self.assertIn("禁止全程使用单一正面角度", profile.design_requirement_template)
+        self.assertIn("三种街机标志性摄影职责", profile.design_requirement_template)
+        self.assertIn("实体360° Bullet-time环绕", profile.design_requirement_template)
         self.assertIn("舞台Spot Light", profile.design_requirement_template)
         system = profile_system_prompt(self.profiles[DEFAULT_SKILL], profile)
         for phrase in (
@@ -284,6 +291,19 @@ class SkillEngineTests(unittest.TestCase):
             "visible tap and immediate release",
             "At least 80%",
             "no more than 1.0 second",
+            "Camera Ledger",
+            "Following pan or tilt",
+            "Counter-motion camera",
+            "Lateral tracking / dolly",
+            "Brief fighter POV",
+            "Controlled handheld with impact feedback",
+            "Whip pan",
+            "same straight-on frontal angle in consecutive Shots",
+            "Three iconic arcade-camera modes",
+            "Classic side-axis exchange",
+            "Signature-move launch",
+            "Decisive finish",
+            "translated 360-degree bullet-time orbit",
             "Do not use a theatre spotlight",
             "body load → release trajectory → contact point → recovery/result",
             "Projectile palm burst",
@@ -317,6 +337,18 @@ class SkillEngineTests(unittest.TestCase):
             "地面打击（Ground and Pound）",
             "关节／绞技（Submission）",
             "至少80%",
+            "Camera Ledger",
+            "顺势Pan／Tilt",
+            "逆势迎摇／Push-Pull",
+            "侧面平行Tracking／Dolly",
+            "短暂格斗者POV",
+            "受控Handheld与撞击反馈",
+            "Whip Pan／闪摇",
+            "三种街机标志性运镜模式",
+            "经典街机侧轴对拆",
+            "必杀技释放",
+            "决定性终结",
+            "实体360° Bullet-time环绕",
             "舞台Spot Light",
             "身体蓄力",
             "掌心能量弹",

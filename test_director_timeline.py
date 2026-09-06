@@ -265,6 +265,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
 
         creator_button = window.findChild(QPushButton, "specialSkillCreatorButton")
         self.assertIsNotNone(creator_button)
+        self.assertEqual(creator_button.text(), "CREATOR")
         self.assertIs(
             creator_button.parentWidget(),
             window.default_skill_combo.parentWidget(),
@@ -2366,7 +2367,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
-    def test_drone_user_scene_chain_allocates_p6_and_never_co_loads_future_picture(self):
+    def test_drone_p1_master_and_p1_derived_stages_keep_segment_mapping_local(self):
         window = DirectorCutStudio()
         drone_index = window.special_combo.findData("drone-fly-on-city")
         self.assertGreaterEqual(drone_index, 0)
@@ -2414,20 +2415,26 @@ class DirectorTimelineDragTests(unittest.TestCase):
             payload, window.scan.counts, existing_media=inventory,
             special_skill_key="drone-fly-on-city",
         )
-        terminal = next(
+        image_requests = [
             row for row in plan["media_requests"] if row["media_type"] == "image"
+        ]
+        self.assertEqual(
+            [row.get("preferred_media_id") for row in image_requests],
+            ["P6", "P7", "P8"],
         )
-        terminal_path = media_root / "automatic_terminal.png"
-        Image.new("RGB", (48, 48), (15, 35, 75)).save(terminal_path)
-        self.addCleanup(lambda: terminal_path.unlink(missing_ok=True))
-        material = dict(terminal)
-        material.update(local_path=str(terminal_path), generated_by_comfyui=True)
-        window._apply_ai_design_direct(plan, [material], replace=True)
+        materials = []
+        for index, request in enumerate(image_requests, 1):
+            output = media_root / f"derived_{index:02d}.png"
+            Image.new("RGB", (48, 48), (15 + index, 35, 75)).save(output)
+            self.addCleanup(lambda path=output: path.unlink(missing_ok=True))
+            material = dict(request)
+            material.update(local_path=str(output), generated_by_comfyui=True)
+            materials.append(material)
+        window._apply_ai_design_direct(plan, materials, replace=True)
 
-        p6 = pictures[5]
-        self.assertEqual(media_shortcut(p6), "P6")
-        self.assertEqual(Path(p6.local_path), terminal_path.resolve())
-        self.assertIn("AUTO TERMINAL KEYFRAME", p6.clip_prompt)
+        assets_by_id = {media_shortcut(asset): asset for asset in window.scan.assets}
+        self.assertEqual(Path(assets_by_id["P6"].local_path), Path(materials[0]["local_path"]).resolve())
+        self.assertNotIn("P13", assets_by_id)
         self.assertFalse(pictures[1].timeline_placed)
 
         window.clip_start.setValue(0.0)
@@ -2435,14 +2442,16 @@ class DirectorTimelineDragTests(unittest.TestCase):
         segments = window._planned_render_segments()
         self.assertEqual(
             [(row.start_seconds, row.end_seconds) for row in segments],
-            [(0.0, 2.5), (2.5, 4.5), (4.5, 7.0), (7.0, 9.0), (9.0, 12.0)],
+            [(0.0, 12.0)],
         )
         self.assertEqual(
             [row.continuity_mode for row in segments],
-            ["none", "motion_reference", "motion_reference", "motion_reference", "motion_reference"],
+            ["none"],
         )
-        expected = ["P1", "P3", "P4", "P5", "P6"]
-        for segment, expected_media_id in zip(segments, expected):
+        expected = [
+            ["P1", "P6", "P7", "P8"],
+        ]
+        for segment, expected_picture_ids in zip(segments, expected):
             window.clip_start.setValue(segment.start_seconds)
             window.clip_end.setValue(segment.end_seconds)
             _compiled, active = window._compiled_job(
@@ -2451,7 +2460,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             active_picture_ids = [
                 media_shortcut(asset) for asset in active if asset.media_type == "image"
             ]
-            self.assertEqual(active_picture_ids, [expected_media_id])
+            self.assertEqual(active_picture_ids, expected_picture_ids)
 
         window.project_dirty = False
         window.close()
@@ -2652,7 +2661,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.close()
         shutil.rmtree(root, ignore_errors=True)
 
-    def test_render_job_uses_only_a_metadata_verified_immutable_end_plate(self):
+    def test_render_job_ignores_retired_immutable_end_plate_metadata(self):
         root = PROJECT_ROOT / ".director_cache" / "immutable_final_hold_spec_test"
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
@@ -2674,11 +2683,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         picture.start_seconds = 9.0
         picture.end_seconds = 12.0
         try:
-            spec = window._immutable_final_hold_spec(0.0, 12.0)
-            self.assertEqual(Path(spec["final_hold_plate"]), image_path.resolve())
-            self.assertEqual(spec["final_hold_seconds"], 1.0)
-            self.assertEqual(spec["final_hold_source_media_id"], "P1")
-            self.assertEqual(spec["final_hold_source_mode"], "immutable_effect_composite")
+            self.assertEqual(window._immutable_final_hold_spec(0.0, 12.0), {})
             self.assertEqual(window._immutable_final_hold_spec(0.0, 8.0), {})
         finally:
             window.project_dirty = False
@@ -2772,7 +2777,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         try:
             request = window._z_image_regeneration_request(p3)
             self.assertNotIn("orbital yaw", request["prompt"])
-            self.assertIn("flight path is implied only through camera motion", request["prompt"])
+            self.assertIn("Clean photographic scene with unobstructed architecture", request["prompt"])
             self.assertIn("visible flight path", request["negative_prompt"])
             self.assertIn("neon loop around buildings", request["negative_prompt"])
             self.assertEqual(request["preferred_media_id"], "P3")

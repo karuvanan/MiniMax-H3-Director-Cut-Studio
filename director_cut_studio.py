@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import faulthandler
+import gc
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -23,7 +24,7 @@ from PySide6.QtCore import (
     QEvent, QEasingCurve, QMimeData, QObject, QPoint, QRectF, QSize, Qt,
     QTimer, QUrl, QVariantAnimation, Signal,
 )
-from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygon, QUndoCommand, QUndoStack
+from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -138,6 +139,7 @@ from design_engine import (
     SPEECH_TIMELINE_REMINDER_PREFIX,
     speech_timing_budget,
     spatial_acoustics_profile,
+    validate_drone_image_request_budget,
     validate_explicit_timed_text_contract,
     validate_requested_speech_layer_contract,
 )
@@ -2729,6 +2731,7 @@ class TimelineView(QGraphicsView):
             "reusable": QColor("#2f9d57"),
             "dirty": QColor("#d4a72c"),
             "running": QColor("#258bc4"),
+            "reconnecting": QColor("#d58a2c"),
             "failed": QColor("#c84d4d"),
             "pending": QColor("#596068"),
         }
@@ -2773,6 +2776,7 @@ class TimelineView(QGraphicsView):
                 "reusable": "Generated · reusable",
                 "dirty": "Edited · needs render",
                 "running": "Rendering",
+                "reconnecting": "Server disconnected · auto reconnecting",
                 "failed": "Render failed",
                 "pending": "Not generated",
             }.get(status, status)
@@ -6734,6 +6738,20 @@ class DesignPageDialog(QDialog):
         self._request_lm_unload()
 
     def _start_plan_images(self, plan: dict) -> None:
+        try:
+            validate_drone_image_request_budget(
+                plan,
+                _bound_special_skill_key(
+                    self.active_design_context or self._selected_design_context()
+                ),
+            )
+        except ValueError as exc:
+            # Keep the JSON editable, but never let a malformed duration or
+            # reference chain launch dozens of expensive Z-Image tasks.
+            self.design_image_warnings.append(str(exc))
+            plan.setdefault("design_warnings", []).append(str(exc))
+            self._finish_design_pipeline(plan)
+            return
         image_requests = [
             item for item in plan.get("media_requests") or []
             if item.get("media_type") == "image"
@@ -8119,6 +8137,8 @@ class DirectorCutStudio(QMainWindow):
         )
         self.design_cleanup_runner: JsonLineProcess | None = None
         self.design_cleanup_result: dict = {}
+        self.pending_design_cleanup_job: dict = {}
+        self.design_cleanup_job_path: Path | None = None
         self.preview_seed: int | None = None
         self.preview_ready = False
         # Long productions can remain a normal one-shot Work Area render or
@@ -8238,6 +8258,15 @@ class DirectorCutStudio(QMainWindow):
         )
         self.project_storage_button.clicked.connect(self.open_project_storage)
         bar.addWidget(self.project_storage_button)
+        self.unload_all_button = QPushButton("UNLOAD ALL")
+        self.unload_all_button.setObjectName("unloadAllButton")
+        self.unload_all_button.setToolTip(
+            "Clear Studio runtime cache and DRAM · release ComfyUI VRAM/cache and models · "
+            "unload every model currently loaded by LM Studio. Project media, Takes and "
+            "Segment render caches are not deleted."
+        )
+        self.unload_all_button.clicked.connect(self.unload_all_resources)
+        bar.addWidget(self.unload_all_button)
         undo_action = self.undo_stack.createUndoAction(self, "UNDO")
         undo_action.setShortcut(QKeySequence.Undo)
         redo_action = self.undo_stack.createRedoAction(self, "REDO")
@@ -8261,7 +8290,7 @@ class DirectorCutStudio(QMainWindow):
                 self.special_combo.addItem(profile.display_name, key)
         self.special_combo.setMinimumWidth(240)
         bar.addWidget(self.special_combo)
-        self.special_skill_creator_button = QPushButton("SPECIAL SKILL CREATOR")
+        self.special_skill_creator_button = QPushButton("CREATOR")
         self.special_skill_creator_button.setObjectName("specialSkillCreatorButton")
         self.special_skill_creator_button.setToolTip(
             "Create or edit a Studio Special Skill, its Chinese version and binding mode"
@@ -8913,6 +8942,13 @@ class DirectorCutStudio(QMainWindow):
         self.settings_http_timeout = QSpinBox()
         self.settings_http_timeout.setRange(1, 600)
         self.settings_http_timeout.setSuffix(" s")
+        self.settings_connection_recovery_timeout = QSpinBox()
+        self.settings_connection_recovery_timeout.setRange(30, 86400)
+        self.settings_connection_recovery_timeout.setSuffix(" s")
+        self.settings_connection_recovery_timeout.setToolTip(
+            "After ComfyUI has accepted a prompt_id, Studio keeps reconnecting for this "
+            "long without re-queuing the same server Job. Default: 3600 seconds."
+        )
         self.settings_workspace_disk_reserve = QDoubleSpinBox()
         self.settings_workspace_disk_reserve.setRange(0.0, 2000.0)
         self.settings_workspace_disk_reserve.setDecimals(1)
@@ -8968,6 +9004,10 @@ class DirectorCutStudio(QMainWindow):
         form.addRow("History poll interval", self.settings_history_poll)
         form.addRow("Generation timeout", self.settings_generation_timeout)
         form.addRow("HTTP request timeout", self.settings_http_timeout)
+        form.addRow(
+            "Connection recovery window",
+            self.settings_connection_recovery_timeout,
+        )
         form.addRow("Workspace free disk reserve", self.settings_workspace_disk_reserve)
         form.addRow("Dialogue Text Layer TTS", self.settings_dialogue_tts)
         form.addRow("VoxCPM2 model", self.settings_voxcpm_model_status)
@@ -8990,6 +9030,7 @@ class DirectorCutStudio(QMainWindow):
             self.settings_history_poll,
             self.settings_generation_timeout,
             self.settings_http_timeout,
+            self.settings_connection_recovery_timeout,
             self.settings_workspace_disk_reserve,
         ):
             widget.valueChanged.connect(self._settings_ui_changed)
@@ -9009,6 +9050,9 @@ class DirectorCutStudio(QMainWindow):
         self.settings_history_poll.setValue(settings.history_poll_interval)
         self.settings_generation_timeout.setValue(settings.generation_timeout)
         self.settings_http_timeout.setValue(settings.http_request_timeout)
+        self.settings_connection_recovery_timeout.setValue(
+            settings.connection_recovery_timeout
+        )
         self.settings_workspace_disk_reserve.setValue(
             settings.workspace_free_disk_reserve_gb
         )
@@ -9191,6 +9235,9 @@ class DirectorCutStudio(QMainWindow):
                 "history_poll_interval": self.settings_history_poll.value(),
                 "generation_timeout": self.settings_generation_timeout.value(),
                 "http_request_timeout": self.settings_http_timeout.value(),
+                "connection_recovery_timeout": (
+                    self.settings_connection_recovery_timeout.value()
+                ),
                 "workspace_free_disk_reserve_gb": (
                     self.settings_workspace_disk_reserve.value()
                 ),
@@ -9863,6 +9910,9 @@ class DirectorCutStudio(QMainWindow):
             "comfyui_history_poll_interval": self.render_settings.history_poll_interval,
             "comfyui_generation_timeout": self.render_settings.generation_timeout,
             "comfyui_http_timeout": self.render_settings.http_request_timeout,
+            "comfyui_connection_recovery_timeout": (
+                self.render_settings.connection_recovery_timeout
+            ),
             "dialogue_tts_engine": self.render_settings.dialogue_tts_engine,
             "music_mode": self.render_settings.music_mode,
             "aspect_ratio": self.aspect_ratio_combo.currentData(),
@@ -9922,7 +9972,7 @@ class DirectorCutStudio(QMainWindow):
             dialog.api_key_edit.setText(self.semantic_openai_api_key)
         self.active_design_apply_dialog = dialog
         dialog.apply_requested.connect(self.apply_ai_design)
-        dialog.cleanup_requested.connect(self.start_design_cleanup)
+        dialog.cleanup_requested.connect(self.queue_design_cleanup)
         dialog.exec()
         if dialog.provider_combo.currentData() == "openai":
             self.semantic_openai_api_key = dialog.api_key_edit.text().strip()
@@ -10561,6 +10611,9 @@ class DirectorCutStudio(QMainWindow):
     def _notify_design_apply_failed(
         self, message: str, *, category: str = "Workspace"
     ) -> None:
+        # Cleanup is transactional: never unload resources while a failed or
+        # incomplete Apply may still need them for correction/retry.
+        self.pending_design_cleanup_job = {}
         dialog = self.active_design_apply_dialog
         if dialog is not None:
             dialog.mark_apply_failed(str(message), category=category)
@@ -10603,6 +10656,7 @@ class DirectorCutStudio(QMainWindow):
             message += f" · {len(warnings)} warning(s)"
         self.statusBar().showMessage(message, 12000)
         self._notify_design_apply_succeeded(warnings)
+        self.start_queued_design_cleanup()
 
     def _start_design_tts_generation(
         self,
@@ -11476,6 +11530,10 @@ class DirectorCutStudio(QMainWindow):
 
     def _validate_design_segment_capacity(self, plan: dict) -> None:
         """Fail before generation when one time range cannot fit H3 9/3/3."""
+        validate_drone_image_request_budget(
+            plan,
+            str(self.special_combo.currentData() or ""),
+        )
         if not self.scan:
             return
         duration = float(plan.get("duration_seconds", self.scan.duration_seconds))
@@ -11614,24 +11672,65 @@ class DirectorCutStudio(QMainWindow):
         plan["media_requests"] = requests
         return True
 
+    def queue_design_cleanup(self, job: dict) -> None:
+        """Remember cleanup intent without racing the durable Apply commit."""
+
+        self.pending_design_cleanup_job = dict(job or {})
+
+    def start_queued_design_cleanup(self) -> None:
+        """Run the queued cleanup only after a successful Workspace commit."""
+
+        job = dict(self.pending_design_cleanup_job)
+        self.pending_design_cleanup_job = {}
+        if job:
+            self.start_design_cleanup(job)
+
     def start_design_cleanup(self, job: dict) -> None:
-        """Unload Design-only ComfyUI and LM Studio models after Apply."""
+        """Release local RAM and remote ComfyUI/LM memory after Apply."""
         if self.design_cleanup_runner and self.design_cleanup_runner.is_running():
             self.design_cleanup_runner.stop()
+        # Release cyclic Python/Qt-side objects first. CUDA allocations owned
+        # by ComfyUI cannot be released from this process; its /free endpoint
+        # below is the authoritative model unload and VRAM-cache operation.
+        job = dict(job or {})
+        operation = str(job.get("operation", "post_apply"))
+        if job.get("clear_local_cache", operation == "manual_unload_all"):
+            QPixmapCache.clear()
+            self.monitor_source_pixmaps.clear()
+            job["local_cache_cleared"] = True
+        local_collected = gc.collect()
+        job["local_gc_collected"] = int(local_collected)
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         job_path = CACHE_ROOT / f"design_cleanup_{time.time_ns()}.json"
         job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        self.design_cleanup_job_path = job_path
         runner = JsonLineProcess(self, "design-model-cleanup")
         runner.message.connect(self._design_cleanup_message)
         runner.finished.connect(self._design_cleanup_finished)
         self.design_cleanup_runner = runner
         self.design_cleanup_result = {}
-        self.statusBar().showMessage("AI Design applied · releasing ComfyUI and LM Studio models…")
+        if operation == "manual_unload_all":
+            self.statusBar().showMessage(
+                "UNLOAD ALL · clearing runtime cache/DRAM and unloading ComfyUI + LM Studio…"
+            )
+        else:
+            self.statusBar().showMessage(
+                "AI Design applied · clearing RAM and unloading ComfyUI VRAM/cache…"
+            )
         if not runner.start(
             str(self.runtime.python),
             [str(PROJECT_ROOT / "design_cleanup_service.py"), str(job_path)],
         ):
-            self.statusBar().showMessage("AI Design applied · model cleanup worker unavailable")
+            self.statusBar().showMessage(
+                "AI Design applied · RAM collected · ComfyUI cleanup worker unavailable"
+            )
+            try:
+                job_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.design_cleanup_job_path = None
+            if operation == "manual_unload_all":
+                self.unload_all_button.setEnabled(True)
 
     def _design_cleanup_message(self, payload: dict) -> None:
         if payload.get("completed") or payload.get("error"):
@@ -11639,25 +11738,73 @@ class DirectorCutStudio(QMainWindow):
 
     def _design_cleanup_finished(self, exit_code: int, log: str) -> None:
         result = self.design_cleanup_result
+        manual = result.get("operation") == "manual_unload_all"
+        prefix = "UNLOAD ALL" if manual else "AI Design applied"
         warnings = list(result.get("warnings") or [])
         if exit_code or result.get("error"):
             warnings.append(str(result.get("error") or log[-400:] or f"worker exit {exit_code}"))
         if warnings:
             self.statusBar().showMessage(
-                "AI Design applied · model cleanup warning: " + " | ".join(warnings),
+                prefix + " · cleanup warning: " + " | ".join(warnings),
                 15000,
             )
         else:
             lm_count = len(result.get("lm_unloaded") or [])
             self.statusBar().showMessage(
-                f"AI Design applied · ComfyUI image model released · "
+                f"{prefix} · runtime cache/DRAM cleared · ComfyUI model/VRAM/cache released · "
                 f"LM Studio model released ({lm_count} instance(s))",
                 12000,
             )
+        # Let Qt dispose of any deferred dialog/media objects, then collect a
+        # second time. This is local application RAM only and never changes
+        # Timeline, mapping, generated files or the committed Workspace.
+        QTimer.singleShot(0, gc.collect)
+        if self.design_cleanup_job_path:
+            try:
+                self.design_cleanup_job_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.design_cleanup_job_path = None
         if self.design_cleanup_runner:
             self.design_cleanup_runner.deleteLater()
         self.design_cleanup_runner = None
         self.design_cleanup_result = {}
+        self.unload_all_button.setEnabled(True)
+
+    def unload_all_resources(self) -> None:
+        """Manually release idle Studio, ComfyUI and LM Studio runtime memory."""
+
+        active_runners = (
+            self.submit_runner,
+            self.design_media_runner,
+            self.media_regeneration_runner,
+            self.design_tts_runner,
+        )
+        if any(runner and runner.is_running() for runner in active_runners):
+            QMessageBox.warning(
+                self,
+                "UNLOAD ALL unavailable",
+                "A render, reference-image or TTS job is still running. Wait for it to finish "
+                "before unloading models and runtime memory.",
+            )
+            return
+        if self.design_cleanup_runner and self.design_cleanup_runner.is_running():
+            self.statusBar().showMessage("UNLOAD ALL · cleanup is already running", 5000)
+            return
+        self.design_ai_settings = load_design_settings(DESIGN_SETTINGS_ENV)
+        self.unload_all_button.setEnabled(False)
+        self.start_design_cleanup({
+            "operation": "manual_unload_all",
+            "clear_local_cache": True,
+            "provider": "lm_studio",
+            "base_url": self.design_ai_settings.lm_studio_base_url,
+            # An empty selection deliberately targets every loaded instance
+            # returned by LM Studio instead of guessing names from settings.
+            "model": "",
+            "unload_all_lm_models": True,
+            "comfyui_server": self.server_url.text().strip(),
+            "timeout": min(120, max(10, self.design_ai_settings.timeout)),
+        })
 
     def choose_workflow(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Open ComfyUI API workflow", str(PROJECT_ROOT), "JSON (*.json)")
@@ -13447,7 +13594,7 @@ class DirectorCutStudio(QMainWindow):
                 direction = str(asset.clip_prompt or "")
                 if not (
                     "SCENE KEYFRAME CHAIN ANCHOR" in direction
-                    or "AUTO TERMINAL KEYFRAME" in direction
+                    or "EXCLUSIVE P1-DERIVED SCENE-STATE REPLACEMENT" in direction
                 ):
                     continue
                 clipped_start = max(start, float(asset.start_seconds))
@@ -13596,7 +13743,7 @@ class DirectorCutStudio(QMainWindow):
             cached_status = str(cached.get("status", "")).lower()
             cached_output = Path(str(cached.get("output_path", "")))
             runtime = self.render_runtime_status.get(segment_id, "")
-            if runtime in {"running", "failed"}:
+            if runtime in {"running", "reconnecting", "failed"}:
                 status = runtime
             elif segment_id in self.render_dirty_segment_ids:
                 status = "dirty"
@@ -14565,11 +14712,22 @@ class DirectorCutStudio(QMainWindow):
             "source_plate_media_id",
             "source_plate_mode",
             "source_plate_effect_profile",
+            "source_image_denoise",
+            "derived_from_media_id",
+            "route_control_media_id",
+            "route_stage_index",
+            "route_stage_count",
             "final_hold_seconds",
             "immutable_scene_plate",
         ):
             if key in metadata:
                 request[key] = metadata[key]
+        # Migrate older caption-only drone stage sidecars on explicit regeneration.
+        if (request.get("derived_from_media_id") == "P1"
+                and request.get("route_stage_index")
+                and not request.get("source_plate_mode")):
+            request.update(source_plate_media_id="P1", source_plate_mode="p1_img2img",
+                           source_image_denoise=0.25)
         source_plate_id = str(request.get("source_plate_media_id", "")).strip().upper()
         if source_plate_id and self.scan:
             source_plate = next(
@@ -19890,11 +20048,22 @@ class DirectorCutStudio(QMainWindow):
             for row in cached_rows
             if Path(str(row.get("output_path", ""))).is_file()
         }
+        current_server = self.server_url.text().strip().rstrip("/")
+        manifest_server = str(cached_manifest.get("server", "")).strip().rstrip("/")
+        pending_by_id = {
+            str(row.get("segment_id", "")): row
+            for row in cached_rows
+            if str(row.get("prompt_id", "")).strip()
+            and str(row.get("status", "")).strip().lower()
+            in {"queued", "monitoring", "reconnecting", "running"}
+            and manifest_server == current_server
+        }
         approved_horizon = float(
             cached_manifest.get("target_duration_seconds", 0.0) or 0.0
         )
         for row in segment_rows:
             cached = cached_by_id.get(str(row["segment_id"]))
+            pending = pending_by_id.get(str(row["segment_id"]))
             core_end = float(
                 row.get("core_end_seconds", row.get("end_seconds", 0.0))
                 or row.get("end_seconds", 0.0)
@@ -19922,6 +20091,20 @@ class DirectorCutStudio(QMainWindow):
                 )
                 if request_kind != "preview":
                     self.render_dirty_segment_ids.discard(str(row["segment_id"]))
+            elif (
+                pending
+                and not dirty
+                and pending.get("fingerprint") == row.get("fingerprint")
+            ):
+                # The remote ComfyUI prompt was already accepted. Preserve its
+                # identity and resume /history monitoring instead of queuing a
+                # duplicate Segment after Studio or the LAN reconnects.
+                row.update(
+                    status="monitoring",
+                    prompt_id=str(pending["prompt_id"]),
+                    queued_at=str(pending.get("queued_at", "")),
+                    attempts_used=int(pending.get("attempts_used", 1) or 1),
+                )
 
         self._refresh_render_status_bar()
 
@@ -19942,6 +20125,9 @@ class DirectorCutStudio(QMainWindow):
             "history_poll_interval": self.render_settings.history_poll_interval,
             "generation_timeout": self.render_settings.generation_timeout,
             "http_timeout": self.render_settings.http_request_timeout,
+            "connection_recovery_timeout": (
+                self.render_settings.connection_recovery_timeout
+            ),
             "request_kind": request_kind,
             "seed": seed,
             "megapixels": megapixels,
@@ -19959,51 +20145,8 @@ class DirectorCutStudio(QMainWindow):
         return job_path, len(segment_rows)
 
     def _immutable_final_hold_spec(self, start: float, end: float) -> dict:
-        """Return an end-of-range hold only for an approved immutable plate.
-
-        This metadata is intentionally read from the local request sidecar,
-        never inferred from prompt prose. Partial renders that end before the
-        terminal plate are therefore unaffected.
-        """
-
-        if not self.scan or end <= start:
-            return {}
-        candidates: list[tuple[float, Path, dict]] = []
-        for asset in self.scan.timeline_assets():
-            if asset.media_type != "image" or not asset.timeline_placed:
-                continue
-            if abs(float(asset.end_seconds) - float(end)) > 0.01:
-                continue
-            local_path = Path(str(asset.local_path or ""))
-            if not local_path.is_file():
-                continue
-            sidecar = local_path.with_suffix(local_path.suffix + ".request.json")
-            if not sidecar.is_file():
-                continue
-            try:
-                metadata = json.loads(sidecar.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
-                continue
-            if not bool(metadata.get("immutable_scene_plate", False)):
-                continue
-            if str(metadata.get("source_plate_media_id", "")).strip().upper() != "P1":
-                continue
-            hold = float(metadata.get("final_hold_seconds", 1.0) or 1.0)
-            if hold <= 0.0:
-                continue
-            candidates.append((float(asset.start_seconds), local_path.resolve(), metadata))
-        if not candidates:
-            return {}
-        _asset_start, plate, metadata = max(candidates, key=lambda row: row[0])
-        return {
-            "final_hold_plate": str(plate),
-            "final_hold_seconds": min(
-                float(end) - float(start),
-                float(metadata.get("final_hold_seconds", 1.0) or 1.0),
-            ),
-            "final_hold_source_media_id": "P1",
-            "final_hold_source_mode": str(metadata.get("source_plate_mode", "")),
-        }
+        """Compatibility shim: automatic P1 tail replacement has been retired."""
+        return {}
 
     def _prepare_windowed_tts_audio(
         self,
@@ -20465,6 +20608,9 @@ class DirectorCutStudio(QMainWindow):
                     "history_poll_interval": self.render_settings.history_poll_interval,
                     "generation_timeout": self.render_settings.generation_timeout,
                     "http_timeout": self.render_settings.http_request_timeout,
+                    "connection_recovery_timeout": (
+                        self.render_settings.connection_recovery_timeout
+                    ),
                     "download_dir": str(
                         workspace / "cache" / "generated_outputs" / request_kind / str(seed)
                     ),
@@ -20598,7 +20744,7 @@ class DirectorCutStudio(QMainWindow):
             segment_id = str(segment_status.get("segment_id", ""))
             status = str(segment_status.get("status", "")).lower()
             if segment_id:
-                if status in {"running", "failed"}:
+                if status in {"running", "reconnecting", "failed"}:
                     self.render_runtime_status[segment_id] = status
                 elif status in {"reusable", "cached", "complete", "completed"}:
                     self.render_runtime_status.pop(segment_id, None)
@@ -20620,6 +20766,8 @@ class DirectorCutStudio(QMainWindow):
                     if status in {"cached", "complete", "completed", "reusable"}:
                         self.render_dirty_segment_ids.discard(segment_id)
                         self.render_runtime_status.pop(segment_id, None)
+                    elif status in {"monitoring", "reconnecting", "running"}:
+                        self.render_runtime_status[segment_id] = "reconnecting"
                     elif status == "failed":
                         self.render_runtime_status[segment_id] = "failed"
             self._refresh_render_status_bar()
