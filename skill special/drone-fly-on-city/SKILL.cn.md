@@ -1,229 +1,76 @@
 ---
 name: drone-fly-on-city
-description: 将用户绘制的红色路线转换为 MiniMax H3 无人机航点任务，生成连续路线飞行及受控 360 度环绕或旋转。适用于城市航拍、地图转航拍、房地产飞越、旅游宣传及可控航拍运镜；不用于静态图片或无关人物视频。
+description: 以P1为视觉场景母版，先在P1场景近地起飞，再围绕P1主题完成一次360度FPV环绕，最后沿已验证P2路线飞到终点；P2无法识别时改用建筑周边高速FPV后备。P3起每5秒从P1像素建立场景状态图，不得预设城市。
 ---
 
-# MiniMax H3 城市无人机航线控制
+# MiniMax H3 无人机路线控制
 
-将用户绘制的红线转换为可编辑航点任务与 H3 英文运镜提示词。红线仅为路线分析数据，绝不得进入视觉生成参考集或出现在成片中。
+与 Default H3 Prompt Writing Skill 一起使用。P1决定画面世界，P2决定摄影机怎样飞。任何示例中的城市、建筑或地标都不是默认生成内容。
 
-## 1. 理解请求
+## 1. 必需素材
 
-接受带红线的图片、地图、卫星图、城市照片、视频帧、口述路线，或“沿红线飞行并 360 度旋转”等请求。有路线图时，将红线作为权威航线并转换成文字航点；绝不可将路线图当作地点、构图或视觉风格参考。所有视觉决策以 `@P1` 为准。保留用户给定的时长、比例、地点、天气、时间、无人机类型、地标、速度和首尾画面；未给定时，使用匹配参考光线的中速平滑航拍与清晰锚点。
+- `@P1`：唯一场景母版及开场画面。全片每个Segment都持续使用P1，锁定实际地点、地标数量、建筑／道路／物件几何、天气、时间、光线、色彩、曝光、空气感、水平线、镜头高度和焦段。第一帧必须从P1可见构图开始。
+- 缺少真正加载的P1或P2时必须明确提示，不能虚构编号。
 
-## 2. 必填参考图角色与视觉隔离
+Design JSON 必须把P1登记为覆盖全片的 `h3_reference/whole_design`，把P2登记为覆盖全片的 `analysis_only/whole_design`。
 
-生成 H3 视频提示词前必须加载两张 Media Pool 图片：
+## 2. 三阶段FPV飞行与P2路线
 
-- `@P1`：必填场景母版，也是唯一视觉事实来源。保留地点、地标、建筑、布局、天气、时间、光向与强度、色板、调色、曝光、对比度、氛围、镜头特性、机位高度和特效。
-- `@P2`：仅限路线控制数据。只读取红线起点、转弯、曲线和终点，并转为抽象文字航点。禁止作为 H3 或 Z-Image 参考、首尾帧、风格、构图、场景来源或媒体请求的视觉来源；不得把 `@P2` 的像素、物件、文字、图形、颜色、叠层、注释、箭头或红线复制到视频。
+Studio会在本机识别P2最大连续红色笔画、细化中心线，并转换为有顺序的3至7个节点。所有Shot必须按这些节点持续平移，保留每个主要弯位、前进方向、真实惯性、自然视差和稳定水平线。不能把S形、折线或点到点的开放路线改成原地旋转或固定圆周。
 
-缺少 `@P1` 或 `@P2` 时，返回硬拦截并要求补齐。不得从 `@P2` 创建 `@P1`，也不得仅凭 `@P2` 生成最终 H3 提示词。
+必须依照顺序执行，不能把环绕与路线混在同一阶段：
 
-### Design JSON 预检约定
+1. 在P1建立的场景内，从安全且合理的近地位置起飞，贴近地面加速后抬起机头；12秒模板固定使用0–2秒。
+2. 以固定安全半径围绕P1主题建筑／主要场景完成一整圈平滑宽幅顺时针飞行。无人机实体位置必须依次经过主体前方／起始侧、右侧、后方、左侧并回到接近前方／起始侧。刚性FPV镜头始终朝向机头及当前飞行切线，严禁独立朝主建筑偏航、摇摄或云台锁定；主题建筑应随飞行自然沿画面内侧边缘移动，在几何需要时移到镜头后方，再随着无人机前进重新出现。周围建筑和背景以强烈自然视差证明实体位移。环绕阶段只准适度协调侧倾，禁止倒飞、桶滚、原地镜头旋转、全景摇摄、光学旋转或背景转动。无人机尚未清楚返回起始侧之前，P2路线保持锁定；12秒模板固定使用2–9秒。
+3. 只有完整环绕在画面上清楚完成后，才从P2绿色起点进入路线，经过全部弯位并最终到达蓝色终点；12秒模板从9秒开始。
 
-每个 Design JSON 的 `existing_media_uses` 必须登记两张已加载图片：
+全程使用刚性连接穿越机的第一人称FPV视角，轻微GoPro式超广角鱼眼、速度动态模糊和符合物理的侧倾。P1环绕阶段只准适度协调侧倾并保持水平线可读；必须完成整圈以后，进入P2路线或FPV后备阶段才允许俯冲、倒飞及最多180度翻滚。建筑与树木不能扭曲，翻滚不能撕裂画格，不得使用平稳机械上帝视角或普通慢推。
 
-```json
-"existing_media_uses": [
-  {
-    "requirement_id": "scene_master_visual",
-    "media_id": "P1",
-    "media_type": "image",
-    "usage": "h3_reference",
-    "reuse_policy": "whole_design",
-    "start_seconds": 0.0,
-    "end_seconds": "<DURATION>",
-    "track": "V1",
-    "instruction": "Use @P1 as the mandatory visual scene master for the entire video. Preserve its setting, layout, weather, lighting, colour grade, mood, exposure, atmosphere, lens character, and effects."
-  },
-  {
-    "requirement_id": "route_control_nonvisual",
-    "media_id": "P2",
-    "media_type": "image",
-    "usage": "analysis_only",
-    "reuse_policy": "whole_design",
-    "start_seconds": 0.0,
-    "end_seconds": "<DURATION>",
-    "track": "V1",
-    "instruction": "Use @P2 only to extract abstract route waypoints. It is non-visual control data: never use it as an H3 or Z-Image image reference, start/end frame, style, composition, or scene source. Do not copy its pixels, red lines, arrows, labels, colours, text, or overlays into the video."
-  }
-]
-```
+P2无法确认时显示ROUTE NEEDS REVIEW，但仍执行近地起飞和360度环绕。只把第三阶段改为安全FPV后备：低空掠地冲刺、大角度左侧倾并拉起进入大圆弧、短暂倒飞后俯冲、向右反向翻滚绕过可见障碍、完成紧凑8字交叉，最后恢复水平冲向安全狭窄通道或远方地平线。不得声称到达无法识别的P2终点。
 
-将 `<DURATION>` 替换成用户要求的数值时长。
+规划阶段可以保存归一化节点；真正写入Shot与H3 Prompt时，必须转换为自然动作，例如“持续向前、向右偏移、在固定高度随弯位改变前进方向”。可渲染字段不得出现P2、红线、WP、坐标、地图、HUD或图形控制层。
 
-## 3. 场景关键帧链与 P1 不可变尾帧
+## 3. P1衍生的每5秒场景链
 
-把用户提供的视觉图片视为有先后顺序的场景关键帧链。`@P1` 永远是第一锚点，`@P2` 永远不属于视觉链。Design 明确选用的其他用户图片，例如 `@P3`、`@P4`、`@P5`，默认按 Picture 编号成为后续权威场景锚点；用户明确提供其他时间顺序时，以用户顺序为准。
+P3是0–5秒的冻结开场场景锚点，并使用最低重绘强度；P4起严格每5秒建立一张time-scoped场景状态图。35秒为P3至P9，45秒则继续生成至P11，不能让长片尾段失去当前参考。每张必须上传P1实际图片，通过p1_img2img低重绘图生图读取P1像素，BLIP／AI只作补充。所有图必须保持P1的主题建筑、地点身份、地标数量、建筑与构图、周围场景、道路、天空、天气、时间、光线、颜色、色调、色温、曝光、空气感和镜头特性。
 
-不论只有 P1/P2，还是视觉链包含 `@P1` 及后续用户场景，都必须在链尾建立一次 P1 返回段：
+P3及P4以后的场景图只是P1的辅助状态，不是新的场景母版；P2永远不是它们的视觉父级。P3不得画运镜，只负责锁定P1开场；真正360度飞行只写入H3 Shot。P1继续覆盖全片，每个5秒区间只额外使用当前场景图，未来图不得提前污染前段。
 
-- 每张用户场景图只拥有一个互不重叠的 `time_scoped` 时间区间。不得让 P1 或后续锚点覆盖整个 Design；渲染较早场景时，不得在同一个原生 H3 请求中加载未来场景图片。
-- 每次场景变化都必须写明 Incoming／Outgoing 物理状态。Studio 将每个所有权区间独立渲染，只把前段最后 24 个视频帧作为无声运动上下文；不得复制前段音频，也不得提前加载下一场景。
-- 只在最后一个用户锚点之后建立一张未命名终点请求，`requirement_id` 使用 `auto_terminal_keyframe_after_<last-anchor>`。它不是新的 T2I 解释图，而是从已加载的 P1 本地像素生成的不可变 Scene Plate。普通版使用 `source_plate_media_id="P1"`、`source_plate_mode="immutable_copy"`、`source_plate_effect_profile="preserve_existing"`、`immutable_scene_plate=true`、`final_hold_seconds=1.0`。
-- 不得填写 `preferred_media_id`。由 Studio 自动选择真正空置的下一个 Virtual Media Pool 编号：P1/P2/P3 已占用时成为 P4；P1 至 P5 已占用时成为 P6。
-- 下一次重新 Design 时，旧的 `AI DESIGN GENERATED REFERENCE` 或 `AUTO TERMINAL KEYFRAME` 只是不再启用的历史资料，不得自动升级为用户场景锚点；只有用户替换或明确提升它时才可使用。
+每张P1衍生图是对应五秒区间的独占场景状态。渲染必须在每个五秒边界拆分，该区间只把当前状态图送给H3，不得同时加载P1及数张衍生图。所有状态图只是同一个P1场景实例随时间变化；一个画面只能出现一份P1主题建筑／地标组合。若P1本身是双塔等成组地标，只能保留原始组合一次，严禁第二组、镜像复制、克隆建筑或重复地标。
 
-自动尾帧请求绝不得设置 `identity_anchor=true`。尾帧必须逐像素以 P1 为唯一底图，完全保持 P1 的摄影机位置、高度、焦段、构图、水平线、地标大小与间距、天际线几何、道路、建筑、天气、基础曝光、色调、对比度和原有城市灯光；不得移动、旋转、升高、重新取景、重设计、复制、扭曲、移除或替换任何元素。普通版不得自行增加新的烟花、烟雾、光源、建筑或人物。
+每张自动图必须是单一冻结摄影瞬间。图片普通Prompt及subject_keywords不得包含360度、orbit、yaw、路线、轨迹或航点动作。准确追加：
 
-所有Z-Image／T2I请求都是冻结静态画面，不是摄影机运动图解。从普通图片提示词和 `subject_keywords` 删除 `360-degree`、`orbit`、`orbital yaw`、圆形、轨迹、路线、航点及同类运动规划短语，只保留城市建筑、构图、天气、光线、色彩、曝光、镜头与唯一冻结机位。随后准确追加：`The drone flight path is implied only through camera motion and must never be visible in the image. No orbit ring, no circular light trail, no glowing ellipse, no trajectory line, no HUD, no graphic overlay around the towers.` 并设置专用Z-Image负面提示词：`visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings`。这份负面词表绝不能复制进H3视频提示词。
+`Clean photographic scene with unobstructed architecture, natural sky and physically plausible lighting. Preserve the source image's scene, colour palette and exposure.`
 
-只有 `@P1` 与控制用 `@P2` 时，运动过程保持普通单场景流程，但结尾仍须回到 P1 原始构图并冻结展示 P1 一秒。只有用户明确要求且确实有助连续性时才可创建其他机位参考；P2 始终不得成为视觉母版。
+Z-Image专用负面词：
 
-## 4. 旋转模式
+`visible flight path, orbit ring, circular light trail, glowing ellipse, light ribbon, trajectory line, energy ring, HUD overlay, graphic circle, neon loop around buildings`
 
-除非用户明确要求组合，否则只选一种模式：
+负面词表不得进入H3视频Prompt。
 
-- **环绕模式（默认）**：无人机沿路线飞行，镜头平滑绕目标地标偏航。
-- **机身偏航自旋**：机身前进时完成一次 360 度偏航；只用于明确要求机身旋转的请求。保持水平线稳定，不翻滚。
-- **镜头平移/摇镜**：无人机跟随路线，镜头平移、俯仰或观察目标。
-- **环绕加跟随**：无人机沿路线平移并绕稳定地标完成一次可测量环绕，仅在路线物理上支持时使用。
+## 4. 原生连续结尾
 
-默认全程只完成一次完整 360 度循环，旋转速度必须物理可信，并与前进运动同步。
+在路线终点自然收束运镜，保留环境和烟花的连续变化。取消自动尾图、强制返回P1、末秒冻结以及本地烟花合成；不另切一个尾帧Segment，输出保留H3生成的结尾。
 
-## 5. 将红线转换为航点
+## 5. H3 Prompt与声音
 
-把图片平面视为归一化屏幕坐标；不可从 2D 图像声称精确 GPS、米制高度或真实遥测。创建 3–6 个严格贴合路线几何的有效航点：
+每段H3 Prompt按同一时间顺序说明：P1场景事实、本Shot对应的实体环绕进度、当前P2路径阶段的物理位移、环境反应、连续性状态及原生声音。FPV镜头只朝向机头及飞行切线，主题建筑不是固定注视中心；必须有可见前进位移及背景视差，禁止云台锁定建筑、独立偏航、原地旋转或以通用圆周取代P2。P2编号和图形控制资料不得出现在最终Prompt。
 
-- `WP0`：路线起点与初始朝向。
-- 中间 WP：每一个显著曲线顶点、转弯或方向变化；不得跳过弯道。
-- 最终 WP：路线终点、最终目标构图与稳定朝向。
+声音属于画内真实声源：连续高空风、远处城市或现场环境底噪，以及与可见动作同步的声音。不要额外对白或旁白；音乐服从主页 `MUSIC: OFF / AUTO / TIMELINE`。
 
-每个航点必须定义 `screen_position`（`x` 与 `y`，0.00–1.00）、`travel_vector`、`altitude_relation`、`look_target`、`yaw_progress_degrees`、`speed` 与 `continuity_note`。S 弯必须在屏幕坐标中形成 S 形序列。偏航按路线长度分配，最终偏航必须正好为 `360`。
+## 6. Apply前检查
 
-## 6. 方向映射
+1. P1覆盖每个Segment，第一帧以P1开始；任何示例城市都没有覆盖P1。
+2. P2只为analysis_only，未进入Timeline、上传或任何视觉Loader。
+3. Shot严格依序完成近地起飞、P1主题360度环绕、P2路线至终点；环绕与路线不能同时执行。
+4. P3为0–5秒开场锚点，P4起每5秒生成并全部源自P1、各自time-scoped、保持同一场景身份。
+5. 当前Segment只加载P1及当前需要的阶段图，没有未来图污染。
+7. 自动图没有轨迹圆环、HUD、光带或可见路线。
 
-| 路线表现 | H3 运镜语言 |
-|---|---|
-| 由下至上，主体变大 | 向前飞、推进、轻微上升 |
-| 由上至下，主体变小 | 后拉、后退、轻微下降 |
-| 左至右 | 保持动量向右漂移或平移 |
-| 右至左 | 保持动量向左漂移或平移 |
-| 大弧线 | 沿平滑弧形航线飞行 |
-| 围绕地标的圆形 | 维持受控环绕半径 |
-| S 弯 | 以缓和偏航执行平滑 S 弯 |
-| 指向天际线 | 向天际线推进，逐步打开纵深 |
-| 指向街道或巷道 | 沿街道轴线推进或下降，不穿过几何体 |
-
-路线方向与可见地理冲突时，保留路线方向，但调整飞行以避开墙体、车流、屋顶、树木、电线和行人。
-
-## 7. H3 提示词构造
-
-最终提示词必须是单段英文，不含中文说明。视觉语言来自 `@P1`，运动语言来自由 `@P2` 提取的文字航点：
-
-1. 开头明确描述 `@P1` 的地点、布局、地标、光线与时间、天气与氛围、调色、曝光和镜头特性。
-2. 只描述物理路线运动；不得在正文提及 “red line”、“map” 或 “route graphic”。说明连续运动、真实惯性、加速与减速。
-3. 明确写出环绕或偏航自旋模式及稳定目标锁定。环绕可用：`While translating along the path, the camera completes one seamless full 360-degree orbital yaw around [target], keeping the target continuously readable and the horizon stable.`
-4. 写出飞行减速、回到 P1 精确原始构图，并在最后一秒直接冻结不可变 P1 Scene Plate。该尾帧不是 H3 或 Z-Image 重新想象的城市画面。
-5. H3 只有一个视频生成提示词，不要把Z-Image负面词表附加到H3；反复写出这些图形反而可能诱导视频模型画出来。结尾只加入正向约束：`写实城市画面保持干净无遮挡，所有导航控制均为非视觉数据并完全位于画外；水平线稳定，航拍视差与惯性连续可信。` 精确的静态图排除句和负面词表只属于Z-Image参考图生成，Studio会在H3编译前排除它们。
-
-若启用音频生成，只追加与场景相符的环境音描述；除非用户要求，否则不要加对白。
-
-## 8. 可编辑航点 JSON
-
-用户要求 Design、计划、JSON 或可编辑控制时，先输出可编辑航点 JSON，再输出英文 H3 提示词。JSON 必须包含 `existing_media_uses` 约定、`route_overlay: "hidden"`、旋转模式、一次旋转循环、360 总偏航度、命名目标锁定、3–6 个文字航点，以及稳定水平线、避碰、无突然瞬移和真实视差/惯性的安全约束。所有 `end_seconds` 必须使用用户要求时长。
-
-```json
-{
-  "mission_type": "camera_trajectory_control",
-  "existing_media_uses": [
-    {
-      "requirement_id": "scene_master_visual",
-      "media_id": "P1",
-      "media_type": "image",
-      "usage": "h3_reference",
-      "reuse_policy": "whole_design",
-      "start_seconds": 0.0,
-      "end_seconds": 15.0,
-      "track": "V1",
-      "instruction": "使用 @P1 作为必填视觉场景母版；保留其全部场景与视觉属性。"
-    },
-    {
-      "requirement_id": "route_control_nonvisual",
-      "media_id": "P2",
-      "media_type": "image",
-      "usage": "analysis_only",
-      "reuse_policy": "whole_design",
-      "start_seconds": 0.0,
-      "end_seconds": 15.0,
-      "track": "V1",
-      "instruction": "只用 @P2 提取抽象文字航点；绝不可作为视觉输入或复制其中的红线路径图形。"
-    }
-  ],
-  "route_overlay": "hidden",
-  "rotation_mode": "orbit",
-  "rotation_cycles": 1,
-  "total_yaw_degrees": 360,
-  "target_lock": "命名的可见地标",
-  "waypoints": [
-    {
-      "id": "WP0",
-      "screen_position": { "x": 0.15, "y": 0.78 },
-      "travel_vector": "向前并轻微向右，跟随路线初始曲线",
-      "altitude_relation": "level",
-      "look_target": "命名的可见地标",
-      "yaw_progress_degrees": 0,
-      "speed": "medium",
-      "continuity_note": "从红线起点开始，立即建立前进动量。"
-    },
-    {
-      "id": "WP1",
-      "screen_position": { "x": 0.52, "y": 0.46 },
-      "travel_vector": "向左平滑弯曲，跟随路线弯道",
-      "altitude_relation": "higher",
-      "look_target": "命名的可见地标",
-      "yaw_progress_degrees": 180,
-      "speed": "medium",
-      "continuity_note": "维持环绕半径，横向移动必须匹配路线曲率。"
-    },
-    {
-      "id": "WP2",
-      "screen_position": { "x": 0.86, "y": 0.22 },
-      "travel_vector": "向最终天际线构图推进，跟随路线出口",
-      "altitude_relation": "higher",
-      "look_target": "命名地标与天际线",
-      "yaw_progress_degrees": 360,
-      "speed": "slow",
-      "continuity_note": "在红线终点缓慢稳定收束，并停留一秒。"
-    }
-  ],
-  "safety_constraints": [
-    "稳定水平线",
-    "不得碰撞建筑、电线、树木、车流或行人",
-    "禁止突然瞬移或方向反转",
-    "真实航拍视差与惯性",
-    "路径严格遵循已提取航点"
-  ]
-}
-```
-
-## 9. 输出规则与质量检查
-
-- 用户只要视频提示词时，只输出最终英文 H3 提示词。
-- 用户要求 Design、计划、JSON 或路线说明时，先输出可编辑 JSON，再输出 `H3 Prompt:` 和最终英文提示词。
-- 每个 Design JSON 均将 `P1` 登记为 `h3_reference`，将 `P2` 登记为 `analysis_only`；P2 只参与规划，不进入 Timeline、Segment 容量、上传清单或 H3 图片槽。
-- 存在多个用户场景图时，必须按第 3 节建立互不重叠的关键帧链，并在最后一个锚点之后只创建一张未命名的环境收尾帧；不得预先指定其 P 编号。
-- 所有航点必须贴合路线形状，不得出现无解释捷径。
-- 最终 H3 提示词必须为英文、只含一次 360 度循环、保持 `@P1` 场景连续性，并对 `@P2` 保持零视觉使用与零文字引用。
-- 成片绝不得出现红色 waypoint、红线、路线叠层、箭头、标记、HUD、UI、注释、涂鸦或其他控制图形。
-- 不得声称已执行真实无人机飞行、获得 GPS 数据或实施物理航点控制。
-
-### 质量检查清单
-
-返回前逐项确认：
-
-- **路径保真**：JSON 与提示词的航点严格描摹红线形状、转弯与曲线；除非用户要求直接飞行，否则不得走直线捷径。
-- **视觉隔离**：最终 H3 提示词不得出现 P2 标签或描述其可见控制图形，只使用第 7 节的正向干净画面约束。
-- **旋转准确**：一次旋转的最终累积偏航严格等于 360°。
-- **模式清晰**：环绕与机身自旋不可混淆，必须符合用户意图。
-- **物理可信**：避开建筑与树木等几何体；水平线稳定，视差与惯性自然。
-- **语言**：最终提示词只用英文，不含实现说明。
-- **JSON 完整**：`@P1` 与 `@P2` 均正确登记于 `existing_media_uses`；只使用归一化屏幕坐标，不声称真实世界遥测。
-- **关键帧隔离**：后续用户场景图各自拥有独立区间；P1 不可变尾帧只位于链尾；渲染前一场景时没有加载任何未来 Picture。
-- **P1 像素锁定**：普通版尾帧的可见像素与 P1 一致，元数据明确使用 `immutable_copy`，不经纯文字 T2I 重绘。
-- **静态参考图隔离**：每张生成城市Picture都是冻结环境画面；普通提示词及关键词没有orbit／yaw／trajectory运动指令，包含精确Clean Frame句，并在专用负面提示词保存光环／光带伪影词表。
-
-## 10. 控制数据卫生
-
-具体路线伪影词汇只允许出现在P2的 `analysis_only` 登记与专用Z-Image `negative_prompt`。正向补图提示词只能额外保留一条精确Clean Frame排除句。不得把负面词表复制进creative_brief、Shot、constraints、marker、transition或最终H3 Prompt；H3最终生成指令只用正向语言描述稳定水平线、连续惯性、干净写实画面、避碰航线和一致城市几何。
+P2画法与能力边界：
+- 用与P1相同比例的白底图，画一条纯红色连续线（#FF0000；1000px宽时约6–10px粗），3–6个清楚弯位。不要箭头、交叉、分岔或其他彩色装饰。
+- 在起点旁放绿色圆点（#00FF00），终点旁放蓝色圆点（#0000FF）。靠近端点但不要覆盖红线。闭合路线留小缺口，让起终点分开。
+- 上下方向仅表达接近／远离，不代表升降。高度、看向哪里请在Requirement另写。
+- 顺序无法验证时显示ROUTE NEEDS REVIEW，保留近地起飞和360度环绕，并使用建筑周边FPV后备；不得虚构P2坐标、方向或终点。
+- P3及P4以后的每5秒场景图读取P1真实像素；低重绘图生图只属尽力保持，不保证100%像素一致，也不能恢复P1看不到的建筑背面。先检查参考图再Preview。
+- P1已有圆环时先换干净P1；图生图可能继承原图瑕疵。P2永远不参与视觉生成。
