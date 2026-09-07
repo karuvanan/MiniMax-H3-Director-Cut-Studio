@@ -12,6 +12,7 @@ from design_engine import (
     DESIGN_JSON_SCHEMA,
     DRONE_FIREWORKS_STILL_CONTRACT,
     DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT,
+    DRONE_CAMERA_ONLY_POV_CONTRACT,
     DRONE_STILL_CLEAN_FRAME_CONTRACT,
     DRONE_STILL_NEGATIVE_PROMPT,
     H3_STABLE_DIALOGUE_LANGUAGES,
@@ -2557,6 +2558,12 @@ On-screen text: "EXACT TITLE"'''
             payload["shots"][0]["camera_movement"] = (
                 "One smooth clockwise 360-degree orbit around the Petronas Twin Towers"
             )
+            payload["shots"][0]["subject_action"] = (
+                "The drone lifts off, banks right and flies past the first street."
+            )
+            payload["shots"][0]["optional_flourish"] = (
+                "Rotor vibration shakes the drone during takeoff."
+            )
             payload["existing_media_uses"] = [
                 {
                     "requirement_id": "scene", "media_id": "P1", "media_type": "image",
@@ -2594,6 +2601,13 @@ On-screen text: "EXACT TITLE"'''
                 renderable.index("ROUTE-EXIT PHASE"),
             )
             self.assertIn("visible forward displacement", renderable)
+            self.assertNotIn("The drone", renderable)
+            self.assertNotIn("rotor vibration", renderable.casefold())
+            self.assertIn(DRONE_CAMERA_ONLY_POV_CONTRACT, renderable)
+            self.assertIn(
+                "The onboard camera viewpoint lifts off",
+                plan["shots"][0]["h3_executable_action"],
+            )
             stage_prompts = "\n".join(
                 row["prompt"] for row in plan["media_requests"]
                 if row.get("derived_from_media_id") == "P1"

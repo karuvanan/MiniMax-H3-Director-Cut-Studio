@@ -814,11 +814,17 @@ def build_ref2va_prompt(
             "group at its assigned time. Never arrange reference Pictures side by side and never "
             "create an additional, mirrored, cloned or repeated copy of the primary building. If "
             "the original subject is a paired landmark, preserve that original pair exactly once, "
-            "not two pairs. During the orbit, the rigid FPV camera faces the drone's instantaneous "
-            "forward tangent and never gimbal-locks, pans or independently yaws toward the landmark; "
+            "not two pairs. During the orbit, the rigid FPV camera optical axis follows the instantaneous "
+            "forward flight tangent and never gimbal-locks, pans or independently yaws toward the landmark; "
             "the landmark may move along the inside frame edge or briefly leave view. Ground launch "
             "happens first; the full physical front-right-rear-left-front lap must visibly complete "
-            "before any route-exit movement begins."
+            "before any route-exit movement begins. PURE CAMERA-ONLY POV - the full image is the "
+            "unobstructed optical output of the moving onboard camera and shows only the P1-established "
+            "world plus authored effects. The camera and carrier stay outside every image boundary. "
+            "Never show camera hardware, vehicle body, nose, arms, rotors, propellers, landing gear, "
+            "controller, carrier shadow or reflection; never cut to an exterior chase, follow, "
+            "over-the-vehicle or observer view. Any aircraft already present in P1 remains unchanged "
+            "distant background scenery and never becomes the foreground camera carrier."
         )
     if special_profile is not None and special_profile.key == SPECIAL_SKILL:
         detailed_rows.append(

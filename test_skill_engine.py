@@ -90,6 +90,8 @@ class SkillEngineTests(unittest.TestCase):
         )
         self.assertIn("visible flight path, orbit ring, circular light trail", skill_text)
         self.assertIn("Still-reference Isolation", skill_text)
+        self.assertIn("pure camera-only optical viewpoint", skill_text)
+        self.assertIn("no drone body, nose, arms, rotors, propellers", skill_text)
         self.assertIn("专用Z-Image负面词", special.design_requirement_template)
         self.assertIn("P3至P9", special.design_requirement_template)
         self.assertNotIn("Kuala Lumpur", special.instruction)
@@ -110,12 +112,17 @@ class SkillEngineTests(unittest.TestCase):
         self.assertNotIn("waypoint marker", prompt.lower())
         self.assertNotIn(special.description, prompt)
         self.assertIn("approved Drone Fly On City Director cues", prompt)
+        self.assertIn("PURE CAMERA-ONLY POV", prompt)
+        self.assertIn("carrier stay outside every image boundary", prompt)
+        self.assertNotIn("drone's instantaneous forward tangent", prompt)
 
     def test_drone_fireworks_profile_preserves_route_isolation_and_effect_ledger(self):
         special = self.profiles["drone-fly-on-city-fireworks"]
         self.assertFalse(special.standalone)
         self.assertIn("fireworks", special.description.lower())
         self.assertIn("Fireworks Physics and Continuity Ledger", special.instruction)
+        self.assertIn("pure camera-only optical viewpoint", special.instruction)
+        self.assertIn("Camera-only POV is preserved", special.instruction)
         self.assertIn("separate radial particle bursts", special.instruction)
         self.assertIn("analysis_only/whole_design", special.instruction)
         self.assertIn("P3至P9", special.design_requirement_template)
@@ -142,6 +149,8 @@ class SkillEngineTests(unittest.TestCase):
         self.assertNotIn("red route", prompt.lower())
         self.assertNotIn("route graphics", prompt.lower())
         self.assertIn("approved Drone Fly On City Fireworks Director cues", prompt)
+        self.assertIn("PURE CAMERA-ONLY POV", prompt)
+        self.assertIn("never cut to an exterior chase", prompt)
 
     def test_every_special_skill_has_an_editable_design_requirement_template(self):
         special_profiles = [profile for profile in self.profiles.values() if profile.special]

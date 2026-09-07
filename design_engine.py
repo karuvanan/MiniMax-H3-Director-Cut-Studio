@@ -3714,6 +3714,15 @@ DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT = (
     "continuous firework ring around buildings, fireworks forming a flight path, fireworks "
     "wrapped around towers, solid neon fireworks, duplicated landmark, fused towers"
 )
+DRONE_CAMERA_ONLY_POV_CONTRACT = (
+    "PURE CAMERA-ONLY POV: show only the P1-established world and authored effects across "
+    "the full frame. The moving camera and its carrier remain completely outside the image "
+    "boundaries during launch, banking, pitching, diving and rolling. Never cut to an exterior, "
+    "chase, follow, over-the-vehicle or observer view. No visible camera hardware, vehicle body, "
+    "nose, arms, rotors, propellers, landing gear, controller, carrier shadow or reflection. "
+    "If P1 already contains a distant aircraft, preserve it only as unchanged background scenery; "
+    "it never becomes the foreground camera carrier."
+)
 DRONE_SPECIAL_SKILL_KEYS = frozenset({
     "drone-fly-on-city",
     "drone-fly-on-city-fireworks",
@@ -3731,6 +3740,31 @@ _DRONE_STILL_MOTION_PRIMING_RE = re.compile(
 
 def is_drone_special_skill(value: object) -> bool:
     return str(value or "").strip().casefold() in DRONE_SPECIAL_SKILL_KEYS
+
+
+def _drone_camera_only_text(value: object) -> str:
+    """Make the camera viewpoint the actor without depicting its carrier."""
+
+    result = str(value or "")
+    substitutions = (
+        (r"\b(?:the\s+)?(?:FPV\s+)?drone['’]s\s+(?:own\s+)?position\b", "the camera path position"),
+        (r"\b(?:the\s+)?(?:FPV\s+)?drone['’]s\s+forward\s+tangent\b", "the forward flight tangent"),
+        (r"\b(?:the\s+)?drone\s+nose\b", "the forward camera optical axis"),
+        (r"\b(?:the\s+)?(?:FPV\s+)?drone\b", "the onboard camera viewpoint"),
+        (r"\bthe\s+aircraft\b", "the onboard camera viewpoint"),
+        (r"\bairframe\b", "camera mount"),
+        (r"\brotor\s+vibration\b", "takeoff vibration"),
+    )
+    for pattern, replacement in substitutions:
+        result = re.sub(pattern, replacement, result, flags=re.I)
+    result = re.sub(
+        r"\bcamera\s+viewpoint\s+viewpoint\b", "camera viewpoint", result, flags=re.I
+    )
+    result = " ".join(result.split())
+    source = str(value or "").lstrip()
+    if result and source[:1].isupper():
+        result = result[:1].upper() + result[1:]
+    return result
 
 
 def validate_drone_image_request_budget(
@@ -4272,11 +4306,11 @@ def enforce_drone_scene_keyframe_chain(
                 360.0 * (phase_end - takeoff_end) / orbit_duration, 1
             )
             motion_parts.append(
-                "LANDMARK-ORBIT PHASE: the FPV drone physically flies part of one complete, smooth, "
+                "LANDMARK-ORBIT PHASE: the onboard camera viewpoint physically travels through part of one complete, smooth, "
                 "wide clockwise lap around P1's primary scene subject at a constant safe radius. "
                 f"Advance the lap from {start_degrees:g} to {end_degrees:g} degrees, physically "
                 f"translating past {orbit_span_language(start_degrees, end_degrees)}. Keep the rigidly "
-                "mounted FPV camera aligned with the drone nose and the instantaneous forward tangent "
+                "mounted FPV camera optical axis aligned with the instantaneous forward flight tangent "
                 "of the flight path; it must never independently yaw, pan or gimbal-lock toward the "
                 "primary subject. Let the subject naturally travel along the inside edge of the frame, "
                 "move behind the camera when geometry requires it, and reappear as the aircraft advances, "
@@ -4346,6 +4380,36 @@ def enforce_drone_scene_keyframe_chain(
               "mechanical god-view camera. P1 remains the visual source; follow the timed physical "
               "camera directions."
         )
+
+        # The planning model often writes the flying vehicle as subject (for
+        # example, "the drone lifts off"). H3 can interpret that literally as
+        # an exterior chase shot. Compile camera motion instead, then enforce
+        # an unobstructed optical POV in every independently rendered Segment.
+        for field_name in (
+            "framing", "camera_angle", "camera_movement", "subject_action",
+            "environment_response", "continuity_state", "optional_flourish",
+            "additional_direction", "h3_executable_action",
+            "h3_optional_flourish", "authored_subject_action",
+            "authored_environment_response",
+        ):
+            if field_name in shot:
+                shot[field_name] = _drone_camera_only_text(shot.get(field_name, ""))
+        budget = shot.get("action_budget")
+        if isinstance(budget, dict):
+            for field_name in (
+                "original_subject_action", "original_environment_response",
+                "original_optional_flourish",
+            ):
+                if field_name in budget:
+                    budget[field_name] = _drone_camera_only_text(
+                        budget.get(field_name, "")
+                    )
+        if DRONE_CAMERA_ONLY_POV_CONTRACT not in shot["additional_direction"]:
+            shot["additional_direction"] = (
+                shot["additional_direction"].rstrip(" .")
+                + (". " if shot["additional_direction"].strip() else "")
+                + DRONE_CAMERA_ONLY_POV_CONTRACT
+            )
 
     fireworks = str(special_skill_key).strip().casefold() == "drone-fly-on-city-fireworks"
     moving_end = duration
@@ -4451,6 +4515,17 @@ def enforce_drone_scene_keyframe_chain(
     )
     if warning not in warnings:
         warnings.append(warning)
+    for field_name in (
+        "title", "creative_brief", "global_visual_style", "overall_soundscape",
+        "non_diegetic_music", "constraints",
+    ):
+        result[field_name] = _drone_camera_only_text(result.get(field_name, ""))
+    if DRONE_CAMERA_ONLY_POV_CONTRACT not in result["constraints"]:
+        result["constraints"] = (
+            result["constraints"].rstrip(" .")
+            + (". " if result["constraints"].strip() else "")
+            + DRONE_CAMERA_ONLY_POV_CONTRACT
+        )
     return result
 
 
@@ -5615,6 +5690,12 @@ def build_design_system_prompt(context: dict) -> str:
         ending_contract = (
             "For drone-fly-on-city and drone-fly-on-city-fireworks, keep a natural generated ending: "
             "do not add an automatic Final Hold, terminal picture, P1 return or fixed last-second freeze. "
+            "DRONE CAMERA VISIBILITY CONTRACT: author a pure unobstructed onboard optical POV, never "
+            "an exterior shot of the flying vehicle. Use the camera viewpoint—not the drone or aircraft—"
+            "as the grammatical subject of movement. The camera carrier stays outside every frame: no "
+            "body, nose, arms, rotors, propellers, landing gear, controller, shadow or reflection, and no "
+            "chase, follow, over-the-vehicle or observer angle. An aircraft already visible in P1 remains "
+            "distant background scenery and never becomes the foreground camera carrier. "
         )
         speaker_gender_contract = (
             "For every dialogue text_layer, infer the gender of the speaking on-screen character from "

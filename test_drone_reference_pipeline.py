@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from design_engine import (bind_design_source_plate_paths, normalize_design_plan,
+from design_engine import (DRONE_CAMERA_ONLY_POV_CONTRACT,
+                           bind_design_source_plate_paths, normalize_design_plan,
                            sanitize_drone_still_image_request)
 from design_media_service import image_workflow, _generate_request
 from drone_route_engine import analyse_red_route, route_span_language
@@ -98,10 +99,15 @@ class DroneReferencePipelineTests(unittest.TestCase):
         self.assertIn('front-to-right-to-rear-to-left-to-front', camera_text)
         self.assertIn('strong natural parallax', camera_text)
         self.assertIn('not an in-place camera rotation', camera_text)
-        self.assertIn('aligned with the drone nose', camera_text)
-        self.assertIn('instantaneous forward tangent', camera_text)
+        self.assertIn('camera optical axis aligned', camera_text)
+        self.assertIn('instantaneous forward flight tangent', camera_text)
         self.assertIn('must never independently yaw', camera_text)
         self.assertNotIn('camera aimed inward', camera_text)
+        self.assertNotIn('the FPV drone', camera_text)
+        self.assertTrue(all(
+            DRONE_CAMERA_ONLY_POV_CONTRACT in row['additional_direction']
+            for row in plan['shots']
+        ))
         schedule = plan['_drone_motion_schedule']
         self.assertEqual(
             schedule['phase_completion_gate'],
