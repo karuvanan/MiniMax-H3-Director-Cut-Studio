@@ -877,13 +877,38 @@ findstr /s /i /m "dghs-imgutils" custom_nodes\*.txt custom_nodes\*.toml custom_n
 
 ### 怎样只重新生成 Timeline 的最后一个 Segment？
 
-如果只修改了结尾 Shot，Studio 会自动把与该 Shot 相交的内部 Segment 标记为待重算；前面没有变化且仍有有效 Take／Manifest 的 Segment 会继续使用缓存。建议先保存 Project，再按以下方式操作：
+如果只修改了结尾 Shot，Studio 会自动把与该 Shot 相交的内部 Segment 标记为待重算；前面没有变化且仍有有效 Take／Manifest 的 Segment 会继续使用缓存。
+
+#### `dirty` 是什么？为什么找不到这个按钮？
+
+`dirty` 是 Studio 内部保存的“旧 Take 已失效、这个 Segment 需要重新生成”状态，不是按钮，也不要求用户手动输入这个字。以下 Timeline 操作会自动把相交的 Segment 标记为 dirty：
+
+- 双击最后一个 Shot，修改并确认 `Core Action`、Shot Prompt、Environment Response、Final Combat Resolve 或其他 Shot 内容。
+- 调整最后一个 Shot 的开始、结束或时长。
+- 修改该范围内的对白、旁白、字幕、素材 Mapping 或参考图。
+
+标记只影响与修改范围相交的内部 Segment，不会主动删除前面仍然有效的 Segment Take。若没有修改任何内容，只想用新 seed 重抽结尾，请使用下方的局部 Preview 流程，不需要寻找 dirty 按钮。
+
+#### 为什么 Open Project 后点击 `REJECT` 没有反应？
+
+`REJECT` 只有在本次运行已经完成一个 `PREVIEW 0.2M` 后才会启用。重新 Open Project 时通常没有处于待验收状态的当前 Preview，因此按钮会保持禁用；它不是“开始重算”或“令 Segment 变 dirty”的按钮。
+
+正确顺序是：
+
+1. 把 Generation Work Area 设为最后 Segment 的实际范围，例如 `42.5s → 50.0s`。
+2. 点击 `PREVIEW 0.2M`，等待局部预览完成。
+3. Preview 完成后，`REJECT` 才会亮起。不满意时点击它，Studio 会丢弃当前 Preview seed，并以新 seed 重新生成同一范围；满意时不要点击 `REJECT`。
+
+这个结果只是最后 Segment 的局部预览，不是完整 Master。
+
+#### 修改结尾后重新输出完整影片
+
+建议先保存 Project，再按以下方式操作：
 
 1. 在 Timeline 编辑最后一个 Shot 的动作、Prompt、时长或其他需要修正的内容。即使只改一处，也会令对应的最后 Segment 失效，不会连带清空整条长片缓存。
-2. 若只想快速检查结尾，把 Generation Work Area 设为最后 Segment 的实际起止时间，例如 `42.5s → 50.0s`，再点 `PREVIEW 0.2M`。这个结果只是局部预览，不是完整 Master。
-3. 局部预览不满意时才点 `REJECT`；它会丢弃当前 Preview seed，并以新 seed 重新生成同一工作区间。`REJECT` 本身不是“标记 Segment 待重算”的按钮。
-4. 要输出完整影片时，把 Generation Work Area 恢复为 `0s → Timeline 总时长`，再点 `RUN+QUEUE`。长片生产会复用未改变的已完成 Segment，只生成被标记为 dirty 的结尾 Segment，然后重新拼接完整 `generated_output.mp4`。
-5. 完成后播放结尾，检查对白是否说完、Final Combat Resolve／Final Hold 是否稳定，以及跨 Segment 的人物位置、环境余波与声音是否连续，再保存 Project。
+2. 把 Generation Work Area 恢复为 `0s → Timeline 总时长`，例如 `0s → 50.0s`。
+3. 点击 `RUN+QUEUE`。长片生产会复用未改变的已完成 Segment，只生成被自动标记为 dirty 的结尾 Segment，然后重新拼接完整 `generated_output.mp4`。
+4. 完成后播放结尾，检查对白是否说完、Final Combat Resolve／Final Hold 是否稳定，以及跨 Segment 的人物位置、环境余波与声音是否连续，再保存 Project。
 
 如果旧 Segment Take、生产 Manifest 或缓存文件已经被删除，Studio 无法凭空复用它们，对应范围会自动重新生成。不要在只选择最后几秒的情况下把局部 `ACCEPT 1.0M` 误当作完整 Master；严格使用 Preview seed 的正式验收流程，应先恢复完整工作区间，再执行 `PREVIEW 0.2M → ACCEPT 1.0M`。
 

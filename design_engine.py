@@ -4404,9 +4404,9 @@ def enforce_drone_scene_keyframe_chain(
                 "weather, time of day, colour palette, colour temperature, lighting direction, "
                 "exposure, atmosphere and lens character. Do not substitute any city, landmark, "
                 "building, sky or weather from an example or template. Render exactly one instance "
-                "of P1's primary subject or landmark group. If P1 contains a paired landmark such as "
-                "two connected towers, preserve that original pair exactly once; never add a second "
-                "pair, duplicate building, cloned landmark or repeated copy elsewhere in the frame. "
+                "of P1's primary subject or landmark group. Preserve the source-visible subject count "
+                "and grouping exactly; never add a second instance, duplicate building, cloned landmark "
+                "or repeated copy elsewhere in the frame. "
                 "This Picture is a later state of the same single P1 scene instance, not an additional "
                 "object beside P1. This is one frozen photographic scene-state reference. "
                 + (
@@ -5416,15 +5416,73 @@ def normalize_design_plan(
     )
 
 
-def build_design_system_prompt(context: dict) -> str:
-    # Local source paths are execution-only data used after planning (for
-    # P1 image-conditioned reference generation). Never expose workstation paths
-    # to either a local or remote Design model.
+def sanitize_design_model_context(context: dict) -> dict:
+    """Return Media Pool context that cannot turn filenames into scene facts.
+
+    Media filenames and workstation paths are transport metadata, not visual
+    evidence.  In particular, a Drone P2 route/control image is interpreted
+    locally; none of its filename, caption or semantic text may reach the
+    planning model and override the P1 scene master.
+    """
+
     prompt_context = deepcopy(context)
+    bound_skills = prompt_context.get("bound_h3_skills") or {}
+    special_profile = bound_skills.get("special") or {}
+    special_key = str(special_profile.get("key", "")).strip().casefold()
+    if is_drone_special_skill(special_key):
+        # A new Drone Design is driven by the current requirement plus P1.
+        # Re-feeding prose from an older applied Drone plan can preserve an
+        # already polluted landmark even after the offending filename is gone.
+        prompt_context.pop("current_prompt_fields", None)
+        prompt_context.pop("existing_shots_and_cues", None)
     for media in prompt_context.get("existing_media") or []:
-        if isinstance(media, dict):
-            media.pop("local_path", None)
-            media.pop("source_plate_local_path", None)
+        if not isinstance(media, dict):
+            continue
+        # A downloaded/camera filename is never evidence.  This also prevents
+        # project-directory names from influencing titles and scene choices.
+        for key in (
+            "filename", "original_filename", "source_filename", "basename",
+            "local_path", "original_local_path", "source_plate_local_path",
+        ):
+            media.pop(key, None)
+
+        media_id = str(media.get("media_id", "")).strip().upper().lstrip("@")
+        analysis_only = is_analysis_only_media_use(media)
+        if is_drone_special_skill(special_key) and media_id == "P2":
+            analysis_only = True
+        if not analysis_only:
+            continue
+
+        # Keep only neutral inventory/availability facts. Route geometry is
+        # read locally after the model returns; showing semantic metadata here
+        # can contaminate the generated title, location and landmark names.
+        neutral = {
+            key: deepcopy(media[key])
+            for key in (
+                "media_id", "node_id", "media_type", "type", "loaded",
+                "locally_available", "timeline_placed", "timeline_track_id",
+                "start_seconds", "end_seconds", "source_duration_seconds",
+            )
+            if key in media
+        }
+        neutral.update({
+            "planning_role": "analysis_only",
+            "analysis_status": "isolated_control",
+            "analysis_summary": (
+                "Non-visual planning control. Its pixels and metadata contain no "
+                "scene, location, landmark, subject, colour or style evidence."
+            ),
+        })
+        media.clear()
+        media.update(neutral)
+    return prompt_context
+
+
+def build_design_system_prompt(context: dict) -> str:
+    # Paths and filenames are execution-only data. The sanitized copy keeps
+    # local materialization possible while preventing metadata from becoming
+    # authored visual facts in either a local or remote Design model.
+    prompt_context = sanitize_design_model_context(context)
     bound_skills = context.get("bound_h3_skills") or {}
     if bound_skills.get("binding_mode") == "standalone_special":
         skill_direction = (
@@ -5630,7 +5688,9 @@ def build_design_system_prompt(context: dict) -> str:
         "project may use P10+, V4+ and A4+. Additional editorial tracks do not increase that per-Segment limit. "
         "Never treat P9, V3 or A3 as a project-wide stopping point. Continue assigning stable logical IDs P10+, V4+ and A4+ when "
         "new story needs occur later in the Timeline; capacity is validated only among references whose time ranges overlap the same Segment. "
-        "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. The user may "
+        "Before requesting any new material, audit the loaded existing_media inventory in the workspace context. Media filenames "
+        "and local paths are deliberately absent because they are transport metadata, never scene evidence; do not infer a title, "
+        "location, landmark, person, object or style from a filename or project-folder name. The user may "
         "refer to its stable Media Pool IDs as @P1, @P2, @V1 or @A1; write the ID without @ in existing_media_uses.media_id. "
         "Inside creative_brief, Shot subject_action, environment_response, additional_direction, marker direction and every other "
         "authored instruction, always cite an existing Media Pool source with its stable @P/@V/@A ID, for example @P4. Never write "
@@ -5650,9 +5710,10 @@ def build_design_system_prompt(context: dict) -> str:
         "the reference should be inactive. Repeated uses share one physical H3 reference slot. "
         "When a loaded image is only a map, route drawing, mask, depth guide, annotation or other planning control, set its "
         "existing_media_uses.usage to analysis_only (route_control_analysis_only is accepted as a compatibility alias). The "
-        "application exposes its analysed information to Design but never places it on the Timeline, counts it against an "
-        "H3 Segment reference slot, or uploads it to MiniMax H3. Never cite that control asset ID or its visible graphics in "
-        "Shot prose; describe only the abstract motion or staging extracted from it. "
+        "application exposes only a neutral planning role to Design and performs route/control analysis locally; it never places "
+        "the control on the Timeline, counts it against an H3 Segment reference slot, or uploads it to MiniMax H3. Its filename, "
+        "caption, OCR and semantic metadata provide zero scene evidence. Never cite that control asset ID or its visible graphics "
+        "in Shot prose; describe only the abstract motion or staging supplied by the application. "
         "media_requests must contain only genuinely missing assets after this reuse audit. Choose that missing count dynamically from "
         "the concept and the time-local Segment budget; never duplicate a requirement already fulfilled by @P1/@V1/@A1. "
         "For media_requests, use h3_reference when an asset supplies subject, product, wardrobe, environment or composition guidance; "

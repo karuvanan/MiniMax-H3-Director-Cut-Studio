@@ -125,7 +125,10 @@ class DroneReferencePipelineTests(unittest.TestCase):
             self.assertIn(
                 'EXCLUSIVE P1-DERIVED SCENE-STATE REPLACEMENT', stage['prompt']
             )
-            self.assertIn('preserve that original pair exactly once', stage['prompt'])
+            self.assertIn(
+                'Preserve the source-visible subject count and grouping exactly',
+                stage['prompt'],
+            )
             self.assertTrue(stage['single_scene_instance'])
             self.assertEqual(stage['exclusive_scene_source_media_id'], 'P1')
             self.assertIn('duplicate building', stage['negative_prompt'])

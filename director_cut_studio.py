@@ -13764,6 +13764,30 @@ class DirectorCutStudio(QMainWindow):
         )
         return completed, str(manifest.get("updated_at") or "")
 
+    @staticmethod
+    def _normalize_restored_master_timeline_start(
+        saved_start: float,
+        output_duration: float,
+        timeline_duration: float,
+    ) -> float:
+        """Rebase a copied full-length Master that inherited a partial-run offset.
+
+        A failed local Segment render can leave ``generated_output_timeline_start``
+        pointing at that Segment even after the user restores a complete
+        ``generated_output.mp4`` from backup. File duration is authoritative in
+        this one unambiguous case: a movie that covers the whole Timeline starts
+        at zero. Genuine partial outputs retain their authored offset.
+        """
+        start = max(0.0, float(saved_start))
+        output_duration = max(0.0, float(output_duration))
+        timeline_duration = max(0.0, float(timeline_duration))
+        if output_duration <= 0.0 or timeline_duration <= 0.0:
+            return start
+        tolerance = max(0.25, min(1.0, timeline_duration * 0.01))
+        if abs(output_duration - timeline_duration) <= tolerance:
+            return 0.0
+        return start
+
     def _cleanup_completed_render_cache(
         self,
         cache_root: Path | None,
@@ -14937,9 +14961,28 @@ class DirectorCutStudio(QMainWindow):
             ):
                 recovered_workspace_state = True
             if generated_output.is_file():
+                saved_timeline_start = float(
+                    payload.get("generated_output_timeline_start", 0.0)
+                )
+                restored_timeline_start = saved_timeline_start
+                try:
+                    output_info = probe_media(generated_output, self.runtime)
+                    restored_timeline_start = (
+                        self._normalize_restored_master_timeline_start(
+                            saved_timeline_start,
+                            float(output_info.get("duration") or 0.0),
+                            self._timeline_duration_seconds(),
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    # The monitor/proxy path will expose an actually broken MP4.
+                    # A failed probe must not prevent the Project itself loading.
+                    restored_timeline_start = saved_timeline_start
+                if abs(restored_timeline_start - saved_timeline_start) > 1e-6:
+                    recovered_workspace_state = True
                 self._show_generated_output(
                     [{"kind": "videos", "local_path": str(generated_output)}],
-                    timeline_start=float(payload.get("generated_output_timeline_start", 0.0)),
+                    timeline_start=restored_timeline_start,
                     autoplay=False,
                 )
             self.accept_preview_button.setEnabled(

@@ -40,6 +40,7 @@ from design_engine import (
     protect_explicit_timed_text_layers,
     reconcile_requested_speech_layer_contract,
     sanitize_drone_still_image_request,
+    sanitize_design_model_context,
     speech_timing_budget,
     spatial_acoustics_profile,
     spatial_acoustics_schedule,
@@ -2651,6 +2652,56 @@ On-screen text: "EXACT TITLE"'''
             self.assertNotIn("local_path", prompt)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+
+    def test_design_model_context_blocks_filename_and_drone_p2_semantic_pollution(self):
+        context = {
+            "bound_h3_skills": {
+                "special": {"key": "drone-fly-on-city-fireworks"},
+            },
+            "existing_media": [
+                {
+                    "media_id": "P1", "media_type": "image", "loaded": True,
+                    "filename": "download_98451.jpg",
+                    "local_path": "C:/private/download_98451.jpg",
+                    "analysis_summary": "Kowloon Walled City poster, dense old buildings",
+                },
+                {
+                    "media_id": "P2", "media_type": "image", "loaded": True,
+                    "filename": "kuala-lumpur-twin-towers-klcc-park-route.png",
+                    "local_path": "C:/private/kuala-lumpur-twin-towers-klcc-park-route.png",
+                    "caption": "Petronas Twin Towers route overlay",
+                    "raw_analysis_summary": "Kuala Lumpur skyline and red line",
+                    "semantic_enrichment": "KLCC landmark route map",
+                    "analysis_summary": "Twin towers route control",
+                    "clip_prompt": "orbit the Petronas towers",
+                },
+            ],
+            "current_prompt_fields": {
+                "brief": "Old Kuala Lumpur Petronas Twin Towers draft",
+                "shots": "Orbit KLCC before following the route",
+            },
+            "existing_shots_and_cues": [
+                {"subject_action": "Pass the Petronas Twin Towers"},
+            ],
+        }
+        sanitized = sanitize_design_model_context(context)
+        serialized = json.dumps(sanitized, ensure_ascii=False).casefold()
+        self.assertIn("kowloon walled city", serialized)
+        for polluted in (
+            "download_98451", "kuala-lumpur", "twin towers", "klcc",
+            "petronas", "c:/private", "filename", "local_path",
+        ):
+            self.assertNotIn(polluted, serialized)
+        route = sanitized["existing_media"][1]
+        self.assertEqual(route["planning_role"], "analysis_only")
+        self.assertEqual(route["analysis_status"], "isolated_control")
+
+        prompt = build_design_system_prompt(context).casefold()
+        self.assertIn("kowloon walled city", prompt)
+        self.assertNotIn("petronas", prompt)
+        self.assertNotIn("kuala-lumpur", prompt)
+        self.assertNotIn("klcc", prompt)
+        self.assertNotIn("old kuala lumpur", prompt)
 
     def test_immutable_plate_renderer_copies_p1_and_composites_only_effects(self):
         from PIL import Image, ImageChops

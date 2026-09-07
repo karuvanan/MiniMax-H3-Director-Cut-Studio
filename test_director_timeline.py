@@ -5551,6 +5551,20 @@ class DirectorTimelineDragTests(unittest.TestCase):
         restored.close()
         shutil.rmtree(workspace, ignore_errors=True)
 
+    def test_full_backup_master_rebases_stale_partial_timeline_start(self):
+        self.assertEqual(
+            DirectorCutStudio._normalize_restored_master_timeline_start(
+                47.5, 50.0, 50.5
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            DirectorCutStudio._normalize_restored_master_timeline_start(
+                42.5, 8.0, 50.5
+            ),
+            42.5,
+        )
+
     def test_completed_shot_previews_under_translucent_running_overlay(self):
         video = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
         if not video.exists():
