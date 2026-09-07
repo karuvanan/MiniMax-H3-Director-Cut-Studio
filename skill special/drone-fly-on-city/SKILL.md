@@ -80,6 +80,8 @@ Execute these phases sequentially, never simultaneously:
 
 Use a fully immersive first-person FPV camera rigidly attached to the aircraft. Use a mild GoPro-like ultra-wide fisheye, speed-driven motion blur and physically motivated banking. During the P1 orbit, use moderate coordinated banking only and keep the horizon readable. Dives, inversion and up to 180-degree rolls are permitted only after the full lap is complete and the verified route or fallback phase has begun. Keep architecture and trees geometrically stable. Do not use a smooth god-view crane, mechanical pan or ordinary slow push.
 
+Treat FPV as a **pure camera-only optical viewpoint**, not a visible drone subject. In every Shot, use “the onboard camera viewpoint rises/banks/travels” as the action subject; never write “the drone lifts off/banks/flies” as visible subject action. The frame must contain only the P1-established world and authored effects. The carrier remains beyond all image boundaries during takeoff, banking, pitching, diving and rolling: no drone body, nose, arms, rotors, propellers, landing gear, controller, carrier shadow or reflection. Never cut to a chase, follow, over-the-drone, observer or exterior vehicle angle. If P1 already contains a distant aircraft, preserve it only as unchanged background scenery; never enlarge, transform or reuse it as the foreground camera carrier.
+
 If P2 cannot be verified, show `ROUTE NEEDS REVIEW` but still execute phases 1 and 2. Replace only phase 3 with this proportional FPV fallback: skim low over the established ground; bank hard left and pull into a broad climbing arc; pass a brief inverted crest and dive; counter-roll right around visible obstacles; complete a tight figure-eight crossover; level out and sprint through a safe narrow opening or toward the distant horizon. Do not claim that this fallback reached P2's endpoint.
 
 ## 5. Convert the Red Line into Waypoints (Critical for Path Following)
@@ -141,6 +143,8 @@ Complete the authored camera movement naturally at its endpoint. Do not force a 
 
 ### 7.5 Clean Frame Contract
 MiniMax H3 receives a single video prompt, so do not append the Z-Image negative-prompt catalogue to H3: repeating those visual terms can prime the video model to draw them. End the H3 prompt with this positive instruction instead: `The photoreal city image remains clean and unobstructed; all navigation control stays non-visual and entirely off-screen, with a stable horizon and physically continuous aerial parallax.` The exact still-image exclusion sentence and artifact list belong only to Z-Image reference generation; Studio removes them before H3 compilation.
+
+Also append the Studio camera-only contract: `PURE CAMERA-ONLY POV: show only the P1-established world and authored effects across the full frame. The moving camera and its carrier remain completely outside the image boundaries. Never cut to an exterior, chase, follow, over-the-vehicle or observer view. No visible camera hardware, vehicle body, nose, arms, rotors, propellers, landing gear, controller, carrier shadow or reflection.`
 
 ### 7.6 Audio Description (Optional)
 If audio generation is enabled, append a brief description of the ambient sound matching the scene (e.g., "soft wind, distant city hum") to ensure the native audio aligns with the visual atmosphere. Do not include dialogue unless explicitly requested.
@@ -245,6 +249,7 @@ Language: Follow the user's requested language; Studio Design must remain one va
 JSON Integrity: @P1 and @P2 are correctly registered in existing_media_uses. Normalized screen-space controls used (no real-world telemetry claims).
 Keyframe Isolation: P1 remains the full-duration scene master; P3 is the 0–5 second opening anchor and P4 onward are five-second P1-derived scene states; no forced terminal request follows the final stage; P2 never enters a Loader.
 Still-reference Isolation: Every generated city Picture is a frozen environment frame. Its ordinary prompt and keywords contain no orbit/yaw/trajectory instruction, it includes the exact clean-frame sentence, and its dedicated negative prompt includes the orbit-ring/light-trail artifact list.
+Camera-Carrier Isolation: Every executable Shot uses the onboard camera viewpoint as its movement subject. No H3 Segment depicts the drone, aircraft body, camera rig, rotors, propellers, landing gear, carrier shadow/reflection or an exterior chase/follow angle.
 
 ## 11. Control-Data Hygiene
 Keep detailed route-artifact vocabulary inside P2's `analysis_only` registration and the dedicated Z-Image `negative_prompt` only. Keep the positive still prompt photographic; no prohibited ring/path vocabulary belongs there. Never copy the negative catalogue into creative_brief, Shot fields, constraints, markers, transitions or the final H3 prompt. Express H3 motion quality positively: stable horizon, continuous inertia, clean photoreal frame, collision-free path and coherent city geometry.
