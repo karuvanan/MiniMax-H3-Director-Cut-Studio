@@ -27,6 +27,8 @@ For the 15-second template, allocate 0–2 seconds to launch, 2–10 seconds to 
 
 Use a fully immersive first-person FPV camera rigidly attached to the aircraft, with mild GoPro-like ultra-wide fisheye, speed-driven motion blur, strong inertia and physically motivated banking. During the P1 lap, use moderate coordinated banking only and keep the horizon readable. Dives, inversion and up to 180-degree rolls are permitted only after the full lap is complete and the verified route or fallback phase has begun. Keep architecture, fireworks and trees geometrically stable through every permitted roll; no frame tearing, slow mechanical god view or ordinary camera push.
 
+FPV is a **pure camera-only optical viewpoint**, never a visible drone subject. Write each motion with the onboard camera viewpoint as actor instead of “the drone”. Show only the P1 world and fireworks across the full frame. Keep the carrier outside every image boundary during launch, banking, pitching, diving and rolling: no drone body, nose, arms, rotors, propellers, landing gear, controller, carrier shadow or reflection. Never cut to a chase, follow, over-the-drone, observer or exterior vehicle angle. If P1 contains a distant aircraft, keep it unchanged as background scenery only; do not transform it into or associate it with the foreground camera carrier.
+
 If P2 is unverified, report `ROUTE NEEDS REVIEW`, retain the launch and 360-degree P1 orbit, and replace only the route phase with a collision-safe FPV scene flight: low ground skim; hard left bank and climbing arc; brief inverted crest into a dive; right counter-roll around visible obstacles; tight figure-eight crossover; level sprint toward a safe opening or distant horizon. Do not invent a P2 route endpoint.
 
 ## 3. P1-Derived Five-Second Scene References
@@ -65,6 +67,8 @@ Let the H3-generated camera reach the authored endpoint naturally. Keep firework
 
 Each H3 Segment prompt follows one chronology: P1 scene facts, ground-launch phase, proportional physical lap progress with front/right/rear/left/front position checkpoints, later verified route displacement or FPV fallback, fireworks state, environment response, continuity state and diegetic audio. Lap degrees apply only before the route begins. During the lap, keep the camera rigidly forward along the flight tangent, let the building cross the inside edge naturally, use background parallax to prove translation, and explicitly reject subject-centred look-at, independent yaw, camera spin, panoramic pan and barrel roll. Reach the route endpoint only when P2 is verified. Never name P2 or expose control graphics in renderable prose.
 
+Every independently rendered Segment must repeat the camera-only invariant: the full image is the unobstructed optical output of the moving camera; the camera carrier and all hardware remain beyond the image boundaries. The executable action must say that the **camera viewpoint** rises, banks, or travels—not that a drone appears or performs the action.
+
 Use continuous high-altitude wind, distant local ambience, launch hiss, distance-delayed low-frequency booms and short crackle tails. Do not restart or cut effects at Shot boundaries. Add no dialogue or narration unless the Timeline contains it. Music obeys `MUSIC: OFF / AUTO / TIMELINE`.
 
 ## 7. Apply Gate
@@ -75,6 +79,7 @@ Use continuous high-altitude wind, distant local ambience, launch hiss, distance
 4. P3 is the 0–5 second opening anchor; P4 onward are five-second P1-derived scene states with no new scene identity.
 5. Current intervals use P1 plus only the relevant stage Pictures; future stages do not leak backward.
 6. Fireworks, smoke, reflection, exposure and audio states remain physically continuous.
+7. Camera-only POV is preserved in every Segment: no drone/camera carrier, body, arms, rotors, propellers, landing gear, controller, shadow, reflection, chase view or exterior follow shot appears.
 
 ## Supported P2 Drawing and Fidelity Limits
 
