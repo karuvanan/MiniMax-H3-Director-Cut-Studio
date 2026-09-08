@@ -14,6 +14,7 @@ from combat_action_engine import (
     route_action_carrier,
     infer_force_vector,
     HONG_KONG_COMIC_FIGHTER_SKILL,
+    reconcile_final_combat_markers,
 )
 
 
@@ -95,6 +96,39 @@ class CombatActionEngineTests(unittest.TestCase):
         self.assertIn("foot sweep", row["subject_action"])
         self.assertIn("force vector", row["subject_action"])
         self.assertTrue(any("outcome-only" in warning for warning in warnings))
+
+    def test_hong_kong_comic_auto_repair_never_inherits_wet_market_target(self):
+        plan = {
+            "duration_seconds": 5.0,
+            "constraints": "",
+            "shots": [{
+                **shot(1, 0.0, 5.0, "S2 lands on his back; S1 stands over him."),
+                "environment_interaction": (
+                    "source-visible rocky mountain; stale nearest wet produce crate metadata"
+                ),
+            }],
+        }
+        apply_combat_action_continuity(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+        )
+        action = plan["shots"][0]["subject_action"]
+        self.assertIn("source-visible rock surface", action)
+        self.assertNotIn("produce crate", action)
+        self.assertNotIn("wet market", action)
+        incoming = plan["shots"][0]["incoming_combat_state"]
+        self.assertIn("source-image terrain", incoming)
+        self.assertNotIn("wet floor", incoming)
+
+    def test_final_combat_marker_reanchors_after_duration_extension(self):
+        markers = [{
+            "time_seconds": 29.0,
+            "preset": "Ending Hold",
+            "direction": "Old pre-extension ending.",
+        }]
+        repaired = reconcile_final_combat_markers(markers, 41.5)
+        self.assertEqual(repaired[0]["time_seconds"], 40.5)
+        self.assertEqual(repaired[0]["preset"], "Final Combat Resolve")
 
     def test_user_edited_repeated_action_remains_a_warning(self):
         value = shot(2, 2.5, 5.0, "S1 attacks S2. S2 blocks and counters.")

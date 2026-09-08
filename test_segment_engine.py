@@ -1,13 +1,17 @@
 import unittest
 
 from segment_engine import (
+    RenderSegment,
     align_segments_to_dialogue_turns,
     content_fingerprint,
     derive_segment_seed,
     derive_named_segment_seed,
     dirty_segment_indexes,
+    normalize_speech_overlap_policy,
     plan_render_segments,
+    plan_speech_track_lanes,
     plan_shot_render_segments,
+    protect_segment_boundaries_from_atomic_shots,
     protect_segment_boundaries_from_speech,
     rebase_timed_rows,
     reuse_cached_segments,
@@ -16,6 +20,53 @@ from segment_engine import (
 
 
 class SegmentEngineTests(unittest.TestCase):
+    def test_speech_lane_planner_routes_collisions_without_cutting_text(self):
+        rows = plan_speech_track_lanes([
+            {
+                "layer_id": "T1", "content_role": "voice_over",
+                "start_seconds": 0.0, "end_seconds": 6.0,
+                "overlap_policy": "auto",
+            },
+            {
+                "layer_id": "T2", "content_role": "voice_over",
+                "start_seconds": 4.0, "end_seconds": 7.0,
+                "overlap_policy": "overlap",
+            },
+            {
+                "layer_id": "T3", "content_role": "voice_over",
+                "start_seconds": 7.0, "end_seconds": 9.0,
+                "overlap_policy": "auto",
+            },
+            {
+                "layer_id": "T4", "content_role": "dialogue",
+                "start_seconds": 4.0, "end_seconds": 8.0,
+                "overlap_policy": "auto",
+            },
+        ])
+        by_id = {row["layer_id"]: row for row in rows}
+        self.assertEqual(by_id["T1"]["lane_number"], 1)
+        self.assertEqual(by_id["T2"]["lane_number"], 2)
+        self.assertEqual(by_id["T3"]["lane_number"], 1)
+        self.assertEqual(by_id["T4"]["lane_number"], 1)
+        self.assertEqual((by_id["T2"]["start_seconds"], by_id["T2"]["end_seconds"]), (4.0, 7.0))
+
+    def test_sequential_speech_policy_preserves_duration_and_moves_later_clip(self):
+        rows = plan_speech_track_lanes([
+            {
+                "layer_id": "T1", "content_role": "dialogue",
+                "start_seconds": 0.0, "end_seconds": 5.0,
+            },
+            {
+                "layer_id": "T2", "content_role": "dialogue",
+                "start_seconds": 4.0, "end_seconds": 6.0,
+                "overlap_policy": "no overlap",
+            },
+        ])
+        self.assertEqual(normalize_speech_overlap_policy("no overlap"), "sequential")
+        self.assertEqual(rows[1]["lane_number"], 1)
+        self.assertEqual((rows[1]["start_seconds"], rows[1]["end_seconds"]), (5.0, 7.0))
+        self.assertTrue(rows[1]["timing_adjusted"])
+
     def test_native_length_keeps_one_exact_segment(self):
         rows = plan_render_segments(0.0, 12.0)
         self.assertEqual(len(rows), 1)
@@ -122,6 +173,32 @@ class SegmentEngineTests(unittest.TestCase):
             )
         )
 
+    def test_overlapping_speech_group_is_never_split_by_boundary_repair(self):
+        planned = plan_render_segments(
+            0.0, 25.0, max_segment_seconds=15.0, overlap_seconds=0.0
+        )
+        speech = [
+            {
+                "content_role": "dialogue", "speaker": "S1",
+                "start_seconds": 10.0, "end_seconds": 16.0,
+                "overlap_policy": "auto",
+            },
+            {
+                "content_role": "dialogue", "speaker": "S2",
+                "start_seconds": 14.0, "end_seconds": 18.0,
+                "overlap_policy": "overlap",
+            },
+        ]
+        protected = protect_segment_boundaries_from_speech(
+            planned, speech, tail_seconds=0.0
+        )
+        self.assertEqual(
+            [(row.core_start_seconds, row.core_end_seconds) for row in protected],
+            [(0.0, 10.0), (10.0, 25.0)],
+        )
+        aligned = align_segments_to_dialogue_turns(protected, speech)
+        self.assertNotIn(14.0, [row.core_end_seconds for row in aligned[:-1]])
+
     def test_speech_boundary_uses_backward_safe_cut_when_forward_exceeds_h3_limit(self):
         planned = plan_render_segments(0.0, 25.0, overlap_seconds=0.0)
         protected = protect_segment_boundaries_from_speech(
@@ -135,6 +212,56 @@ class SegmentEngineTests(unittest.TestCase):
         )
         self.assertEqual(protected[0].core_end_seconds, 14.0)
         self.assertEqual(protected[1].core_start_seconds, 14.0)
+        self.assertTrue(all(row.duration_seconds <= 15.0 for row in protected))
+
+    def test_named_signature_technique_is_not_split_between_native_jobs(self):
+        planned = plan_render_segments(
+            0.0, 41.5, max_segment_seconds=15.0, overlap_seconds=0.0
+        )
+        shots = [
+            {"cue_id": "S1", "start_seconds": 0.0, "end_seconds": 14.0,
+             "subject_action": "Two fighters exchange concrete counters."},
+            {"cue_id": "S2", "start_seconds": 14.0, "end_seconds": 25.0,
+             "subject_action": "The advantage reverses after a forearm block."},
+            {"cue_id": "S7", "start_seconds": 25.0, "end_seconds": 29.0,
+             "subject_action": "S2 completes 无界紫电拳 and S1 absorbs the contact."},
+            {"cue_id": "S8", "start_seconds": 29.0, "end_seconds": 41.5,
+             "subject_action": "S1 returns one final palm counter."},
+        ]
+        protected = protect_segment_boundaries_from_atomic_shots(
+            planned, shots, max_segment_seconds=15.0, grid_seconds=0.5
+        )
+        boundaries = [row.core_end_seconds for row in protected[:-1]]
+        self.assertNotIn(27.0, boundaries)
+        self.assertTrue(all(not (25.0 < boundary < 29.0) for boundary in boundaries))
+
+    def test_signature_dialogue_protects_its_whole_owning_shot(self):
+        planned = [
+            RenderSegment("a", 0, 0.0, 15.0),
+            RenderSegment("b", 1, 15.0, 27.0),
+            RenderSegment("c", 2, 27.0, 41.5),
+        ]
+        protected = protect_segment_boundaries_from_atomic_shots(
+            planned,
+            [{
+                "cue_id": "S7",
+                "start_seconds": 25.0,
+                "end_seconds": 29.0,
+                "subject_action": "The fist loads, contacts and completes its recoil.",
+            }],
+            text_layers=[{
+                "shot_id": "S7",
+                "start_seconds": 25.0,
+                "end_seconds": 27.0,
+                "content": "无界——紫电拳！",
+            }],
+            max_segment_seconds=15.0,
+            grid_seconds=0.5,
+        )
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in protected],
+            [(0.0, 15.0), (15.0, 29.0), (29.0, 41.5)],
+        )
         self.assertTrue(all(row.duration_seconds <= 15.0 for row in protected))
 
     def test_decay_tail_never_pushes_cut_across_next_speech_start(self):

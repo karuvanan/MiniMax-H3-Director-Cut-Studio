@@ -3971,6 +3971,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         state = dialog.state()
         self.assertEqual(state["speaker"], "S2")
         self.assertEqual(state["language"], "Cantonese")
+        self.assertEqual(state["overlap_policy"], "auto")
         self.assertTrue(state["lip_sync"])
         self.assertEqual(state["shot_id"], "S1")
         window.director_cues = [shot]
@@ -3985,7 +3986,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertTrue(spec.text_ranges[0]["lip_sync"])
         dialog.role_combo.setCurrentIndex(dialog.role_combo.findData("voice_over"))
         for title, (_label, widget) in dialog.semantic_rows.items():
-            self.assertEqual(widget.isHidden(), title != "Language")
+            self.assertEqual(widget.isHidden(), title == "Lip Sync")
         dialog.language_combo.setCurrentText("Mandarin Chinese")
         voice_over_state = dialog.state()
         self.assertEqual(voice_over_state["language"], "Mandarin Chinese")
@@ -4011,7 +4012,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(layer.track_id, "A4")
         dialogue_track = next(track for track in window.tracks if track.track_id == "A4")
         self.assertEqual(dialogue_track.kind, "audio")
-        self.assertEqual(dialogue_track.name, "A4 Dialogue")
+        self.assertEqual(dialogue_track.name, "D1 · Dialogue")
         clip = next(
             item for item in window.timeline.scene_obj.items()
             if isinstance(item, TimelineTextClip) and item.layer is layer
@@ -4021,6 +4022,36 @@ class DirectorTimelineDragTests(unittest.TestCase):
             clip.y(),
             window.timeline._track_top(window.tracks.index(dialogue_track)) + 2,
         )
+        window.project_dirty = False
+        window.close()
+
+    def test_overlapping_voiceovers_are_independent_and_auto_routed_to_two_tracks(self):
+        window = DirectorCutStudio()
+        first = TextLayer(
+            "T1", "第一段旁白", 0.0, 6.0, "A5",
+            content_role="voice_over", language="Cantonese",
+        )
+        second = TextLayer(
+            "T2", "第二段旁白", 4.0, 8.0, "A5",
+            content_role="voice_over", language="Cantonese",
+            overlap_policy="overlap",
+        )
+        window.text_layers = [first, second]
+        window._refresh_text_layers(second)
+        self.app.processEvents()
+
+        self.assertEqual((first.start_seconds, first.end_seconds), (0.0, 6.0))
+        self.assertEqual((second.start_seconds, second.end_seconds), (4.0, 8.0))
+        self.assertNotEqual(first.track_id, second.track_id)
+        first_track = next(track for track in window.tracks if track.track_id == first.track_id)
+        second_track = next(track for track in window.tracks if track.track_id == second.track_id)
+        self.assertEqual(first_track.name, "VO1 · Voice-over")
+        self.assertEqual(second_track.name, "VO2 · Voice-over")
+        spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        by_id = {row["layer_id"]: row for row in spec.text_ranges}
+        self.assertEqual(by_id["T1"]["track_id"], first.track_id)
+        self.assertEqual(by_id["T2"]["track_id"], second.track_id)
+        self.assertEqual(by_id["T2"]["overlap_policy"], "overlap")
         window.project_dirty = False
         window.close()
 

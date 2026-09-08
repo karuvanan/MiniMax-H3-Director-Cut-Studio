@@ -37,8 +37,9 @@ ACTION_CAUSALITY_CONTRACT = (
 FACT_LEDGER_CONTRACT = (
     "COMBAT FACT LEDGER: explicit user direction outranks loaded P1/P2 pixels, explicit role "
     "bindings, BLIP Overview, AI Enrich and Skill defaults in that order. Text metadata may "
-    "describe but never replace loaded pixels. S1/P1 and S2/P2 identity, wardrobe and action "
-    "ownership remain stable unless the user explicitly changes them."
+    "describe but never replace loaded pixels. Every explicitly bound character identity, wardrobe "
+    "and action ownership remains stable unless the user changes it; P numbering alone never "
+    "creates an S1/P1 or S2/P2 binding."
 )
 FIVE_DUTY_CONTRACT = (
     "FIVE-DUTY ACTION WINDOW: each 15-second combat window progresses through state pickup, "
@@ -138,7 +139,9 @@ _ACTION_INITIATION_RE = re.compile(
 _OUTCOME_ONLY_RE = re.compile(
     r"(?i)\b(?:lands?\s+(?:on|back)|falls?|is\s+down|lies?|stands?\s+over|"
     r"ends?\s+up|gets?\s+knocked|is\s+thrown|recoils?|is\s+sent|remains?\s+on\s+the\s+ground)\b|"
-    r"倒地|躺下|站在.+上方|被击飞|被擊飛|落地|趴在地上|躺在地上|退到"
+    r"blood (?:appears|starts|becomes visible)|starts? bleeding|"
+    r"倒地|躺下|站在.+上方|被击飞|被擊飛|落地|趴在地上|躺在地上|退到|"
+    r"出现血|出現血|开始流血|開始流血"
  )
 _GENERIC_ACTION_RE = re.compile(
     r"(?i)already within arm'?s reach.*(?:attack|defence|counter).*exchange|"
@@ -260,11 +263,22 @@ def _action_was_user_edited(shot: dict) -> bool:
     )
 
 
-def _causal_target_hint(shot: dict) -> str:
+def _causal_target_hint(shot: dict, *, source_world_only: bool = False) -> str:
     text = " ".join(
         str(shot.get(key, ""))
         for key in ("environment_interaction", "environment_response", "location_transition")
     ).casefold()
+    if source_world_only:
+        # Hong Kong comic conversion must never inherit the fixed Kowloon wet-
+        # market props used by the live-action Street Fighter profile.  Use
+        # only a material visibly established by the source-page fact ledger.
+        if any(token in text for token in ("rock", "stone", "cliff", "mountain", "岩", "石", "山")):
+            return "the established source-visible rock surface"
+        if any(token in text for token in ("water", "river", "sea", "lake", "水", "河", "海", "湖")):
+            return "the established source-visible water edge"
+        if any(token in text for token in ("wall", "column", "building", "structure", "墙", "牆", "柱", "建筑", "建築")):
+            return "the established source-visible structural surface"
+        return "the established source-image combat surface"
     if any(token in text for token in ("gate", "latch", "闸", "閘", "门闩", "門閂")):
         return "the loading gate latch"
     if any(token in text for token in ("crate", "produce", "菜箱", "货箱", "貨箱")):
@@ -279,6 +293,7 @@ def _synthesize_distinct_causal_action(
     *,
     actor: str,
     previous_action: str,
+    source_world_only: bool = False,
 ) -> str:
     """Create a small, physically staged continuation for a repeated Shot.
 
@@ -289,7 +304,7 @@ def _synthesize_distinct_causal_action(
 
     defender = _opponent(actor)
     previous_carrier, _ = route_action_carrier(previous_action)
-    target = _causal_target_hint(shot)
+    target = _causal_target_hint(shot, source_world_only=source_world_only)
     if target == "the loading gate latch":
         return (
             f"{actor} uses a controlled hip-turn to redirect {defender} toward the loading gate; "
@@ -321,12 +336,17 @@ def _synthesize_distinct_causal_action(
     )
 
 
-def _synthesize_high_density_combat_action(shot: dict, index: int) -> str:
+def _synthesize_high_density_combat_action(
+    shot: dict,
+    index: int,
+    *,
+    source_world_only: bool = False,
+) -> str:
     """Replace vague fight placeholders with a distinct renderable cause chain."""
 
     actor = "S1" if index % 2 == 0 else "S2"
     defender = _opponent(actor)
-    target = _causal_target_hint(shot)
+    target = _causal_target_hint(shot, source_world_only=source_world_only)
     exchanges = (
         f"{actor} plants the rear foot and fires a straight lead palm along the centreline; "
         f"{defender} checks the wrist with the outside forearm, slips off-line and drives a compact counter elbow that turns both bodies toward {target}",
@@ -359,12 +379,17 @@ def _synthesize_ground_reversal(current_action: str, previous_action: str) -> st
     )
 
 
-def _synthesize_outcome_cause_action(shot: dict, index: int) -> str:
+def _synthesize_outcome_cause_action(
+    shot: dict,
+    index: int,
+    *,
+    source_world_only: bool = False,
+) -> str:
     """Bridge a model-written result ("S2 lands...") back to its physical cause."""
 
     attacker = "S1" if index % 2 == 0 else "S2"
     defender = _opponent(attacker)
-    target = _causal_target_hint(shot)
+    target = _causal_target_hint(shot, source_world_only=source_world_only)
     return (
         f"{attacker} catches {defender}'s advancing guard, changes level and completes a controlled "
         f"outside foot sweep into {target}; {defender} loses the support foot, lands on the back along "
@@ -646,13 +671,20 @@ def _state_text(vector: dict) -> str:
     return "; ".join(f"{key}={value}" for key, value in vector.items())
 
 
-def _synthesize_allowed_carrier_action(shot: dict, actor: str, previous_action: str) -> str:
+def _synthesize_allowed_carrier_action(
+    shot: dict,
+    actor: str,
+    previous_action: str,
+    *,
+    source_world_only: bool = False,
+) -> str:
     """Replace an unrequested fantasy/weapon carrier with bounded physical choreography."""
 
     return _synthesize_distinct_causal_action(
         shot,
         actor=actor,
         previous_action=previous_action or "standing bare-hand exchange",
+        source_world_only=source_world_only,
     )
 
 
@@ -724,10 +756,9 @@ def reconcile_final_combat_markers(
         })
         result.append(final_rows[0])
     for marker in final_rows:
-        marker["time_seconds"] = min(
-            max(0.0, float(marker.get("time_seconds", duration - 1.0) or 0.0)),
-            max(0.0, duration - 0.5),
-        )
+        # A Final Combat Resolve cue is a tail-state instruction, not a story
+        # event that should remain at its pre-speech-expansion timestamp.
+        marker["time_seconds"] = round(max(0.0, duration - 1.0) * 2.0) / 2.0
         marker["preset"] = "Final Combat Resolve"
         marker["direction"] = (
             "Complete the final authored technique at real-time speed, show recoil and caused "
@@ -744,6 +775,7 @@ def reconcile_combat_action_rows(
     action_baseline_seconds: object | None = None,
     fact_ledger: dict | None = None,
     auto_repair: bool = True,
+    source_world_only: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """Number action beats and relay fighter state across chronological Shots.
 
@@ -807,7 +839,9 @@ def reconcile_combat_action_rows(
             and not _action_was_user_edited(shot)
         ):
             shot["causal_risk_original_action"] = raw_action
-            raw_action = _synthesize_high_density_combat_action(shot, index)
+            raw_action = _synthesize_high_density_combat_action(
+                shot, index, source_world_only=source_world_only
+            )
             shot["causal_risk_repair_status"] = "auto_fixed"
             shot["causal_risk_repair_notes"] = (
                 "Replaced a vague pose/standoff/generic exchange with one concrete load, "
@@ -850,7 +884,9 @@ def reconcile_combat_action_rows(
         ):
             if auto_repair and not _action_was_user_edited(shot):
                 original_action = joined_beats
-                repaired_action = _synthesize_outcome_cause_action(shot, index)
+                repaired_action = _synthesize_outcome_cause_action(
+                    shot, index, source_world_only=source_world_only
+                )
                 shot["causal_risk_original_action"] = original_action
                 shot["causal_risk_repair_status"] = "auto_fixed"
                 shot["causal_risk_repair_notes"] = (
@@ -912,6 +948,7 @@ def reconcile_combat_action_rows(
                     shot,
                     actor=attacker,
                     previous_action=previous_action,
+                    source_world_only=source_world_only,
                 )
                 repaired_signature = _action_signature(repaired_action)
                 if repaired_signature and repaired_signature != previous_signature:
@@ -955,7 +992,10 @@ def reconcile_combat_action_rows(
             if auto_repair and not _action_was_user_edited(shot):
                 original_action = current_action
                 repaired_action = _synthesize_allowed_carrier_action(
-                    shot, attacker, previous_action
+                    shot,
+                    attacker,
+                    previous_action,
+                    source_world_only=source_world_only,
                 )
                 beats = _split_two_beats(repaired_action)
                 current_action = " ".join(beats)
@@ -1021,8 +1061,15 @@ def reconcile_combat_action_rows(
             "support": "both have one readable planted support foot",
             "guard_or_grip": "separate live guards; no unexplained grip",
             "advantage": "contested",
-            "environment_aftermath": "established wet floor and fixtures unchanged",
-            "wetness_damage": "preserve existing sweat, wetness and visible non-graphic contact marks",
+            "environment_aftermath": (
+                "established source-image terrain and visible materials unchanged"
+                if source_world_only else "established wet floor and fixtures unchanged"
+            ),
+            "wetness_damage": (
+                "preserve only source-visible weathering, damage and non-graphic contact marks"
+                if source_world_only else
+                "preserve existing sweat, wetness and visible non-graphic contact marks"
+            ),
         }
         result_actor = str(result_beat.get("attacker") or _opponent(attacker))
         outgoing_vector = {
@@ -1041,7 +1088,11 @@ def reconcile_combat_action_rows(
             ),
             "advantage": f"temporary initiative={result_actor}; no unexplained ownership swap",
             "environment_aftermath": "pending the exact contact consequence assigned to this Shot",
-            "wetness_damage": "carry visible sweat, wetness and contact marks into the next Beat",
+            "wetness_damage": (
+                "carry only source-visible weathering, damage and contact marks into the next Beat"
+                if source_world_only else
+                "carry visible sweat, wetness and contact marks into the next Beat"
+            ),
         }
         incoming = previous_outgoing or _state_text(incoming_vector)
         outgoing = _state_text(outgoing_vector)
@@ -1201,6 +1252,10 @@ def apply_combat_action_continuity(
         plan.get("duration_seconds", baseline),
         action_baseline_seconds=baseline,
         fact_ledger=fact_ledger,
+        source_world_only=(
+            str(special_skill_key or "").strip().casefold()
+            == HONG_KONG_COMIC_FIGHTER_SKILL
+        ),
     )
     if speech_tail_shots:
         last_state = str(
@@ -1351,7 +1406,23 @@ def compact_street_fighter_prompt_field(
         if not row.strip().startswith(_ENGINE_LINE_PREFIXES)
     ]
     text = "\n".join(rows).strip()
+    # Environment/action engines also store editable state as inline labelled
+    # clauses in legacy projects.  Those clauses are emitted once by the
+    # dedicated compact prompt builders below; keeping the editable copy here
+    # multiplied a 15-second H3 prompt into tens of thousands of characters.
+    text = re.sub(
+        r"(?is)\[(?:ENV-PHYSICS|ENV-IN|ENV-OUT|LOCATION)\]\s*.*?"
+        r"(?=\[(?:ENV-PHYSICS|ENV-IN|ENV-OUT|LOCATION)\]|$)",
+        " ",
+        text,
+    )
     for contract in global_contracts:
         text = text.replace(str(contract or ""), "")
     text = _CAST_LOCK_SENTENCE_RE.sub("", text)
-    return re.sub(r"\s+", " ", text).strip(" .\n")
+    text = re.sub(r"\s+", " ", text).strip(" .\n")
+    # Full facts remain editable on the Timeline.  The H3 generation copy uses
+    # the beginning plus tail so it retains the authored action and any final
+    # prohibition without drowning exact dialogue/native-audio instructions.
+    if len(text) > 1200:
+        text = text[:850].rstrip(" ,;:") + " … " + text[-320:].lstrip()
+    return text

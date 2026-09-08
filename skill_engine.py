@@ -915,23 +915,10 @@ def build_ref2va_prompt(
             "event synchronized with its matching visual interval. Never use the preceding generated "
             "segment's audio as a reference, and never copy an earlier utterance across a boundary."
         )
-        for row in sorted(
-            spec.native_audio_ranges,
-            key=lambda item: (
-                float(item.get("start_seconds", 0.0)),
-                float(item.get("end_seconds", 0.0)),
-                str(item.get("cue_id", "")),
-            ),
-        ):
-            start = float(row.get("start_seconds", 0.0))
-            end = max(start, float(row.get("end_seconds", start)))
-            cue_id = str(row.get("cue_id", "Shot"))
-            detailed_rows.append(
-                f"[Native Audio {cue_id} | {_timecode(start)}-{_timecode(end)}] "
-                f"{str(row.get('native_audio_direction', '')).strip()} "
-                f"ENVIRONMENT CONTINUITY - {str(row.get('environment_continuity', '')).strip()} "
-                f"AUDIO REFERENCE INTENT - {str(row.get('audio_reference_intent', '')).strip()}"
-            )
+        detailed_rows.append(
+            "Use the timestamped Native Audio schedule in overall_soundscape exactly once; "
+            "do not duplicate or paraphrase it inside visual Shot prose."
+        )
     active_labels = ", ".join(
         [asset.tag for asset in unique_assets]
         + list(paired_audio_tags.values())
@@ -976,11 +963,20 @@ def build_ref2va_prompt(
         detailed_rows.append("Hard constraints: " + spec.must_keep.strip().rstrip(".。") + ".")
 
     native_soundscape = "\n".join(
+        f"[Native Audio {str(row.get('cue_id', 'Shot'))} | "
         f"{_timecode(float(row.get('start_seconds', 0.0)))}-"
-        f"{_timecode(float(row.get('end_seconds', row.get('start_seconds', 0.0))))}: "
-        f"{str(row.get('native_audio_direction', '')).strip()} "
-        f"{str(row.get('environment_continuity', '')).strip()}"
-        for row in spec.native_audio_ranges
+        f"{_timecode(float(row.get('end_seconds', row.get('start_seconds', 0.0))))}] "
+        f"NATIVE AUDIO DIRECTION - {str(row.get('native_audio_direction', '')).strip()} "
+        f"ENVIRONMENT CONTINUITY - {str(row.get('environment_continuity', '')).strip()} "
+        f"AUDIO REFERENCE INTENT - {str(row.get('audio_reference_intent', '')).strip()}"
+        for row in sorted(
+            spec.native_audio_ranges,
+            key=lambda item: (
+                float(item.get("start_seconds", 0.0)),
+                float(item.get("end_seconds", 0.0)),
+                str(item.get("cue_id", "")),
+            ),
+        )
     )
     authored_soundscape = spec.audio.strip()
     if authored_soundscape and native_soundscape:

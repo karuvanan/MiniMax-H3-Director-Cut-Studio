@@ -126,31 +126,65 @@ def build_structured_prompt(spec: PromptSpec) -> str:
     if spec.text_ranges:
         rows = [
             "TIMELINE TYPE / DIALOGUE TRACK: execute every independently timed clip exactly once; "
-            "never move its wording into Shot action prose."
+            "never move its wording into Shot action prose. Separate speech tracks are independent "
+            "performances; preserve authored overlaps without merging, truncating or reordering them."
         ]
-        for item in sorted(
+        ordered_text_ranges = sorted(
             spec.text_ranges,
             key=lambda row: (
                 float(row.get("start_seconds", 0.0)),
                 float(row.get("end_seconds", 0.0)),
+                str(row.get("layer_id", "")),
             ),
-        ):
+        )
+        speech_rows: list[dict] = []
+        for item in ordered_text_ranges:
             start = float(item.get("start_seconds", 0.0))
             end = float(item.get("end_seconds", start))
             role = str(item.get("content_role", "on_screen_text"))
             text = str(item.get("text", "")).strip()
             track = str(item.get("track_id", "Type"))
+            layer_id = str(item.get("layer_id", "Text"))
             if role == "on_screen_text":
                 rows.append(
-                    f'[{track} {start:.3f}-{end:.3f}s] Show exact text "{text}".'
+                    f'[{track} {layer_id} {start:.3f}-{end:.3f}s] Show exact text "{text}".'
                 )
             else:
                 speaker = str(item.get("speaker", "S1"))
                 language = str(item.get("language", "Original"))
+                delivery = str(item.get("delivery", "Natural"))
+                overlap_policy = str(item.get("overlap_policy", "auto")).strip().lower()
                 rows.append(
-                    f"[{track} {start:.3f}-{end:.3f}s] ({speaker}) "
+                    f"[{track} {layer_id} {start:.3f}-{end:.3f}s] "
+                    f"({role}; {speaker}; {language}; {delivery}; overlap={overlap_policy}) "
                     f"<d>[{language}] {text}</d>"
                 )
+                speech_rows.append({
+                    "layer_id": layer_id,
+                    "track_id": track,
+                    "start_seconds": start,
+                    "end_seconds": end,
+                    "content_role": role,
+                    "speaker": speaker,
+                    "overlap_policy": overlap_policy,
+                })
+        overlap_pairs: list[str] = []
+        for index, left in enumerate(speech_rows):
+            for right in speech_rows[index + 1:]:
+                overlap_start = max(left["start_seconds"], right["start_seconds"])
+                overlap_end = min(left["end_seconds"], right["end_seconds"])
+                if overlap_end <= overlap_start + 1e-6:
+                    continue
+                overlap_pairs.append(
+                    f"{overlap_start:.3f}-{overlap_end:.3f}s: {left['layer_id']} on "
+                    f"{left['track_id']} overlaps {right['layer_id']} on {right['track_id']}"
+                )
+        if overlap_pairs:
+            rows.append(
+                "AUTHORIZED SPEECH OVERLAPS: " + "; ".join(overlap_pairs) + ". "
+                "Keep every voice distinct and synchronized to its own window. Do not make one "
+                "speaker inherit, repeat or complete another layer's words."
+            )
         blocks.append("\n".join(rows))
 
     if spec.native_audio_ranges:

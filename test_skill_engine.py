@@ -383,10 +383,12 @@ class SkillEngineTests(unittest.TestCase):
         media = [
             {
                 "media_id": "P1", "media_type": "image", "loaded": True,
+                "local_path": "page1.jpg",
                 "raw_analysis_summary": "BLIP · Overview: two fighters on a rocky mountain under a blue sky",
             },
             {
                 "media_id": "P2", "media_type": "image", "loaded": True,
+                "local_path": "page2.jpg",
                 "semantic_enrichment": "SUMMARY\nThe same fighters collide above broken stone.",
             },
             {
@@ -401,9 +403,11 @@ class SkillEngineTests(unittest.TestCase):
         self.assertNotIn("{{HONG_KONG_COMIC_SOURCE_EVIDENCE}}", rendered)
         self.assertIn("@P1（BLIP · Overview：two fighters on a rocky mountain", rendered)
         self.assertIn("@P2（AI Enrich：The same fighters collide", rendered)
+        self.assertIn("source_file=page1.jpg", rendered)
+        self.assertIn("仅用于把剧本页码映射到@P1", rendered)
         self.assertNotIn("@P3", rendered)
         self.assertNotIn("older Skill", rendered)
-        self.assertIn("P1／P2只是图片编号，不代表S1／S2一人一图", rendered)
+        self.assertIn("P编号只是图片编号，不代表S1=P1或S2=P2", rendered)
 
     def test_street_fighter_normalization_forces_whole_design_cast_references(self):
         media = [
@@ -524,7 +528,8 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("physical FPV clockwise orbital translation", shot["camera_movement"])
         self.assertNotIn("pull-back", shot["camera_movement"].casefold())
         self.assertNotIn("zoom out", shot["camera_movement"].casefold())
-        self.assertIn("immediate full-speed attack", shot["subject_action"])
+        self.assertIn("straight lead palm", shot["subject_action"])
+        self.assertNotIn("immediate full-speed attack", shot["subject_action"])
         self.assertNotIn("walk", shot["subject_action"].casefold())
         self.assertNotIn("slowly", shot["subject_action"].casefold())
         self.assertIn("CONTINUOUS FPV COMBAT ORBIT:", shot["additional_direction"])

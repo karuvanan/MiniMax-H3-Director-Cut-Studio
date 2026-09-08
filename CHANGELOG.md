@@ -2,6 +2,22 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.2-alpha.7] - 2026-09-09
+
+### Independent overlapping speech layers
+
+- Added an editable `Overlap Policy` to every Dialogue, Voice-over and Lyrics Text Layer. `AUTO` preserves authored timing and routes a collision to another same-role track; `OVERLAP` explicitly authorizes simultaneous performances; `SEQUENTIAL` moves the later line after earlier speech without shortening either line.
+- Added automatic role-specific speech lanes: `D1 / D2...`, `VO1 / VO2...` and `L1 / L2...`. A one-second performance-tail guard also separates immediately adjacent lines, preventing the previous H3 delivery from hiding or cutting the next cue.
+- Kept each authored line as an independent editable Text Layer with its own role, speaker, language, delivery, timing, Shot binding, track and overlap policy. Automatic routing never merges, rewrites or truncates authored text.
+- Reworked speech-aware Segment boundaries around overlapping speech groups. A later Speaker start can no longer split an earlier line while both are audible; one H3 Job receives the complete authorized overlap and its exact Timeline windows.
+- Added `AUTHORIZED SPEECH OVERLAPS` and track/layer identity to the actual MiniMax H3 prompt. H3 is told to preserve the simultaneous performances while prohibiting merged, reordered, duplicated, translated or invented dialogue.
+- Applied the new behavior to Design-created layers, Type Tool editing, Timeline tooltips, save/load, TTS job metadata and prompt reconciliation. Old Projects that do not contain `overlap_policy` load as `AUTO` and are normalized in memory before the next save.
+
+### Compatibility and verification
+
+- Raised Director Project format from `23` to `24` for the persisted Text Layer overlap policy. The addition is backward compatible; no media, Take or approved Segment file is deleted during migration.
+- Verified two complete 169-test suites: Timeline/UI/save-load/render-state coverage and Design/Prompt/Segment/Standard Pipeline coverage. All four modified runtime modules also pass Python bytecode compilation.
+
 ## [0.3.2-alpha.6] - 2026-09-08
 
 ### Hong Kong Comic Fighter production grammar

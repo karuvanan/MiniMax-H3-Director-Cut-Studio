@@ -45,6 +45,31 @@ class PromptEngineTests(unittest.TestCase):
         result = build_structured_prompt(self.spec)
         self.assertIn("phoneme timing to the supplied audio", result)
 
+    def test_independent_speech_tracks_preserve_authored_overlap(self):
+        self.spec.dialogue = ""
+        self.spec.text_ranges = [
+            {
+                "layer_id": "T1", "track_id": "A4",
+                "start_seconds": 1.0, "end_seconds": 5.0,
+                "content_role": "dialogue", "speaker": "S1",
+                "language": "Cantonese", "delivery": "Natural",
+                "overlap_policy": "auto", "text": "你先聽我講。",
+            },
+            {
+                "layer_id": "T2", "track_id": "A7",
+                "start_seconds": 3.5, "end_seconds": 6.0,
+                "content_role": "dialogue", "speaker": "S2",
+                "language": "Cantonese", "delivery": "Urgent",
+                "overlap_policy": "overlap", "text": "我已經聽夠了！",
+            },
+        ]
+        result = build_structured_prompt(self.spec)
+        self.assertIn("AUTHORIZED SPEECH OVERLAPS", result)
+        self.assertIn("3.500-5.000s: T1 on A4 overlaps T2 on A7", result)
+        self.assertIn("overlap=overlap", result)
+        self.assertEqual(result.count("你先聽我講。"), 1)
+        self.assertEqual(result.count("我已經聽夠了！"), 1)
+
     def test_validation_keeps_reference_tags(self):
         prompt = build_structured_prompt(self.spec)
         report = validate_prompt(prompt, reference_tags_from_spec(self.spec))

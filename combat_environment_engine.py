@@ -1156,15 +1156,18 @@ def environmental_combat_prompt_clause(row: dict, *, include_global_contract: bo
 
     if not isinstance(row, dict) or not int(row.get("environment_physics_schema_version", 0) or 0):
         return ""
+    def prompt_value(key: str, limit: int) -> str:
+        return _compact_reference_evidence(row.get(key, ""), limit)
+
     parts = [
-        "ENVIRONMENT INTERACTION - " + str(row.get("environment_interaction", "")).strip(),
-        "CONTINUOUS POWER FIELD - " + str(row.get("continuous_power_field", "")).strip(),
-        "CROWD REACTION - " + str(row.get("crowd_reaction", "")).strip(),
-        "INCOMING ENVIRONMENT STATE - " + str(row.get("incoming_environment_state", "")).strip(),
-        "OUTGOING ENVIRONMENT STATE - " + str(row.get("outgoing_environment_state", "")).strip(),
-        "LOCATION TRANSITION - " + str(row.get("location_transition", "")).strip(),
-        "EVENT CAUSALITY - " + str(row.get("event_causality_chain", "")).strip(),
-        "PHYSICAL FEEDBACK - " + str(row.get("physical_feedback_chain", "")).strip(),
+        "ENVIRONMENT INTERACTION - " + prompt_value("environment_interaction", 700),
+        "CONTINUOUS POWER FIELD - " + prompt_value("continuous_power_field", 420),
+        "CROWD REACTION - " + prompt_value("crowd_reaction", 220),
+        "INCOMING ENVIRONMENT STATE - " + prompt_value("incoming_environment_state", 520),
+        "OUTGOING ENVIRONMENT STATE - " + prompt_value("outgoing_environment_state", 620),
+        "LOCATION TRANSITION - " + prompt_value("location_transition", 320),
+        "EVENT CAUSALITY - " + prompt_value("event_causality_chain", 360),
+        "PHYSICAL FEEDBACK - " + prompt_value("physical_feedback_chain", 280),
     ]
     if include_global_contract:
         parts.append(

@@ -53,6 +53,7 @@ from design_engine import (
     validate_explicit_timed_text_contract,
     validate_drone_image_request_budget,
     validate_requested_speech_layer_contract,
+    _append_subject_count_guard,
     _street_fighter_realtime_action_text,
 )
 from design_media_service import (
@@ -437,6 +438,24 @@ class DesignEngineTests(unittest.TestCase):
         self.assertIn("exactly two unique visible people", request["prompt"])
         self.assertNotIn("exactly one visible identity subject", request["prompt"])
 
+    def test_subject_count_guard_replaces_stale_one_person_and_environment_guards(self):
+        request = {
+            "requirement_id": "auto_image_s4",
+            "subject_keywords": ["S1", "S2", "two-fighter collision"],
+            "prompt": (
+                "S1 catches S2 at the true contact point. Exactly two visible people in frame. "
+                "EXACT SUBJECT COUNT LOCK: exactly one visible person and no one else. No crowd, "
+                "staff, silhouettes, human reflections, portraits, mannequins or duplicated bodies. "
+                "ENVIRONMENT-ONLY COUNT LOCK: no visible people, human silhouettes, reflections, "
+                "portraits, mannequins or face-like figures."
+            ),
+        }
+        _append_subject_count_guard(request, identity=True)
+        self.assertEqual(request["prompt"].count("SUBJECT COUNT LOCK:"), 1)
+        self.assertIn("exactly two unique visible people", request["prompt"])
+        self.assertNotIn("exactly one visible person", request["prompt"])
+        self.assertNotIn("ENVIRONMENT-ONLY", request["prompt"])
+
     def test_hong_kong_comic_generated_stills_are_bound_to_loaded_source_plates(self):
         plan = {
             "duration_seconds": 15.0,
@@ -472,6 +491,45 @@ class DesignEngineTests(unittest.TestCase):
             row["usage"] == "analysis_only" and not row["identity_anchor"]
             for row in plan["existing_media_uses"]
         ))
+
+    def test_hong_kong_comic_strong_labels_override_wrong_but_valid_source_ids(self):
+        plan = {
+            "duration_seconds": 30.0,
+            "design_warnings": [],
+            "existing_media_uses": [
+                {"requirement_id": "s1_identity_anchor", "media_id": "P2", "media_type": "image"},
+                {"requirement_id": "s2_identity_anchor", "media_id": "P3", "media_type": "image"},
+                {"requirement_id": "shot1_composition_anchor", "media_id": "P4", "media_type": "image"},
+            ],
+            "media_requests": [
+                {
+                    "requirement_id": "gen_s1_photoreal_identity", "media_type": "image",
+                    "source_plate_media_id": "P5", "prompt": "One S1 identity portrait.",
+                },
+                {
+                    "requirement_id": "gen_s2_photoreal_identity", "media_type": "image",
+                    "source_plate_media_id": "P5", "prompt": "One S2 identity portrait.",
+                },
+                {
+                    "requirement_id": "auto_image_s1", "media_type": "image",
+                    "source_plate_media_id": "P1", "prompt": "S1 collides with S2.",
+                },
+            ],
+        }
+        inventory = [
+            {"media_id": f"P{index}", "media_type": "image", "loaded": True,
+             "local_path": f"panel_{index}.jpg"}
+            for index in range(1, 6)
+        ]
+        enforce_hong_kong_comic_generated_source_plates(
+            plan, inventory, "hong-kong-comic-fighter"
+        )
+        requests = {row["requirement_id"]: row for row in plan["media_requests"]}
+        self.assertEqual(requests["gen_s1_photoreal_identity"]["source_plate_media_id"], "P2")
+        self.assertEqual(requests["gen_s2_photoreal_identity"]["source_plate_media_id"], "P3")
+        self.assertEqual(requests["auto_image_s1"]["source_plate_media_id"], "P4")
+        self.assertIn("transform @P2", requests["gen_s1_photoreal_identity"]["prompt"])
+        self.assertIn("exactly two unique visible people", requests["auto_image_s1"]["prompt"])
 
     def test_unproven_legacy_generated_comic_reference_is_demoted(self):
         plan = {
@@ -1311,6 +1369,17 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("Minimal upbeat pulse", auto["non_diegetic_music"])
         self.assertIn("Music mix contract", auto["non_diegetic_music"])
         self.assertEqual(normalize_design_music_mode("unknown"), "auto")
+
+    def test_default_auto_does_not_override_explicit_music_off_contract(self):
+        plan = {
+            "non_diegetic_music": "MUSIC OFF per user directive.",
+            "constraints": "Use native location sound only.",
+            "markers": [{"preset": "Music Cue", "time_seconds": 1.0}],
+        }
+        resolved = enforce_design_music_mode(plan, "auto")
+        self.assertEqual(resolved["_music_mode"], "off")
+        self.assertEqual(resolved["non_diegetic_music"], "N/A")
+        self.assertEqual(resolved["markers"], [])
 
     def test_design_system_prompt_obeys_selected_music_mode(self):
         self.assertIn(

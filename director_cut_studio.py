@@ -265,8 +265,11 @@ from segment_engine import (
     align_segments_to_dialogue_turns,
     content_fingerprint,
     derive_named_segment_seed,
+    normalize_speech_overlap_policy,
     plan_render_segments,
+    plan_speech_track_lanes,
     plan_shot_render_segments,
+    protect_segment_boundaries_from_atomic_shots,
     protect_segment_boundaries_from_speech,
     ranges_intersect,
     scope_timed_prompt_text,
@@ -1052,6 +1055,7 @@ class TextLayer:
     lip_sync: bool = True
     shot_id: str = ""
     speech_timing_auto_adjusted: bool = False
+    overlap_policy: str = "auto"
 
     def __post_init__(self) -> None:
         self.font_size = max(8, min(240, int(self.font_size)))
@@ -1070,6 +1074,7 @@ class TextLayer:
         self.delivery = str(self.delivery).strip() or "Natural"
         self.lip_sync = bool(self.lip_sync)
         self.speech_timing_auto_adjusted = bool(self.speech_timing_auto_adjusted)
+        self.overlap_policy = normalize_speech_overlap_policy(self.overlap_policy)
 
 
 def text_layer_from_mapping(value: dict) -> TextLayer:
@@ -2402,7 +2407,7 @@ class TimelineTextClip(QGraphicsRectItem):
         self.setToolTip(
             f"Text layer · {text_layer_track_name(layer.track_id, layer.content_role)}"
             + (
-                f" · Language: {layer.language}"
+                f" · Language: {layer.language} · Overlap: {layer.overlap_policy.upper()}"
                 if layer.content_role in {"dialogue", "voice_over", "lyrics"}
                 else ""
             )
@@ -4283,6 +4288,18 @@ class ContentLayerDialog(QDialog):
         self.delivery_combo.setEditable(True)
         self.delivery_combo.addItems(("Natural", "Calm", "Whispered", "Urgent", "Confident", "Emotional"))
         self.delivery_combo.setCurrentText(layer.delivery)
+        self.overlap_combo = QComboBox()
+        self.overlap_combo.addItem("AUTO · move colliding speech to another track", "auto")
+        self.overlap_combo.addItem("OVERLAP · intentional simultaneous speech", "overlap")
+        self.overlap_combo.addItem("SEQUENTIAL · move this clip after earlier speech", "sequential")
+        self.overlap_combo.setCurrentIndex(
+            max(0, self.overlap_combo.findData(layer.overlap_policy))
+        )
+        self.overlap_combo.setToolTip(
+            "AUTO preserves timing and assigns another speech track when needed. "
+            "OVERLAP explicitly authorizes simultaneous voices. SEQUENTIAL moves "
+            "this clip after earlier speech of the same type without shortening it."
+        )
         self.lip_sync_check = QCheckBox("Accurate visible lip synchronization")
         self.lip_sync_check.setChecked(layer.lip_sync)
         self.shot_combo = QComboBox()
@@ -4308,6 +4325,7 @@ class ContentLayerDialog(QDialog):
             ("Speaker", self.speaker_combo),
             ("Language", self.language_combo),
             ("Delivery", self.delivery_combo),
+            ("Overlap", self.overlap_combo),
             ("Lip Sync", self.lip_sync_check),
             ("所属 Shot", self.shot_combo),
         ):
@@ -4327,7 +4345,7 @@ class ContentLayerDialog(QDialog):
         dialogue = role == "dialogue"
         speech = role in {"dialogue", "voice_over", "lyrics"}
         for title, (label, widget) in self.semantic_rows.items():
-            visible = speech if title == "Language" else dialogue
+            visible = dialogue if title == "Lip Sync" else speech
             label.setVisible(visible)
             widget.setVisible(visible)
         visible_text = role == "on_screen_text"
@@ -4372,6 +4390,9 @@ class ContentLayerDialog(QDialog):
             "speaker": self.speaker_combo.currentText() if speech else "S1",
             "language": self.language_combo.currentText().strip() if speech else "English",
             "delivery": self.delivery_combo.currentText().strip() if speech else "Natural",
+            "overlap_policy": (
+                str(self.overlap_combo.currentData() or "auto") if speech else "auto"
+            ),
             "lip_sync": self.lip_sync_check.isChecked() if dialogue else False,
             "shot_id": self.shot_combo.currentData() if speech else "",
         }
@@ -11155,7 +11176,9 @@ class DirectorCutStudio(QMainWindow):
                 track.track_id, content_role=item["role"], speaker=item["speaker"],
                 language=item["language"], delivery=item["delivery"],
                 lip_sync=item["lip_sync"], shot_id=shot_id,
+                overlap_policy=item.get("overlap_policy", "auto"),
             ))
+        self._normalize_text_layer_tracks()
         if (
             plan.get("theme_text")
             and plan.get("theme_text_explicit_user_requested", False)
@@ -11319,6 +11342,8 @@ class DirectorCutStudio(QMainWindow):
                 "language": layer.language,
                 "delivery": layer.delivery,
                 "lip_sync": layer.lip_sync,
+                "track_id": layer.track_id,
+                "overlap_policy": layer.overlap_policy,
             }
             for layer in sorted(
                 self.text_layers,
@@ -13365,16 +13390,23 @@ class DirectorCutStudio(QMainWindow):
                 cue = DirectorCue(**values)
             new_shots.append(cue)
 
-        if self.special_combo.currentData() == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+        storyboard_combat_skill = str(self.special_combo.currentData() or "").strip().casefold()
+        if storyboard_combat_skill in COMBAT_ACTION_SKILLS:
             reconciled_combat_rows, _combat_warnings = reconcile_combat_action_rows(
                 [asdict(cue) for cue in new_shots],
                 new_duration,
+                source_world_only=(
+                    storyboard_combat_skill == HONG_KONG_COMIC_FIGHTER_SKILL
+                ),
             )
-            reconciled_rows, _environment_warnings = reconcile_environmental_combat_rows(
-                reconciled_combat_rows,
-                new_duration,
-                transition_basis_seconds=min(new_duration, max(0.5, target_duration)),
-            )
+            if storyboard_combat_skill == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+                reconciled_rows, _environment_warnings = reconcile_environmental_combat_rows(
+                    reconciled_combat_rows,
+                    new_duration,
+                    transition_basis_seconds=min(new_duration, max(0.5, target_duration)),
+                )
+            else:
+                reconciled_rows = reconciled_combat_rows
             new_shots = [director_cue_from_mapping(row) for row in reconciled_rows]
 
         def owner_entry(start: float, end: float, shot_id: str = "") -> tuple[DirectorCue, dict] | None:
@@ -14315,6 +14347,25 @@ class DirectorCutStudio(QMainWindow):
                 max_segment_seconds=MAX_NATIVE_SECONDS,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
+            # A named/signature technique is one indivisible H3 action chain.
+            # Keep its load, contact, recoil and environment response inside
+            # the same native request after speech/dialogue boundary repair.
+            planned = protect_segment_boundaries_from_atomic_shots(
+                planned,
+                [
+                    asdict(cue) for cue in self.director_cues
+                    if cue.cue_type == "shot"
+                    and ranges_intersect(cue.start_seconds, cue.end_seconds, start, end)
+                ],
+                text_layers=[
+                    asdict(layer) for layer in self.text_layers
+                    if ranges_intersect(
+                        layer.start_seconds, layer.end_seconds, start, end
+                    )
+                ],
+                max_segment_seconds=MAX_NATIVE_SECONDS,
+                grid_seconds=TIMELINE_SNAP_SECONDS,
+            )
         shots_in_area = [
             cue for cue in self.director_cues
             if cue.cue_type == "shot"
@@ -14781,6 +14832,33 @@ class DirectorCutStudio(QMainWindow):
             )
             index = self.special_combo.findData(special)
             self.special_combo.setCurrentIndex(max(0, index))
+            # Migrate generated combat choreography when an older Project is
+            # opened.  This repairs vague exchanges, outcome-without-cause
+            # rows, stale market targets inside Hong Kong comic projects and
+            # the final resolve timestamp in memory.  The original Project
+            # file remains untouched until the user explicitly saves.
+            if special in COMBAT_ACTION_SKILLS:
+                before_combat = json.dumps(
+                    [
+                        asdict(cue) for cue in self.director_cues
+                        if cue.cue_type in {"shot", "marker"}
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                self._refresh_director_cues()
+                after_combat = json.dumps(
+                    [
+                        asdict(cue) for cue in self.director_cues
+                        if cue.cue_type in {"shot", "marker"}
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if before_combat != after_combat:
+                    integrity_repairs.append(
+                        "Combat Timeline causality, source-world targets and final resolve were migrated"
+                    )
             self.production_strategy = str(
                 payload.get("production_strategy")
                 or (
@@ -16788,16 +16866,24 @@ class DirectorCutStudio(QMainWindow):
         self._mark_dirty()
 
     def _normalize_text_layer_tracks(self) -> bool:
-        """Repair old projects and role edits without hiding speech on V tracks."""
+        """Repair Text Layers and place colliding speech on independent tracks."""
+
         track_model_changed = False
+        timing_changed = False
+        speech_roles = {"dialogue", "voice_over", "lyrics"}
+
+        # Visible titles retain their normal V-track behaviour.
         for layer in self.text_layers:
+            if layer.content_role in speech_roles:
+                layer.overlap_policy = normalize_speech_overlap_policy(
+                    layer.overlap_policy
+                )
+                continue
             wanted_kind = text_layer_track_kind(layer.content_role)
             current_track = next(
                 (
-                    track
-                    for track in self.tracks
-                    if track.track_id == layer.track_id
-                    and track.kind == wanted_kind
+                    track for track in self.tracks
+                    if track.track_id == layer.track_id and track.kind == wanted_kind
                 ),
                 None,
             )
@@ -16807,14 +16893,108 @@ class DirectorCutStudio(QMainWindow):
                 )
                 layer.track_id = current_track.track_id
                 track_model_changed = True
-            wanted_name = text_layer_track_name(
-                current_track.track_id, layer.content_role
-            )
+            wanted_name = text_layer_track_name(current_track.track_id, layer.content_role)
             if current_track.name in {current_track.track_id, wanted_name}:
                 if current_track.name != wanted_name:
                     current_track.name = wanted_name
                     track_model_changed = True
-        return track_model_changed
+
+        speech_layers = [
+            layer for layer in self.text_layers if layer.content_role in speech_roles
+        ]
+        if not speech_layers:
+            return track_model_changed
+
+        assignments = plan_speech_track_lanes(
+            [asdict(layer) for layer in speech_layers],
+            grid_seconds=TIMELINE_SNAP_SECONDS,
+        )
+        by_layer_id = {layer.layer_id: layer for layer in speech_layers}
+        required_lanes: dict[str, int] = {role: 0 for role in speech_roles}
+        for assignment in assignments:
+            layer = by_layer_id.get(str(assignment["layer_id"]))
+            if layer is None:
+                continue
+            layer.overlap_policy = str(assignment["overlap_policy"])
+            new_start = float(assignment["start_seconds"])
+            new_end = float(assignment["end_seconds"])
+            if (
+                abs(layer.start_seconds - new_start) > 1e-6
+                or abs(layer.end_seconds - new_end) > 1e-6
+            ):
+                layer.start_seconds = new_start
+                layer.end_seconds = new_end
+                layer.speech_timing_auto_adjusted = True
+                timing_changed = True
+            required_lanes[layer.content_role] = max(
+                required_lanes[layer.content_role], int(assignment["lane_number"])
+            )
+
+        role_labels = {
+            "dialogue": ("D", "Dialogue"),
+            "voice_over": ("VO", "Voice-over"),
+            "lyrics": ("L", "Lyrics"),
+        }
+        role_tracks: dict[str, list[TimelineTrack]] = {role: [] for role in speech_roles}
+        used_track_ids: set[str] = set()
+        for role in ("dialogue", "voice_over", "lyrics"):
+            prefix, label = role_labels[role]
+            primary = self._design_track(default_text_layer_track(role), "audio")
+            role_tracks[role].append(primary)
+            used_track_ids.add(primary.track_id)
+            wanted_name = f"{prefix}1 · {label}"
+            replaceable_names = {
+                primary.track_id,
+                text_layer_track_name(primary.track_id, role),
+                wanted_name,
+            }
+            if primary.name in replaceable_names and primary.name != wanted_name:
+                primary.name = wanted_name
+                track_model_changed = True
+            for lane_number in range(2, required_lanes[role] + 1):
+                wanted_name = f"{prefix}{lane_number} · {label}"
+                track = next(
+                    (
+                        candidate for candidate in self.tracks
+                        if candidate.kind == "audio"
+                        and candidate.track_id not in used_track_ids
+                        and candidate.name == wanted_name
+                    ),
+                    None,
+                )
+                if track is None:
+                    number = self._next_track_number("A")
+                    track = TimelineTrack(
+                        f"A{number}", wanted_name, "audio", "#258a70"
+                    )
+                    self.tracks.append(track)
+                    track_model_changed = True
+                role_tracks[role].append(track)
+                used_track_ids.add(track.track_id)
+
+        assignment_by_id = {
+            str(row["layer_id"]): row for row in assignments
+        }
+        for layer in speech_layers:
+            assignment = assignment_by_id.get(layer.layer_id)
+            if assignment is None:
+                continue
+            lane_number = max(1, int(assignment["lane_number"]))
+            wanted_track = role_tracks[layer.content_role][lane_number - 1]
+            if layer.track_id != wanted_track.track_id:
+                layer.track_id = wanted_track.track_id
+                track_model_changed = True
+
+        if (
+            timing_changed
+            and not self.restoring_project
+            and self.scan is not None
+        ):
+            maximum_end = max(layer.end_seconds for layer in speech_layers)
+            if maximum_end > self.scan.duration_seconds + 1e-6:
+                self._set_design_duration(maximum_end)
+            self._mark_all_render_segments_dirty()
+        return track_model_changed or timing_changed
 
     def _refresh_text_layers(self, _layer: TextLayer | None = None) -> None:
         track_model_changed = self._normalize_text_layer_tracks()
@@ -16833,6 +17013,7 @@ class DirectorCutStudio(QMainWindow):
                     "language": layer.language,
                     "delivery": layer.delivery,
                     "lip_sync": layer.lip_sync,
+                    "overlap_policy": layer.overlap_policy,
                     "explicit_user_requested": True,
                 }
                 for layer in self.text_layers
@@ -17193,20 +17374,23 @@ class DirectorCutStudio(QMainWindow):
             if getattr(self, "special_combo", None) is not None
             else ""
         )
-        if self.scan and special_key == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+        special_key = str(special_key or "").strip().casefold()
+        if self.scan and special_key in COMBAT_ACTION_SKILLS:
             shot_cues = [cue for cue in self.director_cues if cue.cue_type == "shot"]
             reconciled, _combat_warnings = reconcile_combat_action_rows(
                 [asdict(cue) for cue in shot_cues],
                 self.scan.duration_seconds,
+                source_world_only=(special_key == HONG_KONG_COMIC_FIGHTER_SKILL),
             )
-            reconciled, _environment_warnings = reconcile_environmental_combat_rows(
-                reconciled,
-                self.scan.duration_seconds,
-                transition_basis_seconds=min(
+            if special_key == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+                reconciled, _environment_warnings = reconcile_environmental_combat_rows(
+                    reconciled,
                     self.scan.duration_seconds,
-                    max(0.5, float(getattr(self, "storyboard_target_duration_seconds", self.scan.duration_seconds))),
-                ),
-            )
+                    transition_basis_seconds=min(
+                        self.scan.duration_seconds,
+                        max(0.5, float(getattr(self, "storyboard_target_duration_seconds", self.scan.duration_seconds))),
+                    ),
+                )
             cue_by_id = {cue.cue_id: cue for cue in shot_cues}
             allowed_fields = DirectorCue.__dataclass_fields__.keys()
             for row in reconciled:
@@ -19130,12 +19314,19 @@ class DirectorCutStudio(QMainWindow):
             if layer.content_role == "dialogue":
                 sync = "lip sync" if layer.lip_sync else "no required lip sync"
                 direction = (
-                    f'{layer.speaker} [{layer.language}, {layer.delivery}, {sync}]: "{layer.text}"'
+                    f'{layer.speaker} [{layer.language}, {layer.delivery}, {sync}] '
+                    f'[track={layer.track_id}, overlap={layer.overlap_policy}]: "{layer.text}"'
                 )
             elif layer.content_role == "voice_over":
-                direction = f'Voice-over: "{layer.text}"'
+                direction = (
+                    f'Voice-over [{layer.track_id}, {layer.language}, '
+                    f'overlap={layer.overlap_policy}]: "{layer.text}"'
+                )
             elif layer.content_role == "lyrics":
-                direction = f'Lyrics: "{layer.text}"'
+                direction = (
+                    f'Lyrics [{layer.track_id}, {layer.language}, '
+                    f'overlap={layer.overlap_policy}]: "{layer.text}"'
+                )
             else:
                 direction = f'On-screen text: "{layer.text}"'
             dialogue_lines.append(f"{shot_number}|{direction}")
@@ -19771,9 +19962,29 @@ class DirectorCutStudio(QMainWindow):
                 combat_clause = combat_action_prompt_clause(asdict(cue))
                 if combat_clause:
                     parts.append(combat_clause)
-                parts.append("NATIVE AUDIO DIRECTION - " + cue.native_audio_direction)
-                parts.append("ENVIRONMENT CONTINUITY - " + cue.environment_continuity)
-                parts.append("AUDIO REFERENCE INTENT - " + cue.audio_reference_intent)
+                # Keep a concise Shot-local audio instruction beside the
+                # matching visual action, while the complete editable schedule
+                # remains authoritative in overall_soundscape.  Capping these
+                # copies prevents dense combat prompts from burying dialogue.
+                def compact_native_audio(value: object, limit: int) -> str:
+                    compacted = " ".join(str(value or "").split()).strip()
+                    if len(compacted) > limit:
+                        compacted = compacted[: limit - 1].rstrip(" ,;:") + "…"
+                    return compacted
+
+                parts.append(
+                    "NATIVE AUDIO DIRECTION - "
+                    + compact_native_audio(cue.native_audio_direction, 360)
+                    + ". Every sound belongs to a visible or established filmed-world source as diegetic sound"
+                )
+                parts.append(
+                    "ENVIRONMENT CONTINUITY - "
+                    + compact_native_audio(cue.environment_continuity, 240)
+                )
+                parts.append(
+                    "AUDIO REFERENCE INTENT - "
+                    + compact_native_audio(cue.audio_reference_intent, 220)
+                )
                 cue_detail = cue.detail
                 if street_fighter_prompt:
                     cue_detail = compact_street_fighter_prompt_field(
@@ -19887,6 +20098,7 @@ class DirectorCutStudio(QMainWindow):
                 "language": layer.language,
                 "delivery": layer.delivery,
                 "lip_sync": layer.lip_sync,
+                "overlap_policy": layer.overlap_policy,
                 "shot_id": layer.shot_id,
                 "supplied_audio_tag": supplied_dialogue_audio_tag,
             }
@@ -20207,6 +20419,15 @@ class DirectorCutStudio(QMainWindow):
                 layer for layer in local_speech_layers
                 if layer.content_role == "dialogue"
             ]
+            dialogue_overlap_pairs = [
+                (left, right)
+                for index, left in enumerate(local_dialogue_layers)
+                for right in local_dialogue_layers[index + 1:]
+                if ranges_intersect(
+                    left.start_seconds, left.end_seconds,
+                    right.start_seconds, right.end_seconds,
+                )
+            ]
             if local_dialogue_layers:
                 if street_fighter_cast_mode:
                     brief_parts.append(
@@ -20214,8 +20435,8 @@ class DirectorCutStudio(QMainWindow):
                         f"mapped to {speaker_references['S1']}; S2 is exclusively permanent P2, "
                         f"currently mapped to {speaker_references['S2']}. This P1/P2 order overrides "
                         "every generic female/male convention and never swaps with screen position, "
-                        "Shot order or camera angle. During each Dialogue Text Range only the assigned "
-                        "fighter moves lips and jaw; the opponent reacts with a closed, still mouth."
+                        "Shot order or camera angle. Outside an authored overlapping Dialogue range, "
+                        "only the assigned fighter moves lips and jaw and the opponent reacts silently."
                     )
                 else:
                     brief_parts.append(
@@ -20223,8 +20444,9 @@ class DirectorCutStudio(QMainWindow):
                         f"defined by {speaker_references['S1']}; S2 always means the male "
                         f"voice/character defined by {speaker_references['S2']}. These assignments "
                         "never swap with screen position, shot order or camera angle. During each "
-                        "Dialogue Text Range, only the assigned speaker moves lips and jaw; every "
-                        "listener keeps a fully closed, still mouth and only reacts silently. "
+                        "non-overlapping Dialogue Text Range, only the assigned speaker moves lips "
+                        "and jaw; every listener reacts silently. During an authored overlap, each "
+                        "assigned speaker performs only their own independent Text Layer. "
                         "Voice-over never causes any visible character to lip-sync."
                     )
                 brief_parts.append(
@@ -20240,6 +20462,18 @@ class DirectorCutStudio(QMainWindow):
                     )
                     + "."
                 )
+                if dialogue_overlap_pairs:
+                    brief_parts.append(
+                        "AUTHORED DIALOGUE OVERLAP: "
+                        + "; ".join(
+                            f"{max(start, left.start_seconds, right.start_seconds) - start:.2f}-"
+                            f"{min(end, left.end_seconds, right.end_seconds) - start:.2f}s "
+                            f"{left.layer_id}/{left.track_id} with {right.layer_id}/{right.track_id}"
+                            for left, right in dialogue_overlap_pairs
+                        )
+                        + ". Both voices are intentional and independent. Preserve both exact lines; "
+                          "never merge their words or transfer one speaker's words to the other."
+                    )
             if local_shots:
                 brief_parts.append(
                     "Follow this segment's " + str(len(local_shots))
@@ -20269,7 +20503,8 @@ class DirectorCutStudio(QMainWindow):
                     local_end = min(end, layer.end_seconds) - start
                     speech_windows.append(
                         f"{local_start:.2f}-{local_end:.2f}s {layer.layer_id} "
-                        f"({layer.speaker or 'speaker'})"
+                        f"on {layer.track_id} ({layer.content_role}, "
+                        f"{layer.speaker or 'speaker'}, overlap={layer.overlap_policy})"
                     )
                 brief_parts.append(
                     "SPEECH WHITELIST WITH VOCAL-SILENCE GAPS: human speech is permitted only "
