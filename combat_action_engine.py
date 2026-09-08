@@ -13,6 +13,11 @@ from typing import Iterable
 
 
 STREET_FIGHTER_SKILL = "street-fighter-live-action-h3"
+HONG_KONG_COMIC_FIGHTER_SKILL = "hong-kong-comic-fighter"
+COMBAT_ACTION_SKILLS = frozenset({
+    STREET_FIGHTER_SKILL,
+    HONG_KONG_COMIC_FIGHTER_SKILL,
+})
 COMBAT_ACTION_SCHEMA_VERSION = 3
 COMBAT_FACT_LEDGER_SCHEMA_VERSION = 1
 COMBAT_FACT_AUTHORITY = (
@@ -123,6 +128,31 @@ _STRIKE_RE = re.compile(
     r"(?i)\b(?:punch|palm|elbow|forearm|strike|parry|block|trap|uppercut|jab|cross)\b|"
     r"拳|掌|肘|前臂|击|擊|格挡|格擋|招架|截击|截擊"
 )
+_ACTION_INITIATION_RE = re.compile(
+    r"(?i)\b(?:attack|strike|punch|kick|palm|elbow|forearm|jab|cross|uppercut|"
+    r"parr(?:y|ies|ied)|block|check|sweep|clinch|grip|capture|throw|takedown|slam|"
+    r"drive|redirect|counter|evade|dodge|frame|sprawl|bridge|hip[- ]?escape|"
+    r"contact|impact|launch|charges?)\b|"
+    r"拳|踢|掌|肘|击|擊|格挡|格擋|招架|闪避|閃避|扫|掃|擒拿|抓握|摔|抱|压制|壓制|反击|反擊"
+ )
+_OUTCOME_ONLY_RE = re.compile(
+    r"(?i)\b(?:lands?\s+(?:on|back)|falls?|is\s+down|lies?|stands?\s+over|"
+    r"ends?\s+up|gets?\s+knocked|is\s+thrown|recoils?|is\s+sent|remains?\s+on\s+the\s+ground)\b|"
+    r"倒地|躺下|站在.+上方|被击飞|被擊飛|落地|趴在地上|躺在地上|退到"
+ )
+_GENERIC_ACTION_RE = re.compile(
+    r"(?i)already within arm'?s reach.*(?:attack|defence|counter).*exchange|"
+    r"combat footwork carries|immediate full-speed attack|brief held moment|"
+    r"fighters? hold a tense standoff|looks? directly(?: at)?|raises? (?:his|her|their) "
+    r"(?:right |left )?fist|generic (?:attack|defence|combat)|"
+    r"(?:continue|continues) (?:its|their) backward trajectory|"
+    r"摆出格斗架势|保持对峙|短暂停顿|互相看着|举起拳头"
+)
+_AFTERMATH_ONLY_RE = re.compile(
+    r"(?i)final settle|final hold|aftermath|no new attack|dust settles|"
+    r"wind carries|debris (?:falls|settles)|camera (?:settles|holds)|"
+    r"余波|尘埃落下|塵埃落下|风沙消散|風沙消散|不再攻击|不再攻擊|最终定格|最終定格"
+)
 
 _DUTIES = (
     ("state_pickup", "inherit the exact incoming pose, distance, grip and momentum, then apply immediate pressure"),
@@ -149,7 +179,7 @@ _CAMERA_SECTORS = (
 
 
 def _skill_enabled(value: object) -> bool:
-    return str(value or "").strip().casefold() == STREET_FIGHTER_SKILL
+    return str(value or "").strip().casefold() in COMBAT_ACTION_SKILLS
 
 
 def combat_baseline_duration(plan: dict) -> float:
@@ -291,6 +321,33 @@ def _synthesize_distinct_causal_action(
     )
 
 
+def _synthesize_high_density_combat_action(shot: dict, index: int) -> str:
+    """Replace vague fight placeholders with a distinct renderable cause chain."""
+
+    actor = "S1" if index % 2 == 0 else "S2"
+    defender = _opponent(actor)
+    target = _causal_target_hint(shot)
+    exchanges = (
+        f"{actor} plants the rear foot and fires a straight lead palm along the centreline; "
+        f"{defender} checks the wrist with the outside forearm, slips off-line and drives a compact counter elbow that turns both bodies toward {target}",
+        f"{actor} snaps a jab-cross at head and ribs without resetting the feet; "
+        f"{defender} parries the jab, absorbs the cross on a tight elbow shield and answers with a rising knee that forces one diagonal recovery step",
+        f"{actor} catches the near wrist and collar during the incoming strike, steps hip-to-hip and rotates through a controlled hip throw; "
+        f"{defender} posts the free hand, redirects the fall and lands on one knee still facing {actor}",
+        f"{actor} attacks the planted lead leg with a low outside kick; "
+        f"{defender} shin-checks the kick, drops the checking foot forward and whips a short roundhouse across the opened shoulder line",
+        f"{actor} closes into an underhook-and-wrist clinch, loads weight through the hips and drives laterally; "
+        f"{defender} widens the base, frames at the jaw and pivots the pressure into a shoulder throw beside {target}",
+        f"{actor} launches a body hook from a low level change; "
+        f"{defender} seals the ribs with an elbow frame, traps the punching arm and reaps the support foot so the missed force becomes a visible stumble",
+        f"{actor} shoots for a single-leg capture after the opponent's forward step; "
+        f"{defender} sprawls the hips, circles behind the shoulder and converts the stopped takedown into a standing back-control turn",
+        f"{actor} bridges from the grounded pressure and hip-escapes toward {target}; "
+        f"{defender} follows the rotation, releases the failing grip and both regain unequal standing guards without a neutral reset",
+    )
+    return exchanges[index % len(exchanges)] + "."
+
+
 def _synthesize_ground_reversal(current_action: str, previous_action: str) -> str:
     """Make an implicit top/bottom ownership change explicit."""
 
@@ -299,6 +356,19 @@ def _synthesize_ground_reversal(current_action: str, previous_action: str) -> st
     return (
         f"{bottom_actor} visibly bridges and hip-escapes to reverse the previous ground position; "
         f"{top_actor} follows the reversal and re-establishes control without a neutral reset."
+    )
+
+
+def _synthesize_outcome_cause_action(shot: dict, index: int) -> str:
+    """Bridge a model-written result ("S2 lands...") back to its physical cause."""
+
+    attacker = "S1" if index % 2 == 0 else "S2"
+    defender = _opponent(attacker)
+    target = _causal_target_hint(shot)
+    return (
+        f"{attacker} catches {defender}'s advancing guard, changes level and completes a controlled "
+        f"outside foot sweep into {target}; {defender} loses the support foot, lands on the back along "
+        f"the force vector, and {attacker} follows into a readable standing-over position without a reset."
     )
 
 
@@ -328,9 +398,11 @@ def build_combat_fact_ledger(
     existing_media: Iterable[dict] | None = None,
     *,
     authored_requirement: object = "",
+    special_skill_key: object = STREET_FIGHTER_SKILL,
 ) -> dict:
     """Build one provenance-aware fact ledger without letting metadata replace pixels."""
 
+    skill_key = str(special_skill_key or "").strip().casefold()
     inventory: dict[str, dict] = {}
     for row in existing_media or []:
         if not isinstance(row, dict) or not bool(row.get("loaded", False)):
@@ -347,6 +419,27 @@ def build_combat_fact_ledger(
     }
     subjects: list[dict] = []
     for speaker, media_id in (("S1", "P1"), ("S2", "P2")):
+        if skill_key == HONG_KONG_COMIC_FIGHTER_SKILL:
+            subjects.append({
+                "speaker": speaker,
+                "media_id": "",
+                "loaded": False,
+                "identity_authority": "explicit_user_direction_and_source_panel_evidence",
+                "descriptive_evidence_source": "loaded comic Pictures",
+                "description": (
+                    "resolve this fighter from explicit names/roles and all source panels; "
+                    "P1/P2 numbering does not imply one Picture per fighter"
+                ),
+                "source_chain": [
+                    "explicit_user_direction", "loaded_picture_pixels", "shot_continuity",
+                ],
+                "locked_attributes": [
+                    "face", "apparent_age", "skin_tone", "hair", "body_proportions",
+                    "upper_wardrobe", "lower_wardrobe", "footwear", "accessories",
+                    "signature_ability",
+                ],
+            })
+            continue
         row = inventory.get(media_id)
         evidence_source, description = _media_evidence(row or {})
         loaded = row is not None
@@ -379,11 +472,22 @@ def build_combat_fact_ledger(
         "subjects": subjects,
         "permissions": {
             "weapons": bool(_WEAPON_RE.search(request)),
-            "supernatural_carriers": bool(_SUPERNATURAL_RE.search(request)),
+            "supernatural_carriers": (
+                skill_key == HONG_KONG_COMIC_FIGHTER_SKILL
+                or bool(_SUPERNATURAL_RE.search(request))
+            ),
         },
         "environment": {
-            "source": "special_skill_default",
-            "value": "connected Kowloon-style wet seafood and vegetable market to rainy exterior alley",
+            "source": (
+                "loaded_picture_pixels"
+                if skill_key == HONG_KONG_COMIC_FIGHTER_SKILL
+                else "special_skill_default"
+            ),
+            "value": (
+                "derive location, terrain, weather, light and materials from the current comic Pictures"
+                if skill_key == HONG_KONG_COMIC_FIGHTER_SKILL
+                else "connected Kowloon-style wet seafood and vegetable market to rainy exterior alley"
+            ),
         },
         "conflicts": [],
     }
@@ -508,30 +612,31 @@ def _dynamic_camera_route(
     beat_id: int,
 ) -> tuple[str, str, str]:
     lowered = action.casefold()
+    orbit_direction = "clockwise" if ((beat_id - 1) // 2) % 2 == 0 else "counterclockwise"
     if _REVERSAL_RE.search(lowered):
         relation = "counter"
-        motion = "a tight clockwise reframe arc around the visible advantage reversal"
+        motion = f"a tight {orbit_direction} reframe arc around the visible advantage reversal"
     elif carrier == "kick":
         relation = "follow"
-        motion = "a low-to-hip clockwise lateral FPV arc following the planted foot and kick line"
+        motion = f"a low-to-hip {orbit_direction} lateral FPV arc following the planted foot and kick line"
     elif carrier == "grapple_clinch":
         relation = "follow"
-        motion = "a tight shoulder-height clockwise FPV arc tracking the grip and torso drive"
+        motion = f"a tight shoulder-height {orbit_direction} FPV arc tracking the grip and torso drive"
     elif carrier == "throw_takedown":
         relation = "counter"
-        motion = "a descending hip-to-floor clockwise FPV arc countering the throw momentum"
+        motion = f"a descending hip-to-floor {orbit_direction} FPV arc countering the throw momentum"
     elif carrier == "ground_control":
         relation = "follow"
-        motion = "a mat-level clockwise lateral FPV orbit keeping grip and top/bottom ownership readable"
+        motion = f"a mat-level {orbit_direction} lateral FPV orbit keeping grip and top/bottom ownership readable"
     elif _DEFENCE_RE.search(lowered):
         relation = "counter"
-        motion = "a short clockwise counter-move into the parry line with one restrained contact shake"
+        motion = f"a short {orbit_direction} counter-move into the parry line with one restrained contact shake"
     else:
         relation = "follow"
-        motion = "a shoulder-height clockwise lateral FPV pass following the strike line"
+        motion = f"a shoulder-height {orbit_direction} lateral FPV pass following the strike line"
     trigger = f"BEAT {beat_id:02d} load starts the move; contact or visible miss completes it"
     direction = (
-        f"physical FPV clockwise orbital translation: {motion}, physically translating from {start_sector} to {end_sector}; {trigger}. "
+        f"physical FPV {orbit_direction} orbital translation: {motion}, physically translating from {start_sector} to {end_sector}; {trigger}. "
         "Maintain close subject scale, visible parallax and a readable horizon; no lens retreat or in-place rotation."
     )
     return relation, trigger, direction
@@ -693,9 +798,28 @@ def reconcile_combat_action_rows(
         end = min(duration, max(start + 0.05, float(shot.get("end_seconds", start + 0.5) or start + 0.5)))
         action_end = min(end, baseline) if start < baseline else end
         midpoint = start + (action_end - start) / 2.0
-        beats = _split_two_beats(shot.get("subject_action", ""))
+        raw_action = _without_beat_tags(shot.get("subject_action", ""))
+        if (
+            raw_action
+            and _GENERIC_ACTION_RE.search(raw_action)
+            and not _AFTERMATH_ONLY_RE.search(raw_action)
+            and auto_repair
+            and not _action_was_user_edited(shot)
+        ):
+            shot["causal_risk_original_action"] = raw_action
+            raw_action = _synthesize_high_density_combat_action(shot, index)
+            shot["causal_risk_repair_status"] = "auto_fixed"
+            shot["causal_risk_repair_notes"] = (
+                "Replaced a vague pose/standoff/generic exchange with one concrete load, "
+                "attack line, defence, contact response and displacement chain."
+            )
+        beats = _split_two_beats(raw_action)
         status = "continuous"
         notes: list[str] = []
+
+        if shot.get("causal_risk_repair_status") == "auto_fixed":
+            status = "auto_fixed"
+            notes.append("replaced generic choreography with a distinct causal exchange")
 
         if not beats:
             beats = [
@@ -712,6 +836,33 @@ def reconcile_combat_action_rows(
             )
             status = "auto_fixed"
             notes.append("missing defender response was added")
+
+        # A common H3 failure is to emit only the result of a strike (for
+        # example, "S2 lands on his back; S1 stands over him").  That result
+        # has no renderable contact, force vector or environment trigger, so
+        # rebuild one bounded cause chain unless the user explicitly owns the
+        # choreography.  This keeps the later effects causal instead of
+        # making the model merely enlarge a still frame.
+        joined_beats = " ".join(beats)
+        if (
+            _OUTCOME_ONLY_RE.search(joined_beats)
+            and not _ACTION_INITIATION_RE.search(joined_beats)
+        ):
+            if auto_repair and not _action_was_user_edited(shot):
+                original_action = joined_beats
+                repaired_action = _synthesize_outcome_cause_action(shot, index)
+                shot["causal_risk_original_action"] = original_action
+                shot["causal_risk_repair_status"] = "auto_fixed"
+                shot["causal_risk_repair_notes"] = (
+                    "Inserted the missing initiation, contact, force direction and displacement "
+                    "before the authored outcome-only landing/standing result."
+                )
+                beats = _split_two_beats(repaired_action)
+                status = "auto_fixed"
+                notes.append("inserted a physical cause before an outcome-only action")
+            else:
+                status = "warning"
+                notes.append("outcome-only action has no explicit initiating contact")
 
         attacker = _first_actor(beats[0]) or ("S1" if index % 2 == 0 else "S2")
         response_actor = _first_actor(beats[1])
@@ -1019,7 +1170,7 @@ def apply_combat_action_continuity(
     existing_media: Iterable[dict] | None = None,
     authored_requirement: object = "",
 ) -> dict:
-    """Apply the continuity pass only to the Street Fighter Special Skill."""
+    """Apply the shared causal combat pass to supported fight-director Skills."""
 
     if not _skill_enabled(special_skill_key):
         return plan
@@ -1032,13 +1183,69 @@ def apply_combat_action_continuity(
             plan,
             existing_media,
             authored_requirement=authored_requirement,
+            special_skill_key=special_skill_key,
         )
+    source_shots = [
+        deepcopy(row) for row in plan.get("shots") or [] if isinstance(row, dict)
+    ]
+    active_shots = [
+        row for row in source_shots
+        if float(row.get("start_seconds", 0.0) or 0.0) < baseline - 1e-6
+    ]
+    speech_tail_shots = [
+        row for row in source_shots
+        if float(row.get("start_seconds", 0.0) or 0.0) >= baseline - 1e-6
+    ]
     shots, warnings = reconcile_combat_action_rows(
-        plan.get("shots") or [],
+        active_shots,
         plan.get("duration_seconds", baseline),
         action_baseline_seconds=baseline,
         fact_ledger=fact_ledger,
     )
+    if speech_tail_shots:
+        last_state = str(
+            shots[-1].get("outgoing_combat_state", "") if shots else ""
+        ).strip()
+        last_vector = deepcopy(
+            shots[-1].get("outgoing_combat_state_vector", {}) if shots else {}
+        )
+        for tail in speech_tail_shots:
+            inherited = last_state or (
+                "Both fighters preserve the completed final contact, readable support, "
+                "screen orientation and persistent environmental aftermath."
+            )
+            settle = (
+                "No new attack begins. Both fighters hold the completed causal end state while "
+                "dust, debris, wind and light reactions decay naturally behind the remaining speech."
+            )
+            if not _action_was_user_edited(tail):
+                tail["subject_action"] = settle
+                tail["h3_executable_action"] = settle
+                tail["combat_action_chain"] = settle
+            tail["incoming_combat_state"] = inherited
+            tail["outgoing_combat_state"] = inherited
+            tail["incoming_combat_state_vector"] = deepcopy(last_vector)
+            tail["outgoing_combat_state_vector"] = deepcopy(last_vector)
+            tail["next_action_trigger"] = "FINAL RESOLUTION: no next Beat and no replay."
+            tail["camera_movement"] = (
+                "Stable eye-level three-quarter hold with a level horizon; no zoom, pull-back, "
+                "orbit, in-place spin or slow motion."
+            )
+            tail["movement_speed"] = "Settled"
+            tail["movement_amplitude"] = "None"
+            tail["combat_continuity_status"] = "speech_tail_hold"
+            tail["causal_validation_status"] = "continuous"
+            tail["causal_validation_issues"] = []
+            tail["final_action_resolution"] = settle
+            tail["final_camera_resolution"] = tail["camera_movement"]
+            tail["final_action_stable"] = True
+            tail["combat_action_schema_version"] = COMBAT_ACTION_SCHEMA_VERSION
+        shots.extend(speech_tail_shots)
+        shots.sort(key=lambda row: float(row.get("start_seconds", 0.0) or 0.0))
+        warnings.append(
+            "Dialogue-only duration extension preserves the completed combat end state; "
+            "no synthetic attack Beat is added after the authored action baseline."
+        )
     plan["shots"] = shots
     plan["markers"] = reconcile_final_combat_markers(
         plan.get("markers") or [], plan.get("duration_seconds", baseline)

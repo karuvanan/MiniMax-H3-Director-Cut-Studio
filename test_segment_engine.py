@@ -212,6 +212,32 @@ class SegmentEngineTests(unittest.TestCase):
             for row in protected[:-1]
         ))
 
+    def test_non_lip_synced_combat_shouts_do_not_split_one_action_segment(self):
+        planned = plan_render_segments(0.0, 12.0, overlap_seconds=0.0)
+        speech = [
+            {
+                "content_role": "dialogue",
+                "speaker": "S2",
+                "start_seconds": 2.0,
+                "end_seconds": 3.5,
+                "lip_sync": False,
+            },
+            {
+                "content_role": "dialogue",
+                "speaker": "S1",
+                "start_seconds": 3.5,
+                "end_seconds": 5.0,
+                "lip_sync": False,
+            },
+        ]
+        aligned = align_segments_to_dialogue_turns(
+            planned, speech, max_segment_seconds=15.0, grid_seconds=0.5
+        )
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in aligned],
+            [(0.0, 12.0)],
+        )
+
     def test_dirty_range_only_selects_intersecting_segments(self):
         rows = plan_render_segments(0.0, 60.0)
         self.assertEqual(dirty_segment_indexes(rows, 30.0, 32.0), [2])

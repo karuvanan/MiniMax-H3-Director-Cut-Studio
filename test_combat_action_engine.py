@@ -13,6 +13,7 @@ from combat_action_engine import (
     combat_fact_prompt_context,
     route_action_carrier,
     infer_force_vector,
+    HONG_KONG_COMIC_FIGHTER_SKILL,
 )
 
 
@@ -84,6 +85,17 @@ class CombatActionEngineTests(unittest.TestCase):
         self.assertNotEqual(rows[0]["subject_action"], rows[1]["subject_action"])
         self.assertTrue(any("replaced repeated action" in warning for warning in warnings))
 
+    def test_outcome_only_landing_is_repaired_into_a_causal_attack(self):
+        rows, warnings = reconcile_combat_action_rows(
+            [shot(1, 0, 2.0, "S1 maintains close range. S2 lands on his back; S1 stands over him.")],
+            2.0,
+        )
+        row = rows[0]
+        self.assertEqual(row["combat_continuity_status"], "auto_fixed")
+        self.assertIn("foot sweep", row["subject_action"])
+        self.assertIn("force vector", row["subject_action"])
+        self.assertTrue(any("outcome-only" in warning for warning in warnings))
+
     def test_user_edited_repeated_action_remains_a_warning(self):
         value = shot(2, 2.5, 5.0, "S1 attacks S2. S2 blocks and counters.")
         value["combat_action_chain_user_edited"] = True
@@ -110,6 +122,30 @@ class CombatActionEngineTests(unittest.TestCase):
         self.assertEqual(str(plan["constraints"]).count(ACTION_CAUSALITY_CONTRACT), 1)
         self.assertIn("45.00s]", plan["shots"][0]["subject_action"])
         self.assertNotIn("48.50s]", plan["shots"][0]["subject_action"])
+
+    def test_hong_kong_comic_skill_reuses_action_engine_without_p1_p2_cast_assumption(self):
+        plan = {
+            "duration_seconds": 12.0,
+            "constraints": "",
+            "shots": [shot(1, 0.0, 12.0, "龙界 intercepts 神武不死's electric fist; 神武不死 redirects the contact.")],
+            "existing_media_uses": [{"media_id": "P1"}, {"media_id": "P2"}],
+        }
+        media = [
+            {"media_id": "P1", "media_type": "image", "loaded": True,
+             "raw_analysis_summary": "BLIP · Overview: one comic page containing both fighters on a mountain"},
+            {"media_id": "P2", "media_type": "image", "loaded": True,
+             "raw_analysis_summary": "BLIP · Overview: the same two fighters collide"},
+        ]
+        apply_combat_action_continuity(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=media,
+            authored_requirement="神武不死与龙界使用无界紫电拳和极霸之拳。",
+        )
+        self.assertEqual(plan["combat_action_schema_version"], COMBAT_ACTION_SCHEMA_VERSION)
+        self.assertTrue(plan["combat_fact_ledger"]["permissions"]["supernatural_carriers"])
+        self.assertTrue(all(not row["media_id"] for row in plan["combat_fact_ledger"]["subjects"]))
+        self.assertIn("P1/P2 numbering does not imply", plan["combat_fact_ledger"]["subjects"][0]["description"])
 
     def test_prompt_clause_is_state_delta_not_duplicate_action_chain(self):
         rows, _ = reconcile_combat_action_rows(
@@ -208,6 +244,47 @@ class CombatActionEngineTests(unittest.TestCase):
         preserved, _ = reconcile_combat_action_rows([authored], 3.0)
         self.assertIn("sword", preserved[0]["subject_action"].casefold())
         self.assertEqual(preserved[0]["causal_validation_status"], "warning")
+
+    def test_generic_pose_and_exchange_are_replaced_by_concrete_choreography(self):
+        rows, warnings = reconcile_combat_action_rows(
+            [
+                shot(1, 0, 2.5, "S1 looks directly at S2 and raises his right fist."),
+                shot(2, 2.5, 5.0, "S1 and S2 execute an immediate full-speed attack and defence exchange."),
+            ],
+            5.0,
+        )
+        rendered = " ".join(row["subject_action"] for row in rows).casefold()
+        self.assertNotIn("looks directly", rendered)
+        self.assertNotIn("immediate full-speed attack", rendered)
+        self.assertIn("auto_fixed", {row["combat_continuity_status"] for row in rows})
+        self.assertTrue(any("generic choreography" in warning for warning in warnings))
+        self.assertNotEqual(
+            rows[0]["causal_risk_original_action"],
+            rows[1]["causal_risk_original_action"],
+        )
+
+    def test_dialogue_extension_tail_preserves_final_state_without_new_attack(self):
+        plan = {
+            "duration_seconds": 17.0,
+            "_speech_timing_base_duration": 15.0,
+            "shots": [
+                shot(1, 0, 7.5, "S1 drives a palm toward S2. S2 parries and shifts right."),
+                shot(2, 7.5, 15.0, "S2 sweeps S1. S1 braces and completes the fall."),
+                shot(3, 15.0, 17.0, "Wind carries fine grit through the final frame."),
+            ],
+            "markers": [],
+            "constraints": "",
+            "design_warnings": [],
+        }
+        apply_combat_action_continuity(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+        )
+        tail = plan["shots"][-1]
+        self.assertEqual(tail["combat_continuity_status"], "speech_tail_hold")
+        self.assertIn("No new attack begins", tail["subject_action"])
+        self.assertNotIn("[BEAT", tail["subject_action"])
+        self.assertEqual(tail["movement_speed"], "Settled")
 
     def test_final_shot_completes_into_stable_action_and_camera_state(self):
         rows, _ = reconcile_combat_action_rows(

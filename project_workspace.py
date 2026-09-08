@@ -131,7 +131,18 @@ def picture_overview_project_name(recognition: str) -> str:
         match = re.search(pattern, text, re.I | re.M)
         if match:
             caption = " ".join(match.group(1).strip().split())
-            if caption:
+            # Captions which only identify the source as a page, poster or
+            # screenshot are not a description of the story subject.  They can
+            # also contain a hallucinated franchise name (for example BLIP
+            # calling an unrelated comic page "Star Wars").  Let the authored
+            # Design title name the Workspace instead of persisting that noise.
+            medium_only = bool(re.search(
+                r"^(?:a|an|the)?\s*(?:page|comic(?:\s+book)?\s+page|"
+                r"poster|screenshot|book\s+cover|magazine\s+page)\b",
+                caption,
+                re.I,
+            ))
+            if caption and not medium_only:
                 return workspace_folder_name(caption, "")
     return ""
 

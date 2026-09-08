@@ -30,10 +30,23 @@ ANALYSIS_ONLY_MEDIA_USAGES = frozenset({
 })
 
 STREET_FIGHTER_SPECIAL_SKILL = "street-fighter-live-action-h3"
+HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL = "hong-kong-comic-fighter"
+COMBAT_ACTION_SPECIAL_SKILLS = frozenset({
+    STREET_FIGHTER_SPECIAL_SKILL,
+    HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL,
+})
 STREET_FIGHTER_CAST_TEMPLATE_TOKEN = "{{STREET_FIGHTER_CAST_BINDINGS}}"
+HONG_KONG_COMIC_SOURCE_TEMPLATE_TOKEN = "{{HONG_KONG_COMIC_SOURCE_EVIDENCE}}"
+HONG_KONG_COMIC_TECHNIQUE_TEXT_CONTRACT = (
+    "COMIC TECHNIQUE TITLE CONTRACT: every completed signature technique receives exactly one "
+    "short Chinese move name on an editable Timeline on_screen_text layer. The title appears only "
+    "around the technique's contact/release, never inside a Z-Image or H3 reference, never as random "
+    "AI-generated lettering, and never more than one title at a time."
+)
 STREET_FIGHTER_FPV_COMBAT_CONTRACT = (
-    "CONTINUOUS FPV COMBAT ORBIT: the camera physically flies clockwise around the shared "
-    "midpoint of S1 and S2 with visible parallax and changing occlusion; constant close "
+    "CONTINUOUS FPV COMBAT ORBIT: the camera physically translates around the shared "
+    "midpoint of S1 and S2, alternating direction and height when the attack cause changes, "
+    "with visible parallax and changing occlusion; constant close "
     "combat distance, stable subject scale, no in-place rotation, no zoom-out, no pull-back, "
     "no slow motion, and no non-combat walking. FULL-SPEED FIGHT ONLY: every technique, contact "
     "and recoil is active real-time combat; no entrance, exit, neutral travel, idle pose, bullet "
@@ -180,6 +193,36 @@ def render_special_design_requirement_template(
     """Resolve media-aware placeholders without modifying the reusable Skill file."""
 
     text = str(template or "")
+    if HONG_KONG_COMIC_SOURCE_TEMPLATE_TOKEN in text:
+        source_rows: list[str] = []
+        for raw in existing_media or []:
+            if not isinstance(raw, dict) or not bool(raw.get("loaded", False)):
+                continue
+            media_id = str(raw.get("media_id", "")).strip().upper()
+            media_type = str(raw.get("media_type") or raw.get("type") or "").casefold()
+            if not re.fullmatch(r"P\d+", media_id) or media_type != "image":
+                continue
+            provenance = " ".join(str(raw.get(field, "")) for field in (
+                "recognition", "raw_analysis_summary", "analysis_summary", "local_path",
+            )).casefold()
+            if "ai design generated reference" in provenance or "generated_references" in provenance:
+                continue
+            # Complex multi-panel comic pages are a known weak case for the
+            # compact BLIP caption. Prefer the richer semantic pass when it is
+            # available; pixels and explicit user mapping still outrank both.
+            overview = _semantic_character_summary_from_media_row(raw)
+            evidence_source = "AI Enrich"
+            if not overview:
+                overview = _blip_overview_from_media_row(raw)
+                evidence_source = "BLIP · Overview"
+            if not overview:
+                overview = "已加载港漫画面；以图片像素中的人物、场景、天气、材质与光线为准"
+                evidence_source = "Loaded Picture"
+            source_rows.append(f"@{media_id}（{evidence_source}：{overview}）")
+        source_text = "；".join(source_rows) if source_rows else (
+            "请先加载港漫图片；人物、地点、地形、建筑、天气、色调与可互动材质必须从当前图片读取"
+        )
+        text = text.replace(HONG_KONG_COMIC_SOURCE_TEMPLATE_TOKEN, source_text)
     if STREET_FIGHTER_CAST_TEMPLATE_TOKEN not in text:
         return text
     bindings = {
@@ -291,10 +334,433 @@ def enforce_street_fighter_character_bindings(
     return plan
 
 
+def enforce_hong_kong_comic_source_mapping(
+    plan: dict,
+    existing_media: list[dict] | None,
+    special_skill_key: object,
+) -> dict:
+    """Keep drawn comic pages as analysis evidence rather than H3 visual inputs."""
+
+    if str(special_skill_key or "").strip().casefold() != HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL:
+        return plan
+    duration = float(plan.get("duration_seconds", 0.5) or 0.5)
+    uses = [row for row in plan.get("existing_media_uses") or [] if isinstance(row, dict)]
+    analysis_ids: list[str] = []
+    for raw in existing_media or []:
+        if not isinstance(raw, dict) or not bool(raw.get("loaded", False)):
+            continue
+        media_id = str(raw.get("media_id", "")).strip().upper()
+        media_type = str(raw.get("media_type") or raw.get("type") or "").casefold()
+        if not re.fullmatch(r"P\d+", media_id) or media_type != "image":
+            continue
+        evidence = " ".join(str(raw.get(field, "")) for field in (
+            "raw_analysis_summary", "analysis_summary", "recognition",
+            "semantic_enrichment", "clip_prompt", "local_path",
+        )).casefold()
+        is_generated_reference = (
+            "ai design generated reference" in evidence
+            or "generated_references" in evidence
+        )
+        source_provenance_id = _normalized_media_id(
+            raw.get("source_plate_media_id") or raw.get("derived_from_media_id") or ""
+        )
+        has_source_provenance = bool(
+            source_provenance_id
+            and source_provenance_id != media_id
+            and str(raw.get("source_plate_mode", "")).strip().casefold()
+            in {"source_img2img", "p1_img2img"}
+        )
+        if is_generated_reference and not has_source_provenance:
+            use = next(
+                (row for row in uses if str(row.get("media_id", "")).upper() == media_id),
+                None,
+            )
+            if use is not None:
+                use.update({
+                    "usage": "analysis_only",
+                    "reuse_policy": "analysis_only",
+                    "identity_anchor": False,
+                    "instruction": (
+                        "UNPROVEN GENERATED COMIC REFERENCE EXCLUDED: this old generated Picture "
+                        "has no valid source_plate_media_id/source_img2img provenance. It may contain "
+                        "invented faces, costumes or locations and cannot condition the new H3 render."
+                    ),
+                })
+                analysis_ids.append(media_id)
+            continue
+        legacy_market_pollution = is_generated_reference and any(term in evidence for term in (
+            "wet market", "seafood market", "fish tank", "produce crate",
+            "kowloon walled city-style", "indoor_seafood_aisle",
+        ))
+        if legacy_market_pollution:
+            use = next(
+                (row for row in uses if str(row.get("media_id", "")).upper() == media_id),
+                None,
+            )
+            if use is not None:
+                use.update({
+                    "usage": "analysis_only",
+                    "reuse_policy": "analysis_only",
+                    "identity_anchor": False,
+                    "instruction": (
+                        "LEGACY GENERATED VENUE EXCLUDED: this reference contains a fixed wet-market "
+                        "scene generated by another Special Skill. It is not a source comic fact and "
+                        "must not enter H3 or define the new environment."
+                    ),
+                })
+                analysis_ids.append(media_id)
+            continue
+        drawing_terms = (
+            "comic", "manga", "manhua", "illustration", "drawing", "drawn", "panel",
+            "halftone", "ink line", "speech bubble", "漫画", "漫畫", "港漫", "插画", "插畫",
+            "线稿", "線稿", "网点", "網點", "对白框", "對白框",
+        )
+        photo_terms = (
+            "photoreal", "live-action", "live action", "photograph", "real person",
+            "真人", "实拍", "實拍", "照片",
+        )
+        looks_drawn = any(term in evidence for term in drawing_terms)
+        explicitly_photoreal = any(term in evidence for term in photo_terms)
+        # This Skill is selected specifically for Hong Kong comic input, so an
+        # unanalysed Picture is treated conservatively as source-panel evidence.
+        if explicitly_photoreal and not looks_drawn:
+            continue
+        use = next(
+            (row for row in uses if str(row.get("media_id", "")).upper() == media_id),
+            None,
+        )
+        if use is None:
+            use = {
+                "requirement_id": f"hong_kong_comic_source_{media_id.casefold()}",
+                "media_id": media_id,
+                "media_type": "image",
+                "track": "V1",
+            }
+            uses.append(use)
+        use.update({
+            "usage": "analysis_only",
+            "reuse_policy": "analysis_only",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "identity_anchor": False,
+            "instruction": (
+                "COMIC SOURCE ANALYSIS ONLY: use this Picture to recover character, costume, panel "
+                "order, composition, environment, weather, light, colour and material facts. Do not "
+                "load its page border, halftone, printed text, speech bubbles or drawn texture into H3; "
+                "the time-scoped photoreal source_img2img keyframes are the H3 visual references."
+            ),
+        })
+        analysis_ids.append(media_id)
+    plan["existing_media_uses"] = uses
+    if analysis_ids:
+        warnings = [str(value) for value in plan.get("design_warnings") or []]
+        warning = (
+            "Hong Kong comic source mapping: " + ", ".join(analysis_ids)
+            + " remain analysis-only; use minimal photoreal source_img2img keyframes for H3."
+        )
+        if warning not in warnings:
+            warnings.append(warning)
+        plan["design_warnings"] = warnings
+    return plan
+
+
+def enforce_hong_kong_comic_generated_source_plates(
+    plan: dict,
+    existing_media: list[dict] | None,
+    special_skill_key: object,
+) -> dict:
+    """Bind every generated comic-conversion still to a real loaded source page.
+
+    The language model sometimes asks Z-Image for a photoreal fighter/action
+    frame without setting ``source_plate_media_id``.  That silently turns an
+    img2img conversion into free text-to-image generation, replacing the
+    comic's faces, hair, costume, environment and action design.  Resolve the
+    best source from authored media-use labels, then fall back to chronological
+    Picture position.  Original comic pages stay analysis-only for H3.
+    """
+
+    if str(special_skill_key or "").strip().casefold() != HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL:
+        return plan
+
+    inventory: dict[str, dict] = {}
+    for raw in existing_media or []:
+        if not isinstance(raw, dict) or not bool(raw.get("loaded", False)):
+            continue
+        media_id = str(raw.get("media_id", "")).strip().upper()
+        media_type = str(raw.get("media_type") or raw.get("type") or "").casefold()
+        evidence = " ".join(str(raw.get(field, "")) for field in (
+            "recognition", "raw_analysis_summary", "analysis_summary", "local_path",
+        )).casefold()
+        if not re.fullmatch(r"P\d+", media_id) or media_type != "image":
+            continue
+        if "ai design generated reference" in evidence or "generated_references" in evidence:
+            continue
+        inventory[media_id] = raw
+    if not inventory:
+        return plan
+
+    def media_number(media_id: str) -> int:
+        match = re.search(r"\d+", media_id)
+        return int(match.group()) if match else 10**9
+
+    source_ids = sorted(inventory, key=media_number)
+    duration = max(0.5, float(plan.get("duration_seconds", 0.5) or 0.5))
+    uses = [row for row in plan.get("existing_media_uses") or [] if isinstance(row, dict)]
+
+    # Reassert analysis-only after identity normalization.  A legacy plan may
+    # have promoted P1 to a whole-design H3 identity anchor before this pass.
+    for use in uses:
+        media_id = str(use.get("media_id", "")).strip().upper()
+        if media_id not in inventory:
+            continue
+        use.update({
+            "usage": "analysis_only",
+            "reuse_policy": "analysis_only",
+            "identity_anchor": False,
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+        })
+        use["instruction"] = (
+            "COMIC SOURCE ANALYSIS ONLY: this loaded Picture is pixel authority for identity, "
+            "costume, pose, composition, environment, weather, light and material. It must feed "
+            "the matching Z-Image source_img2img request, but its panel border, halftone, printed "
+            "text and speech bubbles must never be loaded directly into H3."
+        )
+    plan["existing_media_uses"] = uses
+
+    ignored_tokens = {
+        "act", "state", "reference", "composition", "photoreal", "identity", "anchor",
+        "fighter", "image", "generated", "live", "action", "impact", "final", "resolve",
+    }
+
+    def tokens(value: object) -> set[str]:
+        raw = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", str(value or ""))
+        values = set(re.findall(r"[a-z0-9]+", raw.casefold()))
+        return {
+            value for value in values
+            if value not in ignored_tokens
+            and len(value) > 1
+            and not re.fullmatch(r"(?:act|shot|segment|s)\d+", value)
+        }
+
+    labelled_uses: list[tuple[str, set[str], set[str], dict]] = []
+    for use in uses:
+        media_id = str(use.get("media_id", "")).strip().upper()
+        if media_id not in inventory:
+            continue
+        requirement_tokens = tokens(use.get("requirement_id", ""))
+        label = " ".join((
+            str(use.get("requirement_id", "")), str(use.get("instruction", "")),
+            " ".join(str(value) for value in use.get("subject_keywords") or []),
+        ))
+        labelled_uses.append((media_id, requirement_tokens, tokens(label), use))
+
+    converted: list[str] = []
+    for request in plan.get("media_requests") or []:
+        if not isinstance(request, dict) or str(request.get("media_type", "")).casefold() != "image":
+            continue
+        request_id = str(request.get("requirement_id", "") or "comic_conversion")
+        current_source = str(request.get("source_plate_media_id", "")).strip().upper()
+        if current_source not in inventory:
+            request_id_tokens = tokens(request_id)
+            request_tokens = tokens(" ".join((
+                request_id, str(request.get("prompt", "")),
+                " ".join(str(value) for value in request.get("subject_keywords") or []),
+            )))
+            scored: list[tuple[int, int, int, str]] = []
+            for media_id, use_id_tokens, use_tokens, _ in labelled_uses:
+                id_overlap = len(request_id_tokens & use_id_tokens)
+                full_overlap = len(request_tokens & use_tokens)
+                scored.append((id_overlap, full_overlap, -media_number(media_id), media_id))
+            best_id_overlap, best_full_overlap, _, best_id = max(
+                scored, default=(0, 0, 0, source_ids[0])
+            )
+            # A shared action/person label in requirement_id is strong
+            # evidence. Ordinary words such as mountain, fighter or dust are
+            # too broad to choose a source page on their own; in that case use
+            # chronological position rather than collapsing every request to P1.
+            if best_id_overlap <= 0:
+                start = float(request.get("start_seconds", 0.0) or 0.0)
+                end = float(request.get("end_seconds", start) or start)
+                midpoint = max(0.0, min(duration, (start + end) / 2.0))
+                position = midpoint / duration
+                best_id = source_ids[min(len(source_ids) - 1, int(position * len(source_ids)))]
+            current_source = best_id
+        request.update({
+            "source_plate_media_id": current_source,
+            "derived_from_media_id": current_source,
+            "source_plate_mode": "source_img2img",
+            "source_image_denoise": min(
+                0.68, max(0.48, float(request.get("source_image_denoise", 0.58) or 0.58))
+            ),
+        })
+        source_contract = (
+            f"SOURCE COMIC PLATE LOCK: transform @{current_source} through source_img2img. Preserve "
+            "the source pixels' fighter identity, face structure, hair, body proportions, costume "
+            "blocks and colours, pose/contact relationship, terrain, horizon, weather, light direction "
+            "and scene palette. Convert only ink, paper and halftone into photoreal skin, cloth, rock, "
+            "dust and cinematic depth. Do not freely redesign either fighter or the location."
+        )
+        prompt = str(request.get("prompt", "")).strip()
+        if "SOURCE COMIC PLATE LOCK:" not in prompt:
+            request["prompt"] = prompt.rstrip(" .") + (". " if prompt else "") + source_contract
+        negative = str(request.get("negative_prompt", "")).strip()
+        source_negative = (
+            "unrelated face, generic black-clad replacement fighter, changed hairstyle, missing long "
+            "ponytail, changed trousers, changed coat colour, invented costume, source-location replacement, "
+            "comic border, speech bubble, printed glyph, halftone, manga text"
+        )
+        if source_negative not in negative:
+            request["negative_prompt"] = negative.rstrip(" ,") + (", " if negative else "") + source_negative
+        request["comic_source_mapping_status"] = "source_plate_bound"
+        converted.append(f"{request_id}->{current_source}")
+
+    if converted:
+        warnings = [str(value) for value in plan.get("design_warnings") or []]
+        notice = (
+            "Hong Kong comic source_img2img mapping enforced: " + ", ".join(converted)
+            + ". Original comic pages remain analysis-only for H3."
+        )
+        if notice not in warnings:
+            warnings.append(notice)
+        plan["design_warnings"] = warnings
+    return plan
+
+
+def _hong_kong_comic_technique_name(action: object, index: int) -> str:
+    text = str(action or "").casefold()
+    named = (
+        (r"无界紫电拳|無界紫電拳|purple electric", "无界紫电拳"),
+        (r"极霸之拳|極霸之拳", "极霸之拳"),
+        (r"太阳|太陽|烈日|日轮|日輪|solar|corona", "烈阳天劫"),
+        (r"palm|掌", "裂空震天掌"),
+        (r"kick|roundhouse|knee|踢|腿|膝", "天崩裂岳腿"),
+        (r"elbow|forearm|肘|臂", "断空战肘"),
+        (r"throw|takedown|slam|摔|投|抱摔", "撼岳天摔"),
+        (r"fist|punch|hook|拳|勾", "极霸之拳"),
+    )
+    for pattern, name in named:
+        if re.search(pattern, text, flags=re.I):
+            return name
+    fallbacks = ("破界绝杀", "无相天冲", "撼世霸击", "裂天神击", "乾坤震爆")
+    return fallbacks[index % len(fallbacks)]
+
+
+def enforce_hong_kong_comic_technique_text_layers(
+    plan: dict,
+    special_skill_key: object,
+    authored_requirement: object = "",
+) -> dict:
+    """Guarantee editable move titles when the reusable comic template asks for them."""
+
+    if str(special_skill_key or "").strip().casefold() != HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL:
+        return plan
+    requirement = str(authored_requirement or "")
+    if not re.search(
+        r"每(?:一|个|個).{0,8}招式.{0,8}(?:文字|名称|名稱|字幕)|"
+        r"招式.{0,8}(?:文字|名称|名稱|标题|標題)|"
+        r"technique.{0,12}(?:title|name|text)",
+        requirement,
+        flags=re.I,
+    ):
+        return plan
+    layers = [row for row in plan.get("text_layers") or [] if isinstance(row, dict)]
+    title_layers = [
+        row for row in layers
+        if str(row.get("role", "")).casefold() == "on_screen_text"
+    ]
+    used_names = {str(row.get("content", "")).strip() for row in title_layers}
+    for index, shot in enumerate(plan.get("shots") or []):
+        if not isinstance(shot, dict):
+            continue
+        action = str(shot.get("subject_action", ""))
+        settle_match = re.search(
+            r"final settle|no new attack|both stop changing position|最终稳定|最終穩定|不开始新攻击|不開始新攻擊",
+            action,
+            flags=re.I,
+        )
+        before_settle = action[:settle_match.start()] if settle_match else action
+        has_completed_technique = bool(re.search(
+            r"attack|strike|punch|kick|palm|elbow|contact|impact|release|launch|"
+            r"攻击|攻擊|拳|掌|踢|肘|接触|接觸|撞击|撞擊|命中|释放|釋放|爆发|爆發",
+            before_settle,
+            flags=re.I,
+        ))
+        if settle_match and not has_completed_technique:
+            continue
+        start = float(shot.get("start_seconds", 0.0) or 0.0)
+        end = float(shot.get("end_seconds", start + 0.5) or start + 0.5)
+        if any(
+            float(row.get("start_seconds", 0.0) or 0.0) < end
+            and float(row.get("end_seconds", 0.0) or 0.0) > start
+            for row in title_layers
+        ):
+            continue
+        name = _hong_kong_comic_technique_name(action, index)
+        if name in used_names:
+            suffixes = ("·破", "·震", "·灭", "·终")
+            name += suffixes[index % len(suffixes)]
+        layer_start = snap_half_second(min(end - 0.5, start + max(0.5, (end - start) * 0.45)), end)
+        layer_start = max(start, min(layer_start, end - 0.5))
+        layer_end = min(end, layer_start + 1.0)
+        layer = {
+            "start_seconds": layer_start,
+            "end_seconds": max(layer_start + 0.5, layer_end),
+            "track": "V4",
+            "content": name,
+            "role": "on_screen_text",
+            "speaker": "S1",
+            "language": "Chinese",
+            "delivery": (
+                "Editable Hong Kong-comic impact title; bold high-contrast brush lettering, "
+                "briefly synchronized to the completed technique without covering either face"
+            ),
+            "lip_sync": False,
+            "explicit_user_requested": True,
+            "authored_timing_locked": False,
+            "timeline_visible_text_kind": "comic_technique_title",
+        }
+        layers.append(layer)
+        title_layers.append(layer)
+        used_names.add(name)
+    plan["text_layers"] = sorted(
+        layers,
+        key=lambda row: (
+            float(row.get("start_seconds", 0.0) or 0.0),
+            float(row.get("end_seconds", 0.0) or 0.0),
+            str(row.get("track", "")),
+        ),
+    )
+    plan["constraints"] = (
+        str(plan.get("constraints", "")).rstrip(" .")
+        + (". " if str(plan.get("constraints", "")).strip() else "")
+        + HONG_KONG_COMIC_TECHNIQUE_TEXT_CONTRACT
+    ) if "COMIC TECHNIQUE TITLE CONTRACT:" not in str(plan.get("constraints", "")) else str(plan.get("constraints", ""))
+    return plan
+
+
 def _street_fighter_realtime_action_text(value: object) -> str:
     """Remove positive slow/walking staging from executable fighter action text."""
 
     text = str(value or "").strip()
+    # Protect negative constraints before rewriting positive staging prose.
+    # Otherwise ``no slow motion`` becomes the contradictory
+    # ``no in real time`` and ``no walking`` becomes ``no uses ...``.
+    protected: list[str] = []
+
+    def protect(match: re.Match) -> str:
+        protected.append(match.group(0))
+        return f"__NEGATIVE_ACTION_RULE_{len(protected) - 1}__"
+
+    text = re.sub(
+        r"(?i)\b(?:no|without|never)\s+(?:(?:extreme\s+)?slow[- ]motion|"
+        r"bullet[- ]time|impact[- ]freeze(?:\s+frame)?|speed[- ]ramp(?:ing)?|"
+        r"(?:non[- ]combat\s+)?(?:walks?|walking|strolls?|strolling))\b|"
+        r"(?:禁止|不要|不得|严禁|嚴禁)(?:使用|采用|採用|出现|出現)?(?:慢动作|慢動作|"
+        r"子弹时间|子彈時間|冲击定格|衝擊定格|速度渐变|速度漸變|走路|步行|慢慢走)",
+        protect,
+        text,
+    )
     substitutions = (
         (r"(?i)\b(?:in\s+)?(?:extreme\s+)?slow[- ]motion\b", "in real time"),
         (r"(?i)\bbullet[- ]time\b", "real-time"),
@@ -307,7 +773,67 @@ def _street_fighter_realtime_action_text(value: object) -> str:
     )
     for pattern, replacement in substitutions:
         text = re.sub(pattern, replacement, text)
+    for index, original in enumerate(protected):
+        text = text.replace(f"__NEGATIVE_ACTION_RULE_{index}__", original)
     return " ".join(text.split())
+
+
+HONG_KONG_COMIC_SUPERHERO_OPENING_CONTRACT = (
+    "SUPERHERO PRESSURE ARRIVAL: preserve the first 0.75-1.25 seconds. Begin on a low close "
+    "view as the lead fighter plants weight or lands into the existing confrontation; hair and "
+    "clothing snap, only source-visible grit or loose stone rises, and a physically cast shadow "
+    "expands across the real terrain. The camera makes one fast low-to-eye-level rising arc to the "
+    "face and the opponent answers with the first attack by about 1.25 seconds. This is not walking, "
+    "a pose montage, teleportation, a scenic intro or an unrelated explosion."
+)
+
+
+def _append_once_text(value: object, contract: str) -> str:
+    text = str(value or "").strip()
+    signature = contract.split(":", 1)[0].casefold()
+    if signature and signature in text.casefold():
+        return text
+    return text.rstrip(" .") + (". " if text else "") + contract
+
+
+def enforce_hong_kong_comic_superhero_opening(
+    plan: dict,
+    special_skill_key: object,
+) -> dict:
+    """Keep a compact power arrival without sacrificing the first combat act."""
+
+    if str(special_skill_key or "").strip().casefold() != HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL:
+        return plan
+    shots = [row for row in plan.get("shots") or [] if isinstance(row, dict)]
+    if not shots:
+        return plan
+    first = min(shots, key=lambda row: float(row.get("start_seconds", 0.0) or 0.0))
+    if float(first.get("start_seconds", 0.0) or 0.0) > 0.01:
+        return plan
+    action = str(first.get("subject_action", "")).strip()
+    if "SUPERHERO PRESSURE ARRIVAL:" not in action:
+        first["subject_action"] = (
+            "[0.00-1.00s SUPERHERO PRESSURE ARRIVAL] The lead fighter plants weight or lands "
+            "into the confrontation; clothing and hair snap, source-visible grit rises and the "
+            "opponent immediately launches the first defence/counter. "
+            + action
+        ).strip()
+    first["camera_movement"] = (
+        "One fast physical low-angle close rising FPV arc and whip-tilt from the planted foot "
+        "to the lead fighter's face, continuing around the two-fighter midpoint as the first "
+        "attack begins; real parallax, no lens zoom and no in-place spin."
+    )
+    first["movement_speed"] = "Explosive real-time"
+    first["additional_direction"] = _append_once_text(
+        first.get("additional_direction", ""),
+        HONG_KONG_COMIC_SUPERHERO_OPENING_CONTRACT,
+    )
+    constraints = str(plan.get("constraints", ""))
+    if "SUPERHERO PRESSURE ARRIVAL:" not in constraints:
+        plan["constraints"] = _append_once_text(
+            constraints, HONG_KONG_COMIC_SUPERHERO_OPENING_CONTRACT
+        )
+    return plan
 
 
 def enforce_street_fighter_fpv_combat_direction(
@@ -321,7 +847,7 @@ def enforce_street_fighter_fpv_combat_direction(
     the Special Skill prompt has already asked the model not to use them.
     """
 
-    if str(special_skill_key or "").strip().casefold() != STREET_FIGHTER_SPECIAL_SKILL:
+    if str(special_skill_key or "").strip().casefold() not in COMBAT_ACTION_SPECIAL_SKILLS:
         return plan
 
     sector_cycle = (
@@ -343,8 +869,9 @@ def enforce_street_fighter_fpv_combat_direction(
         if not isinstance(shot, dict):
             continue
         start_sector, end_sector = sector_cycle[index % len(sector_cycle)]
+        orbit_direction = "clockwise" if index % 2 == 0 else "counterclockwise"
         shot["camera_movement"] = (
-            "Full-speed physical FPV clockwise orbital translation around the shared midpoint "
+            f"Full-speed physical FPV {orbit_direction} orbital translation around the shared midpoint "
             f"of S1 and S2, travelling from {start_sector} to {end_sector} while both fighters "
             "execute the assigned attack-and-defence exchange; genuine foreground occlusion and "
             "background parallax, constant close combat distance, stable subject scale and a "
@@ -1102,7 +1629,9 @@ def _direct_request_text(request: dict) -> str:
 def _request_visible_person_count(request: dict) -> int:
     text = _direct_request_text(request).lower()
     if re.search(
-        r"\b(?:two|2)\s+(?:people|persons|figures|characters|actors|fighters|warriors)\b",
+        r"\b(?:exactly\s+)?(?:two|2)\s+(?:(?:male|female)\s+)?"
+        r"(?:people|persons|figures|characters|actors|fighters|warriors|martial artists|"
+        r"visible identity subjects)\b",
         text,
     ):
         return 2
@@ -1238,7 +1767,10 @@ def _scope_generated_environment_reference(plan: dict, request: dict) -> None:
     plan["design_warnings"] = warnings
 
 
-def stabilize_generated_identity_references(plan: dict) -> dict:
+def stabilize_generated_identity_references(
+    plan: dict,
+    special_skill_key: object = "",
+) -> dict:
     """Make one generated image authoritative for a recurring human identity.
 
     Independent T2I calls cannot genuinely copy one another.  Letting every
@@ -1251,6 +1783,66 @@ def stabilize_generated_identity_references(plan: dict) -> dict:
         row for row in plan.get("media_requests") or []
         if isinstance(row, dict) and row.get("media_type") == "image"
     ]
+    # A two-fighter comic action plate is not a single face portrait.  Keep it
+    # Shot-local and never append the one-person identity-anchor contract.
+    if str(special_skill_key or "").strip().casefold() == "hong-kong-comic-fighter":
+        two_person_requests = [
+            row for row in requests if _request_visible_person_count(row) >= 2
+        ]
+        for request in two_person_requests:
+            request["prompt"] = _strip_generated_anchor_augmentation(
+                str(request.get("prompt", ""))
+            )
+            if request["prompt"].startswith(_GENERATED_IDENTITY_PREFIX):
+                request["prompt"] = request["prompt"][len(_GENERATED_IDENTITY_PREFIX):]
+            request["prompt"] = re.sub(
+                r"\s*EXACT SUBJECT COUNT LOCK:\s*exactly one visible identity subject\..*$",
+                "",
+                request["prompt"],
+                flags=re.I | re.S,
+            ).rstrip(" .")
+            for key in (
+                "identity_anchor", "identity_anchor_requirement_id",
+                "identity_anchor_media_id", "character_continuity_contract",
+            ):
+                request.pop(key, None)
+            request["reuse_policy"] = "time_scoped"
+            _append_subject_count_guard(request)
+        # Comic conversion has a different authority model from ordinary
+        # reference generation: original pages are analysis/source plates and
+        # generated photoreal stills may never cause P1 (or another page) to be
+        # promoted into a direct whole-design H3 identity anchor. Generated
+        # single-person identity portraits are allowed, but they must remain
+        # source-plate-derived in the dedicated comic normalization pass.
+        for request in requests:
+            if request in two_person_requests:
+                continue
+            visible_count = _request_visible_person_count(request)
+            is_identity = bool(re.search(
+                r"(?i)identity|portrait|face|character|人物|角色|肖像|身份",
+                " ".join((
+                    str(request.get("requirement_id", "")),
+                    str(request.get("prompt", "")),
+                )),
+            ))
+            request["reuse_policy"] = (
+                "whole_design" if visible_count == 1 and is_identity else "time_scoped"
+            )
+            if request["reuse_policy"] == "whole_design":
+                request["identity_anchor"] = True
+            else:
+                request.pop("identity_anchor", None)
+            _append_subject_count_guard(request)
+        warnings = [str(value) for value in plan.get("design_warnings") or []]
+        notice = (
+            "Hong Kong comic generated references preserve source-page authority: "
+            "two-fighter action states remain time-scoped and original comic Pictures "
+            "are never promoted to direct H3 identity anchors."
+        )
+        if notice not in warnings:
+            warnings.append(notice)
+        plan["design_warnings"] = warnings
+        return plan
     existing_anchor = _existing_identity_anchor(plan)
     if existing_anchor is not None:
         duration = float(plan.get("duration_seconds", 0.0) or 0.0)
@@ -1764,7 +2356,9 @@ def validate_requested_speech_layer_contract(requirement: str, plan: dict) -> se
 _VISIBLE_TEXT_REQUEST_RE = re.compile(
     r"\b(?:on[ -]?screen\s+text|title\s+card|show\s+(?:the\s+)?title|subtitles?|captions?)\b|"
     r"\u5c4f\u5e55\u6587\u5b57|\u87a2\u5e55\u6587\u5b57|\u753b\u9762\u6587\u5b57|\u756b\u9762\u6587\u5b57|"
-    r"\u663e\u793a\u6807\u9898|\u986f\u793a\u6a19\u984c|\u5b57\u5e55",
+    r"\u663e\u793a\u6807\u9898|\u986f\u793a\u6a19\u984c|\u5b57\u5e55|"
+    r"招式文字|招式名|招式名称|招式名稱|招式标题|招式標題|"
+    r"\b(?:move|technique)\s+(?:name|title)\b",
     re.I,
 )
 
@@ -1827,6 +2421,11 @@ def enforce_design_subtitle_policy(
         if (
             enabled
             or identity in exact_visible
+            or (
+                bool(layer.get("explicit_user_requested", False))
+                and str(layer.get("timeline_visible_text_kind", "")).strip().casefold()
+                == "comic_technique_title"
+            )
             or (
                 not str(authored_requirement or "").strip()
                 and bool(layer.get("explicit_user_requested", False))
@@ -2020,6 +2619,10 @@ _TIMED_TEXT_LABEL_RE = re.compile(
     r")\s*[：:]\s*(?P<content>.*)$",
     flags=re.I,
 )
+_TIMED_NAMED_CHARACTER_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-z\u3400-\u9fff][A-Za-z0-9\u3400-\u9fff·・\s]{0,28}?)"
+    r"(?:\([^)]{0,40}\)|（[^）]{0,40}）)?\s*[：:]\s*(?P<content>[‘’“\"『「].+)$"
+)
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 
 
@@ -2087,7 +2690,8 @@ def _authored_time_range_matches(text: str) -> list[re.Match]:
 
 _EXPLICIT_VIDEO_DURATION_PATTERNS = (
     re.compile(
-        r"(?:时长|時長|片长|片長|总长|總長|总时长|總時長|"
+        r"(?:准确|準確|精确|精確|精准|精準|exact(?:ly)?|"
+        r"时长|時長|片长|片長|总长|總長|总时长|總時長|"
         r"创作|創作|制作|製作|生成|我要|我想要|需要|duration|length)"
         r"[^\n。！？.!?]{0,28}?"
         r"(?P<value>\d+(?:\.\d+)?)\s*"
@@ -2193,6 +2797,7 @@ def extract_explicit_timed_text_layers(
     active_range: tuple[float, float] | None = None
     active_context: list[str] = []
     layers: list[dict] = []
+    named_speakers: dict[str, str] = {}
     for line_number, raw_line in enumerate(lines):
         line = raw_line.strip()
         if not line:
@@ -2215,23 +2820,51 @@ def extract_explicit_timed_text_layers(
                 + label_line[timed_match.end():]
             )
         label_line = label_line.strip(" -–—[]【】()（）")
+        # Markdown emphasis is presentation only. Without this normalization,
+        # ``**旁白：**“...”`` either fails label matching or leaks asterisks
+        # into the exact authored speech content.
+        label_line = re.sub(r"\*\*", "", label_line).strip()
         label_match = _TIMED_TEXT_LABEL_RE.match(label_line)
-        if not label_match:
+        named_match = None if label_match else _TIMED_NAMED_CHARACTER_RE.match(label_line)
+        if not label_match and not named_match:
             if active_range:
                 active_context.append(line)
             continue
         if not active_range:
             # Untimed narrative labels are not enough to build a deterministic layer.
             continue
-        content = _strip_authored_text_quotes(label_match.group("content"))
+        content = _strip_authored_text_quotes(
+            label_match.group("content") if label_match else named_match.group("content")
+        )
         if not content and line_number + 1 < len(lines):
             candidate = _strip_authored_text_quotes(lines[line_number + 1])
             if candidate and not _authored_time_range_matches(candidate):
                 content = candidate
         if not content or content.lower() in {"如下", "as follows"}:
             continue
-        label = label_match.group("label")
-        role = _timed_text_role(label)
+        if label_match:
+            label = label_match.group("label")
+            role = _timed_text_role(label)
+            speaker = (label_match.group("speaker") or "S1").upper()
+            speaker_explicit = bool(label_match.group("speaker"))
+        else:
+            label = named_match.group("name").strip()
+            role = (
+                "voice_over"
+                if re.search(r"回声|回聲|心声|心聲|内心|內心|echo|inner", label, flags=re.I)
+                else "dialogue"
+            )
+            canonical_name = next(
+                (
+                    known for known in named_speakers
+                    if known in label or label in known
+                ),
+                re.sub(r"年轻|年輕|的?回声|的?回聲|心声|心聲|内心|內心|young|echo|inner", "", label, flags=re.I).strip(),
+            ) or label
+            if canonical_name not in named_speakers:
+                named_speakers[canonical_name] = "S1" if not named_speakers else "S2"
+            speaker = named_speakers[canonical_name]
+            speaker_explicit = True
         language = (
             "Mandarin Chinese"
             if re.search(r"普通话|普通話|国语|國語|Mandarin", label, flags=re.I)
@@ -2249,11 +2882,11 @@ def extract_explicit_timed_text_layers(
             }[role],
             "content": content,
             "role": role,
-            "speaker": (label_match.group("speaker") or "S1").upper(),
+            "speaker": speaker,
             # Kept only through the pre-normalization protection pass.  An
             # omitted speaker means the planner may assign S1/S2 from the
             # speaking character's gender; an explicit S1/S2 remains binding.
-            "_speaker_explicit": bool(label_match.group("speaker")),
+            "_speaker_explicit": speaker_explicit,
             "language": language,
             "delivery": _timed_text_delivery(" ".join(active_context), role),
             "lip_sync": role == "dialogue",
@@ -2491,7 +3124,16 @@ def spatial_acoustics_profile(evidence: object) -> tuple[str, str]:
     text = " ".join(str(evidence or "").lower().split())
 
     def has(*words: str) -> bool:
-        return any(word in text for word in words)
+        for word in words:
+            token = str(word or "").lower()
+            if not token:
+                continue
+            if token.isascii() and token.isalpha() and len(token) <= 4:
+                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text):
+                    return True
+            elif token in text:
+                return True
+        return False
 
     if has("small reflective room", "bathroom", "washroom", "tile", "tiled", "浴室", "洗手间", "瓷砖"):
         return (
@@ -2831,6 +3473,7 @@ DESIGN_JSON_SCHEMA = {
                     "delivery": {"type": "string"},
                     "lip_sync": {"type": "boolean"},
                     "explicit_user_requested": {"type": "boolean"},
+                    "timeline_visible_text_kind": {"type": "string"},
                 },
             },
         },
@@ -3201,9 +3844,10 @@ def repair_design_media_plan(
 
     Empty Picture slots are generation capacity, not reusable Media Pool
     assets.  Some local models nevertheless emit them in
-    ``existing_media_uses``.  Convert those rows into Z-Image requests and add
-    enough time-scoped references to cover the Shot plan at roughly one useful
-    state per five seconds, bounded by Shot count and physical API capacity.
+    ``existing_media_uses``.  Convert those rows into Z-Image requests.  Only
+    synthesize generic coverage when the design has no loaded visual reference
+    at all; a populated virtual Media Pool is authoritative and must not be
+    padded to a fixed one-image-per-five-seconds quota.
     """
 
     source = deepcopy(extract_design_json(payload))
@@ -3411,11 +4055,21 @@ def repair_design_media_plan(
     }
     image_requests = [row for row in requests if row.get("media_type") == "image"]
     shot_count = len(shots)
-    desired_total = min(
-        int(capacities.get("image", 0)),
-        shot_count,
-        max(1, math.ceil(duration / 5.0)),
-    ) if shot_count else 0
+    # A duration-derived target is a last-resort bootstrap for an empty visual
+    # plan, not a production quota.  Long projects commonly carry a compact
+    # chronological keyframe set whose references are deliberately reused
+    # across several Shots.  Counting duration/5 here used to create dozens of
+    # unwanted auto_image requests even when every supplied P reference was
+    # valid and time-scoped.
+    desired_total = (
+        min(
+            int(capacities.get("image", 0)),
+            shot_count,
+            max(1, math.ceil(duration / 5.0)),
+        )
+        if shot_count and not valid_picture_ids
+        else len(valid_picture_ids) + len(image_requests)
+    )
     usable_total = len(valid_picture_ids) + len(image_requests)
     remaining_capacity = max(0, free_image_slots - len(image_requests))
     needed = min(max(0, desired_total - usable_total), remaining_capacity)
@@ -5070,12 +5724,17 @@ def normalize_design_plan(
         for metadata_key in (
             "authored_start_seconds", "authored_end_seconds",
             "speech_timing_auto_adjusted", "speech_budget_was_overloaded",
-            "speech_budget", "authored_timing_locked",
+            "speech_budget", "authored_timing_locked", "timeline_visible_text_kind",
         ):
             if metadata_key in raw:
                 normalized_layer[metadata_key] = deepcopy(raw[metadata_key])
         text_layers.append(normalized_layer)
     plan["text_layers"] = text_layers
+    enforce_hong_kong_comic_technique_text_layers(
+        plan,
+        special_skill_key,
+        authored_requirement,
+    )
 
     for family in ("transitions", "markers"):
         entries: list[dict] = []
@@ -5097,7 +5756,7 @@ def normalize_design_plan(
     )
     if not has_final_hold and not is_drone_special_skill(special_skill_key):
         is_combat_skill = (
-            str(special_skill_key or "").strip().casefold() == STREET_FIGHTER_SPECIAL_SKILL
+            str(special_skill_key or "").strip().casefold() in COMBAT_ACTION_SPECIAL_SKILLS
         )
         plan["markers"].append({
             "time_seconds": snap_half_second(max(0.0, duration - 1.0), duration),
@@ -5262,7 +5921,13 @@ def normalize_design_plan(
         existing_media,
         special_skill_key,
     )
+    enforce_hong_kong_comic_source_mapping(
+        plan,
+        existing_media,
+        special_skill_key,
+    )
     enforce_street_fighter_fpv_combat_direction(plan, special_skill_key)
+    enforce_hong_kong_comic_superhero_opening(plan, special_skill_key)
     existing_media_uses = [
         row for row in plan.get("existing_media_uses") or []
         if isinstance(row, dict)
@@ -5438,9 +6103,39 @@ def normalize_design_plan(
             ).strip()
         for metadata_key in (
             "identity_anchor", "identity_anchor_requirement_id", "identity_anchor_media_id",
+            "distinct_character_identity",
         ):
             if metadata_key in raw:
                 normalized_request[metadata_key] = deepcopy(raw[metadata_key])
+        if media_type == "image":
+            source_plate_id = _normalized_media_id(raw.get("source_plate_media_id", ""))
+            source_mode = str(raw.get("source_plate_mode", "")).strip().lower()
+            if source_plate_id or source_mode:
+                source_row = inventory.get(source_plate_id)
+                if not (
+                    source_plate_id.startswith("P")
+                    and source_row
+                    and bool(source_row.get("loaded", False))
+                    and str(source_row.get("media_type", source_row.get("type", ""))).lower() == "image"
+                ):
+                    raise ValueError(
+                        f"Media request {requirement_id!r} requires a loaded source Picture; "
+                        f"{source_plate_id or '(missing ID)'} is unavailable."
+                    )
+                if source_mode not in {"p1_img2img", "source_img2img"}:
+                    raise ValueError(
+                        f"Media request {requirement_id!r} uses unsupported source_plate_mode "
+                        f"{source_mode!r}."
+                    )
+                normalized_request.update({
+                    "source_plate_media_id": source_plate_id,
+                    "source_plate_mode": source_mode,
+                    "derived_from_media_id": source_plate_id,
+                    "source_image_denoise": min(
+                        0.8,
+                        max(0.1, float(raw.get("source_image_denoise", 0.62))),
+                    ),
+                })
         preferred_media_id = _normalized_media_id(raw.get("preferred_media_id", ""))
         if media_type == "image" and preferred_media_id.startswith("P"):
             preferred_row = inventory.get(preferred_media_id)
@@ -5472,7 +6167,12 @@ def normalize_design_plan(
         ]
     if str(special_skill_key).strip().casefold() == "dark-rescue-h3":
         enforce_dark_rescue_first_person(plan)
-    stabilize_generated_identity_references(plan)
+    stabilize_generated_identity_references(plan, special_skill_key)
+    enforce_hong_kong_comic_generated_source_plates(
+        plan,
+        existing_media,
+        special_skill_key,
+    )
     enforce_street_fighter_cast_market_and_spectators(
         plan,
         existing_media,
@@ -5488,6 +6188,8 @@ def normalize_design_plan(
     return apply_environmental_combat_physics(
         plan,
         special_skill_key=special_skill_key,
+        existing_media=existing_media,
+        authored_requirement=authored_requirement,
     )
 
 
@@ -5685,6 +6387,47 @@ def build_design_system_prompt(context: dict) -> str:
             "derive editable environment_interaction, incoming_environment_state, "
             "outgoing_environment_state, crowd_reaction and location_transition fields and compile "
             "them into each real H3 Segment prompt. "
+        )
+    elif selected_special_key == HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL:
+        ending_contract = (
+            "HONG KONG COMIC FIGHTER ENDING CONTRACT: complete the final technique, recoil and "
+            "force propagation at real-time full speed, then settle both fighters into one readable "
+            "supported state for the last 0.75-1.00 second. Keep the source-derived location, terrain, "
+            "weather, damage and airborne aftermath continuous. Add a Final Combat Resolve marker; "
+            "no replay, walk-away, zoom-out, in-place spin or slow-motion contact. "
+        )
+        speaker_gender_contract = (
+            "HONG KONG COMIC CHARACTER CONTRACT: infer each fighter from the loaded comic Pictures "
+            "and explicit user role descriptions, not from P1/P2 numbering or a generic gender rule. "
+            "Keep names, face, hair, build, costume, ability ownership and screen identity stable. "
+            "Do not invent conversational dialogue. Preserve every explicitly authored narration and "
+            "fighter line verbatim in editable text_layers. When the requirement requests automatic comic "
+            "narration, create at most one short first-person or omniscient voice-over per 15-second act; "
+            "it may establish resolve or consequence but may not explain every punch. Short technique shouts "
+            "remain editable dialogue. Never hide speech inside Shot prompts or burn it into generated pictures. "
+        )
+        environmental_combat_contract = (
+            "REFERENCE-DERIVED WORLD COMBAT CONTRACT: first build a fact ledger from the current loaded "
+            "comic Pictures and explicit request for location, terrain, architecture, objects, weather, "
+            "light, colour and available materials. Preserve those facts as the only world plate. Do not "
+            "inject a Kowloon wet market, arena, street, spectators or any other Skill-default venue. "
+            "For every Shot show fighter load/action, exact contact or visible miss, defender response, "
+            "force vector, displacement, then one material response and one wider atmospheric response. "
+            "Every completed technique must communicate invincible world-class power. The load lifts nearby "
+            "source-visible rock, sand or loose matter and bends local light; contact creates one directional "
+            "compressed-air detonation and localized space-lensing; material then cracks or explodes along "
+            "the force vector; only afterward do violent wind, dust fronts, clouds, weather, illumination and "
+            "physically cast shadows escalate. If a solar technique is requested, stage one climax with a compact "
+            "white-gold corona around the attacking limb/contact, heat refraction, exposure adaptation, warm "
+            "reflections and long moving hard-edged shadows. Use photoreal superhero-scale effects, never a "
+            "cartoon aura, new sun, portal, graphic ring or unrelated background fireball. Effects begin only "
+            "after a visible cause and may not replace or geometrically redesign the source environment. "
+            "For every completed named technique, create exactly one short Chinese move title on an editable "
+            "V-track on_screen_text layer, explicit_user_requested=true, synchronized to contact/release. Never "
+            "draw technique lettering into a generated reference image, never overlap two titles, and never cover "
+            "a fighter's face. "
+            "Persist every environmental consequence into later Shots and compile the editable causal "
+            "fields into the actual H3 Segment prompt. "
         )
     elif is_drone_special_skill(selected_special_key):
         ending_contract = (

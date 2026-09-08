@@ -147,6 +147,26 @@ class SpecialSkillStoreTests(unittest.TestCase):
         self.assertIn("at least five orbital camera sectors", english)
         self.assertIn("五种肉眼可分的摄影角度", chinese)
 
+    def test_hong_kong_comic_fighter_is_source_led_and_has_reusable_template(self):
+        root = Path(__file__).parent / "skill special" / "hong-kong-comic-fighter"
+        document = load_special_skill_document(root)
+        validate_special_skill_document(document)
+        english = (root / "SKILL.md").read_text(encoding="utf-8")
+        chinese = (root / "SKILL.cn.md").read_text(encoding="utf-8")
+        template = (root / "DESIGN_REQUIREMENT.txt").read_text(encoding="utf-8")
+        self.assertEqual(document.key, "hong-kong-comic-fighter")
+        self.assertIn("Source-derived world-scale force", english)
+        self.assertIn("世界级力量与背景因果链", chinese)
+        self.assertIn("{{HONG_KONG_COMIC_SOURCE_EVIDENCE}}", template)
+        self.assertIn("禁止从Skill硬塞九龙菜市场", template)
+        self.assertIn("source_img2img", template)
+        self.assertIn("局部热浪式空间透镜扭曲", template)
+        self.assertIn("每个完整招式", template)
+        self.assertIn("太阳系力量", template)
+        self.assertIn("on_screen_text", template)
+        self.assertIn("港漫旁白", chinese)
+        self.assertIn("solar signature technique", english)
+
 
 if __name__ == "__main__":
     unittest.main()

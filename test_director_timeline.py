@@ -53,6 +53,7 @@ from project_integrity import (
 )
 from runtime_paths import PROJECT_ROOT
 from design_engine import (
+    HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL,
     STREET_FIGHTER_MARKET_CONTRACT,
     STREET_FIGHTER_P1_P2_PIXEL_LOCK,
     normalize_design_plan,
@@ -74,6 +75,40 @@ from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_hong_kong_comic_environment_fields_reach_h3_without_market_contract(self):
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 3.0, "Mountain collision",
+            subject_action="[BEAT 01] S1 drives a palm at S2. [BEAT 02] S2 redirects and counters.",
+            h3_executable_action="[BEAT 01] S1 drives a palm at S2. [BEAT 02] S2 redirects and counters.",
+            incoming_combat_state="S1 left, S2 right, both grounded.",
+            outgoing_combat_state="S1 recoils right; S2 remains planted.",
+            next_action_trigger="The recoil triggers BEAT 03.",
+            combat_action_schema_version=1,
+            environment_interaction=(
+                "cause_actor=S1; contact_target=rocky mountain contact; primary_response=loose rock "
+                "moves screen-right; secondary_response=localized refractive compression and delayed cloud shear"
+            ),
+            incoming_environment_state="Location=rocky mountain; cliff intact",
+            outgoing_environment_state="Location=rocky mountain; debris persists screen-right",
+            crowd_reaction="",
+            location_transition="REFERENCE LOCATION LOCK: remain on the source mountain",
+            environment_physics_schema_version=1,
+        )
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL)
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        window.director_cues = [cue]
+        spec = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        rendered = " ".join(spec.shots) + " " + spec.must_keep
+        self.assertIn("rocky mountain contact", rendered)
+        self.assertIn("localized refractive compression", rendered)
+        self.assertIn("REFERENCE-DERIVED WORLD CAUSALITY:", rendered)
+        self.assertNotIn("HONG KONG KOWLOON WET-MARKET ARENA:", rendered)
+        self.assertNotIn("P1/P2 ABSOLUTE CAST LOCK:", rendered)
+        window.project_dirty = False
+        window.close()
+
     def test_timeline_causal_risk_auto_repairs_and_final_shot_settles(self):
         window = DirectorCutStudio()
         skill_index = window.special_combo.findData("street-fighter-live-action-h3")
@@ -628,6 +663,38 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_authored_text_guard_accepts_unique_auto_adjusted_timing(self):
+        window = DirectorCutStudio()
+        authored = {
+            "start_seconds": 0.0,
+            "end_seconds": 15.0,
+            "track": "A5",
+            "content": "完整旁白必须保留，但系统可以为了对白预算调整时间。",
+            "role": "voice_over",
+            "speaker": "S1",
+            "language": "Chinese",
+            "authored_timing_locked": True,
+        }
+        window.authored_text_requirements = [authored]
+        window.text_layers = [TextLayer(
+            "T1", authored["content"], 5.0, 13.5, "A5",
+            content_role="voice_over", speaker="S1", language="Chinese",
+            lip_sync=False, speech_timing_auto_adjusted=True,
+        )]
+        with patch("director_cut_studio.QMessageBox.critical") as warning:
+            self.assertTrue(window._validate_authored_text_before_run())
+        warning.assert_not_called()
+        self.assertEqual(
+            (
+                window.authored_text_requirements[0]["start_seconds"],
+                window.authored_text_requirements[0]["end_seconds"],
+            ),
+            (5.0, 13.5),
+        )
+        self.assertTrue(window.project_dirty)
+        window.project_dirty = False
+        window.close()
+
     def test_authored_tts_full_audio_slots_defers_without_destroying_text_layers(self):
         window = DirectorCutStudio()
         window.render_settings.dialogue_tts_engine = "edge_tts"
@@ -763,6 +830,26 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(
             window._preferred_workspace_display_name(plan, requirement),
             "Sam Altman's Manual Email",
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_authored_title_outranks_generic_comic_page_blip_name(self):
+        window = DirectorCutStudio()
+        picture = next(
+            item for item in window.scan.assets if item.media_type == "image"
+        )
+        picture.local_path = "C:/loaded/comic_page.jpg"
+        picture.recognition = (
+            "BLIP VISUAL SUMMARY · CUDA\n"
+            "BLIP · Overview: the page for the comic book, the star wars"
+        )
+        plan = sample_design()
+        plan["title"] = "神武不死战龙界：强者的一生"
+
+        self.assertEqual(
+            window._preferred_workspace_display_name(plan, ""),
+            "神武不死战龙界：强者的一生",
         )
         window.project_dirty = False
         window.close()
@@ -1995,6 +2082,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         with patch.object(restored, "queue_media_preparation"):
             restored.load_project_path(project_path)
         self.assertEqual(len(restored.text_layers), 1)
+        self.assertEqual(restored.text_layers[0].language, "Mandarin Chinese")
         self.assertTrue(restored.text_layers[0].speech_timing_auto_adjusted)
         self.assertGreater(restored.text_layers[0].end_seconds, 2.0)
         self.assertGreater(
@@ -3195,8 +3283,15 @@ class DirectorTimelineDragTests(unittest.TestCase):
             output.setMuted(True)
         before = window.playhead_seconds
         window.toggle_playback()
-        for _ in range(12):
+        # Media Foundation can need longer to prime after hundreds of Qt tests.
+        # Wait for the asserted playback state rather than a fixed 420 ms.
+        for _ in range(80):
             QTest.qWait(35)
+            if (
+                window.player.position() > 150
+                and window.timeline_audio_players[audio.node_id].position() > 150
+            ):
+                break
         self.assertGreater(window.playhead_seconds, before)
         self.assertGreater(window.player.position(), 150)
         self.assertGreater(window.timeline_audio_players[audio.node_id].position(), 150)
@@ -3889,8 +3984,15 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(spec.text_ranges[0]["language"], "Cantonese")
         self.assertTrue(spec.text_ranges[0]["lip_sync"])
         dialog.role_combo.setCurrentIndex(dialog.role_combo.findData("voice_over"))
-        self.assertTrue(all(widget.isHidden() for _label, widget in dialog.dialogue_rows))
-        self.assertFalse(dialog.state()["lip_sync"])
+        for title, (_label, widget) in dialog.semantic_rows.items():
+            self.assertEqual(widget.isHidden(), title != "Language")
+        dialog.language_combo.setCurrentText("Mandarin Chinese")
+        voice_over_state = dialog.state()
+        self.assertEqual(voice_over_state["language"], "Mandarin Chinese")
+        self.assertEqual(voice_over_state["speaker"], "S2")
+        self.assertEqual(voice_over_state["delivery"], "Urgent")
+        self.assertEqual(voice_over_state["shot_id"], "S1")
+        self.assertFalse(voice_over_state["lip_sync"])
         dialog.close()
         window.project_dirty = False
         window.close()
@@ -6339,6 +6441,24 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_production_batch_control_accepts_five_seconds(self):
+        window = DirectorCutStudio()
+        self.assertEqual(window.production_batch_spin.minimum(), 5.0)
+        window.production_batch_spin.setValue(5.0)
+        self.assertEqual(window.production_batch_seconds, 5.0)
+        self.assertEqual(window._project_payload()["production_batch_seconds"], 5.0)
+        window.project_dirty = False
+        window.close()
+
+    def test_production_batch_handler_clamps_only_below_five_seconds(self):
+        window = DirectorCutStudio()
+        window._production_batch_seconds_changed(2.0)
+        self.assertEqual(window.production_batch_seconds, 5.0)
+        window._production_batch_seconds_changed(7.5)
+        self.assertEqual(window.production_batch_seconds, 7.5)
+        window.project_dirty = False
+        window.close()
+
     def test_incremental_batch_boundary_extends_to_protect_explicit_speech(self):
         window = DirectorCutStudio()
         window._set_design_duration(120.0)
@@ -6451,7 +6571,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         source = DirectorCutStudio()
         source._set_design_duration(120.0)
         source.production_strategy = "incremental"
-        source.production_batch_seconds = 30.0
+        source.production_batch_seconds = 5.0
         source.incremental_approved_horizon = 30.0
         source.incremental_pending_start = 30.0
         source.incremental_pending_end = 60.0
@@ -6473,6 +6593,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         with patch.object(restored, "queue_media_preparation"):
             restored.load_project_path(project)
         self.assertEqual(restored.production_strategy, "incremental")
+        self.assertEqual(restored.production_batch_seconds, 5.0)
         self.assertEqual(restored.incremental_approved_horizon, 30.0)
         self.assertEqual(restored.incremental_pending_start, 30.0)
         self.assertEqual(restored.incremental_pending_end, 60.0)

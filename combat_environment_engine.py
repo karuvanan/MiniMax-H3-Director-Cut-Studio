@@ -13,6 +13,7 @@ from typing import Iterable
 
 
 STREET_FIGHTER_SKILL = "street-fighter-live-action-h3"
+HONG_KONG_COMIC_FIGHTER_SKILL = "hong-kong-comic-fighter"
 # Additive fields remain readable by alpha.5 projects; keep the persisted
 # schema number stable so old project loaders do not reject the new vectors.
 ENVIRONMENT_PHYSICS_SCHEMA_VERSION = 1
@@ -28,10 +29,150 @@ CAUSALITY_CONTRACT = (
     "instant repair, unrelated explosion, reset prop, duplicate fighter or crowd member entering "
     "the central combat lane."
 )
+REFERENCE_WORLD_CAUSALITY_CONTRACT = (
+    "REFERENCE-DERIVED WORLD CAUSALITY: the loaded comic Pictures and explicit user direction "
+    "are the sole authority for location, terrain, architecture, weather, light and available "
+    "materials. Every power effect begins at a visible fighter load/contact, propagates along the "
+    "recorded force vector, affects only source-visible materials after the force reaches them, and "
+    "persists into later Shots. Every completed technique must feel world-class: nearby loose material "
+    "lifts during the load; the real contact creates a directional pressure detonation and localized "
+    "space-lensing distortion; source-visible stone, sand, water, glass or structures then burst along "
+    "the force vector; only afterward may wind, cloud, rain, haze and physically cast shadows escalate. "
+    "A requested solar technique uses a compact white-gold corona, heat refraction, reflected light and "
+    "moving hard-edged shadows while preserving the source world. Use photoreal superhero-scale effects, "
+    "not cartoon graphics. No default wet market, invented venue, random background fireball, literal "
+    "graphic ring, portal, duplicate fighter or self-repairing background."
+)
+CONTINUOUS_POWER_FIELD_CONTRACT = (
+    "CONTINUOUS LEGENDARY POWER FIELD: from the first frame of the first exchange, both fighters "
+    "are visibly operating at world-class power. Keep a persistent, source-grounded field through "
+    "every Shot: turbulent air and cloth/hair response, loose source-visible grit or stone lifting "
+    "irregularly, localized heat-haze/space refraction around the active limbs, pressure-lit edges, "
+    "moving cast shadows and dust/wind carried across cuts. Every real attack contact adds one "
+    "directional compressed-air detonation and material response; effects may intensify toward the "
+    "climax but must never disappear or reset to ordinary unpowered punches. This is physical "
+    "photoreal VFX attached to the fighters and contact, never a graphic ring, HUD, speed line, "
+    "random background fireball, portal or full-frame cartoon aura."
+)
+
+
+def _is_aftermath_only_action(value: object) -> bool:
+    text = str(value or "").casefold()
+    markers = (
+        "final settle", "final resolution", "no new attack", "both stop changing position",
+        "stable guarded stance", "readable supported stance", "stable support",
+        "最终稳定", "最終穩定", "不开始新攻击", "不開始新攻擊", "稳定支撑", "穩定支撐",
+    )
+    positions = [text.find(token) for token in markers if text.find(token) >= 0]
+    if not positions:
+        return False
+    # A final Shot may contain a real signature strike followed by a stable
+    # resolve.  Only the suffix is aftermath; the whole Shot must retain its
+    # contact and world response.  Classify as aftermath-only only when no
+    # executable attack/contact occurs before the first settle marker.
+    before_settle = text[:min(positions)]
+    attack_terms = (
+        "attack", "strike", "punch", "kick", "palm", "elbow", "knee", "contact",
+        "impact", "collision", "throw", "takedown", "counter", "release", "launch",
+        "拳", "掌", "踢", "肘", "膝", "攻击", "攻擊", "接触", "接觸", "撞击", "撞擊",
+        "命中", "反击", "反擊", "释放", "釋放", "爆发", "爆發",
+    )
+    return not any(token in before_settle for token in attack_terms)
+
+
+def _reference_material_detonation(primary_material: str, materials: str) -> str:
+    lowered = f"{primary_material} {materials}".casefold()
+    if any(token in lowered for token in ("stone", "rock", "gravel", "岩", "石")):
+        return (
+            "the contacted rock face and ground strata crack from the true impact point; fist-sized "
+            "stone fragments, gravel and a dense sand-dust sheet erupt along the recorded force vector"
+        )
+    if any(token in lowered for token in ("sand", "dune", "grit", "沙")):
+        return (
+            "the contacted sand layer compresses into a trench, then a directional sand wall and grit "
+            "vortex burst outward from the true impact point"
+        )
+    if any(token in lowered for token in ("water", "spray", "sea", "river", "水", "海")):
+        return (
+            "the contacted water surface forms a force-aligned trough, then throws a coherent wall of "
+            "spray and mist outward with delayed reflection breakup"
+        )
+    if any(token in lowered for token in ("glass", "concrete", "façade", "facade", "building", "混凝土", "玻璃")):
+        return (
+            "the contacted concrete or glass flexes first, then fractures and ejects source-consistent "
+            "fragments only along the recorded force vector while the intact architecture keeps its geometry"
+        )
+    if any(token in lowered for token in ("wood", "branch", "leaf", "tree", "木", "树", "樹")):
+        return (
+            "the contacted soil or wood deforms first; leaves, splinters and branches then stream away "
+            "from the real contact point along the recorded force vector"
+        )
+    return (
+        f"the contacted {primary_material} deforms first, then {materials} burst outward from the real "
+        "contact point only along the recorded force vector"
+    )
+
+
+def _reference_world_response(
+    phase: float,
+    *,
+    primary_material: str,
+    materials: str,
+    solar_signature_requested: bool,
+) -> str:
+    material_burst = _reference_material_detonation(primary_material, materials)
+    solar_clause = (
+        " At the climax, one solar-aspected signature technique forms a compact white-gold corona "
+        "around the attacking limb/contact only; sun-bright exposure adaptation, hot-air refraction, "
+        "warm reflections and long moving hard-edged shadows sweep across the existing terrain. The "
+        "corona is attack energy, not a new sun, portal, ring or replacement sky."
+        if solar_signature_requested and phase >= 0.55
+        else ""
+    )
+    if phase < 0.25:
+        return (
+            "the load creates the first visible world-class pressure field: clothing and hair snap, "
+            "nearby loose stone and sand lift into an irregular force-aligned wake, turbulent air and "
+            "dust remain alive around both fighters, light bends locally around the attacking limb and "
+            "existing shadows sharpen and shift; at visible contact a compact compressed-air detonation "
+            f"and localized space-lensing occur, then {material_burst}. A small delayed dust/wind "
+            "response begins immediately; wider weather escalates later and background geometry remains fixed"
+        )
+    if phase < 0.7:
+        return (
+            "the persistent pressure field is already active before contact: turbulent air, lifted grit, "
+            "localized refraction and moving cast shadows continue around the fighters. Visible contact "
+            "then produces a compact compressed-air detonation and localized space-lensing; "
+            f"{material_burst}. A delayed pressure wall drives dust, wind and cloud shear across the wider "
+            "source environment, while the horizon and terrain identity remain intact"
+            + solar_clause
+        )
+    return (
+        "the completed technique reaches world-scale escalation without replacing the location: visible "
+        "contact triggers a concentrated pressure detonation and strong localized space-lensing; "
+        f"{material_burst}. At the climax, force reaching the source-visible support surface caves it "
+        "inward at the true impact point and opens a deep localized crater with branching radial fractures; "
+        "source-visible slabs lift only after those fractures arrive. Build three readable depth layers: fine "
+        "dust and a few blurred chips crossing the foreground, dense gravel and fractured material around "
+        "the fighters in the middle ground, and only source-authored large fragments plus paired lateral dust "
+        "plumes behind them. The debris directions, not a graphic circular ring, reveal the expanding pressure. "
+        "Use a single brief physical camera recoil at contact with no lens zoom, then retain a close low-angle "
+        "view so the two fighters and their grip/contact remain readable. Sand and debris rise into a force-aligned "
+        "storm front, cloud layers twist and darken only after the pressure reaches them, and dynamic light casts "
+        "moving fighter and debris shadows across the still-recognizable source terrain"
+        + solar_clause
+    )
 
 
 def _skill_enabled(special_skill_key: object) -> bool:
-    return str(special_skill_key or "").strip().casefold() == STREET_FIGHTER_SKILL
+    return str(special_skill_key or "").strip().casefold() in {
+        STREET_FIGHTER_SKILL,
+        HONG_KONG_COMIC_FIGHTER_SKILL,
+    }
+
+
+def _special_skill_key(value: object) -> str:
+    return str(value or "").strip().casefold()
 
 
 def _snap_half(value: float) -> float:
@@ -633,15 +774,322 @@ def _install_environment_plates(plan: dict, *, transition_basis_seconds: object 
     plan["media_requests"] = requests
 
 
+def _compact_reference_evidence(value: object, limit: int = 360) -> str:
+    """Keep visual evidence useful without leaking filenames or unbounded analysis."""
+
+    if isinstance(value, dict):
+        value = " ".join(
+            str(value.get(key, ""))
+            for key in ("overview", "summary", "visual_style", "environment", "description")
+            if value.get(key)
+        )
+    text = " ".join(str(value or "").replace("\x00", " ").split()).strip(" ;")
+    text = re.sub(r"(?i)(?:[A-Z]:\\|/)[^\s]+", "", text)
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip(" ,;:") + "…"
+    return text
+
+
+def build_reference_environment_fact_ledger(
+    plan: dict,
+    existing_media: Iterable[dict] | None,
+    *,
+    authored_requirement: object = "",
+) -> dict:
+    """Build an environment ledger from loaded-image facts, never asset filenames."""
+
+    evidence: list[dict] = []
+    for raw in existing_media or []:
+        if not isinstance(raw, dict) or not bool(raw.get("loaded", False)):
+            continue
+        media_id = str(raw.get("media_id", "")).strip().upper()
+        media_type = str(raw.get("media_type") or raw.get("type") or "").casefold()
+        if not re.fullmatch(r"P\d+", media_id) or media_type != "image":
+            continue
+        provenance = " ".join(str(raw.get(field, "")) for field in (
+            "recognition", "raw_analysis_summary", "analysis_summary", "local_path",
+        )).casefold()
+        # A previous Design's generated plate may already contain an unwanted
+        # location. It is downstream output, never authority for a new comic plan.
+        if "ai design generated reference" in provenance or "generated_references" in provenance:
+            continue
+        summary = ""
+        for field in (
+            "semantic_enrichment", "raw_analysis_summary", "analysis_summary",
+            "recognition", "clip_prompt",
+        ):
+            summary = _compact_reference_evidence(raw.get(field))
+            if summary:
+                break
+        evidence.append({
+            "media_id": media_id,
+            "authority": "loaded_picture_visual_analysis",
+            "summary": summary or "loaded comic Picture; preserve its visible setting and materials",
+        })
+        if len(evidence) >= 9:
+            break
+
+    authored = _compact_reference_evidence(authored_requirement, 600)
+    plan_environment = _compact_reference_evidence(
+        " ".join(
+            str(plan.get(field, ""))
+            for field in ("creative_brief", "global_visual_style")
+        ),
+        700,
+    )
+    corpus = " ".join(
+        [authored, plan_environment] + [row["summary"] for row in evidence]
+    ).casefold()
+
+    profiles = (
+        (("mountain", "cliff", "rock", "峰", "山", "岩", "峭壁"),
+         "rocky mountain or cliff terrain", "loose rock, gravel and suspended mineral dust", "stone"),
+        (("desert", "sand", "dune", "沙漠", "沙丘", "风沙", "風沙"),
+         "open sand or desert terrain", "sand, grit and airborne dust", "sand"),
+        (("snow", "ice", "glacier", "雪", "冰", "冰川"),
+         "snow or ice terrain", "surface snow, ice crystals and brittle ice", "ice"),
+        (("sea", "ocean", "harbour", "harbor", "river", "lake", "海", "港", "河", "湖"),
+         "open waterside terrain", "water surface, spray and shoreline debris", "water"),
+        (("forest", "tree", "jungle", "树林", "樹林", "森林", "树", "樹"),
+         "wooded terrain", "leaves, branches, soil and suspended pollen", "wood"),
+        (("city", "building", "street", "rooftop", "城市", "建筑", "建築", "街", "天台"),
+         "urban built environment", "concrete grit, glass, façade panels and loose street debris", "concrete"),
+        (("room", "hall", "interior", "室内", "室內", "大厅", "大廳"),
+         "source-visible interior", "dust, fixtures and loose interior objects visible in the source", "mixed interior material"),
+    )
+    location = "the exact source-image environment"
+    materials = "only loose or breakable materials visibly present in the source Pictures"
+    primary_material = "source-visible material"
+    for terms, matched_location, matched_materials, matched_primary in profiles:
+        if any(term in corpus for term in terms):
+            location, materials, primary_material = matched_location, matched_materials, matched_primary
+            break
+    crowd_visible = any(term in corpus for term in (
+        "crowd", "spectator", "bystander", "people", "观众", "觀眾", "人群", "路人",
+    ))
+    return {
+        "schema_version": 1,
+        "authority_order": [
+            "explicit_user_direction", "loaded_picture_pixels", "ai_enrich_for_complex_panels",
+            "blip_overview_fallback", "shot_continuity",
+            "skill_effect_grammar",
+        ],
+        "source_evidence": evidence,
+        "authored_environment_direction": authored,
+        "location": location,
+        "available_materials": materials,
+        "primary_material": primary_material,
+        "crowd_visible": crowd_visible,
+        "power_scale": "world-class legendary combat; every completed technique visibly affects the source world",
+        "solar_signature_requested": bool(re.search(
+            r"太阳|太陽|烈日|日轮|日輪|solar|sun[- ]?(?:powered|aspected|like)?|corona",
+            authored,
+            flags=re.I,
+        )),
+        "effect_palette": (
+            "directional pressure detonation; localized space-lensing; source-material explosion; "
+            "stone/sand lift; violent wind and delayed weather escalation; physically cast moving shadows; "
+            "photoreal superhero-scale energy"
+        ),
+        "forbidden_defaults": [
+            "Kowloon wet market unless visible/requested",
+            "invented architecture or weather replacement",
+            "literal orbit or energy rings",
+        ],
+    }
+
+
+def reconcile_reference_environment_rows(
+    rows: Iterable[dict],
+    duration_seconds: object,
+    *,
+    ledger: dict,
+) -> tuple[list[dict], list[str]]:
+    """Apply source-led world-scale force feedback without replacing the location."""
+
+    shots = sorted(
+        (deepcopy(row) for row in rows if isinstance(row, dict)),
+        key=lambda row: (
+            float(row.get("start_seconds", 0.0) or 0.0),
+            float(row.get("end_seconds", 0.0) or 0.0),
+            str(row.get("id") or row.get("cue_id") or ""),
+        ),
+    )
+    persistent: list[str] = []
+    location = str(ledger.get("location") or "the exact source-image environment")
+    materials = str(ledger.get("available_materials") or "source-visible loose material")
+    primary_material = str(ledger.get("primary_material") or "source-visible material")
+    crowd_visible = bool(ledger.get("crowd_visible", False))
+    solar_signature_requested = bool(ledger.get("solar_signature_requested", False))
+    warnings: list[str] = []
+    total = max(1, len(shots))
+    for index, shot in enumerate(shots):
+        raw_action = str(shot.get("subject_action", ""))
+        aftermath_only = _is_aftermath_only_action(raw_action)
+        has_cause = _has_combat_cause(raw_action) and not aftermath_only
+        action = _compact_action(raw_action)
+        actor = _cause_actor(action, index)
+        force = _force_from_shot(shot, action, actor)
+        phase = 1.0 if total == 1 else index / (total - 1)
+        world_response = _reference_world_response(
+            phase,
+            primary_material=primary_material,
+            materials=materials,
+            solar_signature_requested=solar_signature_requested,
+        )
+        interaction = ""
+        crowd = ""
+        if has_cause:
+            interaction = (
+                f"cause_actor={actor}; action={_mechanic(action)}; contact_target=the visible combat "
+                f"contact inside {location}; contact_material={primary_material}; "
+                f"force_direction={force.get('label')}; force_magnitude=world-class/{force.get('magnitude')}; "
+                f"continuous_power_field={CONTINUOUS_POWER_FIELD_CONTRACT} "
+                f"primary_response={materials} react only after contact and travel with the force; "
+                f"secondary_response={world_response}. Photoreal superhero-scale VFX remain anchored to "
+                "the fighter and contact point. No literal graphic shock ring, random background fireball, "
+                "cartoon aura or unrelated explosion."
+            )
+            persistent_update = (
+                f"Shot {index + 1} aftermath: force-aligned displacement/fracture in {materials}; residual "
+                "rock or sand remains displaced, dust and violent wind continue, cloud shear and localized "
+                "space-lensing decay gradually, and all newly cast light/shadow changes remain causally timed"
+            )
+            persistent.append(persistent_update)
+            if crowd_visible:
+                crowd = (
+                    "Visible source-image bystanders react 0.2-0.6 seconds after the impact, brace or "
+                    "retreat away from the force vector, remain identifiable and never enter the fight."
+                )
+
+        incoming = (
+            f"Location={location}; preserve source composition, terrain, architecture, weather and lighting"
+            f"; continuous power field remains active from the previous frame; {CONTINUOUS_POWER_FIELD_CONTRACT}"
+            + ("; persistent state: " + " | ".join(persistent[-4:-1]) if len(persistent) > 1 else "")
+        )
+        outgoing = (
+            f"Location={location}; preserve source composition and all prior consequences"
+            "; continuous power field remains active into the next Shot; do not reset to ordinary punches"
+            + ("; persistent state: " + " | ".join(persistent[-4:]) if persistent else "")
+        )
+        for field_name, generated in (
+            ("environment_interaction", interaction),
+            ("crowd_reaction", crowd),
+            ("incoming_environment_state", incoming),
+            ("outgoing_environment_state", outgoing),
+            (
+                "location_transition",
+                "REFERENCE LOCATION LOCK: remain in the exact connected environment established by the "
+                "loaded comic Pictures; change location only when a source panel or explicit user instruction "
+                "shows a connected transition, never because of a Skill default.",
+            ),
+        ):
+            if not bool(shot.get(f"{field_name}_user_edited", False)):
+                shot[field_name] = generated
+        shot["contact_material"] = primary_material if has_cause else ""
+        shot["environment_force_vector"] = force if has_cause else {}
+        shot["environment_state_status"] = "continuous"
+        shot["continuous_power_field"] = CONTINUOUS_POWER_FIELD_CONTRACT
+        shot["environment_physics_schema_version"] = ENVIRONMENT_PHYSICS_SCHEMA_VERSION
+        shot["reference_environment_schema_version"] = 1
+        shot["environment_response"] = _replace_generated_line(
+            shot.get("environment_response", ""),
+            "ENV-PHYSICS",
+            interaction if interaction else (
+                "AFTERMATH ONLY: no new contact or explosion; preserve all incoming displaced rock, sand, "
+                "dust, wind, cloud turbulence, light and shadow state while it settles naturally; "
+                "the continuous legendary power field remains visible without a new strike."
+                if aftermath_only else
+                "No material contact is authored; preserve the source-image world without spontaneous damage."
+            ),
+        )
+        shot["continuity_state"] = _replace_generated_line(
+            shot.get("continuity_state", ""), "ENV-IN", shot["incoming_environment_state"]
+        )
+        shot["continuity_state"] = _replace_generated_line(
+            shot.get("continuity_state", ""), "ENV-OUT", shot["outgoing_environment_state"]
+        )
+        shot["additional_direction"] = _replace_generated_line(
+            shot.get("additional_direction", ""), "LOCATION", shot["location_transition"]
+        )
+        shot["additional_direction"] = _append_once(
+            shot.get("additional_direction", ""), REFERENCE_WORLD_CAUSALITY_CONTRACT
+        )
+        if has_cause:
+            shot["event_causality_chain"] = (
+                f"EVENT CAUSE: {actor} completes the visible attack/contact; EVENT RESPONSE: {materials} "
+                f"react along {force.get('label')}; EVENT CONSEQUENCE: localized pressure distortion and "
+                "weather/debris propagation follow after contact; NEXT EVENT: the aftermath persists."
+            )
+            shot["physical_feedback_chain"] = (
+                f"PHYSICAL FEEDBACK: {primary_material} and atmosphere respond along "
+                f"{force.get('label')} with {force.get('magnitude')} magnitude; preserve the original world."
+            )
+        elif aftermath_only:
+            shot["event_causality_chain"] = (
+                "EVENT CAUSE: the final authored technique already completed; EVENT RESPONSE: no new strike "
+                "or explosion; NEXT EVENT: inherited debris, wind, weather, light and shadows settle without reset."
+            )
+            shot["physical_feedback_chain"] = (
+                "PHYSICAL FEEDBACK: preserve and decay the incoming world-scale aftermath; do not invent a new force."
+            )
+        else:
+            shot["event_causality_chain"] = (
+                "EVENT CAUSE: no impact is authored; EVENT RESPONSE: no explosion or background damage; "
+                "NEXT EVENT: preserve the incoming source-image state."
+            )
+            shot["physical_feedback_chain"] = "PHYSICAL FEEDBACK: no new force response without a visible cause."
+    return shots, warnings
+
+
+def _install_continuous_power_field_on_action_references(plan: dict) -> None:
+    """Make early generated keyframes carry the same power language as the climax.
+
+    H3 strongly inherits effects from still references.  The old planner only
+    described the corona/crater in the last action-state request, so the first
+    6–8 seconds were rendered as ordinary human punches even though the Shot
+    prose asked for world-scale force.  Identity anchors remain clean; only
+    time-scoped action frames receive this visual contract.
+    """
+
+    action_terms = re.compile(
+        r"(?i)fighter|martial|combat|clash|strike|punch|kick|fist|palm|impact|power|force|"
+        r"格斗|格鬥|拳|踢|掌|招式|碰撞|力量|战斗|戰鬥"
+    )
+    negative = (
+        " NEGATIVE VISUAL LOCK: no ordinary unpowered punch, no visible flight/energy ring, "
+        "no HUD, no graphic speed lines, no random background fireball, no portal, no full-frame "
+        "cartoon aura, no duplicate fighter, no extra limb."
+    )
+    for request in plan.get("media_requests") or []:
+        if not isinstance(request, dict) or request.get("media_type") != "image":
+            continue
+        if bool(request.get("identity_anchor")):
+            continue
+        if str(request.get("reuse_policy", "")).casefold() != "time_scoped":
+            continue
+        prompt = str(request.get("prompt", "")).strip()
+        if not action_terms.search(prompt):
+            continue
+        if "CONTINUOUS LEGENDARY POWER FIELD:" not in prompt:
+            request["prompt"] = prompt.rstrip(" .") + ". " + CONTINUOUS_POWER_FIELD_CONTRACT
+        if "NEGATIVE VISUAL LOCK:" not in request["prompt"]:
+            request["prompt"] = request["prompt"].rstrip(" .") + "." + negative
+        request["power_field_reference"] = "continuous_from_first_frame"
+
+
 def apply_environmental_combat_physics(
     plan: dict,
     *,
     special_skill_key: object,
+    existing_media: Iterable[dict] | None = None,
+    authored_requirement: object = "",
 ) -> dict:
-    """Enrich a normalized Street Fighter plan with alpha.5 state and media."""
+    """Enrich a normalized combat plan with venue-specific or reference-led physics."""
 
     if not _skill_enabled(special_skill_key):
         return plan
+    skill_key = _special_skill_key(special_skill_key)
     actual_duration = max(0.5, float(plan.get("duration_seconds", 0.5) or 0.5))
     try:
         baseline_duration = float(
@@ -650,9 +1098,38 @@ def apply_environmental_combat_physics(
     except (TypeError, ValueError):
         baseline_duration = actual_duration
     baseline_duration = min(actual_duration, max(0.5, baseline_duration))
+    if skill_key == HONG_KONG_COMIC_FIGHTER_SKILL:
+        existing_ledger = plan.get("reference_environment_fact_ledger")
+        if isinstance(existing_ledger, dict) and bool(existing_ledger.get("user_edited", False)):
+            reference_ledger = deepcopy(existing_ledger)
+        else:
+            reference_ledger = build_reference_environment_fact_ledger(
+                plan, existing_media, authored_requirement=authored_requirement
+            )
+        shots, warnings = reconcile_reference_environment_rows(
+            plan.get("shots") or [], actual_duration, ledger=reference_ledger
+        )
+        plan["shots"] = shots
+        _install_continuous_power_field_on_action_references(plan)
+        plan["environment_physics_schema_version"] = ENVIRONMENT_PHYSICS_SCHEMA_VERSION
+        plan["reference_environment_fact_ledger"] = reference_ledger
+        plan["reference_environment_schema_version"] = 1
+        plan["constraints"] = _append_once(
+            plan.get("constraints", ""), REFERENCE_WORLD_CAUSALITY_CONTRACT
+        )
+        notices = [str(value) for value in plan.get("design_warnings") or []]
+        notice = (
+            "Reference-derived world causality is active: location, materials, weather and lighting "
+            "come from the current comic Pictures; no wet-market or other venue default is injected."
+        )
+        if notice not in notices:
+            notices.append(notice)
+        notices.extend(warnings)
+        plan["design_warnings"] = list(dict.fromkeys(notices))
+        return plan
+
     shots, warnings = reconcile_environmental_combat_rows(
-        plan.get("shots") or [],
-        actual_duration,
+        plan.get("shots") or [], actual_duration,
         transition_basis_seconds=baseline_duration,
     )
     plan["shots"] = shots
@@ -681,6 +1158,7 @@ def environmental_combat_prompt_clause(row: dict, *, include_global_contract: bo
         return ""
     parts = [
         "ENVIRONMENT INTERACTION - " + str(row.get("environment_interaction", "")).strip(),
+        "CONTINUOUS POWER FIELD - " + str(row.get("continuous_power_field", "")).strip(),
         "CROWD REACTION - " + str(row.get("crowd_reaction", "")).strip(),
         "INCOMING ENVIRONMENT STATE - " + str(row.get("incoming_environment_state", "")).strip(),
         "OUTGOING ENVIRONMENT STATE - " + str(row.get("outgoing_environment_state", "")).strip(),
@@ -689,5 +1167,9 @@ def environmental_combat_prompt_clause(row: dict, *, include_global_contract: bo
         "PHYSICAL FEEDBACK - " + str(row.get("physical_feedback_chain", "")).strip(),
     ]
     if include_global_contract:
-        parts.append(CAUSALITY_CONTRACT)
+        parts.append(
+            REFERENCE_WORLD_CAUSALITY_CONTRACT
+            if int(row.get("reference_environment_schema_version", 0) or 0)
+            else CAUSALITY_CONTRACT
+        )
     return " ".join(part for part in parts if not part.endswith(" - "))

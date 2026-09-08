@@ -101,6 +101,8 @@ from native_audio_engine import (
 from combat_environment_engine import (
     CAUSALITY_CONTRACT,
     ENVIRONMENT_PHYSICS_SCHEMA_VERSION,
+    HONG_KONG_COMIC_FIGHTER_SKILL,
+    REFERENCE_WORLD_CAUSALITY_CONTRACT,
     STREET_FIGHTER_SKILL as ENVIRONMENT_COMBAT_SPECIAL_SKILL,
     environmental_combat_prompt_clause,
     reconcile_environmental_combat_rows,
@@ -112,6 +114,7 @@ from combat_action_engine import (
     DYNAMIC_CAMERA_CONTRACT,
     FACT_LEDGER_CONTRACT,
     FIVE_DUTY_CONTRACT,
+    COMBAT_ACTION_SKILLS,
     combat_action_prompt_clause,
     compact_street_fighter_prompt_field,
     reconcile_combat_action_rows,
@@ -209,6 +212,7 @@ from project_workspace import (
     design_requirement_project_name,
     picture_overview_project_name,
     project_display_name_for_plan,
+    project_name_is_provisional,
     refine_provisional_workspace_root,
     rebase_workspace_take_states,
     record_segment_take,
@@ -322,6 +326,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # from the Generation toolbar.  Six hours remains safely inside Qt's
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
+MIN_PRODUCTION_BATCH_SECONDS = 5.0
 SMART_RENDER_POLICY_VERSION = 16
 
 _UNTRACKED_VISIBLE_TEXT_TOKEN_RE = re.compile(
@@ -2395,7 +2400,13 @@ class TimelineTextClip(QGraphicsRectItem):
             handle.setPen(QPen(Qt.NoPen))
         self._position_handles()
         self.setToolTip(
-            "Text layer · use Type Tool to edit · drag body to move · "
+            f"Text layer · {text_layer_track_name(layer.track_id, layer.content_role)}"
+            + (
+                f" · Language: {layer.language}"
+                if layer.content_role in {"dialogue", "voice_over", "lyrics"}
+                else ""
+            )
+            + " · use Type Tool to edit · drag body to move · "
             "drag either bright edge to trim · Delete removes"
         )
 
@@ -4258,8 +4269,16 @@ class ContentLayerDialog(QDialog):
         self.speaker_combo.setCurrentText(layer.speaker)
         self.language_combo = QComboBox()
         self.language_combo.setEditable(True)
-        self.language_combo.addItems(("English", "Chinese", "Cantonese", "Malay", "Japanese", "Korean"))
+        timeline_languages = (
+            "Auto", "Mandarin Chinese", "Cantonese", "Malay",
+            *H3_STABLE_DIALOGUE_LANGUAGES,
+        )
+        self.language_combo.addItems(tuple(dict.fromkeys(timeline_languages)))
         self.language_combo.setCurrentText(layer.language)
+        self.language_combo.setToolTip(
+            "Language for this individual Dialogue, Voice-over or Lyrics layer. "
+            "It is saved with the Timeline and passed to H3 native speech or the selected TTS engine."
+        )
         self.delivery_combo = QComboBox()
         self.delivery_combo.setEditable(True)
         self.delivery_combo.addItems(("Natural", "Calm", "Whispered", "Urgent", "Confident", "Emotional"))
@@ -4284,6 +4303,7 @@ class ContentLayerDialog(QDialog):
         form.addRow("Font Size", self.font_size_spin)
         form.addRow("Color", self.color_button)
         self.dialogue_rows: list[tuple[QLabel, QWidget]] = []
+        self.semantic_rows: dict[str, tuple[QLabel, QWidget]] = {}
         for title, widget in (
             ("Speaker", self.speaker_combo),
             ("Language", self.language_combo),
@@ -4294,6 +4314,7 @@ class ContentLayerDialog(QDialog):
             label = QLabel(title)
             form.addRow(label, widget)
             self.dialogue_rows.append((label, widget))
+            self.semantic_rows[title] = (label, widget)
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._validate)
@@ -4302,11 +4323,14 @@ class ContentLayerDialog(QDialog):
         self._refresh_role_fields()
 
     def _refresh_role_fields(self) -> None:
-        dialogue = self.role_combo.currentData() == "dialogue"
-        for label, widget in self.dialogue_rows:
-            label.setVisible(dialogue)
-            widget.setVisible(dialogue)
-        visible_text = self.role_combo.currentData() == "on_screen_text"
+        role = str(self.role_combo.currentData() or "on_screen_text")
+        dialogue = role == "dialogue"
+        speech = role in {"dialogue", "voice_over", "lyrics"}
+        for title, (label, widget) in self.semantic_rows.items():
+            visible = speech if title == "Language" else dialogue
+            label.setVisible(visible)
+            widget.setVisible(visible)
+        visible_text = role == "on_screen_text"
         self.font_size_spin.setEnabled(visible_text)
         self.color_button.setEnabled(visible_text)
 
@@ -4330,7 +4354,9 @@ class ContentLayerDialog(QDialog):
         self.accept()
 
     def state(self) -> dict:
-        dialogue = self.role_combo.currentData() == "dialogue"
+        role = str(self.role_combo.currentData() or "on_screen_text")
+        dialogue = role == "dialogue"
+        speech = role in {"dialogue", "voice_over", "lyrics"}
         start, end = snap_timeline_range(
             self.start_spin.value(), self.end_spin.value(), self.end_spin.maximum()
         )
@@ -4340,12 +4366,14 @@ class ContentLayerDialog(QDialog):
             "end_seconds": end,
             "font_size": self.font_size_spin.value(),
             "color": self._color,
-            "content_role": self.role_combo.currentData(),
-            "speaker": self.speaker_combo.currentText() if dialogue else "S1",
-            "language": self.language_combo.currentText().strip() if dialogue else "English",
-            "delivery": self.delivery_combo.currentText().strip() if dialogue else "Natural",
+            "content_role": role,
+            # Hidden Voice-over/Lyrics fields retain their existing values;
+            # editing only Language must never reset speaker, delivery or Shot.
+            "speaker": self.speaker_combo.currentText() if speech else "S1",
+            "language": self.language_combo.currentText().strip() if speech else "English",
+            "delivery": self.delivery_combo.currentText().strip() if speech else "Natural",
             "lip_sync": self.lip_sync_check.isChecked() if dialogue else False,
-            "shot_id": self.shot_combo.currentData() if dialogue else "",
+            "shot_id": self.shot_combo.currentData() if speech else "",
         }
 
 
@@ -8806,7 +8834,7 @@ class DirectorCutStudio(QMainWindow):
         generation_bar.addWidget(self.production_strategy_combo)
         self.production_batch_spin = QDoubleSpinBox()
         self.production_batch_spin.setObjectName("productionBatchSeconds")
-        self.production_batch_spin.setRange(16.0, 600.0)
+        self.production_batch_spin.setRange(MIN_PRODUCTION_BATCH_SECONDS, 600.0)
         self.production_batch_spin.setDecimals(1)
         self.production_batch_spin.setSingleStep(0.5)
         self.production_batch_spin.setSuffix("s")
@@ -9223,7 +9251,7 @@ class DirectorCutStudio(QMainWindow):
         self._mark_dirty()
 
     def _production_batch_seconds_changed(self, value: float) -> None:
-        self.production_batch_seconds = max(16.0, float(value))
+        self.production_batch_seconds = max(MIN_PRODUCTION_BATCH_SECONDS, float(value))
         self._refresh_incremental_controls()
         self._mark_dirty()
 
@@ -10535,7 +10563,8 @@ class DirectorCutStudio(QMainWindow):
         if self.production_strategy not in {"full_range", "incremental"}:
             self.production_strategy = "full_range"
         self.production_batch_seconds = max(
-            16.0, float(state.get("production_batch_seconds", 30.0))
+            MIN_PRODUCTION_BATCH_SECONDS,
+            float(state.get("production_batch_seconds", 30.0)),
         )
         incremental = state.get("incremental_production") or {}
         self.incremental_approved_horizon = max(
@@ -12540,6 +12569,14 @@ class DirectorCutStudio(QMainWindow):
             overview = picture_overview_project_name(first_picture.recognition)
             if overview:
                 return overview
+            # When BLIP only says that P1 is a page/poster/screenshot, it has
+            # supplied no useful scene subject for naming.  Prefer an authored
+            # Design title (including a Unicode title) before falling back to
+            # generic reference keywords.
+            if plan:
+                authored_title = str(plan.get("title", "")).strip()
+                if authored_title and not project_name_is_provisional(authored_title):
+                    return authored_title
             media_id = stable_reference_id(first_picture)
             for row in (plan or {}).get("existing_media_uses") or []:
                 if not isinstance(row, dict) or str(row.get("media_id", "")) != media_id:
@@ -14755,7 +14792,8 @@ class DirectorCutStudio(QMainWindow):
             if self.production_strategy not in {"full_range", "incremental"}:
                 self.production_strategy = "full_range"
             self.production_batch_seconds = max(
-                16.0, float(payload.get("production_batch_seconds", 30.0))
+                MIN_PRODUCTION_BATCH_SECONDS,
+                float(payload.get("production_batch_seconds", 30.0)),
             )
             incremental = payload.get("incremental_production") or {}
             duration_limit = self._timeline_duration_seconds()
@@ -19631,35 +19669,40 @@ class DirectorCutStudio(QMainWindow):
         marker_cues = [cue for cue in ordered if cue.cue_type == "marker"]
 
         if shot_cues:
-            street_fighter_prompt = (
-                self.special_combo.currentData() == ENVIRONMENT_COMBAT_SPECIAL_SKILL
-            )
+            selected_combat_skill = str(self.special_combo.currentData() or "").strip().casefold()
+            street_fighter_prompt = selected_combat_skill in COMBAT_ACTION_SKILLS
+            if selected_combat_skill == ENVIRONMENT_COMBAT_SPECIAL_SKILL:
+                environment_contracts = (
+                    STREET_FIGHTER_MARKET_CONTRACT,
+                    STREET_FIGHTER_P1_P2_PIXEL_LOCK,
+                    CAUSALITY_CONTRACT,
+                )
+            elif selected_combat_skill == HONG_KONG_COMIC_FIGHTER_SKILL:
+                environment_contracts = (REFERENCE_WORLD_CAUSALITY_CONTRACT,)
+            else:
+                environment_contracts = ()
             if street_fighter_prompt:
                 must_keep = str(state.get("must_keep", "")).strip()
                 for contract in (
                     STREET_FIGHTER_FPV_COMBAT_CONTRACT,
-                    STREET_FIGHTER_MARKET_CONTRACT,
-                    STREET_FIGHTER_P1_P2_PIXEL_LOCK,
                     FACT_LEDGER_CONTRACT,
                     FIVE_DUTY_CONTRACT,
                     ACTION_CARRIER_CONTRACT,
                     DYNAMIC_CAMERA_CONTRACT,
                     ACTION_CAUSALITY_CONTRACT,
-                    CAUSALITY_CONTRACT,
+                    *environment_contracts,
                 ):
                     if contract.split(":", 1)[0].casefold() not in must_keep.casefold():
                         must_keep = must_keep.rstrip(" .") + (". " if must_keep else "") + contract
                 state["must_keep"] = must_keep
             compact_global_contracts = (
                 STREET_FIGHTER_FPV_COMBAT_CONTRACT,
-                STREET_FIGHTER_MARKET_CONTRACT,
-                STREET_FIGHTER_P1_P2_PIXEL_LOCK,
                 FACT_LEDGER_CONTRACT,
                 FIVE_DUTY_CONTRACT,
                 ACTION_CARRIER_CONTRACT,
                 DYNAMIC_CAMERA_CONTRACT,
                 ACTION_CAUSALITY_CONTRACT,
-                CAUSALITY_CONTRACT,
+                *environment_contracts,
             )
             shots: list[str] = []
             shot_ranges: list[dict] = []
@@ -21131,20 +21174,50 @@ class DirectorCutStudio(QMainWindow):
         if not self.authored_text_requirements:
             return True
         missing: list[dict] = []
+        timing_repairs = 0
         for required in self.authored_text_requirements:
             content = str(required.get("content", "")).strip()
             role = str(required.get("role", ""))
             start = float(required.get("start_seconds", -1.0))
             end = float(required.get("end_seconds", -1.0))
-            if not any(
+            if any(
                 layer.content_role == role
                 and layer.text.strip() == content
                 and abs(layer.start_seconds - start) <= 0.01
                 and abs(layer.end_seconds - end) <= 0.01
                 for layer in self.text_layers
             ):
-                missing.append(required)
+                continue
+            # Speech-budget repair may legitimately move an exact authored line
+            # while preserving every character.  In that case the Timeline is
+            # the new timing authority; refresh the guard contract instead of
+            # falsely reporting that the user's words disappeared.  A manual or
+            # ambiguous timing change remains blocked.
+            adjusted_matches = [
+                layer
+                for layer in self.text_layers
+                if layer.content_role == role
+                and layer.text.strip() == content
+                and layer.speech_timing_auto_adjusted
+            ]
+            if len(adjusted_matches) == 1:
+                layer = adjusted_matches[0]
+                required["start_seconds"] = float(layer.start_seconds)
+                required["end_seconds"] = float(layer.end_seconds)
+                required["track"] = str(layer.track_id)
+                required["speaker"] = str(layer.speaker)
+                required["language"] = str(layer.language)
+                required["authored_timing_locked"] = True
+                timing_repairs += 1
+                continue
+            missing.append(required)
         if not missing:
+            if timing_repairs:
+                self._mark_dirty()
+                self.statusBar().showMessage(
+                    "Authored text guard synchronized with auto-adjusted speech "
+                    f"timing · {timing_repairs} layer(s)"
+                )
             return True
         preview = "\n".join(
             f"{item.get('start_seconds', 0):.2f}-{item.get('end_seconds', 0):.2f}s "

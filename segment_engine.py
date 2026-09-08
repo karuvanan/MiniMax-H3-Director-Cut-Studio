@@ -703,12 +703,20 @@ def align_segments_to_dialogue_turns(
             ),
             str(item.get("content_role", item.get("role", ""))),
             str(item.get("speaker", "S1")),
+            bool(item.get("lip_sync", item.get("requires_lip_sync", True))),
         )
         for item in speech_rows
         if str(item.get("content_role", item.get("role", "")))
         in {"dialogue", "voice_over", "lyrics"}
     )
-    dialogue = [row for row in speech if row[2] == "dialogue" and row[1] > row[0]]
+    # Speaker-boundary splitting is only needed for a visibly lip-synced
+    # on-camera turn.  Non-lip-synced exertion/technique shouts belong to the
+    # surrounding physical action and must not cut one combat causal chain
+    # into two independent H3 requests.
+    dialogue = [
+        row for row in speech
+        if row[2] == "dialogue" and row[1] > row[0] and row[4]
+    ]
     if not dialogue:
         return rows
 
@@ -729,7 +737,7 @@ def align_segments_to_dialogue_turns(
         first = turns[0][0]
         has_prior_speech = any(
             speech_start < first - 1e-6 and speech_end > start + 1e-6
-            for speech_start, speech_end, _role, _speaker in speech
+            for speech_start, speech_end, _role, _speaker, _lip_sync in speech
         )
         if (
             not has_prior_speech

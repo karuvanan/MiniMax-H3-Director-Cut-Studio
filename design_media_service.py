@@ -279,28 +279,31 @@ def image_workflow(
 
 
 def condition_on_source_image(workflow: dict, request: dict, settings: dict) -> dict:
-    """Use real P1 pixels as the latent, never a caption-only substitute."""
-    if request.get("source_plate_mode") != "p1_img2img":
+    """Use verified source pixels as the latent, never a caption-only substitute."""
+    source_mode = str(request.get("source_plate_mode", "")).strip()
+    if source_mode not in {"p1_img2img", "source_img2img"}:
         return workflow
     uploaded = str(request.get("source_image_uploaded_name", "")).strip()
     if not uploaded:
-        raise ValueError("P1 image conditioning requires a successful local-image upload")
+        raise ValueError("Source-image conditioning requires a successful local-image upload")
     samplers = [node for node in workflow.values() if node.get("class_type") == "KSampler"]
     decoders = [node for node in workflow.values() if node.get("class_type") == "VAEDecode"]
     if len(samplers) != 1 or len(decoders) != 1:
-        raise ValueError("P1 img2img requires one KSampler and one VAEDecode; cannot safely adapt this template")
+        raise ValueError("Source img2img requires one KSampler and one VAEDecode; cannot safely adapt this template")
     vae = decoders[0]["inputs"]["vae"]
     first = max((int(key) for key in workflow if str(key).isdigit()), default=0) + 1
     loader, scale, encode = (str(first + offset) for offset in range(3))
     workflow[loader] = {"class_type": "LoadImage", "inputs": {"image": uploaded}}
     workflow[scale] = {"class_type": "ImageScale", "inputs": {
-        "image": [loader, 0], "upscale_method": "lanczos", "crop": "disabled",
+        "image": [loader, 0], "upscale_method": "lanczos",
         "width": int(request["source_image_width"]), "height": int(request["source_image_height"]),
+        "crop": "center" if source_mode == "source_img2img" else "disabled",
     }}
     workflow[encode] = {"class_type": "VAEEncode", "inputs": {
         "pixels": [scale, 0], "vae": deepcopy(vae),
     }}
-    strength = min(0.45, max(0.1, float(request.get("source_image_denoise", 0.25))))
+    maximum_strength = 0.8 if source_mode == "source_img2img" else 0.45
+    strength = min(maximum_strength, max(0.1, float(request.get("source_image_denoise", 0.25))))
     samplers[0]["inputs"].update({"latent_image": [encode, 0], "denoise": strength,
         "steps": max(int(settings["steps"]), math.ceil(int(settings["steps"]) / strength))})
     return workflow
@@ -370,21 +373,30 @@ def _generate_request(
             "immutable_source_plate_generation": plate_result,
         }
     item = dict(item)
-    if source_plate_mode == "p1_img2img":
+    if source_plate_mode in {"p1_img2img", "source_img2img"}:
         from PIL import Image, ImageOps
         source = Path(str(item.get("source_plate_local_path", "")))
         if not source.is_file():
-            raise FileNotFoundError("P1 is missing: refusing to replace image conditioning with text-to-image")
+            raise FileNotFoundError(
+                "Source Picture is missing: refusing to replace image conditioning with text-to-image"
+            )
         with Image.open(source) as opened:
             size = ImageOps.exif_transpose(opened).size
-        ratio = min(int(settings["width"]) / size[0], int(settings["height"]) / size[1], 1.0)
-        item["source_image_width"] = max(16, round(size[0] * ratio / 16) * 16)
-        item["source_image_height"] = max(16, round(size[1] * ratio / 16) * 16)
+        if source_plate_mode == "source_img2img":
+            # General source conversion is an authored reframing operation.
+            # Produce the requested project aspect instead of inheriting the
+            # scanned page dimensions; ImageScale performs a centred crop.
+            item["source_image_width"] = max(16, round(int(settings["width"]) / 16) * 16)
+            item["source_image_height"] = max(16, round(int(settings["height"]) / 16) * 16)
+        else:
+            ratio = min(int(settings["width"]) / size[0], int(settings["height"]) / size[1], 1.0)
+            item["source_image_width"] = max(16, round(size[0] * ratio / 16) * 16)
+            item["source_image_height"] = max(16, round(size[1] * ratio / 16) * 16)
         upload = upload_file(server, source, int(job["http_timeout"]),
-                             upload_name="h3_p1_" + uuid.uuid4().hex + source.suffix.lower())
+                             upload_name="h3_source_" + uuid.uuid4().hex + source.suffix.lower())
         name = str(upload.get("name", "")).strip()
         if not name:
-            raise RuntimeError("P1 upload returned no filename")
+            raise RuntimeError("Source Picture upload returned no filename")
         item["source_image_uploaded_name"] = "/".join(
             part for part in (str(upload.get("subfolder", "")).strip("/"), name) if part)
     workflow = image_workflow(
@@ -416,7 +428,7 @@ def _generate_request(
     download_image(server, image_output, destination, int(job["http_timeout"]))
     transparent_destination = destination.with_name(destination.stem + "_nobg.png")
     # A sky/background is part of the scene master, not a removable backdrop.
-    background_removal = ({} if source_plate_mode == "p1_img2img" else
+    background_removal = ({} if source_plate_mode in {"p1_img2img", "source_img2img"} else
                           remove_solid_background(destination, transparent_destination))
     effective_destination = transparent_destination if background_removal else destination
     sidecar = destination.with_suffix(destination.suffix + ".request.json")

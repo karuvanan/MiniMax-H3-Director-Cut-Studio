@@ -11,6 +11,8 @@ from combat_environment_engine import (
     environmental_combat_prompt_clause,
     environment_transition_time,
     reconcile_environmental_combat_rows,
+    HONG_KONG_COMIC_FIGHTER_SKILL,
+    REFERENCE_WORLD_CAUSALITY_CONTRACT,
 )
 
 
@@ -153,6 +155,159 @@ class EnvironmentalCombatEngineTests(unittest.TestCase):
         self.assertEqual([row["requirement_id"] for row in requests], [INDOOR_PLATE_ID, OUTDOOR_PLATE_ID])
         self.assertEqual(str(plan["constraints"]).count(CAUSALITY_CONTRACT), 1)
         self.assertEqual(plan["shots"][0]["environment_response"].count("[ENV-PHYSICS]"), 1)
+
+    def test_hong_kong_comic_world_uses_picture_environment_and_never_installs_market_plates(self):
+        plan = {
+            "duration_seconds": 12.0,
+            "creative_brief": "Two legendary fighters collide on the source mountain.",
+            "global_visual_style": "Photoreal rocky cliff beneath a blue sky.",
+            "constraints": "",
+            "shots": [shot("S1", 0.0, 6.0, "S1 drives an electric palm into S2's counter fist."),
+                      shot("S2", 6.0, 12.0, "S2 redirects the force and S1 recoils across loose rock.")],
+            "existing_media_uses": [],
+            "media_requests": [],
+        }
+        media = [{
+            "media_id": "P1", "media_type": "image", "loaded": True,
+            "raw_analysis_summary": "BLIP · Overview: two martial artists on a rocky mountain cliff under a blue sky",
+        }, {
+            "media_id": "P4", "media_type": "image", "loaded": True,
+            "local_path": "project/media/generated_references/old_market.png",
+            "recognition": "AI DESIGN GENERATED REFERENCE; Hong Kong wet market with fish tanks",
+        }]
+        apply_environmental_combat_physics(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=media,
+            authored_requirement=(
+                "world-class power distorts air and drives dust through the mountain scene; "
+                "加入太阳招式、超级英雄光效和真实动态阴影"
+            ),
+        )
+        self.assertEqual(plan["media_requests"], [])
+        self.assertEqual(plan["reference_environment_fact_ledger"]["location"], "rocky mountain or cliff terrain")
+        self.assertEqual([row["media_id"] for row in plan["reference_environment_fact_ledger"]["source_evidence"]], ["P1"])
+        rendered = str(plan)
+        self.assertIn("localized space-lensing", rendered)
+        self.assertIn("compressed-air detonation", rendered)
+        self.assertIn("rock face and ground strata crack", rendered)
+        self.assertIn("white-gold corona", rendered)
+        self.assertIn("moving hard-edged shadows", rendered)
+        self.assertIn("deep localized crater", rendered)
+        self.assertIn("three readable depth layers", rendered)
+        self.assertIn("no lens zoom", rendered)
+        self.assertTrue(plan["reference_environment_fact_ledger"]["solar_signature_requested"])
+        self.assertIn(REFERENCE_WORLD_CAUSALITY_CONTRACT, plan["constraints"])
+        self.assertNotIn("fish tank", rendered.casefold())
+        self.assertNotIn("indoor_seafood_aisle", rendered)
+        self.assertNotIn(INDOOR_PLATE_ID, rendered)
+
+    def test_hong_kong_comic_final_settle_preserves_aftermath_without_new_blast(self):
+        plan = {
+            "duration_seconds": 5.0,
+            "constraints": "",
+            "shots": [shot(
+                "S1", 0.0, 5.0,
+                "FINAL SETTLE: both fighters hold a readable supported stance; no new attack.",
+            )],
+            "existing_media_uses": [],
+            "media_requests": [],
+        }
+        apply_environmental_combat_physics(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": "rocky mountain, gravel and sand beneath storm clouds",
+            }],
+        )
+        result = plan["shots"][0]
+        self.assertIn("AFTERMATH ONLY", result["environment_response"])
+        self.assertIn("no new strike or explosion", result["event_causality_chain"])
+        self.assertNotIn("force_magnitude=world-class", result["environment_interaction"])
+
+    def test_hong_kong_comic_final_strike_then_settle_keeps_world_response(self):
+        plan = {
+            "duration_seconds": 5.0,
+            "constraints": "",
+            "shots": [shot(
+                "S1", 0.0, 5.0,
+                "S1 releases a solar palm; it contacts S2 and drives him backward. "
+                "FINAL SETTLE: both fighters recover to stable support; no new attack.",
+            )],
+            "existing_media_uses": [],
+            "media_requests": [],
+        }
+        apply_environmental_combat_physics(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": "rocky mountain, gravel and sand beneath storm clouds",
+            }],
+            authored_requirement="加入太阳招式",
+        )
+        result = plan["shots"][0]
+        self.assertNotIn("AFTERMATH ONLY", result["environment_response"])
+        self.assertIn("force_magnitude=world-class", result["environment_interaction"])
+        self.assertIn("white-gold corona", result["environment_interaction"])
+
+    def test_hong_kong_power_field_is_present_from_first_shot(self):
+        plan = {
+            "duration_seconds": 12.0, "constraints": "",
+            "shots": [
+                shot("S1", 0.0, 3.0, "S1 drives a palm into S2's guard."),
+                shot("S2", 3.0, 6.0, "S2 kicks and S1 checks the kick."),
+            ],
+            "existing_media_uses": [], "media_requests": [{
+                "requirement_id": "early_action", "media_type": "image",
+                "reuse_policy": "time_scoped", "start_seconds": 0.0, "end_seconds": 3.0,
+                "prompt": "Photoreal frozen action state: two fighters clash on the source mountain."
+            }],
+        }
+        apply_environmental_combat_physics(
+            plan, special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=[{"media_id": "P1", "media_type": "image", "loaded": True,
+                             "raw_analysis_summary": "rocky mountain with gravel and storm clouds"}],
+        )
+        self.assertIn("CONTINUOUS LEGENDARY POWER FIELD", plan["shots"][0]["continuous_power_field"])
+        self.assertIn("continuous_power_field=", plan["shots"][0]["environment_interaction"])
+        self.assertIn("CONTINUOUS LEGENDARY POWER FIELD", plan["media_requests"][0]["prompt"])
+        self.assertIn("no ordinary unpowered punch", plan["media_requests"][0]["prompt"])
+
+    def test_hong_kong_power_field_keeps_identity_anchor_clean(self):
+        plan = {
+            "duration_seconds": 5.0, "constraints": "", "shots": [],
+            "existing_media_uses": [], "media_requests": [{
+                "requirement_id": "identity", "media_type": "image",
+                "reuse_policy": "whole_design", "identity_anchor": True,
+                "prompt": "PRIMARY RECURRING CHARACTER IDENTITY ANCHOR. One clear face."
+            }],
+        }
+        apply_environmental_combat_physics(
+            plan, special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=[{"media_id": "P1", "media_type": "image", "loaded": True,
+                             "raw_analysis_summary": "rocky mountain"}],
+        )
+        self.assertNotIn("CONTINUOUS LEGENDARY POWER FIELD", plan["media_requests"][0]["prompt"])
+
+    def test_hong_kong_comic_environment_changes_with_source_evidence(self):
+        plan = {
+            "duration_seconds": 6.0, "constraints": "",
+            "shots": [shot("S1", 0.0, 6.0, "S1 kicks; S2 checks and counters.")],
+            "existing_media_uses": [], "media_requests": [],
+        }
+        apply_environmental_combat_physics(
+            plan,
+            special_skill_key=HONG_KONG_COMIC_FIGHTER_SKILL,
+            existing_media=[{
+                "media_id": "P4", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": "BLIP · Overview: fighters beside a stormy open sea",
+            }],
+        )
+        self.assertEqual(plan["reference_environment_fact_ledger"]["location"], "open waterside terrain")
+        self.assertIn("water surface", plan["shots"][0]["environment_interaction"])
+        self.assertNotIn("Kowloon", plan["shots"][0]["environment_interaction"])
 
     def test_speech_extension_does_not_move_authored_environment_threshold(self):
         plan = {

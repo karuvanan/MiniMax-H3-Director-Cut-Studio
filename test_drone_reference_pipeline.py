@@ -160,6 +160,25 @@ class DroneReferencePipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'successful local-image upload'):
             image_workflow({**request, 'source_image_uploaded_name':''}, self.settings, 1, 'test')
 
+    def test_general_source_img2img_uses_requested_portrait_crop_and_stronger_denoise(self):
+        request = dict(
+            prompt='Photoreal live-action martial artist on a mountain',
+            source_plate_mode='source_img2img',
+            source_image_uploaded_name='comic/page.png',
+            source_image_width=576,
+            source_image_height=1024,
+            source_image_denoise=.65,
+        )
+        graph = image_workflow(request, self.settings, 1, 'test', None)
+        sampler = next(n for n in graph.values() if n['class_type'] == 'KSampler')
+        encoder = graph[sampler['inputs']['latent_image'][0]]
+        scale = graph[encoder['inputs']['pixels'][0]]
+        loader = graph[scale['inputs']['image'][0]]
+        self.assertEqual(loader['inputs']['image'], 'comic/page.png')
+        self.assertEqual((scale['inputs']['width'], scale['inputs']['height']), (576, 1024))
+        self.assertEqual(scale['inputs']['crop'], 'center')
+        self.assertEqual(sampler['inputs']['denoise'], .65)
+
     def test_generation_uploads_source_not_route_and_keeps_sky(self):
         stage = next(r for r in self.plan()['media_requests'] if r.get('derived_from_media_id'))
         item = dict(stage, local_path=str(self.root/'out.png'))

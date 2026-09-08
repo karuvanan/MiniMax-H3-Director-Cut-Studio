@@ -5,6 +5,7 @@ from native_audio_engine import (
     audio_reference_intent_text,
     build_native_audio_profile,
     environment_continuity_text,
+    infer_acoustic_space,
     native_audio_direction_text,
 )
 
@@ -112,6 +113,30 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertEqual(warning["status"], "WARNING")
         self.assertTrue(warning["unauthorized_extra_dialogue"])
         self.assertTrue(warning["environment_sound_missing"])
+
+    def test_character_action_words_do_not_false_match_vehicle_cabin(self):
+        space, _ambience = infer_acoustic_space(
+            "Open mountain exterior. The scarred fighter carries momentum and gains advantage "
+            "while a distant helicopter crosses the sky."
+        )
+        self.assertEqual(space, "open rocky mountain exterior")
+
+    def test_negative_wet_market_skill_rule_cannot_pollute_mountain_audio(self):
+        profile = build_native_audio_profile({
+            "framing": "Close-up",
+            "subject_action": "S1 launches a solar palm on a rocky mountain cliff.",
+            "environment_response": (
+                "Stone fractures and sand scatters after the compressed-air detonation."
+            ),
+            "additional_direction": "No default wet market unless visible or explicitly requested.",
+        })
+        self.assertEqual(profile.acoustic_space, "open rocky mountain exterior")
+        self.assertIn("exposed wind", profile.ambience)
+        self.assertIn("attack air-displacement", profile.foley)
+        self.assertIn("sharp contact transient", profile.foley)
+        self.assertIn("compressed-air detonation", profile.foley)
+        self.assertIn("rock fracture", profile.foley)
+        self.assertIn("solar-corona charge", profile.foley)
 
 
 if __name__ == "__main__":

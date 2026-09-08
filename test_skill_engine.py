@@ -378,6 +378,33 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("S2是@P2（AI Enrich：fighter | appearance: muscular man", rendered)
         self.assertIn("@P1只定义S1，@P2只定义S2", rendered)
 
+    def test_hong_kong_comic_template_lists_panel_evidence_without_cast_binding(self):
+        profile = self.profiles["hong-kong-comic-fighter"]
+        media = [
+            {
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "raw_analysis_summary": "BLIP · Overview: two fighters on a rocky mountain under a blue sky",
+            },
+            {
+                "media_id": "P2", "media_type": "image", "loaded": True,
+                "semantic_enrichment": "SUMMARY\nThe same fighters collide above broken stone.",
+            },
+            {
+                "media_id": "P3", "media_type": "image", "loaded": True,
+                "local_path": "project/media/generated_references/old_market.png",
+                "recognition": "AI DESIGN GENERATED REFERENCE\nA wet market created by an older Skill.",
+            },
+        ]
+        rendered = render_special_design_requirement_template(
+            profile.design_requirement_template, profile.key, media
+        )
+        self.assertNotIn("{{HONG_KONG_COMIC_SOURCE_EVIDENCE}}", rendered)
+        self.assertIn("@P1（BLIP · Overview：two fighters on a rocky mountain", rendered)
+        self.assertIn("@P2（AI Enrich：The same fighters collide", rendered)
+        self.assertNotIn("@P3", rendered)
+        self.assertNotIn("older Skill", rendered)
+        self.assertIn("P1／P2只是图片编号，不代表S1／S2一人一图", rendered)
+
     def test_street_fighter_normalization_forces_whole_design_cast_references(self):
         media = [
             {
@@ -512,6 +539,75 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("STREET FIGHTER ENDING CONTRACT", system)
         self.assertIn("Add a Final Combat Resolve marker", system)
         self.assertIn("stable eye-level three-quarter composition", system)
+
+    def test_hong_kong_comic_normalization_keeps_drawn_sources_analysis_only(self):
+        media = [{
+            "media_id": "P1", "media_type": "image", "loaded": True,
+            "raw_analysis_summary": (
+                "BLIP · Overview: a printed Hong Kong comic panel with two fighters on a rocky mountain"
+            ),
+        }, {
+            "media_id": "P4", "media_type": "image", "loaded": True,
+            "local_path": "project/media/generated_references/old_market.png",
+            "recognition": "AI DESIGN GENERATED REFERENCE; Kowloon Walled City-style wet market with fish tanks",
+        }]
+        source = {
+            "title": "Comic source mapping",
+            "creative_brief": "Two named fighters collide on the source mountain.",
+            "global_visual_style": "Photoreal live-action conversion of the loaded panel.",
+            "overall_soundscape": "Wind, impact and rock debris.",
+            "non_diegetic_music": "N/A", "constraints": "Keep the source world.",
+            "duration_seconds": 5.0,
+            "shots": [{
+                "start_seconds": 0.0, "end_seconds": 5.0, "track": "V1",
+                "preset": "Collision", "framing": "Close-up", "camera_angle": "Side",
+                "camera_movement": "Track contact", "movement_speed": "Fast",
+                "movement_amplitude": "Medium",
+                "subject_action": "S1 drives a palm at S2; S2 redirects and counters.",
+                "environment_response": "Rock dust follows contact.",
+                "continuity_state": "S1 left; S2 right.", "optional_flourish": "",
+                "additional_direction": "Preserve the mountain.",
+            }],
+            "text_layers": [], "transitions": [], "markers": [],
+            "existing_media_uses": [{
+                "requirement_id": "model_wrongly_used_comic_as_h3",
+                "media_id": "P1", "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 5.0, "track": "V1",
+            }, {
+                "requirement_id": "legacy_market_plate",
+                "media_id": "P4", "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 5.0, "track": "V3",
+            }],
+            "media_requests": [{
+                "requirement_id": "live_action_collision",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "time_scoped", "start_seconds": 0.0,
+                "end_seconds": 5.0, "track": "V2",
+                "source_plate_media_id": "P1", "derived_from_media_id": "P1",
+                "source_plate_mode": "source_img2img", "source_image_denoise": 0.58,
+                "prompt": "Photoreal live-action frozen fist collision on the same rocky mountain.",
+            }],
+        }
+        plan = normalize_design_plan(
+            source, {"image": 9, "video": 3, "audio": 3},
+            existing_media=media,
+            special_skill_key="hong-kong-comic-fighter",
+            authored_requirement="Convert the current Hong Kong comic panels to live action.",
+        )
+        comic_use = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P1")
+        self.assertEqual(comic_use["usage"], "analysis_only")
+        self.assertEqual(comic_use["reuse_policy"], "analysis_only")
+        self.assertFalse(comic_use["identity_anchor"])
+        self.assertIn("COMIC SOURCE ANALYSIS ONLY", comic_use["instruction"])
+        legacy_use = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P4")
+        self.assertEqual(legacy_use["usage"], "analysis_only")
+        self.assertIn("LEGACY GENERATED VENUE EXCLUDED", legacy_use["instruction"])
+        self.assertEqual(plan["media_requests"][0]["source_plate_mode"], "source_img2img")
+        self.assertEqual(plan["reference_environment_fact_ledger"]["location"], "rocky mountain or cliff terrain")
+        self.assertNotIn("street_fighter_kowloon", str(plan))
+        self.assertEqual(plan["markers"][-1]["preset"], "Final Combat Resolve")
 
     def test_ref2va_prompt_emits_two_exclusive_subject_definitions_for_fighters(self):
         p1 = MediaAsset(

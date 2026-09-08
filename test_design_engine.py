@@ -29,6 +29,10 @@ from design_engine import (
     enforce_design_dialogue_language,
     enforce_design_music_mode,
     enforce_design_subtitle_policy,
+    enforce_hong_kong_comic_technique_text_layers,
+    enforce_hong_kong_comic_superhero_opening,
+    enforce_hong_kong_comic_generated_source_plates,
+    enforce_hong_kong_comic_source_mapping,
     extract_design_json,
     extract_explicit_timed_text_layers,
     infer_design_dialogue_language,
@@ -49,6 +53,7 @@ from design_engine import (
     validate_explicit_timed_text_contract,
     validate_drone_image_request_budget,
     validate_requested_speech_layer_contract,
+    _street_fighter_realtime_action_text,
 )
 from design_media_service import (
     generate as generate_design_media,
@@ -136,6 +141,52 @@ def sample_design() -> dict:
 
 
 class DesignEngineTests(unittest.TestCase):
+    def test_loaded_picture_can_condition_a_general_source_img2img_request(self):
+        payload = sample_design()
+        payload["existing_media_uses"] = [{
+            "requirement_id": "comic_page_p2",
+            "media_id": "P2",
+            "media_type": "image",
+            "usage": "analysis_only",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": 12.0,
+            "track": "V2",
+            "instruction": "Composition source only.",
+        }]
+        payload["media_requests"] = [{
+            "requirement_id": "live_action_contact",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 3.5,
+            "end_seconds": 6.0,
+            "track": "V1",
+            "subject_keywords": ["two martial artists", "single fist contact"],
+            "prompt": "Exactly two adult martial artists make one fist contact on a rocky mountain, cinematic photoreal live action.",
+            "source_plate_media_id": "P2",
+            "source_plate_mode": "source_img2img",
+            "source_image_denoise": 0.65,
+            "preferred_media_id": "P4",
+        }]
+        inventory = [{
+            "media_id": "P2", "media_type": "image", "loaded": True,
+            "local_path": __file__,
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+        )
+        request = next(
+            row for row in plan["media_requests"]
+            if row["requirement_id"] == "live_action_contact"
+        )
+        self.assertEqual(request["source_plate_media_id"], "P2")
+        self.assertEqual(request["derived_from_media_id"], "P2")
+        self.assertEqual(request["source_plate_mode"], "source_img2img")
+        self.assertEqual(request["source_image_denoise"], 0.65)
+
     def test_dense_generated_dialogue_extends_owning_shot_and_later_timeline(self):
         payload = sample_design()
         payload["text_layers"] = [{
@@ -357,6 +408,148 @@ class DesignEngineTests(unittest.TestCase):
         stabilize_generated_identity_references(plan)
         self.assertEqual(plan["media_requests"], [])
         self.assertTrue(any("bare_p1_pose" in row for row in plan["design_warnings"]))
+
+    def test_hong_kong_comic_two_fighter_plate_is_never_single_identity_anchor(self):
+        plan = {
+            "duration_seconds": 12.0,
+            "creative_brief": "Two legendary fighters clash on a mountain.",
+            "design_warnings": [],
+            "existing_media_uses": [],
+            "media_requests": [{
+                "requirement_id": "two_fighter_clash",
+                "media_type": "image",
+                "reuse_policy": "whole_design",
+                "start_seconds": 0.0,
+                "end_seconds": 12.0,
+                "identity_anchor": True,
+                "prompt": (
+                    "PRIMARY RECURRING CHARACTER IDENTITY ANCHOR. Exactly two fighters clash "
+                    "on a rocky mountain; S1 wears a grey-green coat and S2 a black vest."
+                ),
+            }],
+        }
+        stabilize_generated_identity_references(
+            plan, "hong-kong-comic-fighter"
+        )
+        request = plan["media_requests"][0]
+        self.assertFalse(request.get("identity_anchor", False))
+        self.assertEqual(request["reuse_policy"], "time_scoped")
+        self.assertIn("exactly two unique visible people", request["prompt"])
+        self.assertNotIn("exactly one visible identity subject", request["prompt"])
+
+    def test_hong_kong_comic_generated_stills_are_bound_to_loaded_source_plates(self):
+        plan = {
+            "duration_seconds": 15.0,
+            "design_warnings": [],
+            "existing_media_uses": [
+                {"requirement_id": "long_jie_panel", "media_id": "P1", "media_type": "image"},
+                {"requirement_id": "shen_wu_panel", "media_id": "P2", "media_type": "image"},
+            ],
+            "media_requests": [
+                {"requirement_id": "long_jie_identity", "media_type": "image", "prompt": "Long Jie identity portrait"},
+                {"requirement_id": "shen_wu_action", "media_type": "image", "prompt": "Shen Wu action frame"},
+                {"requirement_id": "opening_pressure_state", "media_type": "image", "start_seconds": 0.0, "end_seconds": 1.0, "prompt": "Opening pressure state"},
+                {"requirement_id": "final_resolve_state", "media_type": "image", "start_seconds": 14.0, "end_seconds": 15.0, "prompt": "Final resolve state"},
+            ],
+        }
+        inventory = [
+            {"media_id": "P1", "media_type": "image", "loaded": True, "local_path": "long_jie.jpg"},
+            {"media_id": "P2", "media_type": "image", "loaded": True, "local_path": "shen_wu.jpg"},
+        ]
+        enforce_hong_kong_comic_generated_source_plates(
+            plan, inventory, "hong-kong-comic-fighter"
+        )
+        requests = {row["requirement_id"]: row for row in plan["media_requests"]}
+        self.assertEqual(requests["long_jie_identity"]["source_plate_media_id"], "P1")
+        self.assertEqual(requests["shen_wu_action"]["source_plate_media_id"], "P2")
+        self.assertEqual(requests["opening_pressure_state"]["source_plate_media_id"], "P1")
+        self.assertEqual(requests["final_resolve_state"]["source_plate_media_id"], "P2")
+        for request in requests.values():
+            self.assertEqual(request["source_plate_mode"], "source_img2img")
+            self.assertEqual(request["derived_from_media_id"], request["source_plate_media_id"])
+            self.assertIn("SOURCE COMIC PLATE LOCK", request["prompt"])
+        self.assertTrue(all(
+            row["usage"] == "analysis_only" and not row["identity_anchor"]
+            for row in plan["existing_media_uses"]
+        ))
+
+    def test_unproven_legacy_generated_comic_reference_is_demoted(self):
+        plan = {
+            "duration_seconds": 15.0,
+            "design_warnings": [],
+            "existing_media_uses": [{
+                "requirement_id": "old_wrong_actor",
+                "media_id": "P10",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "identity_anchor": True,
+            }],
+        }
+        enforce_hong_kong_comic_source_mapping(
+            plan,
+            [{
+                "media_id": "P10", "media_type": "image", "loaded": True,
+                "local_path": "media/generated_references/R0001/wrong_actor.png",
+                "analysis_summary": "AI Design generated reference, photoreal fighter",
+            }],
+            "hong-kong-comic-fighter",
+        )
+        use = plan["existing_media_uses"][0]
+        self.assertEqual(use["usage"], "analysis_only")
+        self.assertFalse(use["identity_anchor"])
+        self.assertIn("UNPROVEN GENERATED COMIC REFERENCE EXCLUDED", use["instruction"])
+
+    def test_hong_kong_comic_source_plate_pass_runs_in_normalize_pipeline(self):
+        payload = sample_design()
+        payload["media_requests"] = [{
+            "requirement_id": "comic_action_state",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "time_scoped",
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "track": "V1",
+            "subject_keywords": ["two fighters"],
+            "prompt": "Exactly two fighters collide on the source terrain.",
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "local_path": __file__, "analysis_summary": "printed Hong Kong comic panel",
+            }],
+            special_skill_key="hong-kong-comic-fighter",
+        )
+        request = plan["media_requests"][0]
+        self.assertEqual(request["source_plate_media_id"], "P1")
+        self.assertEqual(request["source_plate_mode"], "source_img2img")
+        source_use = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P1")
+        self.assertEqual(source_use["usage"], "analysis_only")
+        self.assertFalse(source_use["identity_anchor"])
+
+    def test_markdown_bold_timed_voiceover_does_not_leak_formatting(self):
+        layers = extract_explicit_timed_text_layers(
+            "[00:00-00:04]\n**普通话旁白：**“大地在拳风中裂开。”",
+            4.0,
+        )
+        self.assertEqual(len(layers), 1)
+        self.assertEqual(layers[0]["content"], "大地在拳风中裂开。")
+        self.assertEqual(layers[0]["role"], "voice_over")
+
+    def test_named_comic_characters_and_inner_voice_receive_stable_speakers(self):
+        layers = extract_explicit_timed_text_layers(
+            """[00:00-00:03]
+**龙界（低声）：**“我没有退避的理由。”
+[00:03-00:06]
+**神武不死：**“接我这一拳！”
+[00:06-00:08]
+**年轻龙界的回声：**“站起来。”""",
+            8.0,
+        )
+        self.assertEqual(len(layers), 3)
+        self.assertEqual([row["speaker"] for row in layers], ["S1", "S2", "S1"])
+        self.assertEqual([row["role"] for row in layers], ["dialogue", "dialogue", "voice_over"])
 
     def test_authored_p1_face_contract_recovers_omitted_existing_media_use(self):
         payload = sample_design()
@@ -585,10 +778,57 @@ class DesignEngineTests(unittest.TestCase):
         self.assertEqual(captions[0]["track"], "V4")
         self.assertIn("VISIBLE TEXT WHITELIST", with_subtitles["constraints"])
 
+    def test_subtitles_off_preserves_explicit_comic_technique_title_only(self):
+        plan = sample_design()
+        plan["text_layers"] = [{
+            "start_seconds": 1.0,
+            "end_seconds": 2.0,
+            "track": "V4",
+            "content": "烈阳天劫",
+            "role": "on_screen_text",
+            "speaker": "S1",
+            "language": "Chinese",
+            "delivery": "Comic technique title",
+            "lip_sync": False,
+            "explicit_user_requested": True,
+            "timeline_visible_text_kind": "comic_technique_title",
+        }, {
+            "start_seconds": 2.0,
+            "end_seconds": 3.0,
+            "track": "V4",
+            "content": "AI invented caption",
+            "role": "on_screen_text",
+            "speaker": "S1",
+            "language": "English",
+            "delivery": "Caption",
+            "lip_sync": False,
+            "explicit_user_requested": True,
+        }]
+        result = enforce_design_subtitle_policy(
+            plan,
+            False,
+            authored_requirement="每一个招式都加入可编辑的招式文字。",
+        )
+        self.assertEqual(
+            [row["content"] for row in result["text_layers"]], ["烈阳天劫"]
+        )
+
     def test_design_system_prompt_defaults_subtitles_off(self):
         prompt = build_design_system_prompt({"dialogue_language": "auto"})
         self.assertIn("SUBTITLE CONTRACT: subtitles are OFF", prompt)
         self.assertIn("keep the spoken words exclusively in those text_layers", prompt)
+
+    def test_realtime_action_cleanup_preserves_negative_speed_rules(self):
+        cleaned = _street_fighter_realtime_action_text(
+            "No slow motion, no bullet-time and no non-combat walking. "
+            "S1 slowly walks forward before the punch."
+        )
+        self.assertIn("No slow motion", cleaned)
+        self.assertIn("no bullet-time", cleaned)
+        self.assertIn("no non-combat walking", cleaned)
+        self.assertIn("at full speed", cleaned)
+        self.assertIn("explosive combat footwork", cleaned)
+        self.assertNotIn("no in real time", cleaned.casefold())
 
     LATE_SINGLE_WOMAN_REQUIREMENT = """帮我创作30秒的视频，内容和旁白如下：
 题目：大齡剩女的困惑
@@ -640,6 +880,12 @@ class DesignEngineTests(unittest.TestCase):
         self.assertEqual(infer_explicit_design_duration("[0-5] 画面"), 5.0)
         self.assertEqual(infer_explicit_design_duration("[00:00-00:07] 画面"), 7.0)
         self.assertEqual(infer_explicit_design_duration("0-5秒 画面"), 5.0)
+        self.assertEqual(
+            infer_explicit_design_duration(
+                "准确12.00秒。旁白：[0.00-3.50] 第一幕。对白：[3.50-5.50] 开战。"
+            ),
+            12.0,
+        )
         self.assertEqual(
             extract_explicit_timed_text_layers(
                 "0–360度运镜进度\n普通话对白：「这不是一个时间范围。」"
@@ -2196,6 +2442,57 @@ On-screen text: "EXACT TITLE"'''
             images[0]["prompt"],
         )
 
+    def test_media_repair_does_not_pad_loaded_virtual_pool_to_five_second_quota(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 120.0
+        payload["shots"] = [
+            {
+                **payload["shots"][0],
+                "start_seconds": float(index * 5),
+                "end_seconds": float((index + 1) * 5),
+            }
+            for index in range(24)
+        ]
+        payload["media_requests"] = []
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": f"comic_page_{index}",
+                "media_id": f"P{index}",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": float((index - 1) * 10),
+                "end_seconds": float(min(120, index * 10)),
+                "track": "V1",
+                "subject_keywords": ["comic page"],
+                "instruction": f"Use @P{index} only in its assigned story window.",
+            }
+            for index in range(1, 13)
+        ]
+        inventory = [
+            {
+                "media_id": f"P{index}",
+                "media_type": "image",
+                "loaded": True,
+                "filename": f"page_{index}.jpg",
+            }
+            for index in range(1, 13)
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 30, "video": 3, "audio": 3},
+            existing_media=inventory,
+            strict_t2i_prompts=True,
+            repair_media_plan=True,
+        )
+
+        self.assertEqual(plan["media_requests"], [])
+        self.assertFalse(any(
+            "too few visual references" in warning
+            for warning in plan["design_warnings"]
+        ))
+
     def test_media_repair_upgrades_legacy_internal_auto_image_to_one_instant(self):
         payload = sample_design()
         payload["existing_media_uses"] = []
@@ -2993,6 +3290,77 @@ On-screen text: "EXACT TITLE"'''
             plan["shots"][0]["framing"], "External medium-wide rescue two-shot"
         )
         self.assertNotIn("camera is physically inside S2", plan["constraints"])
+
+    def test_hong_kong_comic_move_titles_are_editable_timeline_layers(self):
+        plan = {
+            "duration_seconds": 6.0,
+            "constraints": "",
+            "shots": [
+                {
+                    "start_seconds": 0.0,
+                    "end_seconds": 3.0,
+                    "subject_action": "Long Jie releases a solar palm into the counter impact.",
+                },
+                {
+                    "start_seconds": 3.0,
+                    "end_seconds": 6.0,
+                    "subject_action": "Shen Wu Bu Si completes a heavy hook punch.",
+                },
+            ],
+            "text_layers": [],
+        }
+        enforce_hong_kong_comic_technique_text_layers(
+            plan,
+            "hong-kong-comic-fighter",
+            "每一个招式都加入可编辑的招式文字。",
+        )
+        titles = [
+            row for row in plan["text_layers"]
+            if row["role"] == "on_screen_text"
+        ]
+        self.assertEqual([row["content"] for row in titles], ["烈阳天劫", "极霸之拳"])
+        self.assertTrue(all(row["track"] == "V4" for row in titles))
+        self.assertTrue(all(row["explicit_user_requested"] for row in titles))
+        self.assertIn("COMIC TECHNIQUE TITLE CONTRACT", plan["constraints"])
+
+    def test_hong_kong_comic_opening_is_fast_superhero_pressure_not_walking(self):
+        plan = {
+            "constraints": "",
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 2.0,
+                "subject_action": "S1 punches and S2 parries.",
+                "camera_movement": "Static",
+                "movement_speed": "Slow",
+                "additional_direction": "",
+            }],
+        }
+        enforce_hong_kong_comic_superhero_opening(
+            plan, "hong-kong-comic-fighter"
+        )
+        first = plan["shots"][0]
+        self.assertIn("0.00-1.00s SUPERHERO PRESSURE ARRIVAL", first["subject_action"])
+        self.assertIn("low-angle close rising FPV arc", first["camera_movement"])
+        self.assertEqual(first["movement_speed"], "Explosive real-time")
+        self.assertIn("not walking", first["additional_direction"])
+
+    def test_dragon_realm_revision_preserves_authored_narration_and_dialogue(self):
+        requirement = (
+            PROJECT_ROOT
+            / "example"
+            / "Dragon_Realm_vs_Immortal_Martial"
+            / "DESIGN_REQUIREMENT_WORLD_POWER_REVISION.txt"
+        ).read_text(encoding="utf-8")
+        layers = extract_explicit_timed_text_layers(requirement, 12.0)
+        self.assertEqual(
+            [(row["role"], row["content"]) for row in layers],
+            [
+                ("voice_over", "龙界复出后第一时间找到神武不死"),
+                ("dialogue", "找不到逃避的理由"),
+            ],
+        )
+        self.assertEqual(layers[1]["speaker"], "S1")
+        self.assertTrue(all(row["explicit_user_requested"] for row in layers))
 
     def test_materialize_creates_timed_keyword_placeholders_and_sidecars(self):
         plan = normalize_design_plan(sample_design(), {"image": 9, "video": 3, "audio": 3})

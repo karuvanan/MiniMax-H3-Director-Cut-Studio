@@ -39,7 +39,20 @@ def infer_acoustic_space(evidence: str) -> tuple[str, str]:
     text = evidence.lower()
 
     def has(*words: str) -> bool:
-        return any(word in text for word in words)
+        # Match short Latin place words as complete tokens.  A plain substring
+        # test made words such as "carries", "scarred" and "advantage" look
+        # like "car"/"van", which incorrectly turned exterior scenes into a
+        # vehicle cabin.  Phrases and CJK evidence remain substring matches.
+        for word in words:
+            token = str(word or "").lower()
+            if not token:
+                continue
+            if token.isascii() and token.isalpha() and len(token) <= 4:
+                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text):
+                    return True
+            elif token in text:
+                return True
+        return False
 
     if has("car interior", "vehicle cabin", "inside the car", "taxi", "van", "车内", "車內"):
         return (
@@ -60,6 +73,31 @@ def infer_acoustic_space(evidence: str) -> tuple[str, str]:
             "open rainy market alley",
             "continuous open-air rain, drain runoff and distant vehicle activity with reduced enclosure, "
             "while nearby market-gate and awning sounds retain their visible direction",
+        )
+    # Natural exteriors must outrank negative Skill constraints such as
+    # ``no default wet market``.  Those words describe what must *not* be
+    # generated and previously polluted mountain scenes with indoor pumps and
+    # vendor room tone.
+    if has("mountain", "cliff", "rocky terrain", "rock face", "峰", "山", "岩", "峭壁"):
+        return (
+            "open rocky mountain exterior",
+            "continuous exposed wind across rock, distant terrain rumble and sparse gravel movement, "
+            "with no enclosed-room reflection tail",
+        )
+    if has("desert", "sand dune", "sandstorm", "grit", "沙漠", "沙丘", "风沙", "風沙"):
+        return (
+            "open sand or desert exterior",
+            "continuous open wind, airborne grit and distant low terrain resonance with natural distance decay",
+        )
+    if has("waterfront", "seaside", "ocean", "riverbank", "lake shore", "海边", "海邊", "河岸", "湖岸"):
+        return (
+            "open waterside exterior",
+            "continuous wind and water movement with distance-correct shoreline reflections and spray",
+        )
+    if has("forest", "woodland", "jungle", "森林", "树林", "樹林", "丛林", "叢林"):
+        return (
+            "open wooded exterior",
+            "continuous leaf movement, open wind and distant natural ambience without an indoor reverberant tail",
         )
     if has(
         "wet market", "indoor_seafood_aisle", "fish_vegetable_junction",
@@ -166,6 +204,33 @@ def infer_foley(evidence: str) -> str:
         if any(word in text for word in words) and label not in rows:
             rows.append(label)
 
+    # Put combat transients first so the four-item cap cannot discard the move
+    # sound in favour of generic clothing or location cues.
+    add(
+        "fast attack air-displacement, limb whooshes and cloth snap",
+        "attack", "strike", "punch", "palm", "kick", "elbow", "knee", "combat",
+        "拳", "掌", "踢", "肘", "膝", "格斗", "格鬥", "攻击", "攻擊",
+    )
+    add(
+        "one sharp contact transient with body recoil at each visible hit",
+        "contact", "impact", "collision", "hit", "block", "parry", "recoil",
+        "attack", "strike", "punch", "palm", "kick", "combat",
+        "接触", "接觸", "撞击", "撞擊", "命中", "格挡", "格擋", "受力",
+        "攻击", "攻擊", "拳", "掌", "踢", "格斗", "格鬥",
+    )
+    add(
+        "compressed-air detonation, pressure crack and delayed low terrain rumble",
+        "pressure", "detonation", "shock", "space-lensing", "world-class",
+        "压缩空气", "壓縮空氣", "爆破", "压力", "壓力", "地动", "地動",
+    )
+    add(
+        "rock fracture, gravel scatter, sand rush and debris impacts along the force vector",
+        "rock", "stone", "gravel", "sand", "debris", "cliff", "岩", "石", "沙", "碎片", "峭壁",
+    )
+    add(
+        "solar-corona charge, plasma release and heat-pressure flare anchored to the technique",
+        "solar", "corona", "plasma", "sun-powered", "太阳", "太陽", "日冕", "等离子", "等離子",
+    )
     add("footsteps, landings and surface contact", "walk", "run", "step", "foot", "跑", "走", "踏", "脚步", "腳步")
     add("cloth and body-movement rustle", "coat", "dress", "cloth", "shirt", "衣", "裙", "外套")
     add("phone handling, taps and authored interface cues", "phone", "smartphone", "手机", "手機")
@@ -176,7 +241,7 @@ def infer_foley(evidence: str) -> str:
     add("weapon movement and exact contact transients", "sword", "knife", "gun", "blade", "剑", "劍", "刀", "枪", "槍")
     if not rows:
         return "exact-frame Foley only for the visible body movement, handled objects and surface contacts in this Shot"
-    return ", ".join(rows[:4])
+    return ", ".join(rows[:6])
 
 
 def build_native_audio_profile(

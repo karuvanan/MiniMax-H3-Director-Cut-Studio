@@ -108,6 +108,14 @@ class ProjectWorkspaceTests(unittest.TestCase):
             "a_young_girl_running_with_a_red_flag",
         )
 
+    def test_generic_comic_page_blip_overview_does_not_name_workspace(self):
+        recognition = (
+            "Type: image\n\n"
+            "BLIP VISUAL SUMMARY · CUDA\n"
+            "BLIP · Overview: the page for the comic book, the star wars\n"
+        )
+        self.assertEqual(picture_overview_project_name(recognition), "")
+
     def test_requirement_first_story_sentence_names_workspace_without_picture(self):
         requirement = (
             "帮我创作30秒的视频，内容是深夜办公室里的林玥收到异常门锁通知。"
