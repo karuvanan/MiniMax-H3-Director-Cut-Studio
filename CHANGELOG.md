@@ -2,6 +2,27 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.2-alpha.6] - 2026-09-08
+
+### Hong Kong Comic Fighter production grammar
+
+- Added `hong-kong-comic-fighter` as a reusable image-led Hong Kong manhua production profile. Loaded panels and explicit user mappings own character, costume, location, weather, palette and material facts; filenames and Skill examples cannot silently replace the current source world.
+- Added comic-to-live-action source-plate rules: original printed pages remain analysis-only, while the minimum required photoreal identity and action-state keyframes use traceable source-image derivation instead of unconstrained text-to-image substitution.
+- Reworked short combat pacing around immediate superhero pressure arrival, full-speed causal exchanges and persistent world-scale force from the first active attack. Every Beat must expose load, attack line or grip, defence, contact or miss, force, displacement, source-grounded environment response and the next trigger.
+- Added action-triggered close moving-camera coverage, source-derived material/weather propagation, synchronized native technique sound, editable move-title/text layers and a stable causal final resolve. Fixed-market scenery, arbitrary spectators, graphic energy rings, slow-motion padding and non-causal background explosions are prohibited unless the current source or user explicitly requires them.
+- Added a reusable universal Design Requirement and a complete 27-line narration/dialogue production script for the current Hong Kong comic workflow.
+
+### Timeline Voice-over language control
+
+- Added an editable `Language` field to every Timeline Voice-over layer. The selector includes Auto, Mandarin Chinese, Cantonese, Malay and the stable H3 dialogue-language set; custom values remain editable for forward compatibility.
+- Persisted the selected language through Director Project save/load and passed it unchanged into H3 text ranges and the selected TTS job. Voice-over clips now expose their active language in the Timeline tooltip.
+- Editing a Voice-over language no longer resets its hidden Speaker, Delivery or Shot binding. Lip synchronization remains Dialogue-only, while Lyrics also gain the same per-layer language control.
+- Added regressions for Voice-over field visibility, value preservation, old-project restoration and H3 prompt/TTS data flow. The full 168-test Timeline suite passes.
+
+### Compatibility
+
+- Kept Director Project format at `23` because the persisted `language` field already existed in the schema; old projects therefore require no migration and retain their previous language/default behavior.
+
 ## [0.3.2-alpha.5] - 2026-09-06
 
 ### High-density Combat Action Continuity

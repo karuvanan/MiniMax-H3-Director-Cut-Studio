@@ -4,7 +4,7 @@
 
 ## 下载与快速开始
 
-- 当前应用版本：[`v0.3.2-alpha.5`](VERSION)
+- 当前应用版本：[`v0.3.2-alpha.6`](VERSION)
 - v0.3.2 重点功能、长片流程与验收说明：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
 - 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
