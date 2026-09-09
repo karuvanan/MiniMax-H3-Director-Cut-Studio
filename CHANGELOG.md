@@ -13,6 +13,13 @@ Every user-visible correction receives an application version and a dated entry 
 - Added `AUTHORIZED SPEECH OVERLAPS` and track/layer identity to the actual MiniMax H3 prompt. H3 is told to preserve the simultaneous performances while prohibiting merged, reordered, duplicated, translated or invented dialogue.
 - Applied the new behavior to Design-created layers, Type Tool editing, Timeline tooltips, save/load, TTS job metadata and prompt reconciliation. Old Projects that do not contain `overlap_policy` load as `AUTO` and are normalized in memory before the next save.
 
+### Reusable 60-second cinematic story adaptation
+
+- Added the Default-bound `cinematic-story-60s-director` Special Skill with English and Chinese production instructions plus an auto-filled `DESIGN_REQUIREMENT.txt` template.
+- The Skill treats pasted prose as adaptation material, extracts its causal conflict and ending, targets eight to twelve Shots around 60 seconds, generates concise Mandarin Dialogue and Voice-over as independent protected Text Layers, and leaves room for visual action, ambience, Foley and Final Hold.
+- Explicit Media Pool references remain the highest visual evidence. Missing identity or scene facts may be designed from the current story without inventing `@P/@V/@A` IDs or generating one reference image for every Shot.
+- Speech is compressed before the Timeline is extended; if further compression would damage natural delivery or the central reversal, the owning Shot and all downstream ranges extend together so no speech-only Segment is created.
+
 ### Compatibility and verification
 
 - Raised Director Project format from `23` to `24` for the persisted Text Layer overlap policy. The addition is backward compatible; no media, Take or approved Segment file is deleted during migration.

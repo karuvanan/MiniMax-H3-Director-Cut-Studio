@@ -167,6 +167,23 @@ class SpecialSkillStoreTests(unittest.TestCase):
         self.assertIn("港漫旁白", chinese)
         self.assertIn("solar signature technique", english)
 
+    def test_cinematic_story_60s_skill_has_adaptation_and_overlap_contract(self):
+        root = Path(__file__).parent / "skill special" / "cinematic-story-60s-director"
+        document = load_special_skill_document(root)
+        validate_special_skill_document(document)
+        english = (root / "SKILL.md").read_text(encoding="utf-8")
+        chinese = (root / "SKILL.cn.md").read_text(encoding="utf-8")
+        template = (root / "DESIGN_REQUIREMENT.txt").read_text(encoding="utf-8")
+        self.assertEqual(document.key, "cinematic-story-60s-director")
+        self.assertIn("60.00 seconds as the initial target", english)
+        self.assertIn("约60秒的MiniMax H3电影短剧", chinese)
+        self.assertIn("故事内容如下", template)
+        self.assertIn("explicit_user_requested=true", template)
+        self.assertNotIn(r"explicit\_user\_requested", template)
+        self.assertIn("Overlap Policy默认使用AUTO", template)
+        self.assertIn("只有语音却没有Shot", template)
+        self.assertIn("不得虚构素材编号", template)
+
 
 if __name__ == "__main__":
     unittest.main()
