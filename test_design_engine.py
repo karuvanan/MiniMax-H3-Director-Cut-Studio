@@ -3557,15 +3557,15 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("checking a watch", plan["shots"][0]["additional_direction"])
         self.assertIn("no running", plan["shots"][0]["additional_direction"].lower())
         self.assertIn("45-60%", plan["shots"][-1]["movement_speed"])
-        self.assertIn("preceding campus as the sole environment", plan["shots"][-1]["environment_response"])
+        self.assertIn("@P5 as the sole environment", plan["shots"][-1]["environment_response"])
         self.assertIn("shared contact shadows", plan["shots"][-1]["environment_response"])
         self.assertIn("Very slow horizontal slide", plan["shots"][-1]["camera_movement"])
-        self.assertIn("viewing direction stable", plan["shots"][-1]["camera_movement"])
+        self.assertIn("preserving its camera height, horizon and viewing direction", plan["shots"][-1]["camera_movement"])
         self.assertNotIn("fpv", plan["shots"][-1]["camera_movement"].lower())
         self.assertNotIn("orbit", plan["shots"][-1]["camera_movement"].lower())
         self.assertEqual(plan["shots"][-1]["continuity_mode"], "Motion Reference")
         self.assertIn("CAMPUS COMPOSITE", plan["shots"][-1]["location_transition"])
-        self.assertIn("incoming motion-reference frames", plan["shots"][-1]["additional_direction"])
+        self.assertIn("incoming motion-reference frames control only", plan["shots"][-1]["additional_direction"])
         self.assertIn("subject identity", plan["shots"][-1]["additional_direction"])
         self.assertIn("INDOOR", plan["shots"][3]["location_transition"])
         self.assertIn("OUTDOOR", plan["shots"][3]["location_transition"])
@@ -3583,7 +3583,18 @@ On-screen text: "EXACT TITLE"'''
                 "Architectural Occlusion Scene Cut",
             ],
         )
-        self.assertEqual(plan["media_requests"], [])
+        self.assertEqual(len(plan["media_requests"]), 1)
+        p5_request = plan["media_requests"][0]
+        self.assertEqual(p5_request["requirement_id"], "beat_p5_environment_population")
+        self.assertEqual(p5_request["preferred_media_id"], "P5")
+        self.assertEqual(
+            (p5_request["start_seconds"], p5_request["end_seconds"]),
+            (11.5, 18.0),
+        )
+        self.assertIn("students with backpacks", p5_request["prompt"])
+        self.assertIn("waiting for a bus", p5_request["prompt"])
+        self.assertIn("pedestrians naturally crossing", p5_request["prompt"])
+        self.assertNotIn("@P", p5_request["prompt"])
         p3 = [row for row in plan["existing_media_uses"] if row["media_id"] == "P3"]
         self.assertEqual([(row["start_seconds"], row["end_seconds"]) for row in p3], [(9.0, 11.5)])
         p1 = [row for row in plan["existing_media_uses"] if row["media_id"] == "P1"]
@@ -3599,6 +3610,26 @@ On-screen text: "EXACT TITLE"'''
         p4 = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P4")
         self.assertIn("P4 SUBJECT COMPOSITE", p4["instruction"])
         self.assertIn("do not use @P4 as a background plate", p4["instruction"])
+        self.assertIn("P5 populated school exterior", p4["instruction"])
+
+        loaded_p5_plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory + [{
+                "media_id": "P5", "media_type": "image", "loaded": True,
+            }],
+            special_skill_key=BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
+        )
+        self.assertEqual(loaded_p5_plan["media_requests"], [])
+        loaded_p5 = next(
+            row for row in loaded_p5_plan["existing_media_uses"]
+            if row["media_id"] == "P5"
+        )
+        self.assertEqual(
+            (loaded_p5["start_seconds"], loaded_p5["end_seconds"]),
+            (11.5, 18.0),
+        )
+        self.assertIn("ENVIRONMENT POPULATION KEYFRAME", loaded_p5["instruction"])
 
 
 if __name__ == "__main__":

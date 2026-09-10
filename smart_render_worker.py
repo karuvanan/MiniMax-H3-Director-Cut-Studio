@@ -34,7 +34,7 @@ from workflow_engine import validate_portable_media_manifest
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 21
+SMART_RENDER_POLICY_VERSION = 22
 AUDIO_JOIN_FADE_SECONDS = 0.04
 
 

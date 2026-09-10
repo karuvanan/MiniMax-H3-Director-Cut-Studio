@@ -331,7 +331,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 21
+SMART_RENDER_POLICY_VERSION = 22
 
 _UNTRACKED_VISIBLE_TEXT_TOKEN_RE = re.compile(
     r"\b(?:text|words?|subtitle|caption|title|lower[- ]?third|hashtag|typography|legible)\b|"
@@ -19944,6 +19944,16 @@ class DirectorCutStudio(QMainWindow):
         """Merge timeline-authored direction into the six-section H3 prompt input."""
         self._refresh_native_audio_directions(reference_assets)
         state = asdict(spec)
+        active_reference_assets = reference_assets or []
+        has_p5_population_plate = (
+            str(self.special_combo.currentData() or "").strip().casefold()
+            == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL
+            and any(
+                asset.media_type == "image"
+                and stable_reference_id(asset).strip().upper() == "P5"
+                for asset in active_reference_assets
+            )
+        )
         state["has_supplied_dialogue_audio"] = bool(
             supplied_dialogue_audio_tag
         )
@@ -20107,7 +20117,11 @@ class DirectorCutStudio(QMainWindow):
                     if campus_bridge
                     else (
                         "Preserve @P4 subject count, faces, bodies, wardrobe and relative arrangement "
-                        "while placing them naturally inside the established campus exterior"
+                        + (
+                            "while placing them naturally inside the @P5 populated school exterior"
+                            if has_p5_population_plate
+                            else "while placing them naturally inside the established campus exterior"
+                        )
                         if campus_composite
                         else cue.framing
                     )
@@ -20116,7 +20130,11 @@ class DirectorCutStudio(QMainWindow):
                     "Eye level from outside the doorway facing @P1"
                     if campus_bridge
                     else (
-                        "Eye level matching the established campus camera axis"
+                        (
+                            "Eye level matching the @P5 school-exterior camera axis"
+                            if has_p5_population_plate
+                            else "Eye level matching the established campus camera axis"
+                        )
                         if campus_composite
                         else cue.camera_angle
                     )
@@ -20131,8 +20149,13 @@ class DirectorCutStudio(QMainWindow):
                         "behind the immediately adjacent campus corner until it covers the whole lens"
                         if campus_bridge
                         else (
-                            "Very slow horizontal slide through the established campus while keeping "
-                            "the inherited camera height, horizon and viewing direction stable"
+                            (
+                                "Very slow horizontal slide through the @P5 school exterior while keeping "
+                                "its camera height, horizon and viewing direction stable"
+                                if has_p5_population_plate
+                                else "Very slow horizontal slide through the established campus while keeping "
+                                     "the inherited camera height, horizon and viewing direction stable"
+                            )
                             if campus_composite
                             else cue.camera_movement
                         )
@@ -20174,11 +20197,21 @@ class DirectorCutStudio(QMainWindow):
                     )
                 elif campus_composite:
                     executable_action = (
+                        "Reveal every @P4 subject already occupying the @P5 populated school exterior "
+                        if has_p5_population_plate else
                         "Reveal every @P4 subject already occupying the same campus exterior that was "
-                        "established immediately before the wipe. Preserve the exact @P4 subject count, "
+                        "established immediately before the wipe. "
+                    ) + (
+                        "Preserve the exact @P4 subject count, "
                         "face, body, hair, wardrobe, accessories and relative arrangement. Transfer only "
                         "those subjects from @P4; integrate their feet, shadows, scale, perspective and "
-                        "campus daylight naturally into the inherited campus. Use clear physical slow "
+                        + (
+                            "campus daylight naturally into @P5. Keep @P5 background people in varied "
+                            "school-leaving, bus-waiting, backpack and crossing-road activity. "
+                            if has_p5_population_plate
+                            else "campus daylight naturally into the inherited campus. "
+                        )
+                        + "Use clear physical slow "
                         "motion, then settle completely before the final 0.5-second hold."
                     )
                 if street_fighter_prompt:
@@ -20201,6 +20234,11 @@ class DirectorCutStudio(QMainWindow):
                     )
                 elif campus_composite:
                     continuity_state = (
+                        "Preserve @P5 campus architecture, ground plane, daylight, background-life layout, "
+                        "camera height, horizon and view direction. Inherit only wipe timing and camera "
+                        "motion from the incoming 24-frame reference. Preserve @P4 only as subject identity "
+                        "and arrangement evidence, not as a background plate."
+                        if has_p5_population_plate else
                         "Inherit campus architecture, ground plane, daylight, camera height, horizon and "
                         "view direction from the incoming 24-frame motion reference. Preserve @P4 only "
                         "as subject identity and arrangement evidence, not as a background plate."
@@ -20224,6 +20262,11 @@ class DirectorCutStudio(QMainWindow):
                     )
                 elif campus_composite:
                     environment_response = (
+                        "@P5 school-exterior sunlight relights every @P4 subject consistently; feet contact "
+                        "the @P5 ground, shadows follow one shared light direction, and atmospheric depth, "
+                        "colour temperature and reflections match @P5 while its background people continue "
+                        "natural dismissal-time activity."
+                        if has_p5_population_plate else
                         "Campus sunlight relights every @P4 subject consistently; feet contact the campus "
                         "ground, shadows follow one shared light direction, and atmospheric depth, colour "
                         "temperature and reflections match the inherited outdoor scene."
@@ -20325,6 +20368,11 @@ class DirectorCutStudio(QMainWindow):
                     )
                 elif campus_composite:
                     cue_detail = (
+                        "P4+P5 CAMPUS COMPOSITE: @P5 owns the complete school-exterior environment, "
+                        "background people and camera axis; the incoming motion-reference frames own only "
+                        "wipe and camera-motion continuity. @P4 owns only its visible foreground subjects "
+                        "and their exact identity, wardrobe and arrangement. Relight and ground them inside @P5."
+                        if has_p5_population_plate else
                         "P4 CAMPUS COMPOSITE: the incoming motion-reference frames own the complete campus "
                         "environment and camera axis. @P4 owns only its visible subjects and their exact "
                         "identity, wardrobe and arrangement. Relight and ground them inside that campus."
@@ -20657,6 +20705,15 @@ class DirectorCutStudio(QMainWindow):
             reference_scene_reset = self._is_reference_scene_reset_shot(first_shot)
             campus_bridge = self._is_beat_synced_campus_bridge_shot(first_shot)
             campus_composite = self._is_beat_synced_p4_campus_composite_shot(first_shot)
+            p5_population_plate = next(
+                (
+                    asset for asset in assets
+                    if asset.media_type == "image"
+                    and stable_reference_id(asset).strip().upper() == "P5"
+                ),
+                None,
+            )
+            has_p5_population_plate = p5_population_plate is not None
             beat_synced_entrance = (
                 str(self.special_combo.currentData() or "").strip().casefold()
                 == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL
@@ -20689,6 +20746,12 @@ class DirectorCutStudio(QMainWindow):
                 brief_parts.append(
                     "MANDATORY TWO-SECOND CAMPUS BRIDGE: frame one already shows the active P1 "
                     "reference crossing the visible interior exit threshold into the campus exterior. "
+                    + (
+                        "Use the active P5 Picture as the exact school-exterior architecture, daylight, "
+                        "ground plane, camera-axis and background-life plate. "
+                        if has_p5_population_plate else ""
+                    )
+                    +
                     "P1 immediately rounds the adjacent campus corner toward the next encounter, and "
                     "the solid corner wall or door frame sweeps across until it covers every pixel. "
                     "Use the complete interval for this single continuous crossing-turn-wipe chain. "
@@ -20696,12 +20759,22 @@ class DirectorCutStudio(QMainWindow):
                 )
             if campus_composite:
                 brief_parts.append(
-                    "P4 CAMPUS COMPOSITE: continue from the incoming 24-frame campus motion reference. "
-                    "Those frames exclusively own the campus architecture, ground plane, daylight, "
-                    "camera height, horizon and viewing direction. The active P4 Picture exclusively "
-                    "owns its visible subject count, faces, bodies, hair, wardrobe, accessories and "
-                    "relative arrangement. Place and relight those P4 subjects inside the inherited "
-                    "campus with correct scale, ground contact and shared shadows."
+                    (
+                        "P4+P5 CAMPUS COMPOSITE: the active P5 Picture exclusively owns the school-exterior "
+                        "architecture, ground plane, daylight, camera height, horizon, viewing direction, "
+                        "bus-stop zone and background-life population. The incoming 24-frame motion reference "
+                        "owns only the architectural-wipe timing and camera-motion handoff. The active P4 "
+                        "Picture exclusively owns its foreground subject count, faces, bodies, hair, wardrobe, "
+                        "accessories and relative arrangement. Place and relight those P4 subjects inside P5 "
+                        "with correct scale, ground contact and shared shadows."
+                        if has_p5_population_plate else
+                        "P4 CAMPUS COMPOSITE: continue from the incoming 24-frame campus motion reference. "
+                        "Those frames exclusively own the campus architecture, ground plane, daylight, "
+                        "camera height, horizon and viewing direction. The active P4 Picture exclusively "
+                        "owns its visible subject count, faces, bodies, hair, wardrobe, accessories and "
+                        "relative arrangement. Place and relight those P4 subjects inside the inherited "
+                        "campus with correct scale, ground contact and shared shadows."
+                    )
                 )
             all_shots = sorted(
                 (cue for cue in self.director_cues if cue.cue_type == "shot"),
@@ -20722,9 +20795,15 @@ class DirectorCutStudio(QMainWindow):
                     if campus_composite:
                         brief_parts.append(
                             "Boundary state contract: the preceding campus-side Shot has already shown "
-                            "P1's surprised face and finished with an architectural wipe. The incoming "
-                            "24 silent frames carry only the established outdoor campus geometry, ground "
-                            "plane, daylight and camera axis into this Segment. Do not replay P1 or the wipe."
+                            "P1's surprised face and finished with an architectural wipe. "
+                            + (
+                                "The incoming 24 silent frames carry only wipe timing and camera motion; P5 "
+                                "remains the immutable school-exterior and background-population plate. "
+                                if has_p5_population_plate else
+                                "The incoming 24 silent frames carry only the established outdoor campus "
+                                "geometry, ground plane, daylight and camera axis into this Segment. "
+                            )
+                            + "Do not replay P1 or the wipe."
                         )
                     else:
                         previous_shot = max(
@@ -20777,18 +20856,40 @@ class DirectorCutStudio(QMainWindow):
                 "continuity metadata; never introduce it into this segment."
             )
             if campus_bridge:
-                local_roles = [
-                    f"{asset.tag}: exact P1 identity and wardrobe authority for the threshold crossing"
-                    for asset in assets if asset.media_type == "image"
-                ] + [
+                local_roles = []
+                for asset in assets:
+                    if asset.media_type != "image":
+                        continue
+                    stable_id = stable_reference_id(asset).strip().upper()
+                    if stable_id == "P5":
+                        local_roles.append(
+                            f"{asset.tag}: P5 school-exterior architecture, daylight, ground plane, "
+                            "camera axis and background-life authority only"
+                        )
+                    else:
+                        local_roles.append(
+                            f"{asset.tag}: exact P1 identity and wardrobe authority for the threshold crossing"
+                        )
+                local_roles += [
                     f"{asset.tag}: continuous Master Audio source window at this Timeline position"
                     for asset in assets if asset.media_type == "audio"
                 ]
             elif campus_composite:
-                local_roles = [
-                    f"{asset.tag}: P4 subject identity, wardrobe, subject count and arrangement only"
-                    for asset in assets if asset.media_type == "image"
-                ] + [
+                local_roles = []
+                for asset in assets:
+                    if asset.media_type != "image":
+                        continue
+                    stable_id = stable_reference_id(asset).strip().upper()
+                    if stable_id == "P5":
+                        local_roles.append(
+                            f"{asset.tag}: P5 school-exterior background, architecture, bus-stop zone, "
+                            "daylight, ground plane and varied background-life authority only"
+                        )
+                    else:
+                        local_roles.append(
+                            f"{asset.tag}: P4 foreground-subject identity, wardrobe, subject count and arrangement only"
+                        )
+                local_roles += [
                     f"{asset.tag}: continuous Master Audio source window at this Timeline position"
                     for asset in assets if asset.media_type == "audio"
                 ]
@@ -21011,7 +21112,12 @@ class DirectorCutStudio(QMainWindow):
                 )
                 state["references"] = (
                     "The active P1 Picture is the sole character-identity and wardrobe authority. "
-                    "Generate only the doorway, immediately adjacent campus corner and exterior depth."
+                    + (
+                        "The active P5 Picture is the sole school-exterior architecture, daylight, ground-plane, "
+                        "camera-axis and background-life authority."
+                        if has_p5_population_plate else
+                        "Generate only the doorway, immediately adjacent campus corner and exterior depth."
+                    )
                 )
                 state["audio"] = (
                     "Continue the active A1 Timeline source window unchanged. Add only synchronized "
@@ -21024,7 +21130,11 @@ class DirectorCutStudio(QMainWindow):
                 )
                 state["must_keep"] = (
                     "Exact active-P1 identity and wardrobe; visible threshold crossing; visibly outdoor "
-                    "campus before the turn; one adjacent-corner turn; complete wall or door-frame wipe."
+                    "campus before the turn; one adjacent-corner turn; complete wall or door-frame wipe. "
+                    + (
+                        "Keep exact P5 campus architecture, background-person layout and school-life context."
+                        if has_p5_population_plate else ""
+                    )
                 )
                 state["technical"] = (
                     "Start the crossing on frame one. Preserve continuous feet, heading and screen "
@@ -21033,10 +21143,17 @@ class DirectorCutStudio(QMainWindow):
                 state["ending"] = "End with solid architecture covering the entire image."
             elif campus_composite:
                 state["style"] = (
+                    "Match the active P5 school exterior, daylight, colour temperature, ground plane, "
+                    "atmospheric depth and camera axis."
+                    if has_p5_population_plate else
                     "Match the established photoreal campus exterior, daylight, colour temperature, "
                     "ground plane, atmospheric depth and camera axis from the incoming motion reference."
                 )
                 state["references"] = (
+                    "The active P5 Picture is the sole environment and background-life source; incoming "
+                    "motion-reference frames supply only wipe timing and camera motion. The active P4 Picture "
+                    "supplies only exact foreground-subject identity, wardrobe, count and arrangement."
+                    if has_p5_population_plate else
                     "Incoming motion-reference frames are the sole environment source. The active P4 "
                     "Picture supplies only exact visible-subject identity, wardrobe, count and arrangement."
                 )
@@ -21046,17 +21163,27 @@ class DirectorCutStudio(QMainWindow):
                 )
                 state["music"] = "Use only the active A1 Timeline source window at normal speed."
                 state["transition"] = (
+                    "Begin as the preceding architectural wipe clears to reveal the P5 school exterior "
+                    "with the P4 subjects naturally present inside it."
+                    if has_p5_population_plate else
                     "Begin as the preceding architectural wipe clears to reveal the same campus exterior "
                     "with the P4 subjects naturally present inside it."
                 )
                 state["must_keep"] = (
-                    "Exact P4 subject identities, count, wardrobe and arrangement integrated into the "
-                    "inherited campus; shared perspective, ground contact, daylight and shadows; very slow "
-                    "horizontal camera slide; stable final 0.5-second hold."
+                    "Exact P4 foreground-subject identities, count, wardrobe and arrangement integrated into "
+                    + ("the exact P5 school exterior and populated background; " if has_p5_population_plate else "the inherited campus; ")
+                    + "shared perspective, ground contact, daylight and shadows; very slow horizontal camera "
+                    "slide; stable final 0.5-second hold."
                 )
                 state["technical"] = (
-                    "Preserve the incoming campus geometry and camera axis. Render one coherent composite "
-                    "scene with stable identity and anatomy and no text, logo or watermark."
+                    (
+                        "Preserve P5 campus geometry, background population and camera axis; use the incoming "
+                        "frames only for wipe and camera motion. "
+                        if has_p5_population_plate else
+                        "Preserve the incoming campus geometry and camera axis. "
+                    )
+                    + "Render one coherent composite scene with stable identity and anatomy and no text, "
+                    "logo or watermark."
                 )
                 state["ending"] = (
                     "Finish the P4 subjects' source-consistent slow motion, then hold the integrated campus "
@@ -21070,10 +21197,17 @@ class DirectorCutStudio(QMainWindow):
             clone.end_seconds = round(min(end, asset.end_seconds) - start, 6)
             if campus_bridge:
                 if clone.media_type == "image":
-                    clone.clip_prompt = (
-                        "Use this active Picture only as the exact P1 face, body, hair, wardrobe "
-                        "and accessory authority during the visible threshold crossing."
-                    )
+                    if stable_reference_id(clone).strip().upper() == "P5":
+                        clone.clip_prompt = (
+                            "Use this active P5 Picture only as the immutable school-exterior architecture, "
+                            "road, bus-stop zone, daylight, ground plane, camera axis and varied background "
+                            "school-life authority. It defines no P1-P4 identity."
+                        )
+                    else:
+                        clone.clip_prompt = (
+                            "Use this active Picture only as the exact P1 face, body, hair, wardrobe "
+                            "and accessory authority during the visible threshold crossing."
+                        )
                 elif clone.media_type == "audio":
                     clone.clip_prompt = (
                         "Play only this Segment's matching Timeline source window as continuous "
@@ -21081,11 +21215,18 @@ class DirectorCutStudio(QMainWindow):
                     )
             elif campus_composite:
                 if clone.media_type == "image":
-                    clone.clip_prompt = (
-                        "Use this active Picture only for exact P4 visible-subject identity, face, body, "
-                        "hair, wardrobe, accessories, subject count and relative arrangement. Integrate "
-                        "those subjects into the campus supplied by the incoming motion reference."
-                    )
+                    if stable_reference_id(clone).strip().upper() == "P5":
+                        clone.clip_prompt = (
+                            "Use this active P5 Picture as the immutable school-exterior environment: exact "
+                            "architecture, road, bus-stop zone, daylight, ground plane, camera axis and varied "
+                            "background school-life population. Preserve it behind the P4 foreground subjects."
+                        )
+                    else:
+                        clone.clip_prompt = (
+                            "Use this active Picture only for exact P4 foreground-subject identity, face, body, "
+                            "hair, wardrobe, accessories, subject count and relative arrangement. Integrate "
+                            "those subjects into the active P5 school exterior; discard this Picture's background."
+                        )
                 elif clone.media_type == "audio":
                     clone.clip_prompt = (
                         "Play only this Segment's matching Timeline source window as continuous Master "

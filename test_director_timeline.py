@@ -5012,6 +5012,34 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertNotIn("fpv", prompt.lower())
         self.assertNotIn("orbit", prompt.lower())
 
+        p4 = MediaAsset(
+            node_id="p4-test", class_type="LoadImage", media_type="image",
+            tag="<Picture 4>", binding="ref_images.ref_image_3",
+            filename="p4.png", reference_id="P4", start_seconds=13.5,
+            end_seconds=18.0,
+        )
+        p5 = MediaAsset(
+            node_id="p5-test", class_type="LoadImage", media_type="image",
+            tag="<Picture 5>", binding="ref_images.ref_image_4",
+            filename="p5.png", reference_id="P5", start_seconds=11.5,
+            end_seconds=18.0,
+        )
+        populated_prompt = window._prompt_for_window(
+            13.5, 18.0, [p4, p5], is_final_window=True,
+            continuity={"kind": "video", "binding": "ref_videos.ref_video_0"},
+        )
+        self.assertIn("P4+P5 CAMPUS COMPOSITE", populated_prompt)
+        self.assertIn("active P5 Picture exclusively owns the school-exterior", populated_prompt)
+        self.assertIn("incoming 24-frame motion reference owns only", populated_prompt)
+        self.assertIn("P4 foreground-subject identity", populated_prompt)
+        self.assertIn("P5 school-exterior background", populated_prompt)
+        self.assertIn("bus-waiting", populated_prompt)
+        self.assertIn("crossing-road activity", populated_prompt)
+        self.assertNotIn(
+            "Incoming motion-reference frames are the sole environment source",
+            populated_prompt,
+        )
+
         bridge_prompt = window._prompt_for_window(
             11.5, 13.5, [], is_final_window=False, continuity=None
         )
