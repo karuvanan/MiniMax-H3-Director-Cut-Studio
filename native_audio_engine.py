@@ -54,6 +54,18 @@ def infer_acoustic_space(evidence: str) -> tuple[str, str]:
                 return True
         return False
 
+    # A Picture-authored scene reset must outrank every place word that may
+    # survive in a negative exclusion such as ``do not import the corridor``.
+    # Without this gate, the audio profile can classify the new Picture scene
+    # as the old location and then inject that location back into H3's visual
+    # prompt through Environment Continuity.
+    if has("reference scene reset", "acoustic scene reset", "独立场景重置", "獨立場景重置"):
+        return (
+            "the independent location visibly established by the active Picture reference",
+            "continuous location tone derived only from the active Picture's visible surfaces, "
+            "weather and activity, with no ambience or reflection tail from an earlier scene",
+        )
+
     if has("car interior", "vehicle cabin", "inside the car", "taxi", "van", "车内", "車內"):
         return (
             "vehicle cabin",

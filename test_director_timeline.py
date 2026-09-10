@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from PIL import Image
 
 from director_cut_studio import (
+    SMART_RENDER_POLICY_VERSION,
     _canonical_special_skill_key,
     ContentLayerDialog,
     DesignPageDialog,
@@ -4946,7 +4947,86 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(job["segments"][1]["continuity"]["frame_count"], 24)
         self.assertEqual(job["segments"][1]["continuity"]["fps"], 24)
         self.assertEqual(job["segments"][-1]["overlap_before_seconds"], 0.0)
-        self.assertEqual(job["render_policy_version"], 16)
+        self.assertEqual(job["render_policy_version"], SMART_RENDER_POLICY_VERSION)
+        window.project_dirty = False
+        window.close()
+
+    def test_p4_subjects_composite_into_inherited_campus_after_face_first_bridge(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(18.0)
+        skill_index = window.special_combo.findData("beat-synced-entrance-18s")
+        self.assertGreaterEqual(skill_index, 0)
+        window.special_combo.blockSignals(True)
+        window.special_combo.setCurrentIndex(skill_index)
+        window.special_combo.blockSignals(False)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 6.0, "Beat-Synced Principal Entrance", detail="Generated corridor.", track_id="V1", subject_action="P1 advances in a corridor."),
+            DirectorCue("S2", "shot", 6.0, 9.0, "P1-to-P2 Corridor Corner Encounter", detail="Same corridor.", track_id="V1", subject_action="P1 rounds the corner and meets P2."),
+            DirectorCue("S3", "shot", 9.0, 11.5, "P2-to-P3 Corridor Corner Encounter", detail="Same corridor.", track_id="V1", subject_action="P2 rounds the corner and meets P3."),
+            DirectorCue("S4", "shot", 11.5, 12.0, "P1 Corridor-to-Campus Corner Discovery", detail="P1 exits through the campus doorway and the wall completes the wipe.", track_id="V1", subject_action="P1 rounds the campus corner."),
+            DirectorCue("S4B", "shot", 12.0, 13.5, "P1 Corridor-to-Campus Corner Discovery", detail="P1 exits through the campus doorway and the wall completes the wipe.", track_id="V1", subject_action="P1 rounds the campus corner."),
+            DirectorCue(
+                "S5", "shot", 13.5, 18.0, "P4 Slow-Motion Final Reveal",
+                detail="P4 is the sole visual authority. Do not import corridor geometry.",
+                track_id="V1",
+                framing="Composition and complete location strictly from P4",
+                camera_movement="Slow lateral orbital arc around P4",
+                subject_action="Reveal P4 alone in slow motion.",
+            ),
+        ]
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(18.0)
+
+        planned = window._planned_render_segments()
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in planned],
+            [(0.0, 11.5), (11.5, 13.5), (13.5, 18.0)],
+        )
+        campus_bridge = next(
+            segment for segment in planned
+            if abs(segment.start_seconds - 11.5) <= 1e-6
+        )
+        self.assertEqual(campus_bridge.continuity_mode, "hard_cut")
+        self.assertEqual(campus_bridge.shot_ids, ["S4"])
+        composite_segment = next(
+            segment for segment in planned
+            if abs(segment.start_seconds - 13.5) <= 1e-6
+        )
+        self.assertEqual(composite_segment.continuity_mode, "motion_reference")
+
+        window._refresh_native_audio_directions()
+        final = window.director_cues[-1]
+        self.assertIn("same open campus exterior", final.native_audio_direction)
+        self.assertIn("same outdoor air", final.native_audio_direction)
+        self.assertIn("Continue the preceding campus ambience", final.environment_continuity)
+
+        prompt = window._prompt_for_window(
+            13.5, 18.0, [], is_final_window=True, continuity=None
+        )
+        self.assertIn("P4 CAMPUS COMPOSITE", prompt)
+        self.assertIn("incoming 24-frame campus motion reference", prompt)
+        self.assertIn("visible subject count", prompt)
+        self.assertIn("very slow horizontal camera slide", prompt.lower())
+        self.assertIn("viewing direction stable", prompt.lower())
+        self.assertNotIn("REFERENCE SCENE RESET", prompt)
+        self.assertNotIn("fpv", prompt.lower())
+        self.assertNotIn("orbit", prompt.lower())
+
+        bridge_prompt = window._prompt_for_window(
+            11.5, 13.5, [], is_final_window=False, continuity=None
+        )
+        self.assertEqual(bridge_prompt.lower().count("[shot "), 1)
+        self.assertIn("mandatory two-second campus bridge", bridge_prompt.lower())
+        self.assertIn("outdoor campus", bridge_prompt.lower())
+        self.assertIn("face and both eyes are clear", bridge_prompt.lower())
+        self.assertIn("unmistakable surprise", bridge_prompt.lower())
+
+        opening_prompt = window._prompt_for_window(
+            0.0, 13.5, [], is_final_window=False, continuity=None
+        )
+        self.assertIn("S1 CORRIDOR MODEL LOCK", opening_prompt)
+        self.assertIn("frontal or three-quarter face", opening_prompt)
+        self.assertIn("No running, power-walking, fast crossing", opening_prompt)
         window.project_dirty = False
         window.close()
 
@@ -5173,7 +5253,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 }
             )
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 16,
+            "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "segments": cached_rows,
         }
         changed = next(cue for cue in window.director_cues if cue.start_seconds == 8.0)
@@ -5267,7 +5347,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         partial = {
             "format": "h3-smart-render-manifest",
             "version": 1,
-            "render_policy_version": 16,
+            "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "request_kind": "final",
             "master_seed": 1234,
             "target_duration_seconds": 120.0,
@@ -5338,7 +5418,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         worker_manifest = {
             "format": "h3-smart-render-manifest",
             "version": 1,
-            "render_policy_version": 16,
+            "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "request_kind": "final",
             "updated_at": "2026-09-01T12:00:00+00:00",
             "segments": [{
@@ -5854,7 +5934,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             row.update(status="complete", output_path=str(output))
             completed.append(row)
         window.smart_render_manifests["production"] = {
-            "render_policy_version": 16,
+            "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "segments": completed,
         }
         window.render_dirty_segment_ids.clear()
@@ -6635,6 +6715,49 @@ class DirectorTimelineDragTests(unittest.TestCase):
         restored.project_dirty = False
         restored.close()
         shutil.rmtree(root)
+
+
+    def test_continuous_reference_audio_is_source_windowed_for_later_h3_segment(self):
+        window = DirectorCutStudio()
+        root = PROJECT_ROOT / ".director_cache" / "test_reference_audio_window"
+        source = root / "master_a1.mp3"
+        cache_root = root / "cache"
+        root.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"source-audio")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        asset = MediaAsset(
+            node_id="audio-loader", class_type="LoadAudio", media_type="audio",
+            filename=source.name, binding="A1", local_path=str(source),
+            start_seconds=0.0, end_seconds=18.0, timeline_placed=True,
+            source_duration_seconds=19.9, source_in_seconds=0.0,
+            source_out_seconds=18.0, reference_id="A1",
+        )
+        commands = []
+
+        class Completed:
+            returncode = 0
+            stderr = b""
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            Path(command[-1]).write_bytes(b"R" * 128)
+            return Completed()
+
+        with patch("director_cut_studio.CACHE_ROOT", cache_root), patch(
+            "director_cut_studio.subprocess.run", side_effect=fake_run
+        ):
+            prepared = window._prepare_windowed_reference_audio([asset], 13.0, 18.0)
+
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("-ss") + 1], "13.000000")
+        self.assertEqual(commands[0][commands[0].index("-t") + 1], "5.000000")
+        self.assertNotEqual(prepared[0].local_path, str(source))
+        self.assertEqual(prepared[0].source_in_seconds, 0.0)
+        self.assertEqual(prepared[0].source_out_seconds, 5.0)
+        self.assertEqual((prepared[0].start_seconds, prepared[0].end_seconds), (13.0, 18.0))
+        self.assertEqual(asset.local_path, str(source))
+        window.project_dirty = False
+        window.close()
 
 
 if __name__ == "__main__":

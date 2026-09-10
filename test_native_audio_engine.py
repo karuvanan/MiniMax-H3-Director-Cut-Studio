@@ -70,6 +70,29 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertIn("open exterior", continuity)
         self.assertIn("do not carry the earlier room tail", continuity)
 
+    def test_picture_scene_reset_outranks_negated_previous_location(self):
+        profile = build_native_audio_profile({
+            "framing": "Composition strictly from P4",
+            "additional_direction": (
+                "REFERENCE SCENE RESET TO P4. Do not import the previous corridor geometry."
+            ),
+            "location_transition": (
+                "REFERENCE SCENE RESET: establish only the independent P4 location."
+            ),
+        })
+        self.assertEqual(
+            profile.acoustic_space,
+            "the independent location visibly established by the active Picture reference",
+        )
+        self.assertNotIn("corridor", profile.ambience)
+        previous = build_native_audio_profile({
+            "framing": "Wide",
+            "subject_action": "People move through a narrow corridor.",
+        })
+        continuity = environment_continuity_text(previous, profile)
+        self.assertIn("Acoustic-space transition", continuity)
+        self.assertIn("do not carry the earlier room tail", continuity)
+
     def test_wet_market_to_rain_alley_uses_distinct_native_spaces(self):
         indoor = build_native_audio_profile({
             "framing": "Close-up",

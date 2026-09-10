@@ -129,6 +129,7 @@ from media_semantic_enrichment import (
     render_semantic_enrichment,
 )
 from design_engine import (
+    BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
     DESIGN_JSON_SCHEMA,
     H3_STABLE_DIALOGUE_LANGUAGES,
     DesignDialogueLanguageContractError,
@@ -330,7 +331,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 16
+SMART_RENDER_POLICY_VERSION = 21
 
 _UNTRACKED_VISIBLE_TEXT_TOKEN_RE = re.compile(
     r"\b(?:text|words?|subtitle|caption|title|lower[- ]?third|hashtag|typography|legible)\b|"
@@ -14197,12 +14198,99 @@ class DirectorCutStudio(QMainWindow):
         if not self.prompt_sync_in_progress:
             self._mark_all_render_segments_dirty()
 
+    def _is_reference_scene_reset_shot(self, cue: DirectorCue | None) -> bool:
+        """Return whether a Shot starts an independent Picture-owned scene."""
+        if cue is None or cue.cue_type != "shot":
+            return False
+        selected_skill = str(self.special_combo.currentData() or "").strip().casefold()
+        if (
+            selected_skill == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL
+            and cue.preset.strip().casefold().startswith("p4 slow-motion final reveal")
+        ):
+            # This Skill now treats P4 as subject/identity evidence inserted
+            # into the campus established by the preceding bridge. Historical
+            # projects may still contain the former REFERENCE SCENE RESET text;
+            # it must not reactivate the discarded P4 background contract.
+            return False
+        evidence = " ".join((
+            cue.preset,
+            cue.detail,
+            cue.location_transition,
+            cue.incoming_environment_state,
+        )).casefold()
+        if "reference scene reset" in evidence or "acoustic scene reset" in evidence:
+            return True
+        return False
+
+    def _reference_scene_reset_shot_at(self, seconds: float) -> DirectorCue | None:
+        tolerance = TIMELINE_SNAP_SECONDS / 2 + 1e-6
+        return next(
+            (
+                cue for cue in self.director_cues
+                if cue.cue_type == "shot"
+                and abs(cue.start_seconds - seconds) <= tolerance
+                and self._is_reference_scene_reset_shot(cue)
+            ),
+            None,
+        )
+
+    def _is_beat_synced_campus_bridge_shot(self, cue: DirectorCue | None) -> bool:
+        """Return whether the 18-second entrance Skill requires a dedicated exit beat."""
+        if cue is None or cue.cue_type != "shot":
+            return False
+        selected_skill = str(self.special_combo.currentData() or "").strip().casefold()
+        return (
+            selected_skill == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL
+            and cue.preset.strip().casefold().startswith(
+                "p1 corridor-to-campus corner discovery"
+            )
+        )
+
+    def _is_beat_synced_p4_campus_composite_shot(
+        self,
+        cue: DirectorCue | None,
+    ) -> bool:
+        """Return whether P4 supplies subjects for the established campus scene."""
+        if cue is None or cue.cue_type != "shot":
+            return False
+        selected_skill = str(self.special_combo.currentData() or "").strip().casefold()
+        return (
+            selected_skill == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL
+            and cue.preset.strip().casefold().startswith("p4 slow-motion final reveal")
+        )
+
+    def _coalesce_beat_synced_campus_bridge_cues(
+        self,
+        cues: list[DirectorCue],
+    ) -> list[DirectorCue]:
+        """Rejoin one logical bridge if a Timeline transition split its Shot item."""
+        bridge_cues = sorted(
+            (cue for cue in cues if self._is_beat_synced_campus_bridge_shot(cue)),
+            key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id),
+        )
+        if len(bridge_cues) <= 1:
+            return cues
+        merged = deepcopy(bridge_cues[0])
+        merged.start_seconds = min(cue.start_seconds for cue in bridge_cues)
+        merged.end_seconds = max(cue.end_seconds for cue in bridge_cues)
+        remainder = [cue for cue in cues if cue not in bridge_cues]
+        return sorted(
+            [*remainder, merged],
+            key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id),
+        )
+
     def _continuity_mode_at_boundary(
         self,
         seconds: float,
         explicit: str = "Auto",
     ) -> str:
         """Resolve a Shot boundary to one safe hidden-render continuity policy."""
+        if self._reference_scene_reset_shot_at(seconds) is not None:
+            # A full-scene Picture handoff must not receive the preceding
+            # segment's final frames. Those frames can visually transplant the
+            # old set even when the active loader set correctly contains only
+            # the new Picture.
+            return "hard_cut"
         normalized = explicit.strip().lower().replace(" ", "_").replace("-", "_")
         if normalized in {"hard_cut", "match_action", "motion_reference", "transition"}:
             return normalized
@@ -14252,13 +14340,31 @@ class DirectorCutStudio(QMainWindow):
                 if clipped_end > clipped_start + 1e-6:
                     keyframe_boundaries.update((clipped_start, clipped_end))
         keyframe_chain_active = len(keyframe_boundaries) > 2
-        if keyframe_chain_active:
+        mandatory_story_boundaries = {start, end}
+        logical_shots = self._coalesce_beat_synced_campus_bridge_cues([
+            cue for cue in self.director_cues if cue.cue_type == "shot"
+        ])
+        for cue in logical_shots:
+            if cue.cue_type != "shot":
+                continue
+            if not (
+                self._is_beat_synced_campus_bridge_shot(cue)
+                or self._is_beat_synced_p4_campus_composite_shot(cue)
+                or self._is_reference_scene_reset_shot(cue)
+            ):
+                continue
+            if start + 1e-6 < cue.start_seconds < end - 1e-6:
+                mandatory_story_boundaries.add(float(cue.start_seconds))
+        mandatory_story_boundary_active = len(mandatory_story_boundaries) > 2
+        if keyframe_chain_active or mandatory_story_boundary_active:
             # A later Picture must never be present in the same native H3
             # request as an earlier scene anchor. Render each ownership range
-            # independently and carry only the previous final 24 video frames
-            # forward as motion context.
+            # independently. The beat-synced entrance Skill also isolates its
+            # two-second corridor-to-campus bridge: otherwise H3 tends to
+            # spend a packed 13.5-second request on the three character
+            # entrances and silently omit this indispensable causal action.
             planned = []
-            ordered = sorted(keyframe_boundaries)
+            ordered = sorted(keyframe_boundaries | mandatory_story_boundaries)
             for range_start, range_end in zip(ordered, ordered[1:]):
                 if range_end <= range_start + 1e-6:
                     continue
@@ -14324,6 +14430,29 @@ class DirectorCutStudio(QMainWindow):
         for index, segment in enumerate(planned):
             if index == 0:
                 segment.continuity_mode = "none"
+            elif any(
+                abs(segment.start_seconds - cue.start_seconds)
+                <= TIMELINE_SNAP_SECONDS / 2 + 1e-6
+                for cue in logical_shots
+                if self._is_beat_synced_p4_campus_composite_shot(cue)
+            ):
+                # P4 contributes subject identity, while the prior bridge's
+                # final 24 frames provide the campus geometry, lighting and
+                # screen direction into which those subjects are integrated.
+                segment.continuity_mode = "motion_reference"
+            elif any(
+                abs(segment.start_seconds - boundary)
+                <= TIMELINE_SNAP_SECONDS / 2 + 1e-6
+                for boundary in mandatory_story_boundaries
+                if boundary > start + 1e-6 and boundary < end - 1e-6
+            ):
+                # Both the P1 campus-return bridge and the P4 scene reset must
+                # start from their own active Picture. Carrying P2/P3 motion
+                # frames across either boundary can replace P1 or transplant
+                # the corridor into P4.
+                segment.continuity_mode = "hard_cut"
+            elif self._reference_scene_reset_shot_at(segment.start_seconds) is not None:
+                segment.continuity_mode = "hard_cut"
             elif keyframe_chain_active:
                 # Scene-anchor isolation is a deliberate visual handoff: no
                 # Picture or soundtrack crosses the boundary, only the prior
@@ -14333,7 +14462,7 @@ class DirectorCutStudio(QMainWindow):
                 segment.continuity_mode = self._continuity_mode_at_boundary(
                     segment.start_seconds
                 )
-        if not keyframe_chain_active:
+        if not keyframe_chain_active and not mandatory_story_boundary_active:
             planned = protect_segment_boundaries_from_speech(
                 planned,
                 [asdict(layer) for layer in self.text_layers],
@@ -14366,11 +14495,11 @@ class DirectorCutStudio(QMainWindow):
                 max_segment_seconds=MAX_NATIVE_SECONDS,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
-        shots_in_area = [
+        shots_in_area = self._coalesce_beat_synced_campus_bridge_cues([
             cue for cue in self.director_cues
             if cue.cue_type == "shot"
             and ranges_intersect(cue.start_seconds, cue.end_seconds, start, end)
-        ]
+        ])
         for index, segment in enumerate(planned):
             unit_start = float(
                 segment.core_start_seconds
@@ -19658,7 +19787,60 @@ class DirectorCutStudio(QMainWindow):
                 "continuity_state": cue.continuity_state,
                 "optional_flourish": cue.optional_flourish,
                 "detail": cue.detail,
+                "additional_direction": cue.detail,
+                "environment_interaction": cue.environment_interaction,
+                "incoming_environment_state": cue.incoming_environment_state,
+                "outgoing_environment_state": cue.outgoing_environment_state,
+                "crowd_reaction": cue.crowd_reaction,
+                "location_transition": cue.location_transition,
             }
+            campus_bridge = self._is_beat_synced_campus_bridge_shot(cue)
+            campus_composite = self._is_beat_synced_p4_campus_composite_shot(cue)
+            if campus_bridge:
+                shot_state.update({
+                    "preset": "P1 outdoor campus exit and face-first discovery",
+                    "framing": "Campus-side frontal medium view of P1",
+                    "camera_angle": "Eye level outside the campus doorway",
+                    "camera_movement": "Track backward in the campus, then complete one architectural wipe",
+                    "subject_action": (
+                        "P1 crosses outside toward camera, reacts in surprise to an off-camera subject, "
+                        "then the campus wall covers the lens."
+                    ),
+                    "environment_response": (
+                        "Open outdoor campus air, daylight, distant campus activity and exterior footsteps."
+                    ),
+                    "detail": "Outdoor campus threshold, frontal P1 face and architectural wipe.",
+                    "additional_direction": "Outdoor campus threshold and frontal P1 reaction.",
+                    "location_transition": "INDOOR TO OUTDOOR CAMPUS",
+                })
+            elif self._is_reference_scene_reset_shot(cue):
+                # Also migrates older saved projects whose generated S5 did
+                # not yet persist a location_transition field.
+                shot_state["location_transition"] = (
+                    "REFERENCE SCENE RESET: establish only the independent "
+                    "location visibly defined by the active Picture reference."
+                )
+            elif campus_composite:
+                shot_state.update({
+                    "preset": "P4 subject composite in outdoor campus",
+                    "framing": "Campus eye-level view with P4 subjects",
+                    "camera_angle": "Eye level on the inherited campus axis",
+                    "camera_movement": "Very slow horizontal slide in the same campus",
+                    "subject_action": (
+                        "P4 subjects appear inside the already established outdoor campus after the "
+                        "architectural wipe, with source-faithful slow motion."
+                    ),
+                    "environment_response": (
+                        "The same open campus ambience, daylight, ground plane and acoustic distance "
+                        "continue while the P4 subjects are integrated into the space."
+                    ),
+                    "location_transition": (
+                        "SAME OUTDOOR CAMPUS: clear the architectural wipe into the unchanged campus; "
+                        "P4 changes the visible subjects, not the acoustic or spatial environment."
+                    ),
+                    "detail": "P4 subjects integrated into the same outdoor campus.",
+                    "additional_direction": "Same outdoor campus; P4 supplies visible subjects only.",
+                })
             profile = build_native_audio_profile(
                 shot_state,
                 dialogue_rows,
@@ -19709,16 +19891,31 @@ class DirectorCutStudio(QMainWindow):
                 if is_acoustic_reference:
                     acoustic_references.append(asset.tag)
             if not cue.native_audio_direction_user_edited:
-                cue.native_audio_direction = native_audio_direction_text(
-                    profile,
-                    has_authored_voice_over=has_voice_over,
-                    music_requested=has_music,
-                )
+                if campus_composite:
+                    cue.native_audio_direction = (
+                        "Acoustic space remains the same open campus exterior established by the preceding "
+                        "Shot. Keep @A1 at its exact Timeline source time and retain the same outdoor air, "
+                        "distant campus activity and subject-to-camera distance; add only visible subject "
+                        "Foley as diegetic sound. No narration, extra dialogue, recording-booth close-mic "
+                        "sound or replacement music."
+                    )
+                else:
+                    cue.native_audio_direction = native_audio_direction_text(
+                        profile,
+                        has_authored_voice_over=has_voice_over,
+                        music_requested=has_music,
+                    )
             if not cue.environment_continuity_user_edited:
-                cue.environment_continuity = environment_continuity_text(
-                    previous_profile,
-                    profile,
-                )
+                if campus_composite:
+                    cue.environment_continuity = (
+                        "Continue the preceding campus ambience, acoustic openness and distance without a "
+                        "room-tone reset while the P4 subjects appear after the wipe."
+                    )
+                else:
+                    cue.environment_continuity = environment_continuity_text(
+                        previous_profile,
+                        profile,
+                    )
             if not cue.audio_reference_intent_user_edited:
                 cue.audio_reference_intent = audio_reference_intent_text(
                     acoustic_references
@@ -19854,7 +20051,9 @@ class DirectorCutStudio(QMainWindow):
                 return seconds
             return max(0.0, seconds - window_start)
 
-        shot_cues = [cue for cue in ordered if cue.cue_type == "shot"]
+        shot_cues = self._coalesce_beat_synced_campus_bridge_cues(
+            [cue for cue in ordered if cue.cue_type == "shot"]
+        )
         cut_cues = [cue for cue in ordered if cue.cue_type == "cut"]
         transition_cues = [cue for cue in ordered if cue.cue_type == "transition"]
         marker_cues = [cue for cue in ordered if cue.cue_type == "marker"]
@@ -19899,17 +20098,89 @@ class DirectorCutStudio(QMainWindow):
             shot_ranges: list[dict] = []
             native_audio_ranges: list[dict] = []
             for cue in shot_cues:
+                reference_scene_reset = self._is_reference_scene_reset_shot(cue)
+                campus_bridge = self._is_beat_synced_campus_bridge_shot(cue)
+                campus_composite = self._is_beat_synced_p4_campus_composite_shot(cue)
+                framing = (
+                    "Campus-side frontal medium view of @P1 crossing the exit threshold, with both "
+                    "eyes and the complete surprised facial reaction readable before a full-frame wipe"
+                    if campus_bridge
+                    else (
+                        "Preserve @P4 subject count, faces, bodies, wardrobe and relative arrangement "
+                        "while placing them naturally inside the established campus exterior"
+                        if campus_composite
+                        else cue.framing
+                    )
+                )
+                camera_angle = (
+                    "Eye level from outside the doorway facing @P1"
+                    if campus_bridge
+                    else (
+                        "Eye level matching the established campus camera axis"
+                        if campus_composite
+                        else cue.camera_angle
+                    )
+                )
+                camera_movement = (
+                    "Very slow horizontal camera slide parallel to the active Picture's original "
+                    "image plane while its optical axis, camera height, yaw, pitch, roll, focal "
+                    "length, horizon and viewing angle remain fixed from first frame to last"
+                    if reference_scene_reset
+                    else (
+                        "Track backward outside the doorway while facing @P1, then slide laterally "
+                        "behind the immediately adjacent campus corner until it covers the whole lens"
+                        if campus_bridge
+                        else (
+                            "Very slow horizontal slide through the established campus while keeping "
+                            "the inherited camera height, horizon and viewing direction stable"
+                            if campus_composite
+                            else cue.camera_movement
+                        )
+                    )
+                )
+                movement_amplitude = (
+                    "minimal horizontal travel followed by zero movement for the final 0.5 second"
+                    if reference_scene_reset
+                    else (
+                        "one short forward crossing and one complete architectural wipe"
+                        if campus_bridge
+                        else (
+                            "minimal lateral travel followed by zero movement for the final 0.5 second"
+                            if campus_composite
+                            else cue.movement_amplitude.lower()
+                        )
+                    )
+                )
                 movement = (
-                    f"Camera movement: {cue.camera_movement}, {cue.movement_speed.lower()} speed, "
-                    f"{cue.movement_amplitude.lower()} amplitude"
+                    f"Camera movement: {camera_movement}, {cue.movement_speed.lower()} speed, "
+                    f"{movement_amplitude} amplitude"
                 )
                 parts = [
                     cue.preset,
-                    f"{cue.framing} framing",
-                    f"{cue.camera_angle} camera angle",
+                    f"{framing} framing",
+                    f"{camera_angle} camera angle",
                     movement,
                 ]
                 executable_action = cue.h3_executable_action or cue.subject_action
+                if campus_bridge:
+                    executable_action = (
+                        "0.00-0.70s: from a campus-side frontal view, @P1 is already crossing the "
+                        "visible interior exit threshold so @P1's face and both eyes are clear. "
+                        "0.70-1.45s: @P1 sees the off-camera next subject, stops for one readable beat, "
+                        "widens the eyes, raises the brows and parts the mouth in unmistakable surprise. "
+                        "1.45-2.00s: while @P1 keeps that eyeline, the camera slides behind the adjacent "
+                        "solid corner wall or door frame until architecture covers the entire image. "
+                        "The face reveal, surprise reaction and full wipe are all mandatory."
+                    )
+                elif campus_composite:
+                    executable_action = (
+                        "Reveal every @P4 subject already occupying the same campus exterior that was "
+                        "established immediately before the wipe. Preserve the exact @P4 subject count, "
+                        "face, body, hair, wardrobe, accessories and relative arrangement. Transfer only "
+                        "those subjects from @P4; integrate their feet, shadows, scale, perspective and "
+                        "campus daylight naturally into the inherited campus. Use clear physical slow "
+                        "motion, then settle completely before the final 0.5-second hold."
+                    )
                 if street_fighter_prompt:
                     executable_action = compact_street_fighter_prompt_field(
                         executable_action, global_contracts=compact_global_contracts
@@ -19922,6 +20193,18 @@ class DirectorCutStudio(QMainWindow):
                         )
                     )
                 continuity_state = cue.continuity_state
+                if campus_bridge:
+                    continuity_state = (
+                        "Begin with exact @P1 identity and wardrobe at the exit threshold; preserve "
+                        "a clear frontal face and surprised eyeline through the reaction; end only when "
+                        "solid architecture covers every pixel."
+                    )
+                elif campus_composite:
+                    continuity_state = (
+                        "Inherit campus architecture, ground plane, daylight, camera height, horizon and "
+                        "view direction from the incoming 24-frame motion reference. Preserve @P4 only "
+                        "as subject identity and arrangement evidence, not as a background plate."
+                    )
                 if street_fighter_prompt:
                     continuity_state = compact_street_fighter_prompt_field(
                         continuity_state, global_contracts=compact_global_contracts
@@ -19934,6 +20217,17 @@ class DirectorCutStudio(QMainWindow):
                         )
                     )
                 environment_response = cue.environment_response
+                if campus_bridge:
+                    environment_response = (
+                        "Enclosed reflections fall away across the threshold while open campus air, "
+                        "daylight and exterior depth become visibly established before the wall wipe."
+                    )
+                elif campus_composite:
+                    environment_response = (
+                        "Campus sunlight relights every @P4 subject consistently; feet contact the campus "
+                        "ground, shadows follow one shared light direction, and atmospheric depth, colour "
+                        "temperature and reflections match the inherited outdoor scene."
+                    )
                 if street_fighter_prompt:
                     environment_response = compact_street_fighter_prompt_field(
                         environment_response, global_contracts=compact_global_contracts
@@ -19972,20 +20266,69 @@ class DirectorCutStudio(QMainWindow):
                         compacted = compacted[: limit - 1].rstrip(" ,;:") + "…"
                     return compacted
 
+                native_audio_direction = cue.native_audio_direction
+                environment_continuity = cue.environment_continuity
+                if reference_scene_reset:
+                    environment_continuity = (
+                        "Establish only the location tone implied by the active Picture from frame one; "
+                        "borrow no ambience, reflection tail, subject sound or spatial character from "
+                        "any earlier generated scene."
+                    )
+                elif campus_bridge:
+                    native_audio_direction = (
+                        "Acoustic space changes during the visible threshold crossing from an enclosed "
+                        "interior exit to an open campus exterior. Keep @A1 at its exact Timeline source "
+                        "time, with only synchronized footsteps, cloth movement and the natural change "
+                        "from short interior reflections to open-air ambience as diegetic sound."
+                    )
+                    environment_continuity = (
+                        "Perform one audible indoor-to-outdoor acoustic transition at the same frame as "
+                        "the visible doorway crossing; exterior ambience is established before the wipe."
+                    )
+                elif campus_composite:
+                    native_audio_direction = (
+                        "Acoustic space remains the same open campus exterior established by the preceding "
+                        "Shot. Keep @A1 at its exact Timeline source time and retain the same outdoor air, "
+                        "distant campus activity and speaking distance; add only visible subject Foley."
+                    )
+                    environment_continuity = (
+                        "Continue the preceding campus ambience, acoustic openness and distance without a "
+                        "room-tone reset while the new visible subjects appear after the wipe."
+                    )
                 parts.append(
                     "NATIVE AUDIO DIRECTION - "
-                    + compact_native_audio(cue.native_audio_direction, 360)
+                    + compact_native_audio(native_audio_direction, 360)
                     + ". Every sound belongs to a visible or established filmed-world source as diegetic sound"
                 )
                 parts.append(
                     "ENVIRONMENT CONTINUITY - "
-                    + compact_native_audio(cue.environment_continuity, 240)
+                    + compact_native_audio(environment_continuity, 240)
                 )
                 parts.append(
                     "AUDIO REFERENCE INTENT - "
                     + compact_native_audio(cue.audio_reference_intent, 220)
                 )
                 cue_detail = cue.detail
+                if reference_scene_reset:
+                    cue_detail = (
+                        "ACTIVE-PICTURE SCENE LOCK: use only the active Picture's visible subjects, "
+                        "complete background, terrain or architecture, object layout, sky or weather, "
+                        "palette, colour temperature, lighting, camera height, focal length, horizon "
+                        "and viewing angle. Add only source-consistent slow motion and a very small "
+                        "horizontal camera slide parallel to the original image plane."
+                    )
+                elif campus_bridge:
+                    cue_detail = (
+                        "MANDATORY CAMPUS BRIDGE: begin at the exit threshold, show @P1 physically "
+                        "crossing outside and rounding the adjacent corner, then finish on a complete "
+                        "wall-or-doorframe wipe. Allocate the entire Segment to this one causal bridge."
+                    )
+                elif campus_composite:
+                    cue_detail = (
+                        "P4 CAMPUS COMPOSITE: the incoming motion-reference frames own the complete campus "
+                        "environment and camera axis. @P4 owns only its visible subjects and their exact "
+                        "identity, wardrobe and arrangement. Relight and ground them inside that campus."
+                    )
                 if street_fighter_prompt:
                     cue_detail = compact_street_fighter_prompt_field(
                         cue_detail, global_contracts=compact_global_contracts
@@ -20068,8 +20411,8 @@ class DirectorCutStudio(QMainWindow):
                             min(cue.end_seconds, window_end)
                             if window_end is not None else cue.end_seconds
                         ),
-                        "native_audio_direction": cue.native_audio_direction,
-                        "environment_continuity": cue.environment_continuity,
+                        "native_audio_direction": native_audio_direction,
+                        "environment_continuity": environment_continuity,
                         "audio_reference_intent": cue.audio_reference_intent,
                     }
                 )
@@ -20278,6 +20621,8 @@ class DirectorCutStudio(QMainWindow):
         continuity: dict | None = None,
     ) -> str:
         """Build an H3 prompt whose timeline timestamps are local to one hidden segment."""
+        campus_bridge = False
+        campus_composite = False
         spec = self._prompt_spec_with_director_cues(
             self.prompt_panel.spec(),
             window_start=start,
@@ -20291,11 +20636,11 @@ class DirectorCutStudio(QMainWindow):
             # to every hidden H3 job makes each job attempt the whole story and
             # visually restart from the reference images. Always replace its
             # action summary with a strictly local generation brief.
-            local_shots = [
+            local_shots = self._coalesce_beat_synced_campus_bridge_cues([
                 cue for cue in self.director_cues
                 if cue.cue_type == "shot"
                 and ranges_intersect(cue.start_seconds, cue.end_seconds, start, end)
-            ]
+            ])
             local_layers = [
                 layer for layer in self.text_layers
                 if ranges_intersect(layer.start_seconds, layer.end_seconds, start, end)
@@ -20304,14 +20649,60 @@ class DirectorCutStudio(QMainWindow):
                 layer for layer in local_layers
                 if layer.content_role in {"dialogue", "voice_over", "lyrics"}
             ]
+            first_shot = min(
+                local_shots,
+                key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id),
+                default=None,
+            )
+            reference_scene_reset = self._is_reference_scene_reset_shot(first_shot)
+            campus_bridge = self._is_beat_synced_campus_bridge_shot(first_shot)
+            campus_composite = self._is_beat_synced_p4_campus_composite_shot(first_shot)
+            beat_synced_entrance = (
+                str(self.special_combo.currentData() or "").strip().casefold()
+                == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL
+            )
             brief_parts = [
                 f"Generate only the timeline interval from {start:.2f}s to {end:.2f}s "
                 f"as one {end - start:.2f}-second continuation.",
                 "Execute only the current Shot blocks listed below. Do not summarize, preview, "
                 "restart, recap, or perform any action scheduled outside this interval.",
-                "Begin in medias res on the first listed action and use the final frames only "
-                "to hand momentum into the next interval.",
+                (
+                    "Begin from the active Picture's independent scene on frame one; do not "
+                    "inherit the preceding segment's subject, set, geometry, lighting, ambience "
+                    "or camera state."
+                    if reference_scene_reset
+                    else "Begin in medias res on the first listed action and use the final frames only "
+                    "to hand momentum into the next interval."
+                ),
             ]
+            if beat_synced_entrance and any(cue.cue_id == "S1" for cue in local_shots):
+                # Runtime compatibility for projects saved before the stronger
+                # corridor-model contract was persisted by Design Apply.
+                brief_parts.append(
+                    "S1 CORRIDOR MODEL LOCK: models move at a relaxed, unhurried pace and perform "
+                    "grounded locker, book, conversation, shoulder-pat, watch-check or side-step "
+                    "activities instead of racing past. Each selected model turns head and upper "
+                    "torso to hold a clear frontal or three-quarter face toward the lens for "
+                    "1.0-1.5 seconds. No running, power-walking, fast crossing or back-only performance."
+                )
+            if campus_bridge:
+                brief_parts.append(
+                    "MANDATORY TWO-SECOND CAMPUS BRIDGE: frame one already shows the active P1 "
+                    "reference crossing the visible interior exit threshold into the campus exterior. "
+                    "P1 immediately rounds the adjacent campus corner toward the next encounter, and "
+                    "the solid corner wall or door frame sweeps across until it covers every pixel. "
+                    "Use the complete interval for this single continuous crossing-turn-wipe chain. "
+                    "The outdoor campus must become visible before the wipe."
+                )
+            if campus_composite:
+                brief_parts.append(
+                    "P4 CAMPUS COMPOSITE: continue from the incoming 24-frame campus motion reference. "
+                    "Those frames exclusively own the campus architecture, ground plane, daylight, "
+                    "camera height, horizon and viewing direction. The active P4 Picture exclusively "
+                    "owns its visible subject count, faces, bodies, hair, wardrobe, accessories and "
+                    "relative arrangement. Place and relight those P4 subjects inside the inherited "
+                    "campus with correct scale, ground contact and shared shadows."
+                )
             all_shots = sorted(
                 (cue for cue in self.director_cues if cue.cue_type == "shot"),
                 key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id),
@@ -20327,33 +20718,53 @@ class DirectorCutStudio(QMainWindow):
                       "history; never stage their opening pose, setup, attack, camera introduction "
                       "or environmental impact again."
                 )
-                previous_shot = max(
-                    (
-                        cue for cue in all_shots
-                        if cue.end_seconds <= start + 1e-6
-                    ),
-                    key=lambda cue: (cue.end_seconds, cue.start_seconds, cue.cue_id),
-                )
-                terminal_state = self._terminal_state_from_shot(previous_shot)
-                if terminal_state:
+                if not reference_scene_reset and not campus_bridge:
+                    if campus_composite:
+                        brief_parts.append(
+                            "Boundary state contract: the preceding campus-side Shot has already shown "
+                            "P1's surprised face and finished with an architectural wipe. The incoming "
+                            "24 silent frames carry only the established outdoor campus geometry, ground "
+                            "plane, daylight and camera axis into this Segment. Do not replay P1 or the wipe."
+                        )
+                    else:
+                        previous_shot = max(
+                            (
+                                cue for cue in all_shots
+                                if cue.end_seconds <= start + 1e-6
+                            ),
+                            key=lambda cue: (cue.end_seconds, cue.start_seconds, cue.cue_id),
+                        )
+                        terminal_state = self._terminal_state_from_shot(previous_shot)
+                        if terminal_state:
+                            brief_parts.append(
+                                "Boundary state contract: "
+                                f"{previous_shot.cue_id} has already finished with {terminal_state} "
+                                "Use that only as the inherited physical state immediately before frame "
+                                "one. Begin with the next action; do not show, reconstruct, hold or replay "
+                                "the completed terminal pose."
+                            )
+            if first_shot is not None:
+                if reference_scene_reset:
                     brief_parts.append(
-                        "Boundary state contract: "
-                        f"{previous_shot.cue_id} has already finished with {terminal_state} "
-                        "Use that only as the inherited physical state immediately before frame "
-                        "one. Begin with the next action; do not show, reconstruct, hold or replay "
-                        "the completed terminal pose."
+                        f"REFERENCE SCENE RESET at {first_shot.cue_id}: the active Picture is the "
+                        "sole full-scene authority. Preserve its visible subjects, complete background, "
+                        "terrain or architecture, object layout, sky or weather, palette, colour "
+                        "temperature and lighting. Use no prior motion-context frames and reconstruct "
+                        "no location from an earlier Shot. Use only a very slow horizontal camera "
+                        "slide parallel to the original image plane while camera height, optical axis, "
+                        "yaw, pitch, roll, focal length, horizon and viewing angle stay fixed from "
+                        "the first frame through the Final Hold."
                     )
-            if local_shots:
-                first_shot = min(
-                    local_shots,
-                    key=lambda cue: (cue.start_seconds, cue.end_seconds, cue.cue_id),
-                )
                 brief_parts.append(
                     f"The first visible event belongs to {first_shot.cue_id}, "
                     f"{first_shot.preset.strip() or first_shot.cue_id}. "
-                    "Enter its already-in-progress physical state in the "
-                    "first second; do not insert an establishing view, neutral ready pose, or "
-                    "reference-image tableau before it."
+                    + (
+                        "Animate directly from the active Picture's source-authentic state; do not "
+                        "reinterpret its location or import a preceding set."
+                        if reference_scene_reset
+                        else "Enter its already-in-progress physical state in the first second; do not "
+                        "insert an establishing view, neutral ready pose, or reference-image tableau before it."
+                    )
                 )
             brief_parts.append(
                 "Reference images define identity, props, geography and explicitly assigned visual "
@@ -20365,10 +20776,27 @@ class DirectorCutStudio(QMainWindow):
                 "A name or place that survives only inside a project-global modifier is inactive "
                 "continuity metadata; never introduce it into this segment."
             )
-            local_roles = [
-                f"{asset.tag}: {' '.join(asset.clip_prompt.split())[:260]}"
-                for asset in assets if asset.clip_prompt.strip()
-            ]
+            if campus_bridge:
+                local_roles = [
+                    f"{asset.tag}: exact P1 identity and wardrobe authority for the threshold crossing"
+                    for asset in assets if asset.media_type == "image"
+                ] + [
+                    f"{asset.tag}: continuous Master Audio source window at this Timeline position"
+                    for asset in assets if asset.media_type == "audio"
+                ]
+            elif campus_composite:
+                local_roles = [
+                    f"{asset.tag}: P4 subject identity, wardrobe, subject count and arrangement only"
+                    for asset in assets if asset.media_type == "image"
+                ] + [
+                    f"{asset.tag}: continuous Master Audio source window at this Timeline position"
+                    for asset in assets if asset.media_type == "audio"
+                ]
+            else:
+                local_roles = [
+                    f"{asset.tag}: {' '.join(asset.clip_prompt.split())[:260]}"
+                    for asset in assets if asset.clip_prompt.strip()
+                ]
             if local_roles:
                 brief_parts.append("Reference roles: " + "; ".join(local_roles) + ".")
             image_assets = [asset for asset in assets if asset.media_type == "image"]
@@ -20534,12 +20962,135 @@ class DirectorCutStudio(QMainWindow):
                 brief_parts.append("Finish on this segment's Timeline Ending Hold marker.")
             state = asdict(spec)
             state["brief"] = " ".join(brief_parts)
+            if reference_scene_reset:
+                # A full-scene reset receives a positive-only local contract.
+                # Global Design fields legitimately describe earlier Shots,
+                # but even negative phrases naming the old set can make H3
+                # rebuild it in an otherwise isolated Picture-only Segment.
+                state["style"] = (
+                    "Match the active Picture's exact visual medium, subjects, complete background, "
+                    "geometry, palette, colour temperature, lighting, lens perspective and viewing angle."
+                )
+                state["references"] = (
+                    "The active Picture is the sole visual and spatial source for this Segment. "
+                    "Keep every visible subject and background element in its original relationship."
+                )
+                state["audio"] = (
+                    "Continue only the active Timeline audio at its matching source time. Derive any "
+                    "quiet diegetic sound solely from surfaces and motion visible in the active Picture."
+                )
+                state["music"] = (
+                    "Use only the active Timeline Master Audio at normal speed; generate no replacement score."
+                )
+                state["transition"] = (
+                    "Begin directly on the active Picture after a fully covered architectural wipe; "
+                    "do not reconstruct the previous view."
+                )
+                state["must_keep"] = (
+                    "Preserve the active Picture's original subjects, complete background, object layout, "
+                    "sky, lighting and viewing angle. Use only a very small slow horizontal slide "
+                    "parallel to the original image plane, with the optical axis and framing fixed. "
+                    "Add no person, location replacement, text, logo or watermark."
+                )
+                state["technical"] = (
+                    "Stable source-faithful geometry and identity; no reframing, perspective redesign, "
+                    "duplicate subject, flicker, morph or unrelated visible element."
+                )
+                state["ending"] = (
+                    "Finish the slow source-consistent motion, then hold the unchanged active-Picture "
+                    "view steadily for the final 0.5 second."
+                )
+            elif campus_bridge:
+                # Saved projects may still carry the former global rule that
+                # described all early beats as one continuous hallway. Give
+                # the dedicated bridge a local-only positive contract so H3
+                # cannot spend its two seconds extending the prior encounter.
+                state["style"] = (
+                    "Photoreal live-action threshold crossing from an enclosed interior exit into a "
+                    "real open campus exterior, with natural daylight adaptation and stable identity."
+                )
+                state["references"] = (
+                    "The active P1 Picture is the sole character-identity and wardrobe authority. "
+                    "Generate only the doorway, immediately adjacent campus corner and exterior depth."
+                )
+                state["audio"] = (
+                    "Continue the active A1 Timeline source window unchanged. Add only synchronized "
+                    "footsteps, clothing movement and the audible indoor-to-outdoor ambience change."
+                )
+                state["music"] = "Use only the active A1 Timeline source window at normal speed."
+                state["transition"] = (
+                    "Begin already crossing the exit threshold; establish exterior campus space; end "
+                    "with the adjacent solid corner completing a full-frame architectural wipe."
+                )
+                state["must_keep"] = (
+                    "Exact active-P1 identity and wardrobe; visible threshold crossing; visibly outdoor "
+                    "campus before the turn; one adjacent-corner turn; complete wall or door-frame wipe."
+                )
+                state["technical"] = (
+                    "Start the crossing on frame one. Preserve continuous feet, heading and screen "
+                    "direction. Complete the wipe by the last frame. Render no text, logo or watermark."
+                )
+                state["ending"] = "End with solid architecture covering the entire image."
+            elif campus_composite:
+                state["style"] = (
+                    "Match the established photoreal campus exterior, daylight, colour temperature, "
+                    "ground plane, atmospheric depth and camera axis from the incoming motion reference."
+                )
+                state["references"] = (
+                    "Incoming motion-reference frames are the sole environment source. The active P4 "
+                    "Picture supplies only exact visible-subject identity, wardrobe, count and arrangement."
+                )
+                state["audio"] = (
+                    "Continue the active A1 source window and the established outdoor campus ambience. "
+                    "Add only visible, synchronized subject Foley at matching camera distance."
+                )
+                state["music"] = "Use only the active A1 Timeline source window at normal speed."
+                state["transition"] = (
+                    "Begin as the preceding architectural wipe clears to reveal the same campus exterior "
+                    "with the P4 subjects naturally present inside it."
+                )
+                state["must_keep"] = (
+                    "Exact P4 subject identities, count, wardrobe and arrangement integrated into the "
+                    "inherited campus; shared perspective, ground contact, daylight and shadows; very slow "
+                    "horizontal camera slide; stable final 0.5-second hold."
+                )
+                state["technical"] = (
+                    "Preserve the incoming campus geometry and camera axis. Render one coherent composite "
+                    "scene with stable identity and anatomy and no text, logo or watermark."
+                )
+                state["ending"] = (
+                    "Finish the P4 subjects' source-consistent slow motion, then hold the integrated campus "
+                    "composition steadily for the final 0.5 second."
+                )
             spec = PromptSpec(**state)
         prompt_assets: list[MediaAsset] = []
         for asset in assets:
             clone = MediaAsset(**asdict(asset))
             clone.start_seconds = round(max(start, asset.start_seconds) - start, 6)
             clone.end_seconds = round(min(end, asset.end_seconds) - start, 6)
+            if campus_bridge:
+                if clone.media_type == "image":
+                    clone.clip_prompt = (
+                        "Use this active Picture only as the exact P1 face, body, hair, wardrobe "
+                        "and accessory authority during the visible threshold crossing."
+                    )
+                elif clone.media_type == "audio":
+                    clone.clip_prompt = (
+                        "Play only this Segment's matching Timeline source window as continuous "
+                        "Master Audio at normal speed."
+                    )
+            elif campus_composite:
+                if clone.media_type == "image":
+                    clone.clip_prompt = (
+                        "Use this active Picture only for exact P4 visible-subject identity, face, body, "
+                        "hair, wardrobe, accessories, subject count and relative arrangement. Integrate "
+                        "those subjects into the campus supplied by the incoming motion reference."
+                    )
+                elif clone.media_type == "audio":
+                    clone.clip_prompt = (
+                        "Play only this Segment's matching Timeline source window as continuous Master "
+                        "Audio at normal speed."
+                    )
             prompt_assets.append(clone)
         continuity = continuity or {}
         prompt_assets, continuity_tag = effective_reference_assets(
@@ -21041,6 +21592,9 @@ class DirectorCutStudio(QMainWindow):
             assets = self._prepare_windowed_tts_audio(
                 assets, core_start, core_end
             )
+            assets = self._prepare_windowed_reference_audio(
+                assets, core_start, core_end
+            )
             uploads = media_upload_manifest(assets)
             patch_media_upload_names(compiled, uploads)
             segment.fingerprint = fingerprint
@@ -21227,6 +21781,80 @@ class DirectorCutStudio(QMainWindow):
             asset.filename = destination.name
         return clones
 
+    def _prepare_windowed_reference_audio(
+        self,
+        assets: list[MediaAsset],
+        start: float,
+        end: float,
+    ) -> list[MediaAsset]:
+        """Give each H3 Segment the matching slice of continuous Timeline audio.
+
+        ComfyUI starts every uploaded audio file at local time zero. Uploading the
+        full A1 file for every hidden Segment therefore restarts the music after a
+        Segment boundary. Physically window ordinary, full-coverage Timeline audio
+        before upload, while leaving authored TTS to its dedicated path and keeping
+        H3's generated ambience untouched.
+        """
+
+        clones = [deepcopy(asset) for asset in assets]
+        duration = max(0.01, end - start)
+        cache = CACHE_ROOT / "reference_audio_windows"
+        cache.mkdir(parents=True, exist_ok=True)
+        for asset in clones:
+            if (
+                asset.media_type != "audio"
+                or "AI DESIGN AUTHORED SPEECH TTS" in str(asset.recognition or "")
+                or float(asset.playback_speed or 1.0) != 1.0
+                or float(asset.start_seconds) > start + 1e-6
+                or float(asset.end_seconds) < end - 1e-6
+            ):
+                continue
+            source = Path(str(asset.local_path or ""))
+            if not source.is_file():
+                continue
+            source_offset = max(
+                0.0,
+                float(asset.source_in_seconds or 0.0)
+                + start - float(asset.start_seconds or 0.0),
+            )
+            # A full-span single H3 request already begins at the correct source
+            # position and needs no extra lossless PCM cache copy.
+            if source_offset <= 1e-6 and abs(duration - float(asset.end_seconds - asset.start_seconds)) <= 1e-6:
+                continue
+            source_key = (
+                f"{source.resolve()}|{source.stat().st_mtime_ns}|"
+                f"{source_offset:.6f}|{duration:.6f}|{asset.reference_id}|{asset.node_id}"
+            )
+            digest = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:20]
+            destination = cache / f"audio_{digest}_{start:.3f}-{end:.3f}.wav"
+            if not destination.is_file() or destination.stat().st_size <= 44:
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                completed = subprocess.run(
+                    [
+                        str(self.runtime.ffmpeg), "-y", "-ss", f"{source_offset:.6f}",
+                        "-i", str(source), "-af", f"apad=whole_dur={duration:.6f}",
+                        "-t", f"{duration:.6f}", "-ar", "48000", "-ac", "2",
+                        "-c:a", "pcm_s16le", str(destination),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    creationflags=creation_flags,
+                    timeout=max(60, int(duration * 4)),
+                )
+                if completed.returncode or not destination.is_file():
+                    detail = completed.stderr.decode("utf-8", errors="replace")[-1000:]
+                    raise RuntimeError(
+                        "Could not prepare continuous segment reference audio: " + detail
+                    )
+            asset.local_path = str(destination.resolve())
+            asset.filename = destination.name
+            asset.source_duration_seconds = duration
+            asset.source_in_seconds = 0.0
+            asset.source_out_seconds = duration
+            asset.start_seconds = start
+            asset.end_seconds = end
+        return clones
+
     def _compiled_job(
         self,
         *,
@@ -21296,7 +21924,10 @@ class DirectorCutStudio(QMainWindow):
                     enable_rtx_vsr=enable_rtx_vsr,
                 ),
             )
-            return compiled, self._prepare_windowed_tts_audio(
+            compiled_assets = self._prepare_windowed_tts_audio(
+                compiled_assets, start, end
+            )
+            return compiled, self._prepare_windowed_reference_audio(
                 compiled_assets, start, end
             )
         finally:

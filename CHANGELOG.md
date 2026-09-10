@@ -20,6 +20,22 @@ Every user-visible correction receives an application version and a dated entry 
 - Explicit Media Pool references remain the highest visual evidence. Missing identity or scene facts may be designed from the current story without inventing `@P/@V/@A` IDs or generating one reference image for every Shot.
 - Speech is compressed before the Timeline is extended; if further compression would damage natural delivery or the central reversal, the owning Shot and all downstream ranges extend together so no speech-only Segment is created.
 
+### Beat-synchronized 18-second character entrance
+
+- Added the Default-bound `beat-synced-entrance-18s` Special Skill with English/Chinese instructions and an auto-filled Design Requirement requiring P1, P2, P3, P4 and A1.
+- Corrected the reusable grammar to five causally connected beats: P1 walks around a real corridor corner and meets P2; P2 continues around a second corner and meets P3; an eyeline cut returns to P1, who physically exits to campus and completes an architectural wipe before P4 appears.
+- Added a deterministic Design normalizer for this Skill so stale or contradictory model output cannot silently turn P3 into architecture, omit P3, keep fashion-model faces turned away, leak identities across beats, request a redundant corridor image, or describe slow camera movement as final-scene slow motion.
+- Passing models now turn naturally toward the lens for a short readable interval. During the campus bridge, the camera faces P1 from outside: P1 crosses the threshold with both eyes readable, shows an unmistakable surprised expression, and only then completes the architectural wipe.
+- Added physical per-Segment audio source windowing for ordinary Timeline references. A later H3 Segment now uploads the matching A1 source slice instead of the complete file from source zero, preventing the reproduced 13-second music restart while preserving H3-native ambience and Foley.
+- Bumped the internal Smart Render policy to invalidate previously cached Segments built with the restarted-audio behavior; no application version or project-format migration is required.
+- Reworked the opening corridor extras as slow, readable activity performers instead of fast passers. Models now use locker/book handling, conversation, shoulder contact, watch checks and side-stepping, while holding a frontal or three-quarter face toward the lens for 1.0–1.5 seconds.
+- Replaced the earlier full-scene P4 reset after reviewing `a_cartoon_character_with_headphones_on_5`. The final Segment now receives the bridge's final 24 silent frames as campus Motion Reference; those frames own the environment, ground plane, daylight and camera axis, while P4 owns only its visible subject identity, appearance, count and arrangement.
+- Added source-isolated P4 campus compositing instructions. P4's original background is discarded, and its subjects are relit and grounded into the inherited campus with coherent scale, perspective, foot contact, shared shadows, colour temperature and atmospheric depth. The final camera uses a very slow horizontal slide instead of FPV or orbit.
+- Fixed the missing 11.50–13.50-second causal bridge found in `a_cartoon_character_with_headphones_on_4`. Although the Timeline contained the P1 corridor-exit Shot, the former 0.00–13.50 H3 request spent its action budget on three character encounters and omitted the final two-second transition.
+- The entrance Skill now compiles exactly three Render Segments: 0.00–11.50, 11.50–13.50 and 13.50–18.00 seconds. The middle Segment hard-resets to P1, starts with P1 already crossing the exit, visibly establishes the outdoor campus, rounds the adjacent corner and ends only after a full architectural wipe.
+- Removed the contradictory template rule that required the corridor to remain unchanged through Beat 4. Corridor continuity now ends after Beat 3; Beat 4 explicitly performs the indoor-to-outdoor change.
+- Raised Smart Render policy to 21 so Segments cached under the former encounter, back-only campus exit and full-scene P4 reset grammar are regenerated instead of being silently reused.
+
 ### Compatibility and verification
 
 - Raised Director Project format from `23` to `24` for the persisted Text Layer overlap policy. The addition is backward compatible; no media, Take or approved Segment file is deleted during migration.

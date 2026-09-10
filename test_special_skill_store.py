@@ -184,6 +184,28 @@ class SpecialSkillStoreTests(unittest.TestCase):
         self.assertIn("只有语音却没有Shot", template)
         self.assertIn("不得虚构素材编号", template)
 
+    def test_beat_synced_entrance_skill_locks_master_audio_and_reference_roles(self):
+        root = Path(__file__).parent / "skill special" / "beat-synced-entrance-18s"
+        document = load_special_skill_document(root)
+        validate_special_skill_document(document)
+        english = (root / "SKILL.md").read_text(encoding="utf-8")
+        chinese = (root / "SKILL.cn.md").read_text(encoding="utf-8")
+        template = (root / "DESIGN_REQUIREMENT.txt").read_text(encoding="utf-8")
+        self.assertEqual(document.key, "beat-synced-entrance-18s")
+        self.assertIn("0.00–6.50s", english)
+        self.assertIn("P3 is a person or featured visual beat", english)
+        self.assertIn("P3不是走廊图", chinese)
+        for reference in ("@P1", "@P2", "@P3", "@P4", "@A1"):
+            self.assertIn(reference, template)
+        self.assertIn("P3不是走廊图", template)
+        self.assertIn("P3用于9.00–11.00秒", template)
+        self.assertIn("走廊由H3生成", chinese)
+        self.assertIn("Source In 15.00秒", template)
+        self.assertIn("45–60%", template)
+        self.assertIn("non_diegetic_music设为N/A", template)
+        self.assertIn("不得生成额外背景音乐", template)
+        self.assertIn("禁止播放按钮", template)
+
 
 if __name__ == "__main__":
     unittest.main()

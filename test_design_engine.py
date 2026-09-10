@@ -9,6 +9,7 @@ from design_cleanup_service import cleanup, lm_origin, unload_lm_studio
 from design_ai_service import handle as handle_design_ai_job, select_available_model
 from drone_route_engine import analyse_red_route
 from design_engine import (
+    BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
     DESIGN_JSON_SCHEMA,
     DRONE_FIREWORKS_STILL_CONTRACT,
     DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT,
@@ -3491,6 +3492,113 @@ On-screen text: "EXACT TITLE"'''
             self.assertEqual(len(saved["media_requests"]), 1)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+    def test_beat_synced_entrance_repairs_p3_audio_slow_motion_and_reference_ranges(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 18.0
+        payload["shots"] = [
+            {**payload["shots"][0], "start_seconds": 0.0, "end_seconds": 8.0,
+             "additional_direction": "@P3 defines the corridor. No extra may look directly into camera for longer than 0.3 seconds."},
+            {**payload["shots"][1], "start_seconds": 8.0, "end_seconds": 11.0},
+            {**payload["shots"][1], "start_seconds": 11.0, "end_seconds": 13.0},
+            {**payload["shots"][1], "start_seconds": 13.0, "end_seconds": 18.0,
+             "movement_speed": "Slow camera truck"},
+        ]
+        payload["existing_media_uses"] = [
+            {
+                "requirement_id": f"legacy_{media_id.lower()}", "media_id": media_id,
+                "media_type": "audio" if media_id == "A1" else "image",
+                "usage": "h3_reference", "reuse_policy": "whole_design",
+                "start_seconds": 0.0, "end_seconds": 18.0,
+                "track": "A1" if media_id == "A1" else "V1",
+                "subject_keywords": [],
+                "instruction": "P3 is the corridor" if media_id == "P3" else "legacy",
+            }
+            for media_id in ("P1", "P2", "P3", "P4", "A1")
+        ]
+        payload["media_requests"] = [{
+            "requirement_id": "unwanted_corridor",
+            "media_type": "image", "usage": "h3_reference",
+            "reuse_policy": "time_scoped", "start_seconds": 0.0,
+            "end_seconds": 8.0, "track": "V5",
+            "subject_keywords": ["corridor"],
+            "prompt": "Photoreal corridor, no visible people.",
+        }]
+        inventory = [
+            {
+                "media_id": media_id,
+                "media_type": "audio" if media_id == "A1" else "image",
+                "loaded": True,
+            }
+            for media_id in ("P1", "P2", "P3", "P4", "A1")
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            special_skill_key=BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
+        )
+
+        self.assertEqual(len(plan["shots"]), 5)
+        self.assertEqual(
+            [(row["start_seconds"], row["end_seconds"]) for row in plan["shots"]],
+            [(0.0, 6.0), (6.0, 9.0), (9.0, 11.5), (11.5, 13.5), (13.5, 18.0)],
+        )
+        self.assertIn("physically rounds", plan["shots"][1]["subject_action"])
+        self.assertIn("notices and passes @P2", plan["shots"][1]["subject_action"])
+        self.assertIn("clearing real corner geometry", plan["shots"][1]["additional_direction"])
+        self.assertIn("physically rounds", plan["shots"][2]["subject_action"])
+        self.assertIn("camera settles on @P3", plan["shots"][2]["subject_action"])
+        self.assertIn("never an environment", plan["shots"][2]["additional_direction"])
+        self.assertIn("1.0-1.5 seconds", plan["shots"][0]["additional_direction"])
+        self.assertIn("opens or closes a locker", plan["shots"][0]["additional_direction"])
+        self.assertIn("checking a watch", plan["shots"][0]["additional_direction"])
+        self.assertIn("no running", plan["shots"][0]["additional_direction"].lower())
+        self.assertIn("45-60%", plan["shots"][-1]["movement_speed"])
+        self.assertIn("preceding campus as the sole environment", plan["shots"][-1]["environment_response"])
+        self.assertIn("shared contact shadows", plan["shots"][-1]["environment_response"])
+        self.assertIn("Very slow horizontal slide", plan["shots"][-1]["camera_movement"])
+        self.assertIn("viewing direction stable", plan["shots"][-1]["camera_movement"])
+        self.assertNotIn("fpv", plan["shots"][-1]["camera_movement"].lower())
+        self.assertNotIn("orbit", plan["shots"][-1]["camera_movement"].lower())
+        self.assertEqual(plan["shots"][-1]["continuity_mode"], "Motion Reference")
+        self.assertIn("CAMPUS COMPOSITE", plan["shots"][-1]["location_transition"])
+        self.assertIn("incoming motion-reference frames", plan["shots"][-1]["additional_direction"])
+        self.assertIn("subject identity", plan["shots"][-1]["additional_direction"])
+        self.assertIn("INDOOR", plan["shots"][3]["location_transition"])
+        self.assertIn("OUTDOOR", plan["shots"][3]["location_transition"])
+        self.assertIn("face and both eyes clear", plan["shots"][3]["subject_action"])
+        self.assertIn("unmistakable surprise", plan["shots"][3]["subject_action"])
+        self.assertIn("full-frame wipe", plan["shots"][3]["subject_action"])
+        self.assertEqual(plan["shots"][3]["continuity_mode"], "Hard Cut")
+        transition_presets = [row["preset"] for row in plan["transitions"]]
+        self.assertEqual(
+            transition_presets,
+            [
+                "Corridor Corner Reveal",
+                "Corridor Corner Reveal",
+                "Eyeline Continuity Cut",
+                "Architectural Occlusion Scene Cut",
+            ],
+        )
+        self.assertEqual(plan["media_requests"], [])
+        p3 = [row for row in plan["existing_media_uses"] if row["media_id"] == "P3"]
+        self.assertEqual([(row["start_seconds"], row["end_seconds"]) for row in p3], [(9.0, 11.5)])
+        p1 = [row for row in plan["existing_media_uses"] if row["media_id"] == "P1"]
+        self.assertEqual(
+            [(row["start_seconds"], row["end_seconds"]) for row in p1],
+            [(0.0, 9.0), (11.5, 13.5)],
+        )
+        p2 = [row for row in plan["existing_media_uses"] if row["media_id"] == "P2"]
+        self.assertEqual([(row["start_seconds"], row["end_seconds"]) for row in p2], [(6.0, 11.5)])
+        self.assertTrue(all(row["reuse_policy"] == "time_scoped" for row in p1 + p3))
+        a1 = next(row for row in plan["existing_media_uses"] if row["media_id"] == "A1")
+        self.assertIn("Segment's Timeline start", a1["instruction"])
+        p4 = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P4")
+        self.assertIn("P4 SUBJECT COMPOSITE", p4["instruction"])
+        self.assertIn("do not use @P4 as a background plate", p4["instruction"])
 
 
 if __name__ == "__main__":
