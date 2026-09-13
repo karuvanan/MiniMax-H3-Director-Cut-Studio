@@ -1,0 +1,7 @@
+name: MTV Singing H3
+version: 1.0.0
+category: music-video
+default_duration_seconds: 12.0
+required_media: [P1, P2, P3, P4, A1]
+generated_media: [P5, P6, P7, P8, P9]
+master_audio: A1
