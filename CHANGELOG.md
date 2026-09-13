@@ -11,6 +11,8 @@ Every user-visible correction receives an application version and a dated entry 
 - 本机首次安装受严格的单卡显存门槛保护：必须大于 16GB VRAM；安装使用独立 Python 3.10 runtime 与 `models/SoulX-Singer-main`，避免污染 Studio、ACE-Step 或 H3 环境。
 - SoulX 转换与安装期间显示全窗口半透明遮罩及青色旋转加载圈，阻止重复点击并清楚提示当前阶段。
 - `UNLOAD ALL` 与转换后的清理会先探测 SoulX 卸载 endpoint；官方原始 WebUI 没有该 endpoint 时明确提示需停止／重启 SoulX server，不虚报已经释放显存。本项目自带的 Studio wrapper 提供本机 `/_unload_svc`。
+- 修复 Windows 主机安装在包含空格的项目路径时被 `webrtcvad==2.0.10` C 扩展编译阻断的问题；Windows 改用提供相同 `webrtcvad` 导入名的 `webrtcvad-wheels==2.0.14`，Linux/macOS 继续使用官方依赖。
+- 修复 Studio-managed SoulX wrapper 将 Gradio 回调名称改成 `lazy_start_svc` 后，Client 仍只查找 `/_start_svc` 而拒绝转换的问题。Wrapper 现在保留官方回调名称，Client 也会按完整参数合约发现兼容 endpoint，可连接修复前仍在运行的 `/lazy_start_svc` 服务。
 
 ### ACE-Step 1.5 Music Workbench
 

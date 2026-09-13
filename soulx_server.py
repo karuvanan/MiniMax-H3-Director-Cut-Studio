@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import wraps
 import gc
 import os
 from pathlib import Path
@@ -60,6 +61,7 @@ def build_page(*, use_fp16: bool = True):
             if getattr(upstream, "APP_STATE", None) is None:
                 upstream.APP_STATE = upstream.AppState(use_fp16=use_fp16)
 
+    @wraps(original_start_svc)
     def lazy_start_svc(
         prompt_audio,
         target_audio,
@@ -114,4 +116,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

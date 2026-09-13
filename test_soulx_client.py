@@ -33,6 +33,21 @@ class SoulXClientTest(unittest.TestCase):
         parameters.extend(soulx_client.EXPECTED_CORE_PARAMETERS[6:])
         self.assertEqual(soulx_client.validate_svc_api(_info(parameters)), parameters)
 
+    def test_wrapper_callback_alias_is_discovered_by_contract(self) -> None:
+        parameters = list(soulx_client.EXPECTED_CORE_PARAMETERS)
+        info = {
+            "named_endpoints": {
+                "/lazy_start_svc": {
+                    "parameters": [
+                        {"parameter_name": name} for name in parameters
+                    ]
+                }
+            }
+        }
+        endpoint, discovered = soulx_client.discover_svc_endpoint(info)
+        self.assertEqual(endpoint, "/lazy_start_svc")
+        self.assertEqual(discovered, parameters)
+
     def test_missing_required_parameter_is_rejected(self) -> None:
         parameters = [
             name for name in soulx_client.EXPECTED_CORE_PARAMETERS if name != "target_audio"

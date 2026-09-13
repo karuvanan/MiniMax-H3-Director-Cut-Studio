@@ -18,6 +18,12 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 DEFAULT_SOULX_SERVER = os.getenv("SOULX_API_URL", "http://192.168.0.185:7861")
 SVC_API_NAME = "/_start_svc"
+SVC_ENDPOINT_ALIASES = (
+    SVC_API_NAME,
+    "/lazy_start_svc",
+    "/start_svc",
+    "/predict",
+)
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "soulx_singer"
 EXPECTED_CORE_PARAMETERS = (
     "prompt_audio",
@@ -87,8 +93,42 @@ def endpoint_parameters(info: dict[str, Any], api_name: str = SVC_API_NAME) -> l
     ]
 
 
+def discover_svc_endpoint(info: dict[str, Any]) -> tuple[str, list[str]]:
+    """Find the SVC endpoint by name first, then by its parameter contract.
+
+    Gradio derives an API name from the callback name when the upstream UI does
+    not provide ``api_name`` explicitly. Older Studio wrappers therefore exposed
+    ``/lazy_start_svc`` while the original callback normally exposes
+    ``/_start_svc``. The parameter contract is the stable part of this API.
+    """
+
+    endpoints = info.get("named_endpoints") if isinstance(info, dict) else None
+    if not isinstance(endpoints, dict):
+        return "", []
+
+    by_folded = {str(name).casefold(): str(name) for name in endpoints}
+    for candidate in SVC_ENDPOINT_ALIASES:
+        actual = by_folded.get(candidate.casefold())
+        if actual:
+            return actual, endpoint_parameters(info, actual)
+
+    best_name = ""
+    best_parameters: list[str] = []
+    best_score = 0
+    for name in endpoints:
+        parameters = endpoint_parameters(info, str(name))
+        score = sum(parameter in parameters for parameter in EXPECTED_CORE_PARAMETERS)
+        if score > best_score:
+            best_name = str(name)
+            best_parameters = parameters
+            best_score = score
+    if best_score >= max(6, len(EXPECTED_CORE_PARAMETERS) - 2):
+        return best_name, best_parameters
+    return "", []
+
+
 def validate_svc_api(info: dict[str, Any]) -> list[str]:
-    parameters = endpoint_parameters(info)
+    _endpoint, parameters = discover_svc_endpoint(info)
     if not parameters:
         raise RuntimeError(f"SoulX endpoint {SVC_API_NAME} is not available")
     missing = [name for name in EXPECTED_CORE_PARAMETERS if name not in parameters]
@@ -216,6 +256,7 @@ def convert_singing_voice(
         raise FileNotFoundError(f"Source song is missing: {target_path}")
 
     endpoint_info = fetch_api_info(server, timeout)
+    endpoint_name, _ = discover_svc_endpoint(endpoint_info)
     parameters = validate_svc_api(endpoint_info)
     try:
         from gradio_client import handle_file
@@ -247,7 +288,7 @@ def convert_singing_voice(
             "SoulX server requires unsupported parameter(s): " + ", ".join(missing_values)
         )
     client = _gradio_client(server)
-    result = client.predict(api_name=SVC_API_NAME, **kwargs)
+    result = client.predict(api_name=endpoint_name, **kwargs)
     generated = _result_path(result)
     if not generated:
         raise RuntimeError("SoulX completed without returning a downloadable audio file")

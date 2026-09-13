@@ -160,6 +160,20 @@ Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF
 
 `Request server model unload after conversion` 默认开启。Studio 会先检查 Server 是否真的公开卸载 endpoint；支持时才会报告已卸载。官方原始 `webui_svc.py` 只公开转换 endpoint，如果状态栏提示 `no unload endpoint`，代表模型仍可能占用 Server VRAM，必须停止／重启 SoulX launcher，或在 Server 版本加入卸载 endpoint 后再运行 MiniMax H3。关闭窗口本身不等于释放远端显存。
 
+#### Windows SoulX 安装失败：`Failed to build webrtcvad==2.0.10`
+
+如果日志停在 `building '_webrtcvad' extension`、`Cannot open compiler generated file`，通常不是 CUDA 或 SoulX 模型损坏，而是上游 `webrtcvad` 在 Windows 项目路径中尝试编译 C 扩展。v0.3.5-alpha.1 已将 Windows 隔离环境改为使用 `webrtcvad-wheels==2.0.14`（仍提供 `webrtcvad` 导入名），Linux/macOS 才使用原始 `webrtcvad==2.0.10`。请重新执行：
+
+```powershell
+.\start_soulx_server.bat
+```
+
+不需要删除已经建立的 Python 3.10 环境；启动器会复用环境并补齐依赖。若仍失败，请查看 `logs/soulx_api.stderr.log`，不要把 SoulX 依赖安装到 Studio 的共用 Python 环境。
+
+#### SoulX 已启动但提示 `endpoint /_start_svc is not available`
+
+这是旧版 Studio wrapper 把 Gradio callback 暴露为 `/lazy_start_svc` 所致，不代表模型缺失。v0.3.5-alpha.1 会按 SVC 的完整参数合约自动发现 `/_start_svc`、`/lazy_start_svc` 或其他兼容 endpoint，同时新启动的 wrapper 会保留官方 `/_start_svc` 名称。更新代码并重新打开 Studio 即可使用；建议同时重启 SoulX Server，让 endpoint 名称恢复为标准格式。
+
 ## 推荐的模型目录结构
 
 ```text

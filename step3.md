@@ -31,6 +31,8 @@
    models/SoulX-Singer-main/pretrained_models/SoulX-Singer-Preprocess/
    ```
 
+   Windows 会使用 `webrtcvad-wheels` 的预编译包，避免在包含空格的 Windows 项目路径中编译 `webrtcvad` C 扩展；它提供相同的 `webrtcvad` Python 导入名。
+
 5. 安装完成后 Studio 会显示：
 
    ```text
@@ -63,6 +65,8 @@ http://127.0.0.1:7861/gradio_api/info
 logs/soulx_api.stdout.log
 logs/soulx_api.stderr.log
 ```
+
+旧版 wrapper 可能显示 `/lazy_start_svc`。v0.3.5-alpha.1 Client 会根据完整参数合约识别它，因此不会再阻止转换；重启新版 SoulX Server 后会恢复标准 `/_start_svc` 名称。
 
 Studio 下次启动时会检查源码、隔离 Python、SVC checkpoint 和预处理模型。四者齐全就自动进入 Server Mode，并通过 `run_soulx_api_hidden.ps1` 静默启动，不需要在 Windows 登录时注册计划任务。
 

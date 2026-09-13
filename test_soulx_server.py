@@ -4,12 +4,23 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from functools import wraps
 from unittest.mock import patch
 
 from soulx_server import release_soulx_models
 
 
 class SoulXServerTest(unittest.TestCase):
+    def test_wraps_preserves_canonical_svc_callback_name(self) -> None:
+        def _start_svc(value):
+            return value
+
+        @wraps(_start_svc)
+        def lazy_start_svc(value):
+            return _start_svc(value)
+
+        self.assertEqual(lazy_start_svc.__name__, "_start_svc")
+
     @patch("soulx_server._clear_device_cache", return_value=True)
     def test_release_drops_svc_and_preprocess_state(self, _cache) -> None:
         state = SimpleNamespace(svc_model=object(), preprocess_pipeline=object())
@@ -25,4 +36,3 @@ class SoulXServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

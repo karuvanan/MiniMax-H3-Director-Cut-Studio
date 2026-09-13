@@ -34,5 +34,8 @@ ToJyutping==3.2.0
 tqdm==4.67.1
 transformers==4.41.2
 wandb==0.24.2
-webrtcvad==2.0.10
-
+# The upstream pin builds a C extension from source. On Windows that fails
+# frequently in paths containing spaces; use the maintained binary wheel,
+# which still provides the same import name: `webrtcvad`.
+webrtcvad-wheels==2.0.14; sys_platform == "win32"
+webrtcvad==2.0.10; sys_platform != "win32"

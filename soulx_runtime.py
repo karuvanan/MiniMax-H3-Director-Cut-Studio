@@ -107,8 +107,11 @@ def _local_health_ready(timeout: float = 2.0) -> bool:
     try:
         with opener.open(request, timeout=max(0.2, timeout)) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        endpoints = payload.get("named_endpoints") if isinstance(payload, dict) else None
-        return 200 <= int(response.status) < 300 and "/_start_svc" in (endpoints or {})
+            status = int(response.status)
+        from soulx_client import discover_svc_endpoint
+
+        endpoint, parameters = discover_svc_endpoint(payload)
+        return 200 <= status < 300 and bool(endpoint and parameters)
     except (OSError, ValueError, urllib.error.URLError):
         return False
 
@@ -227,4 +230,3 @@ def install_local_soulx_server(
         "Local SoulX installation did not become ready within the timeout. "
         f"Review {PROJECT_ROOT / 'logs' / 'soulx_api.stderr.log'}."
     )
-
