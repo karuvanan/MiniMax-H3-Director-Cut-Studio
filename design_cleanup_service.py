@@ -30,10 +30,18 @@ def _open(request: urllib.request.Request, timeout: float):
     return opener.open(request, timeout=max(1.0, timeout))
 
 
-def request(url: str, timeout: float, payload: dict | None = None) -> dict:
+def request(
+    url: str,
+    timeout: float,
+    payload: dict | None = None,
+    *,
+    api_key: str = "",
+) -> dict:
     data = None
     method = "GET"
     headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         method = "POST"
@@ -133,6 +141,9 @@ def cleanup(job: dict) -> dict:
         "comfyui_unloaded": False,
         "comfyui_cache_cleared": False,
         "lm_unloaded": [],
+        "ace_step_unloaded": False,
+        "ace_step_released_slots": [],
+        "ace_step_llm_unloaded": False,
         "warnings": [],
     }
     comfy_url = str(job.get("comfyui_server", "")).strip().rstrip("/")
@@ -159,6 +170,23 @@ def cleanup(job: dict) -> dict:
             )
         except Exception as exc:
             result["warnings"].append(f"LM Studio unload failed: {exc}")
+    ace_step_url = str(job.get("ace_step_server", "")).strip().rstrip("/")
+    if ace_step_url:
+        try:
+            response = request(
+                ace_step_url + "/v1/unload",
+                timeout,
+                {},
+                api_key=str(job.get("ace_step_api_key", "")).strip(),
+            )
+            if response.get("error") or int(response.get("code", 200) or 200) != 200:
+                raise RuntimeError(str(response.get("error") or response))
+            data = response.get("data") if isinstance(response.get("data"), dict) else response
+            result["ace_step_unloaded"] = True
+            result["ace_step_released_slots"] = list(data.get("released_slots") or [])
+            result["ace_step_llm_unloaded"] = bool(data.get("llm_unloaded", False))
+        except Exception as exc:
+            result["warnings"].append(f"ACE-Step unload failed: {exc}")
     return result
 
 

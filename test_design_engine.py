@@ -1640,6 +1640,36 @@ On-screen text: "EXACT TITLE"'''
             [{"instance_id": "first:model:1"}, {"instance_id": "second:model:2"}],
         )
 
+    def test_cleanup_unload_all_releases_ace_step_models(self):
+        calls = []
+
+        def fake_request(url, timeout, payload=None, **kwargs):
+            calls.append((url, payload, kwargs))
+            return {
+                "code": 200,
+                "data": {
+                    "released_slots": [1, 2],
+                    "llm_unloaded": True,
+                    "lazy_reload": True,
+                },
+            }
+
+        with patch("design_cleanup_service.request", side_effect=fake_request):
+            result = cleanup({
+                "operation": "manual_unload_all",
+                "ace_step_server": "http://192.168.0.185:8001/",
+                "ace_step_api_key": "secret",
+                "timeout": 10,
+            })
+
+        self.assertTrue(result["ace_step_unloaded"])
+        self.assertEqual(result["ace_step_released_slots"], [1, 2])
+        self.assertTrue(result["ace_step_llm_unloaded"])
+        self.assertEqual(
+            calls,
+            [("http://192.168.0.185:8001/v1/unload", {}, {"api_key": "secret"})],
+        )
+
     def test_cleanup_does_not_guess_deleted_or_unloaded_model_instance(self):
         calls = []
 

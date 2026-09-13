@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication
 
 from ace_step_dialog import (
@@ -61,6 +62,22 @@ class AceStepMusicCoverDialogTest(unittest.TestCase):
         self.assertEqual(dialog.server_edit.text(), LOCAL_ACE_SERVER)
         self.assertIn("SERVER MODE", dialog.runtime_mode_label.text())
         self.assertFalse(dialog.install_local_button.isEnabled())
+        dialog.close()
+        dialog.deleteLater()
+
+    def test_close_waits_for_active_job_before_auto_unload(self) -> None:
+        dialog = AceStepMusicCoverDialog()
+        dialog._busy = True
+        event = QCloseEvent()
+
+        dialog.closeEvent(event)
+
+        self.assertFalse(event.isAccepted())
+        self.assertIn("models will unload automatically", dialog.status_label.text())
+        self.assertFalse(dialog._closed)
+        dialog.reject()
+        self.assertFalse(dialog._closed)
+        dialog._busy = False
         dialog.close()
         dialog.deleteLater()
 

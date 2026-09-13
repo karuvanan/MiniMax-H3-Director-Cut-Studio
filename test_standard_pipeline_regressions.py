@@ -1045,7 +1045,7 @@ class StandardPipelineRegressions(unittest.TestCase):
         window._notify_design_apply_failed("simulated commit failure")
         self.assertEqual(window.pending_design_cleanup_job, {})
 
-    def test_toolbar_unload_all_targets_comfy_and_every_loaded_lm_model(self):
+    def test_toolbar_unload_all_targets_comfy_lm_and_ace_step_models(self):
         window = DirectorCutStudio()
         self.addCleanup(self._close, window)
         self.assertEqual(window.unload_all_button.text(), "UNLOAD ALL")
@@ -1064,6 +1064,23 @@ class StandardPipelineRegressions(unittest.TestCase):
         self.assertTrue(job["unload_all_lm_models"])
         self.assertEqual(job["model"], "")
         self.assertEqual(job["comfyui_server"], window.server_url.text().strip())
+        self.assertEqual(job["ace_step_server"], window.ace_step_runtime_state.api_url)
+
+    def test_music_cover_close_unloads_only_its_ace_step_connection(self):
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+
+        with patch.object(window, "start_design_cleanup") as cleanup:
+            window.unload_ace_step_after_music_cover(
+                "http://192.168.0.185:8001/", "music-secret"
+            )
+
+        cleanup.assert_called_once_with({
+            "operation": "music_cover_close",
+            "ace_step_server": "http://192.168.0.185:8001",
+            "ace_step_api_key": "music-secret",
+            "timeout": 120,
+        })
 
     def test_09_reference_mapping_is_segment_local_with_unlimited_virtual_pool(self):
         """P10+ is legal project-wide and inactive references never leak into a Segment."""

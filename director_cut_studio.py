@@ -8800,6 +8800,7 @@ class DirectorCutStudio(QMainWindow):
         self.design_cleanup_runner: JsonLineProcess | None = None
         self.design_cleanup_result: dict = {}
         self.pending_design_cleanup_job: dict = {}
+        self.pending_ace_step_unload_job: dict = {}
         self.design_cleanup_job_path: Path | None = None
         self.preview_seed: int | None = None
         self.preview_ready = False
@@ -8929,8 +8930,8 @@ class DirectorCutStudio(QMainWindow):
         self.unload_all_button.setObjectName("unloadAllButton")
         self.unload_all_button.setToolTip(
             "Clear Studio runtime cache and DRAM · release ComfyUI VRAM/cache and models · "
-            "unload every model currently loaded by LM Studio. Project media, Takes and "
-            "Segment render caches are not deleted."
+            "unload every model currently loaded by LM Studio and ACE-Step 1.5. Project "
+            "media, Takes and Segment render caches are not deleted."
         )
         self.unload_all_button.clicked.connect(self.unload_all_resources)
         bar.addWidget(self.unload_all_button)
@@ -10697,9 +10698,32 @@ class DirectorCutStudio(QMainWindow):
             f"API {self.ace_step_runtime_state.api_url}"
         )
         dialog.exec()
+        ace_step_server, ace_step_api_key = dialog.unload_connection()
         if self.active_music_cover_dialog is dialog:
             self.active_music_cover_dialog = None
         dialog.deleteLater()
+        self.unload_ace_step_after_music_cover(ace_step_server, ace_step_api_key)
+
+    def unload_ace_step_after_music_cover(self, server: str, api_key: str = "") -> None:
+        """Release Music Workbench models after its modal window has closed."""
+
+        server = str(server or "").strip().rstrip("/")
+        if not server:
+            return
+        job = {
+            "operation": "music_cover_close",
+            "ace_step_server": server,
+            "ace_step_api_key": str(api_key or "").strip(),
+            "timeout": 120,
+        }
+        if self.design_cleanup_runner and self.design_cleanup_runner.is_running():
+            self.pending_ace_step_unload_job = job
+            self.statusBar().showMessage(
+                "MUSIC COVER closed · ACE-Step model unload queued after current cleanup",
+                8000,
+            )
+            return
+        self.start_design_cleanup(job)
 
     def _ace_step_runtime_changed(self, state: object) -> None:
         if not isinstance(state, AceStepRuntimeState):
@@ -12569,14 +12593,17 @@ class DirectorCutStudio(QMainWindow):
             self.start_design_cleanup(job)
 
     def start_design_cleanup(self, job: dict) -> None:
-        """Release local RAM and remote ComfyUI/LM memory after Apply."""
+        """Release local RAM plus remote ComfyUI, LM Studio and ACE-Step memory."""
+        job = dict(job or {})
+        operation = str(job.get("operation", "post_apply"))
         if self.design_cleanup_runner and self.design_cleanup_runner.is_running():
+            if operation == "music_cover_close":
+                self.pending_ace_step_unload_job = job
+                return
             self.design_cleanup_runner.stop()
         # Release cyclic Python/Qt-side objects first. CUDA allocations owned
         # by ComfyUI cannot be released from this process; its /free endpoint
         # below is the authoritative model unload and VRAM-cache operation.
-        job = dict(job or {})
-        operation = str(job.get("operation", "post_apply"))
         if job.get("clear_local_cache", operation == "manual_unload_all"):
             QPixmapCache.clear()
             self.monitor_source_pixmaps.clear()
@@ -12594,7 +12621,12 @@ class DirectorCutStudio(QMainWindow):
         self.design_cleanup_result = {}
         if operation == "manual_unload_all":
             self.statusBar().showMessage(
-                "UNLOAD ALL · clearing runtime cache/DRAM and unloading ComfyUI + LM Studio…"
+                "UNLOAD ALL · clearing runtime cache/DRAM and unloading ComfyUI + "
+                "LM Studio + ACE-Step 1.5…"
+            )
+        elif operation == "music_cover_close":
+            self.statusBar().showMessage(
+                "MUSIC COVER closed · unloading ACE-Step 1.5 models…"
             )
         else:
             self.statusBar().showMessage(
@@ -12604,9 +12636,12 @@ class DirectorCutStudio(QMainWindow):
             str(self.runtime.python),
             [str(PROJECT_ROOT / "design_cleanup_service.py"), str(job_path)],
         ):
-            self.statusBar().showMessage(
-                "AI Design applied · RAM collected · ComfyUI cleanup worker unavailable"
+            unavailable_prefix = (
+                "MUSIC COVER closed · ACE-Step cleanup worker unavailable"
+                if operation == "music_cover_close"
+                else "AI Design applied · RAM collected · ComfyUI cleanup worker unavailable"
             )
+            self.statusBar().showMessage(unavailable_prefix)
             try:
                 job_path.unlink(missing_ok=True)
             except OSError:
@@ -12621,8 +12656,16 @@ class DirectorCutStudio(QMainWindow):
 
     def _design_cleanup_finished(self, exit_code: int, log: str) -> None:
         result = self.design_cleanup_result
-        manual = result.get("operation") == "manual_unload_all"
-        prefix = "UNLOAD ALL" if manual else "AI Design applied"
+        operation = str(result.get("operation", ""))
+        manual = operation == "manual_unload_all"
+        music_cover_close = operation == "music_cover_close"
+        prefix = (
+            "UNLOAD ALL"
+            if manual
+            else "MUSIC COVER closed"
+            if music_cover_close
+            else "AI Design applied"
+        )
         warnings = list(result.get("warnings") or [])
         if exit_code or result.get("error"):
             warnings.append(str(result.get("error") or log[-400:] or f"worker exit {exit_code}"))
@@ -12631,11 +12674,22 @@ class DirectorCutStudio(QMainWindow):
                 prefix + " · cleanup warning: " + " | ".join(warnings),
                 15000,
             )
+        elif music_cover_close:
+            ace_slots = len(result.get("ace_step_released_slots") or [])
+            ace_lm = " + LM" if result.get("ace_step_llm_unloaded") else ""
+            self.statusBar().showMessage(
+                f"MUSIC COVER closed · ACE-Step models unloaded "
+                f"({ace_slots} slot(s){ace_lm}) · API remains online",
+                12000,
+            )
         else:
             lm_count = len(result.get("lm_unloaded") or [])
+            ace_slots = len(result.get("ace_step_released_slots") or [])
+            ace_lm = " + LM" if result.get("ace_step_llm_unloaded") else ""
             self.statusBar().showMessage(
                 f"{prefix} · runtime cache/DRAM cleared · ComfyUI model/VRAM/cache released · "
-                f"LM Studio model released ({lm_count} instance(s))",
+                f"LM Studio model released ({lm_count} instance(s)) · "
+                f"ACE-Step released ({ace_slots} slot(s){ace_lm})",
                 12000,
             )
         # Let Qt dispose of any deferred dialog/media objects, then collect a
@@ -12653,9 +12707,16 @@ class DirectorCutStudio(QMainWindow):
         self.design_cleanup_runner = None
         self.design_cleanup_result = {}
         self.unload_all_button.setEnabled(True)
+        pending_ace_job = dict(self.pending_ace_step_unload_job)
+        self.pending_ace_step_unload_job = {}
+        if pending_ace_job:
+            QTimer.singleShot(
+                0,
+                lambda queued_job=pending_ace_job: self.start_design_cleanup(queued_job),
+            )
 
     def unload_all_resources(self) -> None:
-        """Manually release idle Studio, ComfyUI and LM Studio runtime memory."""
+        """Release idle Studio, ComfyUI, LM Studio and ACE-Step runtime memory."""
 
         active_runners = (
             self.submit_runner,
@@ -12686,6 +12747,8 @@ class DirectorCutStudio(QMainWindow):
             "model": "",
             "unload_all_lm_models": True,
             "comfyui_server": self.server_url.text().strip(),
+            "ace_step_server": self.ace_step_runtime_state.api_url,
+            "ace_step_api_key": os.getenv("ACESTEP_API_KEY", ""),
             "timeout": min(120, max(10, self.design_ai_settings.timeout)),
         })
 

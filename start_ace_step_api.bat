@@ -74,7 +74,7 @@ echo [ACE-Step] Models: %ACESTEP_CHECKPOINTS_DIR%
 echo [ACE-Step] First launch downloads the required model files.
 echo.
 
-"%ACE_STEP_PYTHON%" -m acestep.api_server --host 0.0.0.0 --port 8001
+"%ACE_STEP_PYTHON%" "%~dp0ace_step_server.py" --host 0.0.0.0 --port 8001
 set "ACE_STEP_EXIT=%ERRORLEVEL%"
 
 popd

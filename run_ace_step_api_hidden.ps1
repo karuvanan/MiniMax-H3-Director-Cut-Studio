@@ -20,7 +20,7 @@ try {
 $existingServer = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.CommandLine -and
-        $_.CommandLine -like "*acestep.api_server*" -and
+        ($_.CommandLine -like "*acestep.api_server*" -or $_.CommandLine -like "*ace_step_server.py*") -and
         $_.CommandLine -like "*--port 8001*"
     } |
     Select-Object -First 1
@@ -37,4 +37,3 @@ Start-Process `
     -WindowStyle Hidden `
     -RedirectStandardOutput $stdoutLog `
     -RedirectStandardError $stderrLog
-

@@ -10,6 +10,8 @@ Every user-visible correction receives an application version and a dated entry 
 
 ### ACE-Step 1.5 Music Workbench
 
+- Extended the homepage `UNLOAD ALL` action to release all loaded ACE-Step 1.5 DiT/VAE/text-encoder and LM resources through a Studio-managed `/v1/unload` endpoint. The API process remains available and lazily reloads models on the next request; unload is rejected while music jobs are queued or running.
+- Closing the Music Workbench now automatically unloads only the ACE-Step models from the exact API connection used by that window. Closing is deferred while an analysis, generation, connection test or installation is active, preventing an in-flight music task from being interrupted before cleanup.
 - Added the native `MUSIC COVER` workspace beside the Studio workflow controls. It connects to an ACE-Step 1.5 HTTP API, uploads source and optional timbre-reference audio, analyzes the source, auto-fills editable Prompt, Lyrics, BPM, key, time signature and duration fields, and keeps the complete API response visible.
 - Added four source-audio workflows: `Cover`, `Repaint`, `Lego` and `Extract`. Repaint exposes an explicit start/end window, preservation mode and strength. Lego/Extract expose twelve track classes and editable task instructions and automatically select the required `acestep-v15-base` model.
 - Added selected-model initialization through `/v1/init`. A first Lego/Extract request can download/load Base; later Turbo/Base changes load the matching model before submission. Base uses an expanded Steps range while Turbo retains its optimized limit.

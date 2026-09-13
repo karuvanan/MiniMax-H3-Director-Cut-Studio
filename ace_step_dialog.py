@@ -818,6 +818,11 @@ class AceStepMusicCoverDialog(QDialog):
     def _api_key(self) -> str:
         return self.api_key_edit.text().strip()
 
+    def unload_connection(self) -> tuple[str, str]:
+        """Return the exact API connection that this Music Workbench used."""
+
+        return self._server(), self._api_key()
+
     def _update_runtime_controls(self) -> None:
         state = self.runtime_state
         if state.mode == "server":
@@ -1471,7 +1476,29 @@ class AceStepMusicCoverDialog(QDialog):
         if hasattr(self, "busy_overlay"):
             self.busy_overlay.setGeometry(self.rect())
 
+    def _block_busy_close(self) -> bool:
+        if not self._busy:
+            return False
+        self.status_label.setText(
+            "Please wait for the active ACE-Step task to finish before closing · "
+            "models will unload automatically on exit"
+        )
+        return True
+
+    def reject(self) -> None:
+        """Treat Escape like the title-bar close button while a task is active."""
+
+        if self._block_busy_close():
+            return
+        self._closed = True
+        self.busy_overlay.stop()
+        self.player.stop()
+        super().reject()
+
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._block_busy_close():
+            event.ignore()
+            return
         self._closed = True
         self.busy_overlay.stop()
         self.player.stop()

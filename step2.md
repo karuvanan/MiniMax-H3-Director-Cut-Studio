@@ -153,8 +153,15 @@ run_h3_prompt_studio.bat
 
 主机必须保持开机并运行 Studio/ACE-Step。副机无法通过已经关闭的 HTTP API 反向启动已关机的主机。
 
+## 释放主机显存
+
+主机或副机可以点击 Studio 主页顶部的 `UNLOAD ALL`。Studio 会向当前显示的 ACE-Step API 发出卸载请求，释放 DiT、VAE、文字编码器及分析 LM，但保留 API 服务。下一次打开 Music Workbench 分析或生成时，模型会自动重新载入。
+
+正常关闭 `MUSIC COVER` 视窗时，也会自动向该视窗实际使用的 API 发出同样的模型卸载请求；这项自动清理只处理 ACE-Step，不会连带卸载 ComfyUI 或 LM Studio。若分析或生成仍在进行，视窗会等待任务结束后才允许关闭。
+
+为保护成品，ACE-Step 有任务正在运行或排队时会拒绝卸载。更新此功能后需要重新启动主机上的 Studio／ACE-Step 服务，让新的 `/v1/unload` 扩展生效。
+
 ## 延伸阅读
 
 - v0.3.5 Music Workbench 功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - 返回主说明：[`README.md`](README.md)
-

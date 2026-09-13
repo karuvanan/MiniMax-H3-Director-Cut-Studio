@@ -144,6 +144,8 @@ mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
 
 Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF 已删除、改量化版本或被 LM Studio 改成短 alias，会自动选择同系列可用模型并保存修复后的 ID。生成结束时只卸载 `/api/v1/models` 明确列在 `loaded_instances` 的实际实例；未加载／已删除模型直接视为已释放，不会重复产生 `model_not_found`，也不会误卸载其他模型。
 
+主页顶部的 `UNLOAD ALL` 会一次释放 Studio runtime cache、ComfyUI、LM Studio，以及当前 Server／Client API 所连接的 ACE-Step 1.5 DiT、VAE、文字编码器和 LM。ACE-Step API 进程会继续运行；下一次分析或生成时自动重新载入所需模型。若音乐任务仍在排队或生成，服务器会拒绝卸载，避免破坏进行中的成品。
+
 ## 推荐的模型目录结构
 
 ```text
