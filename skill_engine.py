@@ -183,7 +183,10 @@ def load_skill_profiles(workspace: str | Path) -> dict[str, SkillProfile]:
 
 
 def _display_name(value: str) -> str:
-    return " ".join(part.capitalize() for part in value.replace("_", "-").split("-"))
+    return " ".join(
+        "MTV" if part.casefold() == "mtv" else part.capitalize()
+        for part in value.replace("_", "-").split("-")
+    )
 
 
 def _frontmatter(text: str, fallback_name: str) -> tuple[str, str]:

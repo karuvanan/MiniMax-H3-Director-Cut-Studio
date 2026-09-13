@@ -463,6 +463,41 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_soulx_button_is_immediately_left_of_music_cover_and_connected(self):
+        with patch.object(DirectorCutStudio, "open_soulx_singer") as open_soulx:
+            window = DirectorCutStudio()
+            button = window.findChild(QPushButton, "soulxButton")
+            self.assertIsNotNone(button)
+            self.assertEqual(button.text(), "SOULX")
+            toolbar_widgets = [
+                window.director_toolbar.widgetForAction(action)
+                for action in window.director_toolbar.actions()
+            ]
+            self.assertIs(toolbar_widgets[-2], button)
+            self.assertIs(toolbar_widgets[-1], window.music_cover_button)
+            button.click()
+            self.app.processEvents()
+            open_soulx.assert_called_once()
+            window.project_dirty = False
+            window.close()
+            window.deleteLater()
+
+    def test_soulx_opens_standalone_dialog_without_timeline_callback(self):
+        window = DirectorCutStudio()
+        with patch("director_cut_studio.SoulXSingerDialog") as dialog_class:
+            dialog = dialog_class.return_value
+            window.open_soulx_singer()
+        dialog_class.assert_called_once_with(
+            window,
+            runtime_state=window.soulx_runtime_state,
+        )
+        dialog.exec.assert_called_once()
+        dialog.deleteLater.assert_called_once()
+        self.assertIn("standalone MP3 workflow", window.statusBar().currentMessage())
+        window.project_dirty = False
+        window.close()
+        window.deleteLater()
+
     def test_music_cover_opens_native_studio_dialog(self):
         window = DirectorCutStudio()
         with patch("director_cut_studio.AceStepMusicCoverDialog") as dialog_class:

@@ -11,6 +11,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from soulx_client import request_server_unload
+
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -144,6 +146,9 @@ def cleanup(job: dict) -> dict:
         "ace_step_unloaded": False,
         "ace_step_released_slots": [],
         "ace_step_llm_unloaded": False,
+        "soulx_unloaded": False,
+        "soulx_unload_supported": False,
+        "soulx_unload_detail": "",
         "warnings": [],
     }
     comfy_url = str(job.get("comfyui_server", "")).strip().rstrip("/")
@@ -187,6 +192,22 @@ def cleanup(job: dict) -> dict:
             result["ace_step_llm_unloaded"] = bool(data.get("llm_unloaded", False))
         except Exception as exc:
             result["warnings"].append(f"ACE-Step unload failed: {exc}")
+    soulx_url = str(job.get("soulx_server", "")).strip().rstrip("/")
+    if soulx_url:
+        try:
+            response = request_server_unload(soulx_url, timeout)
+            result["soulx_unload_supported"] = bool(response.get("supported", False))
+            result["soulx_unloaded"] = bool(response.get("unloaded", False))
+            warning = str(response.get("warning") or "").strip()
+            result["soulx_unload_detail"] = warning
+            if warning:
+                result["warnings"].append(warning)
+        except Exception as exc:
+            # SoulX is an optional standalone service. If it is offline there
+            # is no remote model process to release, so UNLOAD ALL should not
+            # report a false failure. Reachable-but-incompatible servers are
+            # reported by request_server_unload() above.
+            result["soulx_unload_detail"] = str(exc)
     return result
 
 

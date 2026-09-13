@@ -45,7 +45,7 @@ Studio 启动后自动判断当前电脑角色，但不会在 Client Mode 自动
    .\run_h3_prompt_studio.bat
    ```
 
-3. 点击顶部最右侧 `MUSIC COVER`。
+3. 点击顶部的 `MUSIC COVER`（`SOULX` 位于它左侧）。
 4. 尚未安装时，窗口显示 `CLIENT MODE`、检测到的 VRAM 和 `INSTALL LOCAL ACE-STEP`。
 5. 点击 `INSTALL LOCAL ACE-STEP` 并确认。只有此时 Studio 才会开始安装：
 

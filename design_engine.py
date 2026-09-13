@@ -21,6 +21,11 @@ from fourdx_engine import (
     enforce_making_of_fourdx_plan,
     fourdx_preferences_from_requirement,
 )
+from music_video_engine import (
+    MTV_SINGING_SPECIAL_SKILL,
+    enforce_mtv_scene_keyframes,
+    enforce_mtv_singing_plan,
+)
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
@@ -6321,6 +6326,12 @@ def normalize_design_plan(
         existing_media,
         special_skill_key,
     )
+    enforce_mtv_singing_plan(
+        plan,
+        existing_media,
+        special_skill_key=special_skill_key,
+        authored_requirement=authored_requirement,
+    )
     existing_media_uses = [
         row for row in plan.get("existing_media_uses") or []
         if isinstance(row, dict)
@@ -6539,6 +6550,11 @@ def normalize_design_plan(
         media_requests.append(normalized_request)
         requested_requirement_ids.add(requirement_id)
     plan["media_requests"] = media_requests
+    enforce_mtv_scene_keyframes(
+        plan,
+        existing_media,
+        special_skill_key=special_skill_key,
+    )
     if str(special_skill_key or "").strip().casefold() == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL:
         # P1-P4 are supplied identities/subjects and H3 creates the corridor.
         # Reserve exactly one Z-Image request for the outdoor environment shared

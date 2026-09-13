@@ -2,7 +2,17 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
-## [0.3.5] - 2026-09-13
+## [0.3.5-alpha.1] - 2026-09-14
+
+### SoulX-Singer 独立歌声克隆
+
+- 新增主页 `SOULX` 工作区：使用 Voice Reference 与 Source Song 调用 SoulX-Singer SVC，完成后试听并以 `SAVE AS MP3` 导出；结果不会未经确认自动写入 Media Pool、Timeline 或 MiniMax H3。
+- 增加 SoulX 运行模式检测：完整本机 runtime 与模型进入 `SERVER MODE`，自动使用 `127.0.0.1:7861`；未安装电脑保持 `CLIENT MODE`，默认连接 `192.168.0.185:7861`，不自动下载或安装。
+- 本机首次安装受严格的单卡显存门槛保护：必须大于 16GB VRAM；安装使用独立 Python 3.10 runtime 与 `models/SoulX-Singer-main`，避免污染 Studio、ACE-Step 或 H3 环境。
+- SoulX 转换与安装期间显示全窗口半透明遮罩及青色旋转加载圈，阻止重复点击并清楚提示当前阶段。
+- `UNLOAD ALL` 与转换后的清理会先探测 SoulX 卸载 endpoint；官方原始 WebUI 没有该 endpoint 时明确提示需停止／重启 SoulX server，不虚报已经释放显存。本项目自带的 Studio wrapper 提供本机 `/_unload_svc`。
+
+### ACE-Step 1.5 Music Workbench
 
 ### Documentation
 

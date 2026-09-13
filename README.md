@@ -4,11 +4,12 @@
 
 ## 首要部署说明
 
-第一次使用请依序完成以下两份说明；副机在 Step 2 会自动进入 Client Mode，不需要安装 ACE-Step 模型。
+第一次使用请依序完成以下部署说明；副机在对应步骤会自动进入 Client Mode，不需要安装大模型。
 
 1. **所有电脑必须完成**：[`Step 1：部署 Studio Runtime、Qwen3-TTS 与 VoxCPM2`](step1.md)
 2. **规划音乐主机与副机**：[`Step 2：ACE-Step 1.5 Music Workbench 主机／副机部署`](step2.md)
-3. 完成后统一从项目根目录启动：
+3. **规划歌声克隆主机与副机**：[`Step 3：SoulX-Singer 主机／副机部署`](step3.md)
+4. 完成后统一从项目根目录启动：
 
    ```powershell
    .\run_h3_prompt_studio.bat
@@ -20,7 +21,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.5`](VERSION)
+- 当前应用版本：[`v0.3.5-alpha.1`](VERSION)
 - v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
 - v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
@@ -144,7 +145,20 @@ mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
 
 Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF 已删除、改量化版本或被 LM Studio 改成短 alias，会自动选择同系列可用模型并保存修复后的 ID。生成结束时只卸载 `/api/v1/models` 明确列在 `loaded_instances` 的实际实例；未加载／已删除模型直接视为已释放，不会重复产生 `model_not_found`，也不会误卸载其他模型。
 
-主页顶部的 `UNLOAD ALL` 会一次释放 Studio runtime cache、ComfyUI、LM Studio，以及当前 Server／Client API 所连接的 ACE-Step 1.5 DiT、VAE、文字编码器和 LM。ACE-Step API 进程会继续运行；下一次分析或生成时自动重新载入所需模型。若音乐任务仍在排队或生成，服务器会拒绝卸载，避免破坏进行中的成品。
+主页顶部的 `UNLOAD ALL` 会一次释放 Studio runtime cache、ComfyUI、LM Studio，以及当前 Server／Client API 所连接的 ACE-Step 1.5 DiT、VAE、文字编码器和 LM；如果 SoulX Server 提供卸载 endpoint，也会一并请求释放 SoulX 模型。ACE-Step API 进程会继续运行；下一次分析或生成时自动重新载入所需模型。若音乐任务仍在排队或生成，服务器会拒绝卸载，避免破坏进行中的成品。
+
+### SoulX 独立歌声克隆工作流
+
+主页的 `SOULX` 位于 `MUSIC COVER` 左边，默认连接 `http://192.168.0.185:7861`。它只负责调用 Server 上 `SoulX-Singer-main` 的 SVC 服务、试听结果和导出 MP3，不会把未验收的声音自动写进 Media Pool、Timeline 或 MiniMax H3。
+
+1. 在 SoulX Server 启动 `webui_svc.py`，确认局域网可以访问 `7861` 端口。
+2. 点击主页 `SOULX`，先用 `TEST` 验证 `/_start_svc`。
+3. `Voice reference` 选择需要克隆的目标音色，例如老人男声；`Source song` 选择 ACE-Step 或其他来源的原歌曲。
+4. 默认保留 `Separate source-song vocals`、`Auto pitch shift` 和 `Mix original accompaniment`，点击 `CLONE SINGING VOICE`。
+5. 完成后先 `PLAY` 验收，再用 `SAVE AS MP3` 保存。
+6. 打开 MTV Special Skill，把已经验收的 MP3 手动放入 `A1`。Studio 不会替你自动执行这一步。
+
+`Request server model unload after conversion` 默认开启。Studio 会先检查 Server 是否真的公开卸载 endpoint；支持时才会报告已卸载。官方原始 `webui_svc.py` 只公开转换 endpoint，如果状态栏提示 `no unload endpoint`，代表模型仍可能占用 Server VRAM，必须停止／重启 SoulX launcher，或在 Server 版本加入卸载 endpoint 后再运行 MiniMax H3。关闭窗口本身不等于释放远端显存。
 
 ## 推荐的模型目录结构
 

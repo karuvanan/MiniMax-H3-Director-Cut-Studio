@@ -97,6 +97,12 @@ from ace_step_runtime import (
     detect_ace_step_runtime,
     start_local_server_if_installed,
 )
+from soulx_dialog import SoulXSingerDialog
+from soulx_runtime import (
+    SoulXRuntimeState,
+    detect_soulx_runtime,
+    start_local_soulx_server_if_installed,
+)
 from native_audio_engine import (
     NativeAudioProfile,
     audio_reference_intent_text,
@@ -187,6 +193,12 @@ from fourdx_engine import (
     normalize_fourdx_preferences,
     requested_fourdx_duration,
     update_fourdx_requirement_block,
+)
+from music_video_engine import (
+    MTV_MASTER_AUDIO_CONTRACT,
+    exact_master_audio_asset,
+    is_mtv_singing_skill,
+    replace_video_audio_with_exact_master,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from smart_cut_engine import (
@@ -8767,8 +8779,15 @@ class DirectorCutStudio(QMainWindow):
         self.ace_step_local_start_requested = start_local_server_if_installed(
             self.ace_step_runtime_state
         )
+        self.soulx_runtime_state = detect_soulx_runtime(
+            gpu_vram_gb=self.ace_step_runtime_state.gpu_vram_gb
+        )
+        self.soulx_local_start_requested = start_local_soulx_server_if_installed(
+            self.soulx_runtime_state
+        )
         # API keys remain memory-only for the lifetime of this Studio window.
         self.semantic_openai_api_key = ""
+        self.active_soulx_dialog: SoulXSingerDialog | None = None
         self.active_music_cover_dialog: AceStepMusicCoverDialog | None = None
         self._closing = False
         self._timed_out_generations: set[tuple[str, int]] = set()
@@ -8820,6 +8839,7 @@ class DirectorCutStudio(QMainWindow):
         self.active_generation_started_at = 0.0
         self.active_generation_profile = ""
         self.active_generation_duration_seconds = 0.0
+        self.active_generation_timeline_start = 0.0
         self.active_generation_job_path: Path | None = None
         self.smart_render_manifest: dict = {}
         self.smart_render_manifests: dict[str, dict] = {}
@@ -8930,8 +8950,9 @@ class DirectorCutStudio(QMainWindow):
         self.unload_all_button.setObjectName("unloadAllButton")
         self.unload_all_button.setToolTip(
             "Clear Studio runtime cache and DRAM · release ComfyUI VRAM/cache and models · "
-            "unload every model currently loaded by LM Studio and ACE-Step 1.5. Project "
-            "media, Takes and Segment render caches are not deleted."
+            "unload every model currently loaded by LM Studio, ACE-Step 1.5 and any SoulX "
+            "server that exposes an unload endpoint. Project media, Takes and Segment render "
+            "caches are not deleted."
         )
         self.unload_all_button.clicked.connect(self.unload_all_resources)
         bar.addWidget(self.unload_all_button)
@@ -8997,6 +9018,17 @@ class DirectorCutStudio(QMainWindow):
         toolbar_spacer = QWidget()
         toolbar_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         bar.addWidget(toolbar_spacer)
+        self.soulx_button = QPushButton("SOULX")
+        self.soulx_button.setObjectName("soulxButton")
+        self.soulx_button.setToolTip(
+            f"Open independent SoulX singing-voice clone workbench · "
+            f"{self.soulx_runtime_state.mode.upper()} MODE · "
+            f"API {self.soulx_runtime_state.api_url} · "
+            "result is saved as MP3 and is never inserted into H3 automatically"
+        )
+        self.soulx_button.setStyleSheet("background:#6e46a8; font-weight:700;")
+        self.soulx_button.clicked.connect(self.open_soulx_singer)
+        bar.addWidget(self.soulx_button)
         self.music_cover_button = QPushButton("MUSIC COVER")
         self.music_cover_button.setObjectName("musicCoverButton")
         self.music_cover_button.setToolTip(
@@ -10683,6 +10715,34 @@ class DirectorCutStudio(QMainWindow):
                 },
             },
         }
+
+    def open_soulx_singer(self) -> None:
+        """Open the independent SoulX-Singer voice-conversion workbench."""
+
+        dialog = SoulXSingerDialog(self, runtime_state=self.soulx_runtime_state)
+        dialog.runtime_mode_changed.connect(self._soulx_runtime_changed)
+        self.active_soulx_dialog = dialog
+        self.statusBar().showMessage(
+            f"SoulX Singing Voice Clone · {self.soulx_runtime_state.mode.upper()} MODE · "
+            f"API {self.soulx_runtime_state.api_url} · standalone MP3 workflow"
+        )
+        dialog.exec()
+        if self.active_soulx_dialog is dialog:
+            self.active_soulx_dialog = None
+        dialog.deleteLater()
+
+    def _soulx_runtime_changed(self, state: object) -> None:
+        if not isinstance(state, SoulXRuntimeState):
+            return
+        self.soulx_runtime_state = state
+        self.soulx_button.setToolTip(
+            f"Open independent SoulX singing-voice clone workbench · {state.mode.upper()} "
+            f"MODE · API {state.api_url} · result is saved as MP3 and is never inserted "
+            "into H3 automatically"
+        )
+        self.statusBar().showMessage(
+            f"SoulX {state.mode.upper()} MODE · API {state.api_url}"
+        )
 
     def open_ace_step_music_cover(self) -> None:
         """Open the native ACE-Step Music Cover workspace inside Studio."""
@@ -12622,7 +12682,7 @@ class DirectorCutStudio(QMainWindow):
         if operation == "manual_unload_all":
             self.statusBar().showMessage(
                 "UNLOAD ALL · clearing runtime cache/DRAM and unloading ComfyUI + "
-                "LM Studio + ACE-Step 1.5…"
+                "LM Studio + ACE-Step 1.5 + SoulX…"
             )
         elif operation == "music_cover_close":
             self.statusBar().showMessage(
@@ -12686,10 +12746,11 @@ class DirectorCutStudio(QMainWindow):
             lm_count = len(result.get("lm_unloaded") or [])
             ace_slots = len(result.get("ace_step_released_slots") or [])
             ace_lm = " + LM" if result.get("ace_step_llm_unloaded") else ""
+            soulx = " · SoulX released" if result.get("soulx_unloaded") else ""
             self.statusBar().showMessage(
                 f"{prefix} · runtime cache/DRAM cleared · ComfyUI model/VRAM/cache released · "
                 f"LM Studio model released ({lm_count} instance(s)) · "
-                f"ACE-Step released ({ace_slots} slot(s){ace_lm})",
+                f"ACE-Step released ({ace_slots} slot(s){ace_lm}){soulx}",
                 12000,
             )
         # Let Qt dispose of any deferred dialog/media objects, then collect a
@@ -12749,6 +12810,7 @@ class DirectorCutStudio(QMainWindow):
             "comfyui_server": self.server_url.text().strip(),
             "ace_step_server": self.ace_step_runtime_state.api_url,
             "ace_step_api_key": os.getenv("ACESTEP_API_KEY", ""),
+            "soulx_server": self.soulx_runtime_state.api_url,
             "timeout": min(120, max(10, self.design_ai_settings.timeout)),
         })
 
@@ -14280,7 +14342,30 @@ class DirectorCutStudio(QMainWindow):
                     self.generated_player.setSource(QUrl())
             except OSError:
                 pass
-        if source.resolve() != destination.resolve():
+        master_spec = None
+        if kind == "video" and self.scan and is_mtv_singing_skill(
+            self.special_combo.currentData()
+        ):
+            master_spec = exact_master_audio_asset(
+                self.scan.timeline_assets(),
+                special_skill_key=str(self.special_combo.currentData()),
+                timeline_start=float(self.active_generation_timeline_start),
+                duration=float(self.active_generation_duration_seconds),
+            )
+            if master_spec is None:
+                raise RuntimeError(
+                    "MTV Singing H3 requires a locally available A1 Timeline Master Audio."
+                )
+        if master_spec is not None:
+            replace_video_audio_with_exact_master(
+                self.runtime.ffmpeg,
+                source,
+                master_spec,
+                destination,
+            )
+            archived[preferred_index]["exact_master_audio_id"] = "A1"
+            archived[preferred_index]["audio_policy"] = "exact_timeline_master"
+        elif source.resolve() != destination.resolve():
             link_or_copy(source, destination)
         archived[preferred_index]["local_path"] = str(destination.resolve())
         archived[preferred_index]["workspace_take"] = str(destination.resolve())
@@ -20138,6 +20223,7 @@ class DirectorCutStudio(QMainWindow):
             str(self.special_combo.currentData() or "").strip().casefold()
             == AI_MOVIE_MAKING_OF_4DX_SKILL
         )
+        mtv_audio = is_mtv_singing_skill(self.special_combo.currentData())
         previous_profile: NativeAudioProfile | None = None
         inherited_space: tuple[str, str] | None = None
         for cue in shots:
@@ -20289,6 +20375,8 @@ class DirectorCutStudio(QMainWindow):
                         effect_id,
                         phase=phase,
                     )["native_audio_direction"]
+                elif mtv_audio:
+                    cue.native_audio_direction = MTV_MASTER_AUDIO_CONTRACT
                 elif campus_composite:
                     cue.native_audio_direction = (
                         "Acoustic space remains the same open campus exterior established by the preceding "
@@ -20308,6 +20396,11 @@ class DirectorCutStudio(QMainWindow):
                     cue.environment_continuity = fourdx_native_audio_fields()[
                         "environment_continuity"
                     ]
+                elif mtv_audio:
+                    cue.environment_continuity = (
+                        "Continue P4's visible acoustic space and advance A1 source time continuously "
+                        "across this cut. Never restart, loop, replace or time-stretch A1 at a Segment boundary."
+                    )
                 elif campus_composite:
                     cue.environment_continuity = (
                         "Continue the preceding campus ambience, acoustic openness and distance without a "
@@ -20323,6 +20416,11 @@ class DirectorCutStudio(QMainWindow):
                     cue.audio_reference_intent = fourdx_native_audio_fields()[
                         "audio_reference_intent"
                     ]
+                elif mtv_audio:
+                    cue.audio_reference_intent = (
+                        "@A1 is the exact performance-timing source and final Timeline Master Audio, "
+                        "not a mood, BPM or timbre suggestion. H3 must not synthesize a replacement singer."
+                    )
                 else:
                     cue.audio_reference_intent = audio_reference_intent_text(
                         acoustic_references
@@ -22802,6 +22900,23 @@ class DirectorCutStudio(QMainWindow):
         if self.submit_runner and self.submit_runner.is_running():
             QMessageBox.information(self, "Generation running", "The current ComfyUI job is still running.")
             return
+        if self.scan and is_mtv_singing_skill(self.special_combo.currentData()):
+            master_spec = exact_master_audio_asset(
+                self.scan.timeline_assets(),
+                special_skill_key=str(self.special_combo.currentData()),
+                timeline_start=float(self.clip_start.value()),
+                duration=float(self.clip_end.value() - self.clip_start.value()),
+            )
+            if master_spec is None:
+                QMessageBox.critical(
+                    self,
+                    "MTV Master Audio missing",
+                    "MTV Singing H3 requires a locally available @A1 clip covering the active "
+                    "Generation Work Area. Load A1 and place it across this range. If the physical "
+                    "A1 source is shorter than the range, shorten the Work Area or load a longer "
+                    "A1 file before running Preview or Final.",
+                )
+                return
         is_smart_render = False
         segment_count = 1
         try:
@@ -22891,6 +23006,7 @@ class DirectorCutStudio(QMainWindow):
         self.active_generation_started_at = time.monotonic()
         self.active_generation_profile = estimate_profile
         self.active_generation_duration_seconds = duration
+        self.active_generation_timeline_start = float(self.clip_start.value())
         self.active_generation_job_path = job_path.resolve()
         if not is_smart_render:
             for segment in self._planned_render_segments():
@@ -23128,7 +23244,7 @@ class DirectorCutStudio(QMainWindow):
             archive_warning = ""
             try:
                 outputs = self._archive_generated_outputs(outputs, kind)
-            except OSError as exc:
+            except (OSError, RuntimeError) as exc:
                 archive_warning = str(exc)
             result["outputs"] = outputs
             try:
@@ -23265,6 +23381,7 @@ class DirectorCutStudio(QMainWindow):
         self.active_generation_started_at = 0.0
         self.active_generation_profile = ""
         self.active_generation_duration_seconds = 0.0
+        self.active_generation_timeline_start = 0.0
         self.active_generation_job_path = None
         self._refresh_incremental_controls()
 
