@@ -1,0 +1,37 @@
+帮我创作一支60秒、16:9、电影级写实的「10种4DX电影效果现场 Making-of」沉浸式示范片。这不是旁白技术教程、素材抠图流程或普通剧情片；影片主角是银幕事件、4DX影厅装置、现场灯光声音与观众身体反馈如何同步发生。
+
+请先读取目前已经启用的所有 @P、@V、@A 素材，以用户明确映射、锁定和素材本身为最高事实。P1-P9 不预设固定用途；根据实际像素和用户说明判断人物、物件、环境、动作状态或分析控制角色，文件名不是画面证据。兼容的素材优先复用；每个被选择的效果章节最多只允许申请一张time-scoped Z-Image场景图，不生成替代版本或每Shot一图。
+
+影片按顺序建立开场、十个效果章节和稳定收尾：PITCH俯仰、ROLL侧倾、HEAVE升降、WIND强风、AIR SHOT瞬时喷气、VIBRATION连续震动、IMPACT背部冲击、FLASH闪光、FOG/SMOKE烟雾、WATER/RAIN水雨。默认十项全部启用；如果用户在Design取消某项，只移除对应章节并平均重分配其余时间。
+
+从第一帧开始就进入正在运行的专业4DX电影院。每个效果章节至少99%的时间必须同时看见：大银幕上的原创电影事件、三排或以上黑色运动座椅、正在工作的影厅环境装置、不同位置的成年观众，以及观众与当前效果对应的身体和表情反馈。不要先用大段时间准备或解释，最后才短暂显示效果。
+
+场地必须是黑暗的专业4DX电影院，不得生成宴会厅、会议室、电脑室、办公室、电竞模拟器、餐桌、电脑桌或桌面显示器。观众必须是多个不同人物，不得复制脸孔、同步做相同动作或全程静坐。Pitch时身体随座椅前后承托；Roll时侧倾并平衡；Heave时抓紧扶手并出现失重／着陆反馈；Wind时头发衣服受风；Air Shot时局部观众眨眼闪避；Vibration时身体、座椅和饮料表面连续震动；Impact时接触后才明显后冲；Flash时观众眯眼转头；Fog/Smoke时烟从影厅出口扩散并引起指向、侧身和挥散；Water/Rain时观众挡脸、擦水、笑与互相确认。
+
+每章的银幕事件、影厅座椅、风、水、雾、喷气、闪光、互动照明、现场声音和观众反应必须共享同一个触发时间、方向、强度与衰减。示例使用原创题材原型，例如战机起飞、高速过弯、垂直坠落与着陆、龙卷风追逐、擦身而过、地下机械震动、车辆碰撞、雷击、火场烟层、暴雨海浪，不复制或点名任何现有电影、角色或商标。
+
+银幕不得只是普通平面播放。每个效果章节必须先让事件明确存在于仍然可见边框的大银幕内，然后只让一个承载当前效果的前景元素越过银幕平面，短暂遮住一小段银幕边框，并沿同一方向延伸到前排上方的影厅空间。风、光、水滴、烟雾、碎片或压力必须从银幕连续进入影厅；前排观众首先按来向闪避、低头、眨眼或挡脸，中排稍后后仰，后排再以较小幅度惊呼、指向或互相确认。不得复制飞机、车辆、人物或事件主体，不得在影厅出现第二个完整主体，也不得生成传送门、独立全息影像或漂浮矩形画面。
+
+运镜使用隐形观众视角的沉浸式FPV：沿座椅通道向前穿行，再围绕中央观众群进行宽阔、真实位移的空间弧线运动。突破银幕时必须停留在侧通道三分之四角度，让银幕边框、突出元素与观众脸部同时存在于同一画面；不得切成只见观众、不见银幕的正面群像。不得出现无人机机身，不得原地旋转360度、桶滚、Zoom Out或用镜头晃动冒充座椅受力。
+
+精确章节标题、箭头、参数和Before／After说明必须建立为可编辑Timeline文字／图形层，不得让H3或Z-Image在画面里生成乱码、UI或HUD。摄影机运动不是座椅运动；只有片中物体、人物、天气或环境真实产生的力，才可以触发4DX事件。
+
+全片取消旁白、人物对白、主持人、录音棚声音和背景音乐。每章必须同时清楚听见四层H3原生现场声：银幕事件从前方影厅扬声器传来；近距离运动座椅马达、机械作动和座椅衣物摩擦；与突出银幕方向一致的风、水、雾、喷气、震动或碰撞；前排先发生、中后排稍迟发生的喘息、惊呼、短叫、闪避声和笑声。物理效果与观众反应必须明显高于安静的放映机／室内底噪。不得新增TTS替换、语音分离、FFmpeg混响、EQ、卷积混响或后期重混。本Skill固定MUSIC OFF，并在实际H3编译时覆盖主页的MUSIC AUTO，禁止用配乐代替现场声。
+
+4DX EXPERIENCE CONTROL
+Selected effects: PITCH, ROLL, HEAVE, WIND, AIR SHOT, VIBRATION, IMPACT, FLASH, FOG / SMOKE, WATER / RAIN
+Selected effect count: 10
+Authored target duration: 60.00 seconds
+Calculated minimum duration: 60.00 seconds
+Resolved design duration: 60.00 seconds
+Duration rule: 15 seconds for the first effect, plus 5 seconds for every additional selected effect. A longer authored target is preserved; a shorter one is raised to the calculated minimum.
+Intensity: MEDIUM
+Event density: BALANCED
+Each selected effect becomes one immersive live-auditorium chapter. Keep the movie-screen cause, active theatre mechanism and varied audience reaction visible together for at least 99% of the chapter.
+Screen-depth policy: one effect-bearing element must visibly cross and occlude the movie-screen border, continue into the auditorium as a coherent stereoscopic/practical effect, and trigger directional audience surprise. Never duplicate the source subject.
+Sound policy: DIEGETIC 4DX AUDITORIUM ONLY. Keep four audible layers: screen event, close seat/mechanism Foley, directional environmental effect, and staggered audience reactions. No voice-over, dialogue, announcer, score or background music; this Skill overrides a global MUSIC AUTO setting during H3 compilation.
+Camera policy: immersive FPV translation and a wide spatial orbit around reacting audience rows; no visible drone, in-place spin, barrel roll or zoom-out.
+Camera movement is never seat movement. Keep H3 visual/audio direction separate from structured Physical Events and 4DX Events.
+END 4DX EXPERIENCE CONTROL
+
+输出覆盖0.00-60.00秒、无空白和重叠的Director Design JSON。开场和Final Hold各只占0.5秒，其余时间全部分配给已选择的4DX现场章节。不得建立Voice-over、Dialogue或Lyrics Text Layer。每个章节建立独立Physical Event和相连的4DX Event，事件持续时间覆盖对应章节的99%。最后0.5秒保留正在消散的烟、水滴、光线、座椅余震和观众反应，只禁止开始新的事件。
