@@ -91,6 +91,12 @@ from media_engine import (
     probe_media,
 )
 from audio_engine import evaluate_native_audio_qc
+from ace_step_dialog import AceStepMusicCoverDialog
+from ace_step_runtime import (
+    AceStepRuntimeState,
+    detect_ace_step_runtime,
+    start_local_server_if_installed,
+)
 from native_audio_engine import (
     NativeAudioProfile,
     audio_reference_intent_text,
@@ -170,6 +176,17 @@ from design_engine import (
     validate_drone_image_request_budget,
     validate_explicit_timed_text_contract,
     validate_requested_speech_layer_contract,
+)
+from fourdx_engine import (
+    AI_MOVIE_MAKING_OF_4DX_SKILL,
+    FOURDX_EFFECTS,
+    fourdx_effect_id_from_text,
+    fourdx_native_audio_fields,
+    fourdx_overall_soundscape,
+    fourdx_preferences_from_requirement,
+    normalize_fourdx_preferences,
+    requested_fourdx_duration,
+    update_fourdx_requirement_block,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from smart_cut_engine import (
@@ -1057,6 +1074,8 @@ class TextLayer:
     shot_id: str = ""
     speech_timing_auto_adjusted: bool = False
     overlap_policy: str = "auto"
+    timeline_visible_text_kind: str = ""
+    render_owner: str = "h3"
 
     def __post_init__(self) -> None:
         self.font_size = max(8, min(240, int(self.font_size)))
@@ -1076,6 +1095,12 @@ class TextLayer:
         self.lip_sync = bool(self.lip_sync)
         self.speech_timing_auto_adjusted = bool(self.speech_timing_auto_adjusted)
         self.overlap_policy = normalize_speech_overlap_policy(self.overlap_policy)
+        self.timeline_visible_text_kind = str(self.timeline_visible_text_kind or "")
+        self.render_owner = (
+            "studio_graphics"
+            if str(self.render_owner).strip().casefold() == "studio_graphics"
+            else "h3"
+        )
 
 
 def text_layer_from_mapping(value: dict) -> TextLayer:
@@ -6586,6 +6611,87 @@ class DesignPageDialog(QDialog):
             self.requirement_edit.setToolTip(
                 "Starter template loaded from the selected Special Skill. You can edit or replace it."
             )
+        self.fourdx_controls = QGroupBox(
+            "4DX EXPERIENCE · SELECT ONE OR MORE"
+        )
+        self.fourdx_controls.setObjectName("designFourDXControls")
+        fourdx_layout = QGridLayout(self.fourdx_controls)
+        fourdx_layout.setContentsMargins(8, 8, 8, 8)
+        fourdx_layout.setHorizontalSpacing(10)
+        fourdx_layout.setVerticalSpacing(5)
+        stored_preferences = self.context.get("fourdx_preferences")
+        self.fourdx_preferences = normalize_fourdx_preferences(
+            stored_preferences
+            if isinstance(stored_preferences, dict)
+            else fourdx_preferences_from_requirement(
+                self.requirement_edit.toPlainText()
+            )
+        )
+        self.fourdx_effect_checks: dict[str, QCheckBox] = {}
+        for index, (effect_id, label, description) in enumerate(FOURDX_EFFECTS):
+            checkbox = QCheckBox(label)
+            checkbox.setObjectName(f"designFourDX_{effect_id}")
+            checkbox.setChecked(
+                effect_id in self.fourdx_preferences["selected_effects"]
+            )
+            checkbox.setToolTip(description)
+            checkbox.toggled.connect(self._fourdx_controls_changed)
+            self.fourdx_effect_checks[effect_id] = checkbox
+            fourdx_layout.addWidget(checkbox, index // 5, index % 5)
+        fourdx_layout.addWidget(QLabel("INTENSITY"), 2, 0)
+        self.fourdx_intensity_combo = QComboBox()
+        self.fourdx_intensity_combo.setObjectName("designFourDXIntensity")
+        for label, value in (("LOW", "low"), ("MEDIUM", "medium"), ("HIGH", "high")):
+            self.fourdx_intensity_combo.addItem(label, value)
+        self.fourdx_intensity_combo.setCurrentIndex(max(
+            0,
+            self.fourdx_intensity_combo.findData(
+                self.fourdx_preferences["intensity"]
+            ),
+        ))
+        self.fourdx_intensity_combo.currentIndexChanged.connect(
+            self._fourdx_controls_changed
+        )
+        fourdx_layout.addWidget(self.fourdx_intensity_combo, 2, 1)
+        fourdx_layout.addWidget(QLabel("DENSITY"), 2, 2)
+        self.fourdx_density_combo = QComboBox()
+        self.fourdx_density_combo.setObjectName("designFourDXDensity")
+        for label, value in (
+            ("SPARSE", "sparse"), ("BALANCED", "balanced"), ("DENSE", "dense")
+        ):
+            self.fourdx_density_combo.addItem(label, value)
+        self.fourdx_density_combo.setCurrentIndex(max(
+            0,
+            self.fourdx_density_combo.findData(
+                self.fourdx_preferences["density"]
+            ),
+        ))
+        self.fourdx_density_combo.currentIndexChanged.connect(
+            self._fourdx_controls_changed
+        )
+        fourdx_layout.addWidget(self.fourdx_density_combo, 2, 3)
+        self.fourdx_duration_label = QLabel()
+        self.fourdx_duration_label.setObjectName("designFourDXDuration")
+        self.fourdx_duration_label.setWordWrap(True)
+        self.fourdx_duration_label.setStyleSheet("color:#b9d8ff;")
+        fourdx_layout.addWidget(self.fourdx_duration_label, 3, 0, 1, 5)
+        is_fourdx_skill = (
+            _bound_special_skill_key(self.context)
+            == AI_MOVIE_MAKING_OF_4DX_SKILL
+        )
+        self.fourdx_controls.setVisible(is_fourdx_skill)
+        if is_fourdx_skill:
+            self.requirement_edit.setPlainText(update_fourdx_requirement_block(
+                self.requirement_edit.toPlainText(), self.fourdx_preferences
+            ))
+            self.fourdx_preferences = fourdx_preferences_from_requirement(
+                self.requirement_edit.toPlainText()
+            )
+            self._refresh_fourdx_duration_label()
+            self.requirement_edit.textChanged.connect(
+                self._refresh_fourdx_duration_label
+            )
+            concept_layout.addWidget(self.fourdx_controls)
         concept_layout.addWidget(self.requirement_edit)
 
         media_intelligence = QGroupBox("MEDIA POOL INTELLIGENCE")
@@ -6851,6 +6957,62 @@ class DesignPageDialog(QDialog):
         if item:
             self._insert_media_reference(item)
 
+    def _fourdx_controls_changed(self, *_args) -> None:
+        """Synchronize the selected 4DX preferences into an owned requirement block."""
+
+        if not hasattr(self, "fourdx_effect_checks"):
+            return
+        self.fourdx_preferences = normalize_fourdx_preferences({
+            "selected_effects": [
+                effect_id
+                for effect_id, checkbox in self.fourdx_effect_checks.items()
+                if checkbox.isChecked()
+            ],
+            "intensity": self.fourdx_intensity_combo.currentData(),
+            "density": self.fourdx_density_combo.currentData(),
+        })
+        updated_requirement = update_fourdx_requirement_block(
+            self.requirement_edit.toPlainText(), self.fourdx_preferences
+        )
+        self.requirement_edit.blockSignals(True)
+        self.requirement_edit.setPlainText(updated_requirement)
+        self.requirement_edit.blockSignals(False)
+        self.fourdx_preferences = fourdx_preferences_from_requirement(
+            updated_requirement
+        )
+        self._refresh_fourdx_duration_label()
+        self._invalidate_json()
+
+    def _refresh_fourdx_duration_label(self) -> None:
+        if not hasattr(self, "fourdx_duration_label"):
+            return
+        current = normalize_fourdx_preferences({
+            "selected_effects": [
+                effect_id
+                for effect_id, checkbox in self.fourdx_effect_checks.items()
+                if checkbox.isChecked()
+            ],
+            "intensity": self.fourdx_intensity_combo.currentData(),
+            "density": self.fourdx_density_combo.currentData(),
+            "requested_duration_seconds": requested_fourdx_duration(
+                self.requirement_edit.toPlainText()
+            ),
+        })
+        requested = current.get("requested_duration_seconds")
+        requested_label = (
+            f"{float(requested):.0f}s" if requested is not None else "AUTO"
+        )
+        self.fourdx_duration_label.setText(
+            f"DURATION · {current['selected_effect_count']} effect(s) · "
+            f"authored {requested_label} · minimum "
+            f"{current['minimum_duration_seconds']:.0f}s · resolved "
+            f"{current['resolved_duration_seconds']:.0f}s"
+        )
+        self.fourdx_duration_label.setToolTip(
+            "1 effect = 15s. Every additional selected effect adds 5s. "
+            "A longer authored duration is preserved; a shorter duration is raised automatically."
+        )
+
     def _selected_design_context(self) -> dict:
         context = dict(self.context)
         selected: list[dict] = []
@@ -6878,6 +7040,8 @@ class DesignPageDialog(QDialog):
         context["music_mode"] = normalize_design_music_mode(
             self.music_mode_combo.currentData()
         )
+        if _bound_special_skill_key(context) == AI_MOVIE_MAKING_OF_4DX_SKILL:
+            context["fourdx_preferences"] = deepcopy(self.fourdx_preferences)
         return context
 
     @staticmethod
@@ -7858,6 +8022,14 @@ class DesignPageDialog(QDialog):
         self._submit("comfy_zimage_models", {"base_url": server})
 
     def generate_design(self) -> None:
+        if (
+            hasattr(self, "fourdx_controls")
+            and _bound_special_skill_key(self.context)
+            == AI_MOVIE_MAKING_OF_4DX_SKILL
+        ):
+            # Capture a duration the user just typed before generation, then
+            # rewrite the managed block with the current effect-count budget.
+            self._fourdx_controls_changed()
         requirement = self.requirement_edit.toPlainText().strip()
         if not requirement:
             self._show_preflight_failure(
@@ -7873,7 +8045,14 @@ class DesignPageDialog(QDialog):
         if not self._select_explicit_media_references(requirement):
             return
         self.active_design_context = self._selected_design_context()
-        requested_duration = infer_explicit_design_duration(requirement)
+        if _bound_special_skill_key(self.context) == AI_MOVIE_MAKING_OF_4DX_SKILL:
+            requested_duration = float(
+                fourdx_preferences_from_requirement(requirement)[
+                    "resolved_duration_seconds"
+                ]
+            )
+        else:
+            requested_duration = infer_explicit_design_duration(requirement)
         if requested_duration is not None:
             self.active_design_context["requested_duration_seconds"] = requested_duration
         self._persist_settings()
@@ -8578,9 +8757,19 @@ class DirectorCutStudio(QMainWindow):
         self.smart_cut_active_request: dict = {}
         self.smart_cut_dialog: SmartCutDialog | None = None
         self.smart_cut_last_plan: dict = {}
+        self.fourdx_preferences: dict = normalize_fourdx_preferences(None)
+        self.fourdx_experience_design: dict = {}
+        self.fourdx_reference_role_ledger: list[dict] = []
+        self.fourdx_physical_events: list[dict] = []
+        self.fourdx_events: list[dict] = []
         self.design_ai_settings = load_design_settings(DESIGN_SETTINGS_ENV)
+        self.ace_step_runtime_state = detect_ace_step_runtime()
+        self.ace_step_local_start_requested = start_local_server_if_installed(
+            self.ace_step_runtime_state
+        )
         # API keys remain memory-only for the lifetime of this Studio window.
         self.semantic_openai_api_key = ""
+        self.active_music_cover_dialog: AceStepMusicCoverDialog | None = None
         self._closing = False
         self._timed_out_generations: set[tuple[str, int]] = set()
         self.worker_watchdog = QTimer(self)
@@ -8698,13 +8887,18 @@ class DirectorCutStudio(QMainWindow):
         self.setMinimumSize(1180, 720)
         self._build_toolbar()
         self._build_workspace()
-        self.statusBar().showMessage("Director Cut runtime ready")
+        self.statusBar().showMessage(
+            f"Director Cut runtime ready · ACE-Step {self.ace_step_runtime_state.mode.upper()} MODE · "
+            f"{self.ace_step_runtime_state.api_url}"
+        )
         if LATEST_WORKFLOW.exists():
             self.load_workflow_path(LATEST_WORKFLOW)
         self._connect_dirty_signals()
 
     def _build_toolbar(self) -> None:
         bar = QToolBar("Director Controls")
+        bar.setObjectName("directorToolbar")
+        self.director_toolbar = bar
         bar.setMovable(False)
         self.addToolBar(bar)
         open_button = QPushButton("OPEN API WORKFLOW")
@@ -8716,13 +8910,13 @@ class DirectorCutStudio(QMainWindow):
         self.design_button.setStyleSheet("background:#563d86; font-weight:700;")
         self.design_button.clicked.connect(self.open_design_page)
         bar.addWidget(self.design_button)
-        new_project_button = QPushButton("NEW PROJECT")
+        new_project_button = QPushButton("NEW")
         new_project_button.clicked.connect(self.new_project)
         bar.addWidget(new_project_button)
-        open_project = QPushButton("OPEN PROJECT")
+        open_project = QPushButton("OPEN")
         open_project.clicked.connect(self.open_project)
         bar.addWidget(open_project)
-        save_project = QPushButton("SAVE PROJECT")
+        save_project = QPushButton("SAVE")
         save_project.clicked.connect(self.save_project)
         bar.addWidget(save_project)
         self.project_storage_button = QPushButton("STORAGE")
@@ -8799,6 +8993,18 @@ class DirectorCutStudio(QMainWindow):
         )
         self.special_skill_creator_button.clicked.connect(self.open_special_skill_creator)
         bar.addWidget(self.special_skill_creator_button)
+        toolbar_spacer = QWidget()
+        toolbar_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        bar.addWidget(toolbar_spacer)
+        self.music_cover_button = QPushButton("MUSIC COVER")
+        self.music_cover_button.setObjectName("musicCoverButton")
+        self.music_cover_button.setToolTip(
+            f"Open ACE-Step Music Workbench · {self.ace_step_runtime_state.mode.upper()} "
+            f"MODE · API {self.ace_step_runtime_state.api_url}"
+        )
+        self.music_cover_button.setStyleSheet("background:#156f7a; font-weight:700;")
+        self.music_cover_button.clicked.connect(self.open_ace_step_music_cover)
+        bar.addWidget(self.music_cover_button)
         generation_bar = QToolBar("Generation Controls")
         generation_bar.setObjectName("generationToolbar")
         self.generation_toolbar = generation_bar
@@ -10432,6 +10638,8 @@ class DirectorCutStudio(QMainWindow):
             ),
             "dialogue_tts_engine": self.render_settings.dialogue_tts_engine,
             "music_mode": self.render_settings.music_mode,
+            "fourdx_preferences": deepcopy(self.fourdx_preferences),
+            "fourdx_experience_design": deepcopy(self.fourdx_experience_design),
             "aspect_ratio": self.aspect_ratio_combo.currentData(),
             "available_tracks": [track.track_id for track in self.tracks],
             "media_capacity": total_capacity,
@@ -10474,6 +10682,35 @@ class DirectorCutStudio(QMainWindow):
                 },
             },
         }
+
+    def open_ace_step_music_cover(self) -> None:
+        """Open the native ACE-Step Music Cover workspace inside Studio."""
+
+        dialog = AceStepMusicCoverDialog(
+            self,
+            runtime_state=self.ace_step_runtime_state,
+        )
+        dialog.runtime_mode_changed.connect(self._ace_step_runtime_changed)
+        self.active_music_cover_dialog = dialog
+        self.statusBar().showMessage(
+            f"ACE-Step Music Workbench · {self.ace_step_runtime_state.mode.upper()} MODE · "
+            f"API {self.ace_step_runtime_state.api_url}"
+        )
+        dialog.exec()
+        if self.active_music_cover_dialog is dialog:
+            self.active_music_cover_dialog = None
+        dialog.deleteLater()
+
+    def _ace_step_runtime_changed(self, state: object) -> None:
+        if not isinstance(state, AceStepRuntimeState):
+            return
+        self.ace_step_runtime_state = state
+        self.music_cover_button.setToolTip(
+            f"Open ACE-Step Music Workbench · {state.mode.upper()} MODE · API {state.api_url}"
+        )
+        self.statusBar().showMessage(
+            f"ACE-Step {state.mode.upper()} MODE · API {state.api_url}"
+        )
 
     def open_design_page(self) -> None:
         if not self.scan:
@@ -10524,6 +10761,11 @@ class DirectorCutStudio(QMainWindow):
             "storyboard_target_duration_seconds": self.storyboard_target_duration_seconds,
             "storyboard_view_mode": self.storyboard_view_mode,
             "smart_cut_last_plan": deepcopy(self.smart_cut_last_plan),
+            "fourdx_preferences": deepcopy(self.fourdx_preferences),
+            "fourdx_experience_design": deepcopy(self.fourdx_experience_design),
+            "fourdx_reference_role_ledger": deepcopy(self.fourdx_reference_role_ledger),
+            "fourdx_physical_events": deepcopy(self.fourdx_physical_events),
+            "fourdx_events": deepcopy(self.fourdx_events),
             "production_strategy": self.production_strategy,
             "production_batch_seconds": self.production_batch_seconds,
             "incremental_production": {
@@ -10579,6 +10821,19 @@ class DirectorCutStudio(QMainWindow):
             else "large_icons"
         )
         self.smart_cut_last_plan = deepcopy(state.get("smart_cut_last_plan") or {})
+        self.fourdx_preferences = normalize_fourdx_preferences(
+            state.get("fourdx_preferences")
+        )
+        self.fourdx_experience_design = deepcopy(
+            state.get("fourdx_experience_design") or {}
+        )
+        self.fourdx_reference_role_ledger = deepcopy(
+            state.get("fourdx_reference_role_ledger") or []
+        )
+        self.fourdx_physical_events = deepcopy(
+            state.get("fourdx_physical_events") or []
+        )
+        self.fourdx_events = deepcopy(state.get("fourdx_events") or [])
         self.production_strategy = str(
             state.get("production_strategy") or "full_range"
         )
@@ -10793,6 +11048,25 @@ class DirectorCutStudio(QMainWindow):
     def _apply_ai_design_direct(self, plan: dict, materials: list[dict], replace: bool) -> list[str]:
         if not self.scan:
             return ["No workflow loaded"]
+        if str(self.special_combo.currentData() or "") == AI_MOVIE_MAKING_OF_4DX_SKILL:
+            self.fourdx_experience_design = deepcopy(
+                plan.get("experience_design") or {}
+            )
+            self.fourdx_preferences = normalize_fourdx_preferences(
+                self.fourdx_experience_design
+            )
+            self.fourdx_reference_role_ledger = deepcopy(
+                plan.get("reference_role_ledger") or []
+            )
+            self.fourdx_physical_events = deepcopy(
+                plan.get("physical_events") or []
+            )
+            self.fourdx_events = deepcopy(plan.get("fourdx_events") or [])
+        elif replace:
+            self.fourdx_experience_design = {}
+            self.fourdx_reference_role_ledger = []
+            self.fourdx_physical_events = []
+            self.fourdx_events = []
         duration = float(plan["duration_seconds"])
         target_duration = float(
             plan.get("_speech_timing_base_duration", duration) or duration
@@ -11128,6 +11402,9 @@ class DirectorCutStudio(QMainWindow):
                 location_transition_user_edited=bool(
                     shot.get("location_transition_user_edited", False)
                 ),
+                native_audio_direction=str(shot.get("native_audio_direction", "")),
+                environment_continuity=str(shot.get("environment_continuity", "")),
+                audio_reference_intent=str(shot.get("audio_reference_intent", "")),
             ))
         for index, transition in enumerate(plan["transitions"], 1):
             start = float(transition["time_seconds"])
@@ -11178,6 +11455,12 @@ class DirectorCutStudio(QMainWindow):
                 language=item["language"], delivery=item["delivery"],
                 lip_sync=item["lip_sync"], shot_id=shot_id,
                 overlap_policy=item.get("overlap_policy", "auto"),
+                timeline_visible_text_kind=item.get("timeline_visible_text_kind", ""),
+                render_owner=(
+                    "studio_graphics"
+                    if item.get("timeline_visible_text_kind") == "making_of_stage_label"
+                    else item.get("render_owner", "h3")
+                ),
             ))
         self._normalize_text_layer_tracks()
         if (
@@ -12439,6 +12722,11 @@ class DirectorCutStudio(QMainWindow):
         self.storyboard_target_duration_seconds = 45.0
         self.storyboard_view_mode = "large_icons"
         self.smart_cut_last_plan = {}
+        self.fourdx_preferences = normalize_fourdx_preferences(None)
+        self.fourdx_experience_design = {}
+        self.fourdx_reference_role_ledger = []
+        self.fourdx_physical_events = []
+        self.fourdx_events = []
         self.smart_cut_job_id = ""
         self.smart_cut_unload_job_id = ""
         self.smart_cut_dialog = None
@@ -14671,6 +14959,11 @@ class DirectorCutStudio(QMainWindow):
             "storyboard_target_duration_seconds": self.storyboard_target_duration_seconds,
             "storyboard_view_mode": self.storyboard_view_mode,
             "smart_cut_last_plan": deepcopy(self.smart_cut_last_plan),
+            "fourdx_preferences": deepcopy(self.fourdx_preferences),
+            "fourdx_experience_design": deepcopy(self.fourdx_experience_design),
+            "fourdx_reference_role_ledger": deepcopy(self.fourdx_reference_role_ledger),
+            "fourdx_physical_events": deepcopy(self.fourdx_physical_events),
+            "fourdx_events": deepcopy(self.fourdx_events),
             "production_strategy": self.production_strategy,
             "production_batch_seconds": self.production_batch_seconds,
             "incremental_production": {
@@ -14834,6 +15127,19 @@ class DirectorCutStudio(QMainWindow):
             self.smart_cut_last_plan = deepcopy(
                 payload.get("smart_cut_last_plan") or {}
             )
+            self.fourdx_preferences = normalize_fourdx_preferences(
+                payload.get("fourdx_preferences")
+            )
+            self.fourdx_experience_design = deepcopy(
+                payload.get("fourdx_experience_design") or {}
+            )
+            self.fourdx_reference_role_ledger = deepcopy(
+                payload.get("fourdx_reference_role_ledger") or []
+            )
+            self.fourdx_physical_events = deepcopy(
+                payload.get("fourdx_physical_events") or []
+            )
+            self.fourdx_events = deepcopy(payload.get("fourdx_events") or [])
             self.storyboard_target_spin.blockSignals(True)
             self.storyboard_target_spin.setValue(
                 self.storyboard_target_duration_seconds
@@ -19622,20 +19928,28 @@ class DirectorCutStudio(QMainWindow):
         self._sync_timeline_clip_sources()
         if interactive:
             self._sync_prompt_panel_from_timeline()
-        soundscape = automatic_background_soundscape({
-            "overall_soundscape": self.prompt_panel.soundscape.toPlainText(),
-            "creative_brief": self.prompt_panel.brief.toPlainText(),
-            "shots": [
-                {
-                    "subject_action": cue.subject_action,
-                    "environment_response": cue.environment_response,
-                }
-                for cue in self.director_cues if cue.cue_type == "shot"
-            ],
-        })
+        active_special_skill = str(
+            self.special_combo.currentData() or ""
+        ).strip().casefold()
+        if active_special_skill == AI_MOVIE_MAKING_OF_4DX_SKILL:
+            soundscape = fourdx_overall_soundscape()
+        else:
+            soundscape = automatic_background_soundscape({
+                "overall_soundscape": self.prompt_panel.soundscape.toPlainText(),
+                "creative_brief": self.prompt_panel.brief.toPlainText(),
+                "shots": [
+                    {
+                        "subject_action": cue.subject_action,
+                        "environment_response": cue.environment_response,
+                    }
+                    for cue in self.director_cues if cue.cue_type == "shot"
+                ],
+            })
         if soundscape != self.prompt_panel.soundscape.toPlainText().strip():
             self.prompt_panel.soundscape.setPlainText(soundscape)
         music_mode = normalize_design_music_mode(self.render_settings.music_mode)
+        if active_special_skill == AI_MOVIE_MAKING_OF_4DX_SKILL:
+            music_mode = "off"
         music = self.prompt_panel.music.toPlainText().strip()
         if music_mode == "off":
             music = "N/A"
@@ -19757,6 +20071,10 @@ class DirectorCutStudio(QMainWindow):
                 if asset.enabled and asset.timeline_placed
             ]
         assets = assets or []
+        fourdx_audio = (
+            str(self.special_combo.currentData() or "").strip().casefold()
+            == AI_MOVIE_MAKING_OF_4DX_SKILL
+        )
         previous_profile: NativeAudioProfile | None = None
         inherited_space: tuple[str, str] | None = None
         for cue in shots:
@@ -19848,6 +20166,8 @@ class DirectorCutStudio(QMainWindow):
             )
             inherited_space = (profile.acoustic_space, profile.ambience)
             music_mode = normalize_design_music_mode(self.render_settings.music_mode)
+            if fourdx_audio:
+                music_mode = "off"
             timeline_music_cue = self._timeline_music_requested_for_range(
                 cue.start_seconds, cue.end_seconds
             )
@@ -19891,7 +20211,22 @@ class DirectorCutStudio(QMainWindow):
                 if is_acoustic_reference:
                     acoustic_references.append(asset.tag)
             if not cue.native_audio_direction_user_edited:
-                if campus_composite:
+                if fourdx_audio:
+                    effect_id = fourdx_effect_id_from_text(
+                        cue.preset,
+                        cue.subject_action,
+                        cue.detail,
+                    )
+                    phase = (
+                        "final_hold"
+                        if "final hold" in f"{cue.preset} {cue.detail}".casefold()
+                        else "effect" if effect_id else "intro"
+                    )
+                    cue.native_audio_direction = fourdx_native_audio_fields(
+                        effect_id,
+                        phase=phase,
+                    )["native_audio_direction"]
+                elif campus_composite:
                     cue.native_audio_direction = (
                         "Acoustic space remains the same open campus exterior established by the preceding "
                         "Shot. Keep @A1 at its exact Timeline source time and retain the same outdoor air, "
@@ -19906,7 +20241,11 @@ class DirectorCutStudio(QMainWindow):
                         music_requested=has_music,
                     )
             if not cue.environment_continuity_user_edited:
-                if campus_composite:
+                if fourdx_audio:
+                    cue.environment_continuity = fourdx_native_audio_fields()[
+                        "environment_continuity"
+                    ]
+                elif campus_composite:
                     cue.environment_continuity = (
                         "Continue the preceding campus ambience, acoustic openness and distance without a "
                         "room-tone reset while the P4 subjects appear after the wipe."
@@ -19917,9 +20256,14 @@ class DirectorCutStudio(QMainWindow):
                         profile,
                     )
             if not cue.audio_reference_intent_user_edited:
-                cue.audio_reference_intent = audio_reference_intent_text(
-                    acoustic_references
-                )
+                if fourdx_audio:
+                    cue.audio_reference_intent = fourdx_native_audio_fields()[
+                        "audio_reference_intent"
+                    ]
+                else:
+                    cue.audio_reference_intent = audio_reference_intent_text(
+                        acoustic_references
+                    )
             previous_profile = profile
 
     def _seed_native_audio_for_new_cue(self, cue: DirectorCue) -> None:
@@ -20009,6 +20353,9 @@ class DirectorCutStudio(QMainWindow):
             "Production mix contract:", 1
         )[0].strip(" .")
         raw_music_direction = str(state.get("music", "")).strip()
+        active_special_skill = str(
+            self.special_combo.currentData() or ""
+        ).strip().casefold()
         if window_start is not None and window_end is not None:
             timeline_music_requested = self._timeline_music_requested_for_range(
                 window_start, window_end
@@ -20021,6 +20368,10 @@ class DirectorCutStudio(QMainWindow):
                 for cue in self.director_cues
             )
         music_mode = normalize_design_music_mode(self.render_settings.music_mode)
+        if active_special_skill == AI_MOVIE_MAKING_OF_4DX_SKILL:
+            # This format owns a diegetic-auditorium-only mix. A global AUTO
+            # preference must not silently reintroduce a score at render time.
+            music_mode = "off"
         authored_music = raw_music_direction.split(
             "Music mix contract:", 1
         )[0].strip(" .")
@@ -20491,6 +20842,8 @@ class DirectorCutStudio(QMainWindow):
                 "lip_sync": layer.lip_sync,
                 "overlap_policy": layer.overlap_policy,
                 "shot_id": layer.shot_id,
+                "timeline_visible_text_kind": layer.timeline_visible_text_kind,
+                "render_owner": layer.render_owner,
                 "supplied_audio_tag": supplied_dialogue_audio_tag,
             }
             for layer in sorted(
@@ -20498,6 +20851,7 @@ class DirectorCutStudio(QMainWindow):
                 key=lambda item: (item.start_seconds, item.end_seconds, item.layer_id),
             )
             if layer.text.strip()
+            and layer.render_owner != "studio_graphics"
             and (
                 window_start is None
                 or (

@@ -16,6 +16,11 @@ from drone_route_engine import analyse_red_route, route_span_language
 from combat_environment_engine import apply_environmental_combat_physics
 from combat_action_engine import apply_combat_action_continuity
 from segment_engine import normalize_speech_overlap_policy
+from fourdx_engine import (
+    AI_MOVIE_MAKING_OF_4DX_SKILL,
+    enforce_making_of_fourdx_plan,
+    fourdx_preferences_from_requirement,
+)
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
@@ -2772,7 +2777,7 @@ def enforce_design_subtitle_policy(
             or (
                 bool(layer.get("explicit_user_requested", False))
                 and str(layer.get("timeline_visible_text_kind", "")).strip().casefold()
-                == "comic_technique_title"
+                in {"comic_technique_title", "making_of_stage_label"}
             )
             or (
                 not str(authored_requirement or "").strip()
@@ -3741,6 +3746,10 @@ DESIGN_JSON_SCHEMA = {
         "combat_baseline_duration_seconds": {"type": "number"},
         "combat_fact_ledger_schema_version": {"type": "integer"},
         "combat_fact_ledger": {"type": "object"},
+        "experience_design": {"type": "object"},
+        "reference_role_ledger": {"type": "array"},
+        "physical_events": {"type": "array"},
+        "fourdx_events": {"type": "array"},
         "shots": {
             "type": "array",
             "minItems": 1,
@@ -3843,6 +3852,7 @@ DESIGN_JSON_SCHEMA = {
                     },
                     "explicit_user_requested": {"type": "boolean"},
                     "timeline_visible_text_kind": {"type": "string"},
+                    "render_owner": {"type": "string"},
                 },
             },
         },
@@ -5897,6 +5907,11 @@ def normalize_design_plan(
         source.get("theme_text_explicit_user_requested", False)
     )
     plan["duration_seconds"] = duration
+    for structured_key in (
+        "experience_design", "reference_role_ledger", "physical_events", "fourdx_events",
+    ):
+        if structured_key in source:
+            plan[structured_key] = deepcopy(source.get(structured_key))
     if not plan["title"]:
         plan["title"] = "AI Director Design"
     if not plan["creative_brief"]:
@@ -6097,6 +6112,7 @@ def normalize_design_plan(
             "authored_start_seconds", "authored_end_seconds",
             "speech_timing_auto_adjusted", "speech_budget_was_overloaded",
             "speech_budget", "authored_timing_locked", "timeline_visible_text_kind",
+            "render_owner",
         ):
             if metadata_key in raw:
                 normalized_layer[metadata_key] = deepcopy(raw[metadata_key])
@@ -6622,11 +6638,17 @@ def normalize_design_plan(
         existing_media=existing_media,
         authored_requirement=authored_requirement,
     )
-    return apply_environmental_combat_physics(
+    plan = apply_environmental_combat_physics(
         plan,
         special_skill_key=special_skill_key,
         existing_media=existing_media,
         authored_requirement=authored_requirement,
+    )
+    return enforce_making_of_fourdx_plan(
+        plan,
+        existing_media=existing_media,
+        preferences=fourdx_preferences_from_requirement(authored_requirement),
+        special_skill_key=special_skill_key,
     )
 
 
@@ -6865,6 +6887,36 @@ def build_design_system_prompt(context: dict) -> str:
             "a fighter's face. "
             "Persist every environmental consequence into later Shots and compile the editable causal "
             "fields into the actual H3 Segment prompt. "
+        )
+    elif selected_special_key == AI_MOVIE_MAKING_OF_4DX_SKILL:
+        ending_contract = (
+            "AI MOVIE MAKING-OF / VFX BREAKDOWN / 4DX FORMAT CONTRACT: create a complete "
+            "film of at least 45 seconds, not a normal story with a cosmetic 4DX overlay. Build "
+            "one continuous progression through Source Photography, Reference Analysis, Character "
+            "Extraction, Environment Reconstruction, Scene Assembly, motivated Lighting/Contact "
+            "Shadow/VFX, Final Cinematic Composite, Physical Event to 4DX Breakdown, and a stable "
+            "Final Hold. Use every enabled @P/@V/@A only according to its evidence and user mapping; "
+            "filenames are never scene facts. Generate only genuinely missing scene/pass references, "
+            "never one Picture per selected effect. Technical stage labels, arrows, values and diagrams "
+            "must be exact editable on_screen_text/graphic Timeline layers; H3 must leave clean safe "
+            "areas and must never invent UI, HUD or illegible technical lettering. The visible film must "
+            "show a physical cause before every response. 4DX selections are preferences: use one only "
+            "when the current visible event causally supports it, otherwise record SKIPPED_NO_CAUSAL_SOURCE. "
+            "Camera pan, tilt, dolly, orbit, zoom or shake is camera motion and never seat motion. Keep "
+            "H3 native image, dialogue, environment sound and Foley unchanged; do not add TTS replacement, "
+            "audio separation, FFmpeg reverb, EQ, convolution or post-mix effects. End with the completed "
+            "composite held steadily for at least one second and begin no new event or speech there. "
+        )
+        speaker_gender_contract = (
+            "MAKING-OF CAST CONTRACT: preserve user-bound subject identities and source appearances. "
+            "Do not infer a new cast merely to demonstrate extraction or compositing. "
+        )
+        environmental_combat_contract = (
+            "PHYSICAL EVENT CONTRACT: for every candidate event, describe source, target, contact or "
+            "near-miss, force direction, material response, onset, duration and decay. Keep planned "
+            "Physical Events and 4DX Events as separate structured data linked by stable IDs; never "
+            "turn a device command into an unexplained visual event. Manual Timeline events outrank "
+            "automatic suggestions and must not be silently overwritten. "
         )
     elif is_drone_special_skill(selected_special_key):
         ending_contract = (

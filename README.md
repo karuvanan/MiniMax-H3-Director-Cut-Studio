@@ -2,55 +2,34 @@
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
-## 下载与快速开始
+## 首要部署说明
 
-- 当前应用版本：[`v0.3.2-alpha.7`](VERSION)
-- v0.3.2 重点功能、长片流程与验收说明：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
-- 修正与版本记录：[`CHANGELOG.md`](CHANGELOG.md)
+第一次使用请依序完成以下两份说明；副机在 Step 2 会自动进入 Client Mode，不需要安装 ACE-Step 模型。
+
+1. **所有电脑必须完成**：[`Step 1：部署 Studio Runtime、Qwen3-TTS 与 VoxCPM2`](step1.md)
+2. **规划音乐主机与副机**：[`Step 2：ACE-Step 1.5 Music Workbench 主机／副机部署`](step2.md)
+3. 完成后统一从项目根目录启动：
+
+   ```powershell
+   .\run_h3_prompt_studio.bat
+   ```
+
+> ACE-Step 规则：完整安装的高显存电脑自动进入 `SERVER MODE` 并启动本机 `127.0.0.1:8001`；未安装的电脑保持 `CLIENT MODE`，不下载任何 ACE-Step 文件，默认连接 `192.168.0.185:8001`。
+
+源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。请先完成 Step 1，不要只复制 `ai_libraries_common`。
+
+## 版本、下载与教程
+
+- 当前应用版本：[`v0.3.5`](VERSION)
+- v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
+- v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
+- v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
+- 完整修正记录：[`CHANGELOG.md`](CHANGELOG.md)
 - [MiniMax H3 Director Cut Studio 教程](https://lcz.me/topic/1317/minimax-h3-director-cut-studio-%E6%95%99%E7%A8%8B-%E6%9B%B4%E6%96%B0%E5%9C%A8%E7%AC%AC%E4%B8%80%E6%A5%BC)
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
 - [示范输出影片（YouTube）](https://www.youtube.com/@imbiplazaASUS/videos)
 
-源码仓库不会包含 Python runtime、FFmpeg、BLIP／Whisper 权重、ComfyUI checkpoint 或生成影片。完整 runtime 应解压到 `ai_libraries_common/`，模型则依照下方清单分别放进 Studio 与 ComfyUI 的模型目录。
-
-### Step 1：部署 Studio Runtime、Qwen3-TTS 与 VoxCPM2
-
-1. 下载／Clone GitHub 源码，再把 Google Drive 的完整 `ai_libraries_common` 解压到项目根目录。只备份或下载 `ai_libraries_common` 并不足够；根目录中的 Studio 源码、BAT、requirements 和 workflow JSON 也必须保留。
-2. 在项目根目录依照以下顺序安装 Qwen3-TTS 隔离 runtime，再下载约 2.5GB 的 Qwen 模型：
-
-   ```powershell
-   .\install_qwen3_tts_runtime.bat
-   .\download_qwen3_tts_model.bat
-   ```
-
-   第一条命令建立 `ai_libraries_common/qwen_tts_runtime/` 与 `qwen_tts_support/`；第二条命令自动建立并下载到：
-
-   ```text
-   models/Qwen3-TTS-12Hz-0.6B-CustomVoice/
-   ```
-
-3. Qwen 下载脚本不会下载 VoxCPM2。需要 VoxCPM2 Local 时，另行执行：
-
-   ```powershell
-   .\ai_libraries_common\python_env\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='openbmb/VoxCPM2', local_dir=r'models\VoxCPM2')"
-   ```
-
-   完成后应同时存在：
-
-   ```text
-   models/
-   ├─ Qwen3-TTS-12Hz-0.6B-CustomVoice/
-   └─ VoxCPM2/
-   ```
-
-4. 验证 Qwen runtime 与模型，再启动 Studio：
-
-   ```powershell
-   .\ai_libraries_common\python_env\python.exe .\qwen3_tts_setup.py verify
-   .\run_h3_prompt_studio.bat
-   ```
-
-看到 `Qwen3-TTS isolated runtime is ready` 与 `Qwen3-TTS model is ready` 代表 Qwen 部署完整。VoxCPM2 权重则由 Studio Settings 或点击 `Vox` 时再次检查。若不使用 Vox，可以略过第 3 步。
+## Studio 预览
 
 <img width="1280" height="720" alt="ezgif-44c9bbaa3fbac75c" src="https://github.com/user-attachments/assets/9884c63e-4bf6-4c90-b276-e17bcb8f6fb3" />
 

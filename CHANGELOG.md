@@ -2,6 +2,66 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.5] - 2026-09-13
+
+### Documentation
+
+- Reorganized the main README into a concise deployment entry page. Moved the Studio Runtime, Qwen3-TTS and VoxCPM2 guide to `step1.md`, and the ACE-Step 1.5 host/client deployment guide to `step2.md`.
+
+### ACE-Step 1.5 Music Workbench
+
+- Added the native `MUSIC COVER` workspace beside the Studio workflow controls. It connects to an ACE-Step 1.5 HTTP API, uploads source and optional timbre-reference audio, analyzes the source, auto-fills editable Prompt, Lyrics, BPM, key, time signature and duration fields, and keeps the complete API response visible.
+- Added four source-audio workflows: `Cover`, `Repaint`, `Lego` and `Extract`. Repaint exposes an explicit start/end window, preservation mode and strength. Lego/Extract expose twelve track classes and editable task instructions and automatically select the required `acestep-v15-base` model.
+- Added selected-model initialization through `/v1/init`. A first Lego/Extract request can download/load Base; later Turbo/Base changes load the matching model before submission. Base uses an expanded Steps range while Turbo retains its optimized limit.
+- Added a full-window translucent busy mask with a centered cyan spinner for analysis, generation and local installation. Generated audio can be played, paused, stopped and saved inside the same window.
+- Added all 24 major/minor key presets with sharp/flat glyphs, output volume gain with peak limiting, six voice-age/gender presets, eight regional language-family presets, sixteen animal-sound presets and a 24-instrument multi-select palette.
+- Changed Palette behavior so selecting instruments, voices, language families or animal sounds never starts an API job. `REMIX SELECTED PALETTE` runs explicitly; `GENERATE` also applies any unsubmitted selection automatically before generation.
+- Corrected source-conditioned duration handling. The client builds an exact-length structural guide before submission and verifies/fits the downloaded result so a requested 120-second output is no longer silently restricted to the original clip length.
+
+### Automatic Client / Server Mode
+
+- Added per-computer ACE-Step runtime detection whenever Studio starts, including when launched through `run_h3_prompt_studio.bat`.
+- A computer with a valid local runtime plus an installed Turbo checkpoint/installation marker enters `SERVER MODE`, starts ACE-Step invisibly and uses `http://127.0.0.1:8001`.
+- A computer without a complete local installation remains in `CLIENT MODE`, performs no clone, environment setup or model download, and defaults to the shared LAN API at `http://192.168.0.185:8001`.
+- Added an explicit `INSTALL LOCAL ACE-STEP` action for eligible Client machines. Installation is never automatic; the action is enabled only when the largest detected NVIDIA GPU has strictly more than 16GB VRAM, then clones the official repository when necessary, creates the isolated runtime, downloads the model and records successful Server Mode setup.
+- Updated the launcher with duplicate-server detection, hidden-process support, local logs and safe on-demand Base model loading. Removed the rejected Windows-login scheduled-task approach; server startup is owned by Studio runtime detection instead.
+- Kept Director Project format at `25`; these runtime and Music Workbench additions do not change the saved project schema.
+
+### Verification
+
+- Added focused Client/Server classification, strict VRAM-gate, local API selection, model initialization, four-mode request, Repaint window, Lego track, Palette deferral, duration and native-dialog tests.
+- Passed the focused ACE-Step suite and the complete Director Timeline regression suite.
+
+## [0.3.3-alpha.1] - 2026-09-12
+
+### Complete AI Movie Making-of / VFX Breakdown / 4DX film format
+
+- Added the Default-bound `ai-movie-making-of-4dx` Special Skill as a complete 45-second-or-longer film format.
+- Corrected the format after reviewing `h3_project_291`: replaced the generic Source Photography / Reference Analysis / Character Extraction / Scene Assembly tutorial sequence with a dedicated ten-effect Making-of showcase. The default Timeline now contains an intro, one chapter each for Pitch, Roll, Heave, Wind, Air Shot, Vibration, Impact, Flash, Fog/Smoke and Water/Rain, plus a stable Final Hold.
+- Each chapter now reveals a recognizable practical production setup, match-cuts to an original cinematic genre scene, exposes the visible trigger and material response, and creates one linked Physical Event and 4DX Event. All ten controls are selected by default; deselected chapters are omitted and the remaining duration is redistributed.
+- Added original demonstration scenarios for fighter-jet pitch, high-speed corner roll, drop/landing heave, tornado wind, near-miss air shot, structural vibration, collision impact, lightning flash, fire-corridor smoke and ocean water/rain. Prompts prohibit copied franchise characters, logos and exact movie-scene recreations.
+- Replaced unconstrained Design image expansion with at most one time-scoped Z-Image scene plate per selected effect and no alternate/per-Shot variants.
+- Raised the embedded Experience Design schema to version 2 for the chapter-based showcase; the Director Project container remains version 25 and old projects still load safely.
+- Corrected the live-experience grammar after reviewing `a_woman_with_long_black_hair_and_a_white_top_11`. Removed all automatically generated Voice-over/Dialogue/Lyrics layers and set this Skill to diegetic 4DX auditorium sound only: screen audio, seat motors, environmental rigs, impacts, clothing/seat movement and audience reactions.
+- Changed effect timing from a late short demonstration to a 99% per-chapter active interval. The half-second intro begins inside an already-running auditorium and the half-second Final Hold retains only physically decaying residue.
+- Required a purpose-built cinema with visible screen, three or more motion-seat rows and varied effect-specific audience reactions; explicitly rejected the banquet-hall/computer-lab/static-crowd failure seen in the reviewed output.
+- Added an invisible FPV spectator camera that translates through aisles and makes wide spatial arcs around reacting audience rows while keeping the screen readable. Visible drones, in-place 360-degree spins, barrel rolls and zoom-out padding are forbidden.
+- Added effect-count duration budgeting to the Design controls and managed requirement block: one effect requires 15 seconds and every additional selected effect adds 5 seconds, reaching 60 seconds for all ten. A longer authored duration is preserved; a shorter target is raised automatically, and the resolved value becomes the actual Timeline duration.
+- Added a live Design duration status showing selected count, authored target, calculated minimum and resolved duration. `CREATE DIRECTOR DESIGN JSON` now synchronizes this block before generation and sends the resolved duration—not a conflicting shorter sentence—to the planning model.
+- Corrected the flat-screen failure found in `a_woman_with_long_black_hair_and_a_white_top_12`. Every selected chapter now carries a deterministic `Screen-Plane Breakout`: one effect-bearing foreground element begins inside the framed movie image, occludes a small part of the visible screen border, and continues with matched perspective, light and atmosphere into the front-row airspace.
+- Added a staggered audience-startle chain to the actual H3 Shot prompt: front rows react first in the incoming direction, middle rows follow a fraction later, and rear rows respond with smaller delayed gasps, pointing or social confirmation. Duplicate aircraft, vehicles, people, detached holograms, portals and full-size subjects among the seats are explicitly forbidden.
+- Raised the embedded Experience Design schema to version 3 for the structured screen-plane bridge and audience-reaction trigger fields. The Director Project container remains version 25; existing projects continue to load with their saved v1/v2 experience data.
+- Versioned the generated scene-plate requirement IDs as `fourdx_screen_breakout_v3_*`, preventing reopened projects from silently reusing an older flat-screen reference image after this upgrade.
+- Corrected the audio failure found in `a_woman_with_long_black_hair_and_a_white_top_13`: the global `MUSIC AUTO` setting could regenerate a cinematic score during final H3 compilation even though the 4DX Skill owned `MUSIC OFF`. The 4DX format now forces effective music mode OFF at prompt-panel and segment-compilation boundaries without changing the user's saved preference for other Skills.
+- Replaced the generic Native Audio inference that misclassified the 4DX venue as a furnished office. Every 4DX Shot now receives a purpose-built auditorium profile with four concurrent H3-native layers: front-screen event audio, near-field seat/mechanism Foley, directional environmental equipment, and staggered front/middle/rear audience reactions. User-edited Native Audio Direction remains authoritative.
+- Added ten multi-select Design controls for Pitch, Roll, Heave, Wind, Air Shot, Vibration, Impact, Flash, Fog/Smoke and Water/Rain, plus independent Intensity and Event Density controls. Changes update one Studio-owned block inside Design Requirement without replacing the user's story.
+- Added an authority-ranked reference-role ledger for enabled P/V/A media. Explicit user mapping and uploaded evidence outrank AI Enrich, BLIP and conservative inference; filenames remain transport metadata and never define a landmark, character or scene.
+- Added separate structured `physical_events` and `fourdx_events`, linked by stable IDs. A selected effect is planned only when a visible causal source exists; otherwise it is reported as `skipped_no_causal_source`. Camera movement is explicitly excluded as a seat-motion source.
+- Compiled every Making-of stage into the actual H3 Shot direction. Exact technical labels are created as editable Studio on-screen-text layers so H3 and Z-Image are not asked to generate UI, HUD or unstable lettering.
+- Preserved the native H3 audio boundary: the feature adds no TTS replacement, speech separation, FFmpeg reverb, EQ, convolution reverb or post-generation remixing.
+- Persisted preferences, Experience Design, reference ledger and both event families through Apply Undo/Redo and Director Project save/load. Raised Director Project format from `24` to `25`; older projects load with safe defaults.
+- Added a release checklist and focused engine/UI/schema/save-load regressions for the new format.
+
 ## [0.3.2-alpha.7] - 2026-09-09
 
 ### Independent overlapping speech layers

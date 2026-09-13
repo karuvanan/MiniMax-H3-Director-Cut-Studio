@@ -449,6 +449,36 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(clip.brush().color().name().lower(), "#8f1d25")
         self.assertTrue(clip.label.text().startswith("! DIA"))
 
+    def test_music_cover_button_is_rightmost_and_connected(self):
+        with patch.object(DirectorCutStudio, "open_ace_step_music_cover") as open_music_cover:
+            window = DirectorCutStudio()
+            button = window.findChild(QPushButton, "musicCoverButton")
+            self.assertIsNotNone(button)
+            self.assertEqual(button.text(), "MUSIC COVER")
+            self.assertIs(window.director_toolbar.actions()[-1].defaultWidget(), button)
+            button.click()
+            self.app.processEvents()
+            open_music_cover.assert_called_once()
+            window.project_dirty = False
+            window.close()
+            window.deleteLater()
+
+    def test_music_cover_opens_native_studio_dialog(self):
+        window = DirectorCutStudio()
+        with patch("director_cut_studio.AceStepMusicCoverDialog") as dialog_class:
+            dialog = dialog_class.return_value
+            window.open_ace_step_music_cover()
+        dialog_class.assert_called_once_with(
+            window,
+            runtime_state=window.ace_step_runtime_state,
+        )
+        dialog.exec.assert_called_once()
+        dialog.deleteLater.assert_called_once()
+        self.assertIn("192.168.0.185:8001", window.statusBar().currentMessage())
+        window.project_dirty = False
+        window.close()
+        window.deleteLater()
+
     def test_ai_design_button_applies_timeline_and_is_undoable(self):
         window = DirectorCutStudio()
         design_workspace = (

@@ -1,0 +1,275 @@
+{
+  "1": {
+    "inputs": {
+      "audio": "GUAP EMET SOUND.mp3"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "加载参考音频"
+    }
+  },
+  "2": {
+    "inputs": {
+      "audio": [
+        "1",
+        0
+      ],
+      "clip": [
+        "37:3",
+        0
+      ],
+      "genre_hint": "high-energy theatrical electronic dance-pop, club and performance-edit influences",
+      "creative_direction": "Create a new choreographic track with strong visual hit points and an original hook",
+      "vocal_mode": "vocal_chops",
+      "reference_strength": "balanced",
+      "duration_mode": "match_reference",
+      "fixed_duration": 20,
+      "lyrics_override": "",
+      "seed": [
+        "37:38",
+        0
+      ],
+      "cfg_scale": 1.7,
+      "top_k": 50
+    },
+    "class_type": "Music3AudioReferenceEncode",
+    "_meta": {
+      "title": "分析参考音频、自动写 Prompt 并编码"
+    }
+  },
+  "3": {
+    "inputs": {
+      "source": [
+        "2",
+        2
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览完整 Music 3 Caption"
+    }
+  },
+  "4": {
+    "inputs": {
+      "source": [
+        "2",
+        3
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览自动 Lyrics"
+    }
+  },
+  "5": {
+    "inputs": {
+      "source": [
+        "2",
+        4
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览音频分析 JSON"
+    }
+  },
+  "3": {
+    "inputs": {
+      "source": [
+        "2",
+        2
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览完整 Music 3 Caption"
+    }
+  },
+  "4": {
+    "inputs": {
+      "source": [
+        "2",
+        3
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览自动 Lyrics"
+    }
+  },
+  "5": {
+    "inputs": {
+      "source": [
+        "2",
+        4
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览音频分析 JSON"
+    }
+  },
+  "35": {
+    "inputs": {
+      "filename_prefix": "audio/audio_minimax_music3_auto_prompt",
+      "format": "mp3",
+      "format.quality": "V0",
+      "audio": [
+        "37:43",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "保存音频（高级）"
+    }
+  },
+  "37:6": {
+    "inputs": {
+      "unet_name": "minimax_music3_dit_fp16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "37:3": {
+    "inputs": {
+      "clip_name": "minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "37:7": {
+    "inputs": {
+      "vae_name": "minimax_music3_dav.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "37:10": {
+    "inputs": {
+      "conditioning": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "条件零化"
+    }
+  },
+  "37:15": {
+    "inputs": {
+      "seconds": [
+        "2",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyMiniMaxMusic3LatentAudio",
+    "_meta": {
+      "title": "Empty MiniMax Music3 Latent Audio"
+    }
+  },
+  "37:9": {
+    "inputs": {
+      "seed": [
+        "37:38",
+        0
+      ],
+      "steps": 30,
+      "cfg": 1.7,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "37:6",
+        0
+      ],
+      "positive": [
+        "2",
+        0
+      ],
+      "negative": [
+        "37:10",
+        0
+      ],
+      "latent_image": [
+        "37:15",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "K采样器"
+    }
+  },
+  "37:12": {
+    "inputs": {
+      "samples": [
+        "37:9",
+        0
+      ],
+      "vae": [
+        "37:7",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE解码（音频）"
+    }
+  },
+  "37:38": {
+    "inputs": {
+      "seed": 197122968890040
+    },
+    "class_type": "SeedNode",
+    "_meta": {
+      "title": "种子"
+    }
+  },
+  "37:42": {
+    "inputs": {
+      "tile_size": 1536,
+      "overlap": 64,
+      "samples": [
+        "37:9",
+        0
+      ],
+      "vae": [
+        "37:7",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudioTiled",
+    "_meta": {
+      "title": "VAE解码音频（分块）"
+    }
+  },
+  "37:43": {
+    "inputs": {
+      "switch": true,
+      "on_false": [
+        "37:12",
+        0
+      ],
+      "on_true": [
+        "37:42",
+        0
+      ]
+    },
+    "class_type": "ComfySwitchNode",
+    "_meta": {
+      "title": "切换"
+    }
+  }
+}
