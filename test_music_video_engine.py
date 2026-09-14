@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from design_engine import normalize_design_plan
+from design_engine import normalize_design_plan, render_special_design_requirement_template
 from skill_engine import load_skill_profiles
 from music_video_engine import (
     MTV_SINGING_SPECIAL_SKILL,
@@ -9,6 +9,7 @@ from music_video_engine import (
     enforce_mtv_scene_keyframes,
     enforce_mtv_singing_plan,
     exact_master_audio_asset,
+    mtv_master_audio_duration,
 )
 
 
@@ -54,6 +55,27 @@ class MusicVideoEngineTests(unittest.TestCase):
         ]
         self.assertEqual(profile.display_name, "MTV Singing H3")
         self.assertIn("P5至P9", profile.design_requirement_template)
+        self.assertIn("{{MTV_A1_DURATION}}", profile.design_requirement_template)
+
+    def test_mtv_duration_uses_complete_a1_source_not_short_workspace_clip(self):
+        a1 = _media("A1", "audio")
+        a1.update(
+            start_seconds=0.0,
+            end_seconds=12.0,
+            source_duration_seconds=87.347,
+            source_out_seconds=0.0,
+        )
+        self.assertEqual(mtv_master_audio_duration([a1]), 87.347)
+
+    def test_mtv_template_displays_resolved_a1_duration(self):
+        a1 = _media("A1", "audio")
+        a1.update(source_duration_seconds=42.75, source_out_seconds=0.0)
+        rendered = render_special_design_requirement_template(
+            "A1自动时长：{{MTV_A1_DURATION}}。",
+            MTV_SINGING_SPECIAL_SKILL,
+            [a1],
+        )
+        self.assertEqual(rendered, "A1自动时长：42.75秒。")
 
     def test_mtv_contract_maps_roles_and_removes_invented_lyrics(self):
         media = [
@@ -175,6 +197,38 @@ class MusicVideoEngineTests(unittest.TestCase):
         ))
         self.assertEqual(len(result["media_requests"]), 5)
         self.assertEqual(result["shots"][-1]["end_seconds"], 12.0)
+
+    def test_normalize_pipeline_overrides_old_12s_template_with_a1_duration(self):
+        payload = _plan()
+        payload.update({
+            "title": "Full A1 MTV",
+            "global_visual_style": "Photoreal cinematic performance.",
+        })
+        a1 = _media("A1", "audio")
+        a1.update(
+            source_duration_seconds=18.347,
+            source_out_seconds=0.0,
+        )
+        media = [
+            _media("P1", "image"), _media("P2", "image"),
+            _media("P3", "image"), _media("P4", "image"), a1,
+        ]
+        result = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=media,
+            repair_media_plan=True,
+            authored_requirement="帮我创作12秒MTV，歌曲参考@A1",
+            special_skill_key=MTV_SINGING_SPECIAL_SKILL,
+        )
+        self.assertEqual(result["duration_seconds"], 18.347)
+        self.assertEqual(result["shots"][0]["start_seconds"], 0.0)
+        self.assertEqual(result["shots"][-1]["end_seconds"], 18.347)
+        a1_use = next(
+            row for row in result["existing_media_uses"]
+            if row.get("media_id") == "A1"
+        )
+        self.assertEqual(a1_use["end_seconds"], 18.347)
 
 
 if __name__ == "__main__":

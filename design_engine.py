@@ -22,9 +22,11 @@ from fourdx_engine import (
     fourdx_preferences_from_requirement,
 )
 from music_video_engine import (
+    MTV_A1_DURATION_TEMPLATE_TOKEN,
     MTV_SINGING_SPECIAL_SKILL,
     enforce_mtv_scene_keyframes,
     enforce_mtv_singing_plan,
+    mtv_master_audio_duration,
 )
 
 
@@ -205,6 +207,18 @@ def render_special_design_requirement_template(
     """Resolve media-aware placeholders without modifying the reusable Skill file."""
 
     text = str(template or "")
+    if (
+        str(special_skill_key or "").strip().casefold()
+        == MTV_SINGING_SPECIAL_SKILL
+        and MTV_A1_DURATION_TEMPLATE_TOKEN in text
+    ):
+        duration = mtv_master_audio_duration(existing_media)
+        duration_label = (
+            f"{duration:.3f}".rstrip("0").rstrip(".") + "秒"
+            if duration is not None
+            else "尚未读取；请先加载并完成A1媒体分析"
+        )
+        text = text.replace(MTV_A1_DURATION_TEMPLATE_TOKEN, duration_label)
     if HONG_KONG_COMIC_SOURCE_TEMPLATE_TOKEN in text:
         source_rows: list[str] = []
         for raw in existing_media or []:
@@ -5855,7 +5869,17 @@ def normalize_design_plan(
 ) -> dict:
     media_repair_warnings: list[str] = []
     prepared_payload = deepcopy(extract_design_json(payload))
-    authored_duration = infer_explicit_design_duration(authored_requirement)
+    mtv_duration = (
+        mtv_master_audio_duration(existing_media)
+        if str(special_skill_key or "").strip().casefold()
+        == MTV_SINGING_SPECIAL_SKILL
+        else None
+    )
+    authored_duration = (
+        mtv_duration
+        if mtv_duration is not None
+        else infer_explicit_design_duration(authored_requirement)
+    )
     if authored_duration is not None:
         returned_duration = snap_half_second(
             prepared_payload.get("duration_seconds", 5.0),
@@ -5897,9 +5921,13 @@ def normalize_design_plan(
         media_repair_warnings.extend(repaired_media_warnings)
     else:
         source = prepared_payload
-    duration = snap_half_second(
-        source.get("duration_seconds", 5.0),
-        MAX_DESIGN_DURATION_SECONDS,
+    duration = (
+        min(MAX_DESIGN_DURATION_SECONDS, float(mtv_duration))
+        if mtv_duration is not None
+        else snap_half_second(
+            source.get("duration_seconds", 5.0),
+            MAX_DESIGN_DURATION_SECONDS,
+        )
     )
     duration = max(0.5, duration)
     required_text = (
@@ -6750,12 +6778,21 @@ def build_design_system_prompt(context: dict) -> str:
     requested_duration = context.get("requested_duration_seconds")
     duration_contract = ""
     if requested_duration is not None:
-        duration_contract = (
-            f"DURATION CONTRACT: The user explicitly requested exactly {float(requested_duration):.2f} seconds. "
-            f"Set duration_seconds to {float(requested_duration):.2f}; preserve all authored timecodes through that "
-            "final timestamp. Never condense, summarize, stretch or replace this duration with "
-            "current_duration_seconds from the workspace. The current Timeline duration is context only. "
-        )
+        if str(context.get("duration_source_media_id", "")).strip().upper() == "A1":
+            duration_contract = (
+                "A1 MASTER-DURATION CONTRACT: the loaded @A1 source recording is the duration authority. "
+                f"Its playable duration is {float(requested_duration):.3f} seconds. Set duration_seconds "
+                f"to exactly {float(requested_duration):.3f}; make every Shot, reference range and final "
+                "hold cover 0.000 through that timestamp. Ignore any older numeric duration in the reusable "
+                "template or current workspace. Never trim, loop, time-stretch or pad the song to fit another duration. "
+            )
+        else:
+            duration_contract = (
+                f"DURATION CONTRACT: The user explicitly requested exactly {float(requested_duration):.2f} seconds. "
+                f"Set duration_seconds to {float(requested_duration):.2f}; preserve all authored timecodes through that "
+                "final timestamp. Never condense, summarize, stretch or replace this duration with "
+                "current_duration_seconds from the workspace. The current Timeline duration is context only. "
+            )
     selected_dialogue_language = canonical_dialogue_language(
         context.get("dialogue_language")
     )

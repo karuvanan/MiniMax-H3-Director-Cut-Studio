@@ -198,6 +198,7 @@ from music_video_engine import (
     MTV_MASTER_AUDIO_CONTRACT,
     exact_master_audio_asset,
     is_mtv_singing_skill,
+    mtv_master_audio_duration,
     replace_video_audio_with_exact_master,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
@@ -7656,7 +7657,13 @@ class DesignPageDialog(QDialog):
             if available_ids
             else " No Media Pool assets are selected, so request only the genuinely necessary missing material."
         )
-        requested_duration = infer_explicit_design_duration(self.pending_requirement)
+        requested_duration = (
+            planning_context.get("requested_duration_seconds")
+            if is_mtv_singing_skill(
+                _bound_special_skill_key(planning_context)
+            )
+            else infer_explicit_design_duration(self.pending_requirement)
+        )
         duration_rule = (
             "\n\nMANDATORY DURATION CONTRACT: The requested output is exactly "
             f"{requested_duration:.2f} seconds. Set duration_seconds to exactly "
@@ -8057,7 +8064,20 @@ class DesignPageDialog(QDialog):
         if not self._select_explicit_media_references(requirement):
             return
         self.active_design_context = self._selected_design_context()
-        if _bound_special_skill_key(self.context) == AI_MOVIE_MAKING_OF_4DX_SKILL:
+        active_special_skill = _bound_special_skill_key(self.active_design_context)
+        if is_mtv_singing_skill(active_special_skill):
+            requested_duration = mtv_master_audio_duration(
+                self.active_design_context.get("existing_media") or []
+            )
+            if requested_duration is None:
+                self._show_preflight_failure(
+                    "MTV Singing H3 cannot read the duration of @A1 yet. Load A1, wait "
+                    "until media preparation reports its audio duration, then click Design again.",
+                    category="A1 Master Audio",
+                )
+                return
+            self.active_design_context["duration_source_media_id"] = "A1"
+        elif active_special_skill == AI_MOVIE_MAKING_OF_4DX_SKILL:
             requested_duration = float(
                 fourdx_preferences_from_requirement(requirement)[
                     "resolved_duration_seconds"
@@ -10619,6 +10639,8 @@ class DirectorCutStudio(QMainWindow):
                     "start_seconds": float(asset.start_seconds),
                     "end_seconds": float(asset.end_seconds),
                     "source_duration_seconds": float(asset.source_duration_seconds),
+                    "source_in_seconds": float(asset.source_in_seconds),
+                    "source_out_seconds": float(asset.source_out_seconds),
                     "caption": caption,
                     "clip_prompt": asset.clip_prompt,
                     "raw_analysis_summary": raw_analysis,

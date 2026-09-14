@@ -9,6 +9,7 @@ import subprocess
 
 
 MTV_SINGING_SPECIAL_SKILL = "mtv-singing-h3"
+MTV_A1_DURATION_TEMPLATE_TOKEN = "{{MTV_A1_DURATION}}"
 
 MTV_MASTER_AUDIO_CONTRACT = (
     "A1 EXACT MASTER AUDIO: @A1 is the only soundtrack and the authoritative sung "
@@ -67,6 +68,45 @@ def _loaded(row: object | None) -> bool:
         )
         or path
     )
+
+
+def mtv_master_audio_duration(existing_media: list[object] | None) -> float | None:
+    """Return A1's authoritative playable source duration for MTV planning.
+
+    The source recording length outranks the current Timeline length. This is
+    important when a 120-second A1 is first loaded into a 12-second workspace:
+    media preparation temporarily clips its Timeline placement, but the MTV
+    Design must still expand to the complete song before Apply.
+    """
+
+    for row in existing_media or []:
+        media_id = _media_id(
+            _row_value(row, "media_id", "")
+            or _row_value(row, "reference_id", "")
+        )
+        media_type = str(_row_value(row, "media_type", "") or "").casefold()
+        if media_id != "A1" or media_type != "audio" or not _loaded(row):
+            continue
+        source_duration = float(
+            _row_value(row, "source_duration_seconds", 0.0) or 0.0
+        )
+        source_in = max(
+            0.0, float(_row_value(row, "source_in_seconds", 0.0) or 0.0)
+        )
+        source_out = float(_row_value(row, "source_out_seconds", 0.0) or 0.0)
+        # An explicit source trim is an authored A1 window. Otherwise the
+        # complete probed recording is the duration authority.
+        if source_out > source_in + 0.01:
+            available = source_out - source_in
+        elif source_duration > source_in + 0.01:
+            available = source_duration - source_in
+        else:
+            start = float(_row_value(row, "start_seconds", 0.0) or 0.0)
+            end = float(_row_value(row, "end_seconds", 0.0) or 0.0)
+            available = end - start
+        if available > 0.01:
+            return round(max(0.5, available), 3)
+    return None
 
 
 def _append_once(text: object, clause: str) -> str:
