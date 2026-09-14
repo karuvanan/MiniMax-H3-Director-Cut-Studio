@@ -47,6 +47,68 @@ class SingingLipSyncQCError(RuntimeError):
         super().__init__(str(result.get("message") or "Singing Lip-Sync QC failed."))
 
 
+SINGING_LIPSYNC_AUTO_REPAIR_MARKER = "SINGING LIP-SYNC AUTO-DIRECTOR REPAIR"
+
+
+def apply_singing_lipsync_auto_repair(
+    workflow: dict,
+    *,
+    repair_round: int,
+) -> tuple[bool, str]:
+    """Strengthen the actual H3 prompt after an MTV timing-QC miss."""
+
+    round_number = max(1, int(repair_round))
+    support_rule = (
+        "P2 and P3 may remain only as silent background support with closed, "
+        "non-vocal mouths"
+        if round_number == 1
+        else "Remove P2 and P3 from readable facial coverage; P1 is the only visible face"
+    )
+    framing = (
+        "stable medium close-up"
+        if round_number <= 2
+        else "stable close-up with P1's full face, lips and jaw unobstructed"
+    )
+    direction = (
+        f"{SINGING_LIPSYNC_AUTO_REPAIR_MARKER} · round {round_number}. "
+        f"Re-stage this exact Segment as one continuous {framing}. "
+        "Keep P1 facing the camera frontally or at a readable three-quarter angle for "
+        "the entire vocal interval. P1's lips, jaw and both mouth corners remain sharp, "
+        "well lit and never covered by hair, hands, props, foreground objects or motion blur. "
+        "P1 continuously performs only the exact current A1 Timeline window; local 00:00 "
+        "continues from that A1 position and never restarts the song. "
+        f"{support_rule}. No other person speaks, sings, lip-syncs or opens their mouth as a "
+        "performer. No profile turn, back turn, walking away, face exit, cutaway, rapid orbit, "
+        "whip pan, zoom, montage, slow motion or shot transition during this recovery Segment. "
+        "Preserve P1 identity, clothing, scene and A1 audio exactly; change only staging and "
+        "camera readability to recover singing lip synchronization."
+    )
+
+    prompt_nodes: list[dict] = []
+    for node in workflow.values():
+        if not isinstance(node, dict) or node.get("class_type") != "MiniMaxH3ReferenceToVideo":
+            continue
+        prompt_ref = (node.get("inputs") or {}).get("prompt")
+        if isinstance(prompt_ref, (list, tuple)) and prompt_ref:
+            target = workflow.get(str(prompt_ref[0]))
+            if target is None:
+                target = workflow.get(prompt_ref[0])
+            if isinstance(target, dict):
+                prompt_nodes.append(target)
+        elif isinstance(prompt_ref, str):
+            node.setdefault("inputs", {})["prompt"] = prompt_ref.rstrip() + "\n\n" + direction
+            return True, direction
+
+    for node in prompt_nodes:
+        inputs = node.setdefault("inputs", {})
+        for key in ("value", "text", "prompt"):
+            current = inputs.get(key)
+            if isinstance(current, str):
+                inputs[key] = current.rstrip() + "\n\n" + direction
+                return True, direction
+    return False, direction
+
+
 def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
@@ -670,7 +732,10 @@ def queue_segment(
 ) -> dict:
     server = job["server"].rstrip("/")
     http_timeout = max(1, int(job.get("http_timeout", 30)))
+    singing_qc_enabled = bool((segment.get("singing_lipsync_qc") or {}).get("enabled"))
     attempts = max(1, min(5, int(job.get("segment_attempts", 3))))
+    if singing_qc_enabled:
+        attempts = max(attempts, 5)
     reconnect_timeout = max(
         1,
         int(job.get("connection_recovery_timeout", DEFAULT_RECONNECT_TIMEOUT_SECONDS)),
@@ -683,7 +748,11 @@ def queue_segment(
         and resume_status in {"queued", "monitoring", "reconnecting", "running"}
     )
     first_attempt = max(1, int(segment.get("attempts_used", 1) or 1))
-    attempt_range = [first_attempt] if resume_existing else range(1, attempts + 1)
+    attempt_range = (
+        range(first_attempt, attempts + 1)
+        if resume_existing
+        else range(1, attempts + 1)
+    )
     for attempt in attempt_range:
         prompt_id = resumed_prompt_id if resume_existing else ""
         try:
@@ -762,21 +831,77 @@ def queue_segment(
                         singing_qc_spec.get("reference_offset_seconds", 0.0)
                     ),
                 )
-                emit(
-                    {
-                        "progress": singing_qc_result["message"],
-                        "singing_lipsync_qc": singing_qc_result,
-                        "segment_id": segment.get("segment_id", ""),
-                        "segment_start_seconds": singing_qc_spec.get(
-                            "timeline_start_seconds", segment.get("start_seconds", 0.0)
-                        ),
-                        "segment_end_seconds": singing_qc_spec.get(
-                            "timeline_end_seconds", segment.get("end_seconds", 0.0)
-                        ),
-                    }
-                )
                 if not singing_qc_result.get("passed"):
-                    raise SingingLipSyncQCError(singing_qc_result)
+                    original_message = str(singing_qc_result.get("message") or "")
+                    has_more_attempts = attempt < attempts
+                    prompt_patched = False
+                    repair_direction = ""
+                    if has_more_attempts:
+                        prompt_patched, repair_direction = apply_singing_lipsync_auto_repair(
+                            workflow,
+                            repair_round=attempt,
+                        )
+                    singing_qc_result = dict(singing_qc_result)
+                    singing_qc_result.update(
+                        status="auto_repair" if has_more_attempts else "warning",
+                        hard_block=False,
+                        original_message=original_message,
+                        auto_repair_round=attempt,
+                        auto_repair_attempt_limit=attempts,
+                        auto_repair_will_retry=has_more_attempts,
+                        prompt_patched=prompt_patched,
+                    )
+                    if has_more_attempts:
+                        singing_qc_result["message"] = (
+                            "Singing Lip-Sync QC AUTO-REPAIR · timing did not meet the target; "
+                            "P1 front/three-quarter singing coverage applied and Segment will "
+                            f"regenerate automatically ({attempt}/{attempts})."
+                        )
+                    else:
+                        singing_qc_result["message"] = (
+                            "Singing Lip-Sync QC WARNING · automatic Shot repair reached its "
+                            f"{attempts}-attempt safety limit; the Job will continue with this "
+                            "Segment for review. It will not be reused as a passed QC cache."
+                        )
+                    emit(
+                        {
+                            "progress": singing_qc_result["message"],
+                            "singing_lipsync_qc": singing_qc_result,
+                            "singing_lipsync_auto_repair": (
+                                {
+                                    "round": attempt,
+                                    "attempt_limit": attempts,
+                                    "prompt_patched": prompt_patched,
+                                    "direction": repair_direction,
+                                }
+                                if has_more_attempts
+                                else None
+                            ),
+                            "segment_id": segment.get("segment_id", ""),
+                            "segment_start_seconds": singing_qc_spec.get(
+                                "timeline_start_seconds", segment.get("start_seconds", 0.0)
+                            ),
+                            "segment_end_seconds": singing_qc_spec.get(
+                                "timeline_end_seconds", segment.get("end_seconds", 0.0)
+                            ),
+                        }
+                    )
+                    if has_more_attempts:
+                        raise SingingLipSyncQCError(singing_qc_result)
+                else:
+                    emit(
+                        {
+                            "progress": singing_qc_result["message"],
+                            "singing_lipsync_qc": singing_qc_result,
+                            "segment_id": segment.get("segment_id", ""),
+                            "segment_start_seconds": singing_qc_spec.get(
+                                "timeline_start_seconds", segment.get("start_seconds", 0.0)
+                            ),
+                            "segment_end_seconds": singing_qc_spec.get(
+                                "timeline_end_seconds", segment.get("end_seconds", 0.0)
+                            ),
+                        }
+                    )
             persisted_segment = {key: value for key, value in segment.items() if key != "workflow"}
             return {
                 **persisted_segment,
@@ -794,8 +919,14 @@ def queue_segment(
         except Exception as exc:
             last_error = exc
             failure_class = classify_generation_error(exc)
+            retrying_qc = isinstance(exc, SingingLipSyncQCError)
             emit({
-                "progress": f"Segment {segment['index'] + 1} attempt {attempt}/{attempts} failed: {exc}",
+                "progress": (
+                    f"Segment {segment['index'] + 1} applying automatic singing Shot repair "
+                    f"before attempt {attempt + 1}/{attempts}"
+                    if retrying_qc and attempt < attempts
+                    else f"Segment {segment['index'] + 1} attempt {attempt}/{attempts} failed: {exc}"
+                ),
                 "segment_index": segment["index"],
                 "failure_class": failure_class,
                 "attempt": attempt,
@@ -822,8 +953,6 @@ def queue_segment(
                 time.sleep(2.0 if failure_class == "oom" else 1.0)
         finally:
             resume_existing = False
-    if isinstance(last_error, SingingLipSyncQCError):
-        raise last_error
     raise RuntimeError(str(last_error or "Unknown segment generation error"))
 
 

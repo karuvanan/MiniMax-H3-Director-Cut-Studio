@@ -6869,6 +6869,37 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_mtv_qc_auto_repair_updates_affected_shot_without_stopping(self):
+        window = DirectorCutStudio()
+        window.director_cues = [
+            DirectorCue(
+                "S1", "shot", 20.0, 28.0, "Performance",
+                subject_action="P1 performs in the current scene.",
+            ),
+            DirectorCue(
+                "S2", "shot", 28.0, 35.0, "Next",
+                subject_action="Unrelated following shot.",
+            ),
+        ]
+        repair = {
+            "round": 3,
+            "direction": (
+                "SINGING LIP-SYNC AUTO-DIRECTOR REPAIR · round 3. "
+                "P1 is the only readable singing face."
+            ),
+        }
+        window._apply_singing_lipsync_auto_repair_to_shots(repair, 22.0, 28.0)
+        self.assertEqual(window.director_cues[0].framing, "Close-up")
+        self.assertIn("frontal or readable three-quarter", window.director_cues[0].camera_angle)
+        self.assertIn("MTV singing QC repair", window.director_cues[0].subject_action)
+        self.assertIn("AUTO-DIRECTOR REPAIR", window.director_cues[0].detail)
+        self.assertEqual(
+            window.director_cues[1].subject_action,
+            "Unrelated following shot.",
+        )
+        window.project_dirty = False
+        window.close()
+
     def test_saved_mtv_prompt_removes_guessed_mouth_timing_without_lyrics(self):
         window = DirectorCutStudio()
         index = window.special_combo.findData("mtv-singing-h3")

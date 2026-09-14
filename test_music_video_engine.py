@@ -108,7 +108,7 @@ class MusicVideoEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             plan["mtv_audio_policy"]["singing_lipsync_qc"],
-            "hard_block_before_accept",
+            "auto_director_repair_continue",
         )
         self.assertEqual(plan["mtv_audio_policy"]["final_audio_mode"], "replace_h3_with_exact_timeline_master")
 

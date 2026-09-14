@@ -417,7 +417,7 @@ def enforce_mtv_singing_plan(
         "lyric_timing_mode": (
             "authored_text_layers" if authored_lyric_timing else "audio_driven_only"
         ),
-        "singing_lipsync_qc": "hard_block_before_accept",
+        "singing_lipsync_qc": "auto_director_repair_continue",
         "lead_singer_id": "P1",
         "support_ids": ["P2", "P3"],
         "scene_master_id": "P4",

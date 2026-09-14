@@ -2,6 +2,25 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.5-alpha.2] - 2026-09-15
+
+### MTV Singing H3 对嘴可靠性
+
+- 将 `A1` 确立为没有人工歌词时间码时唯一的歌声与嘴形节奏依据。H3 Prompt 不再使用 Whisper／ASR 从混合歌曲识别出的文字作为歌词、对白或叙事提示，避免错误识别污染人物口型。
+- 清理已保存 MTV Project 中旧有的猜测式嘴形指令，包括自行推断的开口、闭口、主歌、高潮、尾音和结束姿势；重新打开旧项目即可在实际 Segment Prompt 编译时应用保护，不要求重新执行 Design。
+- 将 MTV 的隐藏 H3 生成窗口限制为最多 7 秒，并以约 5–7 秒的均衡窗口覆盖完整工作区。长歌曲不再使用容易在后半段脱离 A1 的 14 秒 Segment，也不会在结尾留下极短碎片窗口。
+- 强化 P1/P2/P3 演唱职责：P1 是唯一可见、可辨认的正面演唱者；P2/P3 只作无声陪衬，保持非发声嘴形。群像镜头不得让多个角色同时呈现可读的演唱嘴形。
+- 修正 A1 尾段处理：最后一个网格对齐窗口读取真实歌曲尾部，最多只为 H3 时间格补 0.5 秒静音；禁止从 A1 开头重新播放、循环、拉伸或伪造尾音。
+- 新增生成前置 `Singing Lip-Sync QC`。系统在 Segment 缓存之前，将 H3 未改写的原生输出音轨与该 Segment 的准确 A1 时间窗比较；通过时显示 `PASS`。节奏、尾段或起音明显漂移时不暂停Job，而是自动把该段调整为P1正面／清晰四分之三侧面演唱、嘴唇与下颌无遮挡、P2/P3静默非发声，再重新生成，最多五次。
+- MTV 即使只有一个5–7秒Segment也统一交由Smart Render执行，使单段与长片都具备相同自动导演修复能力。五次仍未达标时显示 `WARNING` 并继续完成Job；该段可以立即预览，但不会被当成已通过QC的缓存复用，下次运行仍会重新修复。
+- 最终成片仍使用未经改写的精确 A1 主音轨；QC 只负责检测和决定是否重新生成，不对 H3 音频执行 TTS、变声、重混、时间拉伸或修复。
+- Smart Render policy 提升至 `23`，使旧版 14 秒 MTV 缓存和没有通过 Singing Lip-Sync QC 的缓存失效。Director Project 格式保持 `25`，现有 Project、Media Pool、Timeline 与已接受 Take 无需迁移。
+
+### Verification
+
+- 通过 MTV 音频窗口、Prompt 污染清理、均衡分段、P1/P2/P3 发声职责、尾段静音、Smart Render五轮自动修复、不中断Warning回退与旧Native Submit兼容专项测试。
+- 使用真实 MTV Project 验证 A1 最终封装音轨：测试窗口节奏相关度 `1.00`、延迟 `0 ms`；旧 Project 的错误 ASR 文本及猜测式嘴形指令不会再进入新 H3 Segment Prompt。
+
 ## [0.3.5-alpha.1] - 2026-09-14
 
 ### SoulX-Singer 独立歌声克隆

@@ -21,7 +21,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.5-alpha.1`](VERSION)
+- 当前应用版本：[`v0.3.5-alpha.2`](VERSION)
 - v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
 - v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)

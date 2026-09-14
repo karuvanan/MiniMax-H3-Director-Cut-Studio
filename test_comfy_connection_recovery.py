@@ -179,7 +179,7 @@ class ComfyConnectionRecoveryTests(unittest.TestCase):
             self.assertEqual(submit_main(), 0)
         duplicate_queue.assert_not_called()
 
-    def test_native_mtv_job_hard_blocks_before_success_payload_when_qc_fails(self):
+    def test_legacy_native_mtv_qc_warning_does_not_stop_job(self):
         job_path = self.root / "native_mtv_qc.job.json"
         video = self.root / "segment.mp4"
         reference = self.root / "a1.wav"
@@ -212,6 +212,7 @@ class ComfyConnectionRecoveryTests(unittest.TestCase):
             "status": "hard_block",
             "message": "Singing Lip-Sync QC HARD BLOCK · tail lip-sync lock decayed.",
         }
+        lines = []
         with (
             patch.object(sys, "argv", ["comfy_submit_worker.py", str(job_path)]),
             patch(
@@ -227,9 +228,19 @@ class ComfyConnectionRecoveryTests(unittest.TestCase):
                 return_value=failed_qc,
             ),
             patch("comfy_submit_worker._connection_event"),
+            patch("builtins.print", side_effect=lambda value, **_kwargs: lines.append(value)),
         ):
-            with self.assertRaisesRegex(RuntimeError, "Singing Lip-Sync QC HARD BLOCK"):
-                submit_main()
+            self.assertEqual(submit_main(), 0)
+        payloads = [json.loads(line) for line in lines]
+        self.assertTrue(any(row.get("completed") for row in payloads))
+        warnings = [
+            row["singing_lipsync_qc"]
+            for row in payloads
+            if isinstance(row.get("singing_lipsync_qc"), dict)
+            and row["singing_lipsync_qc"].get("status") == "warning"
+        ]
+        self.assertTrue(warnings)
+        self.assertFalse(warnings[-1]["hard_block"])
 
 
 if __name__ == "__main__":

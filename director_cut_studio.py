@@ -22488,7 +22488,9 @@ class DirectorCutStudio(QMainWindow):
             "segments": segment_rows,
             "segment_count": len(segment_rows),
             "progress_shots": self._progress_shot_rows(start, end),
-            "segment_attempts": 3,
+            "segment_attempts": (
+                5 if is_mtv_singing_skill(self.special_combo.currentData()) else 3
+            ),
             "history_poll_interval": self.render_settings.history_poll_interval,
             "generation_timeout": self.render_settings.generation_timeout,
             "http_timeout": self.render_settings.http_request_timeout,
@@ -22686,7 +22688,7 @@ class DirectorCutStudio(QMainWindow):
                     "duration_seconds": max(0.01, float(end) - float(start)),
                     "timeline_start_seconds": float(start),
                     "timeline_end_seconds": float(end),
-                    "policy": "hard_block_before_accept",
+                    "policy": "auto_director_repair_continue",
                 }
         return {}
 
@@ -23104,7 +23106,10 @@ class DirectorCutStudio(QMainWindow):
             duration = self.clip_end.value() - self.clip_start.value()
             # MTV singing uses shorter, A1-locked native windows even when the
             # complete work area is below H3's ordinary 15-second limit.
-            is_smart_render = len(self._planned_render_segments()) > 1
+            is_smart_render = (
+                bool(self.scan)
+                and is_mtv_singing_skill(self.special_combo.currentData())
+            ) or len(self._planned_render_segments()) > 1
             if is_smart_render:
                 job_path, segment_count = self._build_smart_render_job(
                     request_kind=request_kind,
@@ -23307,6 +23312,13 @@ class DirectorCutStudio(QMainWindow):
         if isinstance(payload.get("segment_completed"), dict):
             self._show_render_segment_preview(dict(payload["segment_completed"]))
         singing_qc = payload.get("singing_lipsync_qc")
+        singing_auto_repair = payload.get("singing_lipsync_auto_repair")
+        if isinstance(singing_auto_repair, dict) and singing_auto_repair:
+            self._apply_singing_lipsync_auto_repair_to_shots(
+                singing_auto_repair,
+                float(payload.get("segment_start_seconds", self.clip_start.value())),
+                float(payload.get("segment_end_seconds", self.clip_end.value())),
+            )
         if isinstance(singing_qc, dict) and singing_qc:
             self._apply_singing_lipsync_qc_status(
                 singing_qc,
@@ -23342,6 +23354,53 @@ class DirectorCutStudio(QMainWindow):
                 )
         if payload.get("queued") or payload.get("error") or payload.get("completed"):
             self.submit_result = payload
+
+    def _apply_singing_lipsync_auto_repair_to_shots(
+        self,
+        repair: dict,
+        range_start: float,
+        range_end: float,
+    ) -> None:
+        """Persist the runtime MTV restaging on the affected Timeline Shots."""
+
+        direction = str(repair.get("direction") or "").strip()
+        if not direction:
+            return
+        marker = "SINGING LIP-SYNC AUTO-DIRECTOR REPAIR"
+        repair_round = max(1, int(repair.get("round", 1) or 1))
+        changed = False
+        for cue in self.director_cues:
+            if cue.cue_type != "shot" or not ranges_intersect(
+                cue.start_seconds,
+                cue.end_seconds,
+                range_start,
+                range_end,
+            ):
+                continue
+            original_action = str(cue.authored_subject_action or cue.subject_action or "")
+            clean_action = original_action.split("\nMTV singing QC repair:", 1)[0].rstrip()
+            repair_action = (
+                "MTV singing QC repair: P1 remains front-facing or at a readable "
+                "three-quarter angle and sings continuously from the current A1 window; "
+                "P2/P3 remain silent with non-vocal mouths."
+            )
+            cue.authored_subject_action = "\n".join(
+                value for value in (clean_action, repair_action) if value
+            )
+            cue.subject_action = cue.authored_subject_action
+            clean_detail = str(cue.detail or "").split("\n" + marker, 1)[0].rstrip()
+            cue.detail = "\n".join(
+                value for value in (clean_detail, direction) if value
+            )
+            cue.framing = "Medium close-up" if repair_round <= 2 else "Close-up"
+            cue.camera_angle = "Eye level · frontal or readable three-quarter"
+            cue.camera_movement = "Locked stable follow"
+            cue.movement_speed = "Natural singing tempo"
+            cue.movement_amplitude = "Minimal"
+            changed = True
+        if changed:
+            self._refresh_director_cues()
+            self._mark_dirty()
 
     def _apply_singing_lipsync_qc_status(
         self,

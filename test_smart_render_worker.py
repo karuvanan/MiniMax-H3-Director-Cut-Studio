@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from smart_render_worker import (
-    SingingLipSyncQCError,
     _patch_continuity,
+    apply_singing_lipsync_auto_repair,
     build_render_progress,
     build_assembly_command,
     assemble_master,
@@ -22,7 +22,7 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
-    def test_singing_lipsync_qc_hard_blocks_uncorrelated_segment(self):
+    def test_singing_lipsync_qc_repairs_and_continues_uncorrelated_segment(self):
         root = PROJECT_ROOT / ".director_cache" / "smart_render_singing_qc_test"
         root.mkdir(parents=True, exist_ok=True)
         video = root / "segment.mp4"
@@ -58,10 +58,21 @@ class SmartRenderWorkerTests(unittest.TestCase):
             "status": "hard_block",
             "message": "Singing Lip-Sync QC HARD BLOCK · tail lip-sync lock decayed.",
         }
+        workflow = {
+            "10": {
+                "class_type": "PrimitiveStringMultiline",
+                "inputs": {"value": "Original MTV Segment prompt."},
+            },
+            "20": {
+                "class_type": "MiniMaxH3ReferenceToVideo",
+                "inputs": {"prompt": ["10", 0]},
+            },
+        }
+        events = []
         with (
             patch(
                 "smart_render_worker._request_json",
-                side_effect=[{"prompt_id": "qc-1"}, {"prompt_id": "qc-2"}],
+                side_effect=[{"prompt_id": f"qc-{index}"} for index in range(1, 6)],
             ),
             patch("smart_render_worker.wait_for_history", return_value=({}, {})),
             patch(
@@ -74,15 +85,109 @@ class SmartRenderWorkerTests(unittest.TestCase):
             ) as analyzer,
             patch("smart_render_worker.release_comfy_memory", return_value="released"),
             patch("smart_render_worker.time.sleep"),
-            patch("smart_render_worker.emit"),
+            patch("smart_render_worker.emit", side_effect=events.append),
         ):
-            with self.assertRaises(SingingLipSyncQCError):
-                queue_segment(job, segment, {}, [])
-        self.assertEqual(analyzer.call_count, 2)
+            result = queue_segment(job, segment, workflow, [])
+        self.assertEqual(analyzer.call_count, 5)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["singing_lipsync_qc_result"]["status"], "warning")
+        self.assertFalse(result["singing_lipsync_qc_result"]["hard_block"])
+        self.assertIn("AUTO-DIRECTOR REPAIR", workflow["10"]["inputs"]["value"])
+        self.assertTrue(any(event.get("singing_lipsync_auto_repair") for event in events))
         self.assertEqual(
             classify_generation_error(qc_result["message"]),
             "singing_lipsync_qc",
         )
+        video.unlink(missing_ok=True)
+        audio.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_singing_auto_repair_targets_the_h3_prompt_node(self):
+        workflow = {
+            "138": {
+                "class_type": "PrimitiveStringMultiline",
+                "inputs": {"value": "Original prompt"},
+            },
+            "171": {
+                "class_type": "MiniMaxH3ReferenceToVideo",
+                "inputs": {"prompt": ["138", 0]},
+            },
+        }
+        patched, direction = apply_singing_lipsync_auto_repair(
+            workflow, repair_round=2
+        )
+        self.assertTrue(patched)
+        self.assertIn(direction, workflow["138"]["inputs"]["value"])
+        self.assertIn("P1 is the only visible face", direction)
+        self.assertIn("three-quarter angle", direction)
+
+    def test_resumed_singing_qc_miss_queues_repair_without_stopping(self):
+        root = PROJECT_ROOT / ".director_cache" / "smart_render_resumed_singing_qc_test"
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        audio = root / "a1.wav"
+        video.write_bytes(b"video")
+        audio.write_bytes(b"audio")
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "http_timeout": 1,
+            "segment_attempts": 5,
+            "segment_count": 1,
+            "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+            "ffmpeg": "ffmpeg",
+        }
+        segment = {
+            "segment_id": "seg-resumed-qc",
+            "index": 0,
+            "start_seconds": 21.0,
+            "end_seconds": 28.0,
+            "download_dir": str(root),
+            "status": "monitoring",
+            "prompt_id": "already-running",
+            "attempts_used": 2,
+            "singing_lipsync_qc": {
+                "enabled": True,
+                "reference_audio": str(audio),
+                "duration_seconds": 7.0,
+            },
+        }
+        workflow = {
+            "10": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "MTV"}},
+            "20": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {"prompt": ["10", 0]}},
+        }
+        failed_qc = {
+            "passed": False,
+            "status": "hard_block",
+            "message": "Singing Lip-Sync QC HARD BLOCK · tail drift.",
+        }
+        with (
+            patch(
+                "smart_render_worker._request_json",
+                side_effect=[
+                    {"prompt_id": "repair-3"},
+                    {"prompt_id": "repair-4"},
+                    {"prompt_id": "repair-5"},
+                ],
+            ) as request_json,
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})) as wait,
+            patch(
+                "smart_render_worker.download_outputs",
+                return_value=[{"kind": "videos", "local_path": str(video)}],
+            ),
+            patch(
+                "smart_render_worker.analyze_singing_lipsync_alignment",
+                return_value=failed_qc,
+            ),
+            patch("smart_render_worker.release_comfy_memory", return_value="released"),
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit"),
+        ):
+            result = queue_segment(job, segment, workflow, [])
+        self.assertEqual(wait.call_count, 4)
+        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["singing_lipsync_qc_result"]["status"], "warning")
         video.unlink(missing_ok=True)
         audio.unlink(missing_ok=True)
         root.rmdir()

@@ -414,7 +414,7 @@ def main() -> int:
         )
         if generated_video is None:
             raise RuntimeError(
-                "Singing Lip-Sync QC HARD BLOCK · generated video is unavailable."
+                "Singing Lip-Sync QC could not run because the generated video is unavailable."
             )
         singing_qc_result = analyze_singing_lipsync_alignment(
             Path(job["ffmpeg"]),
@@ -429,6 +429,19 @@ def main() -> int:
                 singing_qc_spec.get("reference_offset_seconds", 0.0)
             ),
         )
+        if not singing_qc_result.get("passed"):
+            original_message = str(singing_qc_result.get("message") or "")
+            singing_qc_result = dict(singing_qc_result)
+            singing_qc_result.update(
+                status="warning",
+                hard_block=False,
+                original_message=original_message,
+                message=(
+                    "Singing Lip-Sync QC WARNING · this legacy native submission cannot "
+                    "self-repair in place, so the Job will continue for review. New MTV "
+                    "submissions are routed through Smart Render automatic Shot repair."
+                ),
+            )
         print(
             json.dumps(
                 {
@@ -445,8 +458,6 @@ def main() -> int:
             ),
             flush=True,
         )
-        if not singing_qc_result.get("passed"):
-            raise RuntimeError(singing_qc_result["message"])
     # Retired final_hold_* job metadata is deliberately ignored.
     print(
         json.dumps(
