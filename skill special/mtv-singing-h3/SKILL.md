@@ -15,6 +15,8 @@ Apply this Special Skill with the bound Default H3 Prompt Writing Skill. The tas
 - `@P4` is the scene master. It owns location geometry, camera axis, perspective, colour, colour temperature, weather, surface materials, practical-light direction and atmosphere. It owns no P1-P3 identity.
 - `@A1` is the only continuous Master Audio and the authoritative sung performance.
 
+Studio must derive the Design duration from A1's playable source window. A1's probed source duration overrides the old workspace duration and every numeric duration left in a reusable template. If the user explicitly trims A1 with source-in/source-out, that selected source window becomes the duration. Do not start Design until A1 duration metadata is available.
+
 If any explicitly referenced source is not loaded, report the exact missing ID before Apply. Never substitute another slot.
 
 ## A1 exact-master rule
@@ -24,6 +26,8 @@ Use the original A1 recording without changing its singer, lyrics, melody, pitch
 H3 receives the matching A1 source window to drive performance timing. P1's visible mouth shapes, jaw, breaths, eye expression, head accents and gestures follow that exact window. After generation, the Studio replaces H3's synthesized audio stream with the unchanged A1 Timeline master. Do not regenerate, imitate, transpose, pitch-correct, time-stretch, loop, restart, remix or layer a second song, singer, TTS voice or score over A1.
 
 When a later hidden Segment starts, its A1 source time equals that Segment's Timeline start. Never replay the beginning of A1 at a cut.
+
+Every Shot, media-use range, generated P5-P9 state, Generation Work Area and final assembly must cover `0.000` through the resolved A1 ending. The final Shot may end at a non-half-second timestamp when required to preserve the exact audio ending. Never shorten, loop, time-stretch or silence-pad A1 to fit the previous Timeline.
 
 ## Lyrics and lip-sync
 
@@ -61,6 +65,6 @@ Before returning Studio Director Design JSON, verify:
 - P4 controls the scene and P5-P9 are P4-derived environment states;
 - A1 is the sole exact final soundtrack, not a style reference;
 - no invented lyrics, second singer, TTS vocal or replacement score exists;
-- target duration remains the requested A1 window and is not extended by invented lyrics;
+- target duration equals the automatically resolved A1 playable duration, regardless of the previous Timeline or template duration, and is not extended by invented lyrics;
 - Shots cover the complete duration without gaps or overlap;
 - final hold is stable and A1 is never restarted at Segment boundaries.

@@ -4,4 +4,6 @@
 
 核心原则是“画面跟歌走，声音不重唱”：MiniMax H3 使用 A1 的对应时间窗驱动 P1 的嘴形、呼吸、表情和动作；成片发布时，Studio 用原始 A1 时间线音轨替换 H3 新生成的音频，避免走调、换声、歌词改变或每段重播歌曲开头。
 
+片长不再固定为12秒。Studio会以A1的完整可播放源音频长度作为Design、Timeline、Shot、P5-P9时段和最终输出的时长权威；如果用户明确设定A1 source-in/source-out，则以该可播放窗口为准。旧Timeline或模板里的数字不得裁掉歌曲结尾。
+
 如果用户没有提供逐字歌词，不得虚构 Lyrics、Dialogue 或 Voice-over。若提供逐字歌词，只把它们作为 A6 上可编辑的歌词时间层，固定 Speaker=S1、Lip Sync=true；真正听到的歌曲仍然是 A1。
