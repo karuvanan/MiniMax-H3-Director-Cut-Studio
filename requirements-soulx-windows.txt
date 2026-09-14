@@ -1,5 +1,6 @@
 # Isolated Windows runtime for SoulX-Singer SVC. Torch/torchaudio are installed
-# separately from the CUDA 12.1 wheel index by start_soulx_server.bat.
+# separately by start_soulx_server.bat. The launcher keeps a working runtime,
+# but upgrades incompatible GPUs to the CUDA 12.8 build (Blackwell included).
 accelerate==1.11.0
 beartype==0.22.9
 einops==0.8.2

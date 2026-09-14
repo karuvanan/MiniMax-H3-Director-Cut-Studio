@@ -47,6 +47,14 @@
 .\start_soulx_server.bat
 ```
 
+代码升级后若旧 Server 仍占用7861，请改为执行一次：
+
+```powershell
+.\restart_soulx_server.bat
+```
+
+这个脚本只停止同一项目路径下的 SoulX 7861 进程，然后加载新版 wrapper；不会停止其他项目或其他端口的服务。
+
 脚本会复用 `models/SoulX-Singer-main/.runtime/<电脑名称>/.venv/`，没有环境时才创建；缺少模型时才下载，然后由 Studio wrapper 启动：
 
 ```text
@@ -59,7 +67,11 @@ http://0.0.0.0:7861
 http://127.0.0.1:7861/gradio_api/info
 ```
 
-必须能看到 `/_start_svc` endpoint。日志位于：
+必须能看到新版 `/_studio_start_svc` endpoint；旧版 `/_start_svc` 仍可兼容。日志位于：
+
+如果看到 `CUDA error: no kernel image is available for execution on the device`，请覆盖最新 `start_soulx_server.bat` 后再次执行 `restart_soulx_server.bat`。启动器会保留模型，只把不支持当前GPU架构的旧 PyTorch CUDA 12.1 runtime 自动升级到经过验证的 CUDA 12.8 runtime。
+
+关闭Studio里的SoulX窗口会自动请求 `/_unload_svc`。Server控制台出现 `[SoulX] models unloaded` 与显存前后数值即代表SVC和预处理模型已经释放；API进程继续在线，之后按需懒加载。
 
 ```text
 logs/soulx_api.stdout.log

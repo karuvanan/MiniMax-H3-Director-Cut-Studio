@@ -48,6 +48,54 @@ class SoulXClientTest(unittest.TestCase):
         self.assertEqual(endpoint, "/lazy_start_svc")
         self.assertEqual(discovered, parameters)
 
+    def test_broken_old_wrapper_is_rejected_with_restart_instruction(self) -> None:
+        parameters = list(soulx_client.EXPECTED_CORE_PARAMETERS)
+        parameters.extend(["param_10", "param_11"])
+        info = {
+            "named_endpoints": {
+                "/lazy_start_svc": {
+                    "parameters": [
+                        {"parameter_name": name} for name in parameters
+                    ]
+                }
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "restart_soulx_server.bat"):
+            soulx_client.validate_svc_api(info)
+
+    @patch("soulx_client._to_mp3")
+    @patch("soulx_client._gradio_client")
+    @patch("soulx_client.fetch_api_info")
+    def test_anonymous_extended_controls_map_to_device_and_fp16(
+        self, fetch_info, gradio_client, to_mp3
+    ) -> None:
+        parameters = list(soulx_client.EXPECTED_CORE_PARAMETERS)
+        parameters.extend(["param_10", "param_11"])
+        fetch_info.return_value = _info(parameters)
+        client = gradio_client.return_value
+        client.predict.return_value = "generated.wav"
+        with patch("pathlib.Path.is_file", return_value=True), patch(
+            "gradio_client.handle_file", side_effect=lambda value: f"upload:{value}"
+        ):
+            to_mp3.return_value = Path("approved.mp3")
+            output = soulx_client.convert_singing_voice(
+                "http://127.0.0.1:7861",
+                voice_reference="voice.wav",
+                source_song="song.wav",
+                device="cuda",
+                use_fp16=True,
+            )
+        kwargs = client.predict.call_args.kwargs
+        # Gradio published the callback's old 10 names against 12 actual
+        # components. Values must follow the component order, not those labels.
+        self.assertEqual(kwargs["pitch_shift"], "cuda")
+        self.assertTrue(kwargs["n_step"])
+        self.assertEqual(kwargs["cfg"], 0)
+        self.assertEqual(kwargs["seed"], 32)
+        self.assertEqual(kwargs["param_10"], 1.0)
+        self.assertEqual(kwargs["param_11"], 42)
+        self.assertEqual(output.name, "approved.mp3")
+
     def test_missing_required_parameter_is_rejected(self) -> None:
         parameters = [
             name for name in soulx_client.EXPECTED_CORE_PARAMETERS if name != "target_audio"

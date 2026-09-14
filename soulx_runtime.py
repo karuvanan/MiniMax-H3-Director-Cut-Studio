@@ -24,8 +24,12 @@ SOULX_REPOSITORY = "https://github.com/Soul-AILab/SoulX-Singer.git"
 SOULX_HOME = PROJECT_ROOT / "models" / "SoulX-Singer-main"
 SERVER_MARKER = SOULX_HOME / ".studio_server_mode.json"
 HIDDEN_LAUNCHER = PROJECT_ROOT / "run_soulx_api_hidden.ps1"
+STOPPER = PROJECT_ROOT / "stop_soulx_server.ps1"
+SOULX_STDOUT_LOG = PROJECT_ROOT / "logs" / "soulx_api.stdout.log"
+SOULX_STDERR_LOG = PROJECT_ROOT / "logs" / "soulx_api.stderr.log"
 SVC_CHECKPOINT = SOULX_HOME / "pretrained_models" / "SoulX-Singer" / "model-svc.pt"
 PREPROCESS_HOME = SOULX_HOME / "pretrained_models" / "SoulX-Singer-Preprocess"
+_LOCAL_START_REQUESTED_AT = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,12 +112,24 @@ def _local_health_ready(timeout: float = 2.0) -> bool:
         with opener.open(request, timeout=max(0.2, timeout)) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
             status = int(response.status)
-        from soulx_client import discover_svc_endpoint
-
-        endpoint, parameters = discover_svc_endpoint(payload)
-        return 200 <= status < 300 and bool(endpoint and parameters)
+        return 200 <= status < 300 and _stable_api_ready(payload)
     except (OSError, ValueError, urllib.error.URLError):
         return False
+
+
+def _stable_api_ready(payload: dict[str, object]) -> bool:
+    """Accept only the Studio-owned API, never an old upstream wrapper.
+
+    Older SoulX processes may still answer ``/gradio_api/info`` while exposing
+    the broken 12-component/10-parameter ``/lazy_start_svc`` callback. Treating
+    that response as healthy prevents the hidden launcher from replacing the
+    stale process, so local Server Mode must require the stable endpoint.
+    """
+
+    from soulx_client import SVC_API_NAME, discover_svc_endpoint
+
+    endpoint, parameters = discover_svc_endpoint(payload)
+    return endpoint.casefold() == SVC_API_NAME.casefold() and bool(parameters)
 
 
 def start_local_soulx_server_if_installed(
@@ -121,10 +137,15 @@ def start_local_soulx_server_if_installed(
 ) -> bool:
     """Start local SoulX invisibly only after a complete installation is detected."""
 
+    global _LOCAL_START_REQUESTED_AT
+
     runtime = state or detect_soulx_runtime()
     if runtime.mode != "server" or not runtime.installed:
         return False
     if _local_health_ready():
+        _LOCAL_START_REQUESTED_AT = 0.0
+        return True
+    if _LOCAL_START_REQUESTED_AT and time.monotonic() - _LOCAL_START_REQUESTED_AT < 120.0:
         return True
     if not HIDDEN_LAUNCHER.is_file():
         return False
@@ -136,7 +157,44 @@ def start_local_soulx_server_if_installed(
         / "powershell.exe"
     )
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(
+    _LOCAL_START_REQUESTED_AT = time.monotonic()
+    try:
+        subprocess.Popen(
+            [
+                str(powershell),
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(HIDDEN_LAUNCHER),
+            ],
+            cwd=str(PROJECT_ROOT),
+            creationflags=creation_flags,
+        )
+    except Exception:
+        _LOCAL_START_REQUESTED_AT = 0.0
+        raise
+    return True
+
+
+def stop_local_soulx_server(*, timeout: float = 30.0) -> bool:
+    """Stop only this project's local SoulX process tree and release port 7861."""
+
+    global _LOCAL_START_REQUESTED_AT
+
+    if not STOPPER.is_file():
+        raise RuntimeError(f"SoulX process controller is missing: {STOPPER}")
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
         [
             str(powershell),
             "-NoProfile",
@@ -145,12 +203,55 @@ def start_local_soulx_server_if_installed(
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            str(HIDDEN_LAUNCHER),
+            str(STOPPER),
+            "-ProjectRoot",
+            str(PROJECT_ROOT),
+            "-Port",
+            "7861",
+            "-WaitSeconds",
+            "20",
         ],
         cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=max(5.0, float(timeout)),
         creationflags=creation_flags,
     )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown stop failure").strip()
+        raise RuntimeError(f"SoulX local server stop failed: {detail}")
+    _LOCAL_START_REQUESTED_AT = 0.0
     return True
+
+
+def read_soulx_startup_progress() -> str:
+    """Return the newest useful hidden-launcher phase for the dialog status line."""
+
+    chunks: list[str] = []
+    for path in (SOULX_STDOUT_LOG, SOULX_STDERR_LOG):
+        try:
+            if path.is_file():
+                chunks.append(path.read_text(encoding="utf-8", errors="replace")[-65536:])
+        except OSError:
+            pass
+    text = "\n".join(chunks)
+    phases = (
+        ("Installing PyTorch", "SoulX Server · updating GPU runtime (PyTorch CUDA)…"),
+        ("Building the isolated Python", "SoulX Server · preparing isolated Python runtime…"),
+        ("Downloading official SVC", "SoulX Server · downloading required models…"),
+        ("capability sm_", "SoulX Server · CUDA architecture validated…"),
+        ("[SoulX] Models:", "SoulX Server · loading API and binding model paths…"),
+        ("Running on local URL", "SoulX Server · API process online, validating contract…"),
+        ("models unloaded", "SoulX Server · idle model state released, validating API…"),
+    )
+    latest_position = -1
+    latest_message = "SoulX Server · waiting for local API startup…"
+    for marker, message in phases:
+        position = text.rfind(marker)
+        if position > latest_position:
+            latest_position = position
+            latest_message = message
+    return latest_message
 
 
 def install_local_soulx_server(

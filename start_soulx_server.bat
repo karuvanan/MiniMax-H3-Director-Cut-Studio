@@ -10,6 +10,8 @@ set "SOULX_REQUIREMENTS=%~dp0requirements-soulx-windows.txt"
 set "UV_PYTHON_INSTALL_DIR=%SOULX_RUNTIME%\.uv-python"
 set "UV_CACHE_DIR=%SOULX_RUNTIME%\.uv-cache"
 set "UV_EXE="
+set "SOULX_TORCH_VERSION=2.7.1"
+set "SOULX_TORCH_INDEX=https://download.pytorch.org/whl/cu128"
 
 if not exist "%SOULX_HOME%\webui_svc.py" goto :MissingSource
 
@@ -21,11 +23,29 @@ if not defined UV_EXE (
 )
 
 if not exist "%SOULX_PYTHON%" goto :RepairEnvironment
+:ValidateRuntime
 "%SOULX_PYTHON%" -c "import torch,gradio,librosa" >nul 2>&1
-if errorlevel 1 goto :RepairEnvironment
+if errorlevel 1 goto :RuntimeImportFailed
+"%SOULX_PYTHON%" -c "import torch; assert torch.cuda.is_available(), 'CUDA is unavailable'; cap=torch.cuda.get_device_capability(0); arch='sm_%%d%%d'%%cap; builds=torch.cuda.get_arch_list(); print('[SoulX] Torch',torch.__version__,'CUDA',torch.version.cuda,'GPU',torch.cuda.get_device_name(0),'capability',arch); assert arch in builds, 'PyTorch build does not contain '+arch+'; available: '+','.join(builds); torch.zeros(1,device='cuda').add_(1); torch.cuda.synchronize()"
+if errorlevel 1 goto :RepairTorch
 goto :EnsureModels
 
+:RuntimeImportFailed
+if defined SOULX_ENV_REBUILT goto :SetupFailed
+goto :RepairEnvironment
+
+:RepairTorch
+if defined SOULX_TORCH_REPAIRED goto :CudaIncompatible
+if not defined UV_EXE goto :RepairEnvironment
+set "SOULX_TORCH_REPAIRED=1"
+echo [SoulX] Existing PyTorch cannot execute kernels on this GPU.
+echo [SoulX] Installing PyTorch %SOULX_TORCH_VERSION% with CUDA 12.8 architecture support...
+"!UV_EXE!" pip install --python "%SOULX_PYTHON%" --reinstall torch==%SOULX_TORCH_VERSION% torchaudio==%SOULX_TORCH_VERSION% --index-url %SOULX_TORCH_INDEX%
+if errorlevel 1 goto :SetupFailed
+goto :ValidateRuntime
+
 :RepairEnvironment
+set "SOULX_ENV_REBUILT=1"
 echo [SoulX] Building the isolated Python 3.10 runtime:
 echo [SoulX] %SOULX_VENV%
 
@@ -43,10 +63,11 @@ if errorlevel 1 goto :SetupFailed
 "!UV_EXE!" venv --clear --python 3.10 "%SOULX_VENV%"
 if errorlevel 1 goto :SetupFailed
 
-"!UV_EXE!" pip install --python "%SOULX_PYTHON%" torch==2.2.0+cu121 torchaudio==2.2.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+"!UV_EXE!" pip install --python "%SOULX_PYTHON%" torch==%SOULX_TORCH_VERSION% torchaudio==%SOULX_TORCH_VERSION% --index-url %SOULX_TORCH_INDEX%
 if errorlevel 1 goto :SetupFailed
 "!UV_EXE!" pip install --python "%SOULX_PYTHON%" -r "%SOULX_REQUIREMENTS%"
 if errorlevel 1 goto :SetupFailed
+goto :ValidateRuntime
 
 :EnsureModels
 set "SOULX_PREPROCESS_FOUND="
@@ -63,11 +84,12 @@ if errorlevel 1 goto :SetupFailedFromHome
 popd
 
 :LaunchApi
-powershell.exe -NoProfile -Command "try { Invoke-RestMethod -Uri 'http://127.0.0.1:7861/gradio_api/info' -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }" >nul 2>&1
+powershell.exe -NoProfile -Command "try { $i=Invoke-RestMethod -Uri 'http://127.0.0.1:7861/gradio_api/info' -TimeoutSec 2; if (@($i.named_endpoints.PSObject.Properties.Name) -contains '/_studio_start_svc') { exit 0 }; exit 2 } catch { exit 1 }" >nul 2>&1
 if not errorlevel 1 (
     echo [SoulX] API is already running at http://0.0.0.0:7861
     exit /b 0
 )
+if errorlevel 2 goto :OutdatedServer
 
 pushd "%SOULX_HOME%"
 echo [SoulX] API: http://0.0.0.0:7861
@@ -87,6 +109,13 @@ echo [SoulX] Environment/model setup failed. Review the error above.
 if not defined SOULX_NO_PAUSE pause
 exit /b 1
 
+:CudaIncompatible
+echo.
+echo [SoulX] CUDA validation still failed after installing the CUDA 12.8 build.
+echo [SoulX] Update the NVIDIA display driver, then run restart_soulx_server.bat again.
+if not defined SOULX_NO_PAUSE pause
+exit /b 1
+
 :MissingSource
 echo [SoulX] Missing source: %SOULX_HOME%\webui_svc.py
 if not defined SOULX_NO_PAUSE pause
@@ -96,3 +125,9 @@ exit /b 1
 echo [SoulX] Missing requirements: %SOULX_REQUIREMENTS%
 if not defined SOULX_NO_PAUSE pause
 exit /b 1
+
+:OutdatedServer
+echo [SoulX] An outdated or incompatible API is still occupying port 7861.
+echo [SoulX] Run restart_soulx_server.bat once, then start Studio again.
+if not defined SOULX_NO_PAUSE pause
+exit /b 2

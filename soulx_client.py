@@ -17,9 +17,10 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 DEFAULT_SOULX_SERVER = os.getenv("SOULX_API_URL", "http://192.168.0.185:7861")
-SVC_API_NAME = "/_start_svc"
+SVC_API_NAME = "/_studio_start_svc"
 SVC_ENDPOINT_ALIASES = (
     SVC_API_NAME,
+    "/_start_svc",
     "/lazy_start_svc",
     "/start_svc",
     "/predict",
@@ -128,9 +129,20 @@ def discover_svc_endpoint(info: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 def validate_svc_api(info: dict[str, Any]) -> list[str]:
-    _endpoint, parameters = discover_svc_endpoint(info)
+    endpoint, parameters = discover_svc_endpoint(info)
     if not parameters:
         raise RuntimeError(f"SoulX endpoint {SVC_API_NAME} is not available")
+    if (
+        endpoint.casefold() == "/lazy_start_svc"
+        and len(parameters) == 12
+        and parameters[:10] == list(EXPECTED_CORE_PARAMETERS)
+        and parameters[10:] == ["param_10", "param_11"]
+    ):
+        raise RuntimeError(
+            "SoulX Server is running the outdated broken wrapper (/lazy_start_svc, "
+            "12 inputs on a 10-parameter callback). Run restart_soulx_server.bat "
+            "on the Server host, then reconnect."
+        )
     missing = [name for name in EXPECTED_CORE_PARAMETERS if name not in parameters]
     if missing:
         raise RuntimeError("SoulX SVC endpoint is incompatible; missing: " + ", ".join(missing))
@@ -229,6 +241,34 @@ def _to_mp3(source: Path) -> Path:
     return target
 
 
+def _request_kwargs(parameters: list[str], values: dict[str, Any]) -> dict[str, Any]:
+    """Map logical values onto the endpoint's published component order."""
+
+    anonymous_extended = (
+        len(parameters) == 12
+        and parameters[:10] == list(EXPECTED_CORE_PARAMETERS)
+        and parameters[10:] == ["param_10", "param_11"]
+    )
+    if anonymous_extended:
+        # This schema is produced when a 10-argument wrapper is attached to a
+        # 12-input Gradio event. Names after auto_mix_acc are shifted by two,
+        # but Gradio still validates values against the real component order.
+        logical_order = [
+            *EXPECTED_CORE_PARAMETERS[:6],
+            "device_choice",
+            "use_fp16",
+            "pitch_shift",
+            "n_step",
+            "cfg",
+            "seed",
+        ]
+        return {
+            parameter: values[logical_name]
+            for parameter, logical_name in zip(parameters, logical_order)
+        }
+    return {name: values[name] for name in parameters if name in values}
+
+
 def convert_singing_voice(
     server: str,
     *,
@@ -281,7 +321,7 @@ def convert_singing_voice(
         "device_choice": str(device or "cuda"),
         "use_fp16": bool(use_fp16),
     }
-    kwargs = {name: values[name] for name in parameters if name in values}
+    kwargs = _request_kwargs(parameters, values)
     missing_values = [name for name in parameters if name not in kwargs]
     if missing_values:
         raise RuntimeError(

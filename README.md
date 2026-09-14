@@ -174,6 +174,18 @@ Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF
 
 这是旧版 Studio wrapper 把 Gradio callback 暴露为 `/lazy_start_svc` 所致，不代表模型缺失。v0.3.5-alpha.1 会按 SVC 的完整参数合约自动发现 `/_start_svc`、`/lazy_start_svc` 或其他兼容 endpoint，同时新启动的 wrapper 会保留官方 `/_start_svc` 名称。更新代码并重新打开 Studio 即可使用；建议同时重启 SoulX Server，让 endpoint 名称恢复为标准格式。
 
+部分 Gradio 部署还会把12个输入错误套用10参数 callback 名称，并把最后两项显示为 `param_10`、`param_11`。这会导致 Pitch 的 `0` 被当成 Device，出现 `Value: 0 is not in the list of choices`。v0.3.5-alpha.1 会按照真实组件顺序重新映射 Device、FP16、Pitch、Steps、CFG 与 Seed，不需要手动修改 Server。
+
+为避免后续 Gradio 版本再次改变合约，新版 Server 另外提供固定的 `/_studio_start_svc` endpoint。它明确命名全部12项输入，并自动适配官方10参数或扩展12参数的 SoulX callback；同时启用详细错误回传。更新 `soulx_server.py` 后必须停止旧 Server 并重新启动，Client 才会优先使用这个稳定 endpoint。
+
+如果网页 `Use via API` 仍只显示 `/lazy_start_svc`，或统计为多次请求 `0% successful`，代表旧进程仍占用7861。请在 Server 项目根目录执行 `restart_soulx_server.bat`；它只会停止命令行属于当前项目、并运行 `soulx_server.py`/`webui_svc.py` 的7861进程，然后启动新版稳定 API。
+
+如果转换进入推理后显示 `CUDA error: no kernel image is available for execution on the device`，代表旧 SoulX runtime 的 PyTorch wheel 没有包含该显卡的 CUDA 架构。新版 `start_soulx_server.bat` 会先执行真实 CUDA tensor 与 capability 检查；发现不兼容时自动把隔离环境升级为 ABI 配对的 `torch/torchaudio 2.7.1` CUDA 12.8 build，再重新验证和启动。模型文件不会删除或重新下载。若升级后仍失败，请先更新 NVIDIA 驱动，再执行 `restart_soulx_server.bat`。
+
+SoulX Server现在采用明确的空载生命周期：API启动完成后先释放官方WebUI预加载的SVC与预处理模型，首次转换才懒加载。SoulX窗口底部会持续显示隔离Runtime、CUDA验证、模型路径、API合约检测等启动阶段，直到显示 `SoulX API ready`；API尚未就绪时不可提交转换。
+
+`Unload server models after conversion (closing always unloads)` 默认开启。每次转换后会调用 `/_unload_svc`，清除完整AppState、Python对象、CUDA cache及IPC cache。关闭SoulX窗口时一定再执行一次释放：如果是本机 `SERVER MODE`，Studio还会停止当前项目的7861隐藏Server进程树，使VRAM/DRAM的回收效果与关闭 `restart_soulx_server.bat` 的CMD一致；再次点击 `SOULX` 会自动重启并显示启动进度。如果是 `CLIENT MODE`，Studio只请求远端卸载模型，不会终止共用的远端Server。Server控制台会显示 `models unloaded` 以及卸载前后的allocated/reserved显存。
+
 ## 推荐的模型目录结构
 
 ```text

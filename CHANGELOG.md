@@ -13,6 +13,11 @@ Every user-visible correction receives an application version and a dated entry 
 - `UNLOAD ALL` 与转换后的清理会先探测 SoulX 卸载 endpoint；官方原始 WebUI 没有该 endpoint 时明确提示需停止／重启 SoulX server，不虚报已经释放显存。本项目自带的 Studio wrapper 提供本机 `/_unload_svc`。
 - 修复 Windows 主机安装在包含空格的项目路径时被 `webrtcvad==2.0.10` C 扩展编译阻断的问题；Windows 改用提供相同 `webrtcvad` 导入名的 `webrtcvad-wheels==2.0.14`，Linux/macOS 继续使用官方依赖。
 - 修复 Studio-managed SoulX wrapper 将 Gradio 回调名称改成 `lazy_start_svc` 后，Client 仍只查找 `/_start_svc` 而拒绝转换的问题。Wrapper 现在保留官方回调名称，Client 也会按完整参数合约发现兼容 endpoint，可连接修复前仍在运行的 `/lazy_start_svc` 服务。
+- 兼容部分 Gradio/SoulX 部署把12个实际输入错误套用10参数 callback 名称、并把最后两项发布成匿名 `param_10`、`param_11` 的情况；Client 改为按照真实组件顺序传送 Device、FP16、Pitch、Steps、CFG 与 Seed，避免 Pitch 值 `0` 被误送进 Device 下拉框。
+- 新增 Studio-owned `/_studio_start_svc` 稳定 endpoint，使用固定的12项命名参数并在 Server 内分别适配官方10参数及扩展12参数 SoulX callback；不再让 Gradio 自动命名决定 Client 合约。Server 启用详细错误回传，后台失败会显示真实异常并保留完整日志路径。
+- 修复升级后旧 SoulX 进程继续占用7861、导致启动器与 Studio 健康检查误判“Server 已运行”而永远不载入新版 wrapper 的问题。Server Mode 现在必须检测到 `/_studio_start_svc` 才视为健康；新增 `stop_soulx_server.ps1`，按项目路径停止完整 SoulX 进程树、核对7861真实监听PID，并等待端口确认可重新绑定后才启动；非本项目监听器只报告而不停止。`restart_soulx_server.bat` 与隐藏启动器共用这套安全控制。重启器不再以跨行 `^` 传递 PowerShell pipeline，两个 Windows BAT 亦固定使用 CRLF，避免 `Get-CimInstance` 收到字面 `^` 或 `goto` 找不到实际存在的标签。Client 遇到已知0%成功率的旧12输入/10参数 wrapper 时会直接给出升级指引。
+- 修复约32GB Blackwell GPU 使用旧 `torch 2.2.0+cu121` 时出现 `CUDA error: no kernel image is available for execution on the device`。SoulX 启动器现在实际建立CUDA tensor并核对设备 capability 是否存在于 `torch.cuda.get_arch_list()`；旧环境不兼容时只重装ABI配对的 `torch/torchaudio 2.7.1` CUDA 12.8 wheel，然后重新验证，无需删除模型或重建整个SoulX目录。新安装也默认使用同一兼容组合。
+- 完成 SoulX 模型生命周期：官方WebUI import时建立的初始 `APP_STATE` 会在API绑定后立即释放，使空闲Server保持无模型待命；网页及Studio转换只在请求到来时懒加载。转换、懒加载与卸载共用同一把锁，避免任务执行中途清理。Studio默认在转换完成时调用 `/_unload_svc`；关闭SoulX窗口时再强制释放，本机Server Mode同时停止项目所属的7861隐藏进程树，远端Client Mode则不终止共用Server。SoulX窗口底部会连续显示Runtime、CUDA、模型与API检测阶段，直到 `SoulX API ready`。
 
 ### ACE-Step 1.5 Music Workbench
 

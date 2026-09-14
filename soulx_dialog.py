@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import shutil
 import threading
+import time
 
 from PySide6.QtCore import QPointF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
@@ -41,6 +42,9 @@ from soulx_runtime import (
     SoulXRuntimeState,
     detect_soulx_runtime,
     install_local_soulx_server,
+    read_soulx_startup_progress,
+    start_local_soulx_server_if_installed,
+    stop_local_soulx_server,
 )
 
 
@@ -115,6 +119,7 @@ class SoulXSingerDialog(QDialog):
     task_failed = Signal(str, str)
     task_progress = Signal(str)
     runtime_mode_changed = Signal(object)
+    readiness_checked = Signal(object)
 
     def __init__(
         self,
@@ -124,6 +129,11 @@ class SoulXSingerDialog(QDialog):
         super().__init__(parent)
         self._busy = False
         self._closed = False
+        self._close_unload_attempted = False
+        self._close_release_completed = False
+        self._readiness_probe_running = False
+        self._api_ready = False
+        self._readiness_started = time.monotonic()
         self._threads: set[threading.Thread] = set()
         self.output_path: Path | None = None
         self.runtime_state = runtime_state or detect_soulx_runtime()
@@ -197,8 +207,14 @@ class SoulXSingerDialog(QDialog):
         self.device_combo = QComboBox()
         self.device_combo.addItems(["auto", "cuda", "directml", "cpu"])
         self.device_combo.setCurrentText("cuda")
-        self.auto_unload_check = QCheckBox("Request server model unload after conversion")
+        self.auto_unload_check = QCheckBox(
+            "Unload server models after conversion (closing always unloads)"
+        )
         self.auto_unload_check.setChecked(True)
+        self.auto_unload_check.setToolTip(
+            "Releases SoulX models after each conversion. Closing this window always "
+            "unloads the models; Local Server Mode also stops its hidden server process."
+        )
         self.pitch_shift_spin = QSpinBox()
         self.pitch_shift_spin.setRange(-36, 36)
         self.pitch_shift_spin.setValue(0)
@@ -270,7 +286,12 @@ class SoulXSingerDialog(QDialog):
         self.task_succeeded.connect(self._handle_success)
         self.task_failed.connect(self._handle_failure)
         self.task_progress.connect(self.status_label.setText)
+        self.readiness_checked.connect(self._handle_readiness_result)
+        self.readiness_timer = QTimer(self)
+        self.readiness_timer.setInterval(900)
+        self.readiness_timer.timeout.connect(self._probe_server_readiness)
         self._update_runtime_controls()
+        self._start_readiness_monitor()
 
     def _server(self) -> str:
         return self.server_edit.text().strip().rstrip("/")
@@ -296,6 +317,75 @@ class SoulXSingerDialog(QDialog):
         else:
             self.install_local_button.setText("LOCAL INSTALL REQUIRES >16 GB VRAM")
             self.install_local_button.setEnabled(False)
+
+    def _start_readiness_monitor(self) -> None:
+        self._api_ready = False
+        self._readiness_started = time.monotonic()
+        self.convert_button.setEnabled(False)
+        if self.runtime_state.mode == "server":
+            try:
+                start_local_soulx_server_if_installed(self.runtime_state)
+                self.status_label.setText("SoulX Server · starting local service…")
+            except Exception as exc:
+                self.status_label.setText(f"SoulX Server start failed · {exc}")
+        else:
+            self.status_label.setText(
+                f"SoulX Client · connecting remote API · {self._server()}"
+            )
+        self.readiness_timer.start()
+        QTimer.singleShot(0, self._probe_server_readiness)
+
+    def _probe_server_readiness(self) -> None:
+        if self._closed or self._api_ready or self._readiness_probe_running:
+            return
+        self._readiness_probe_running = True
+        server = self._server()
+        mode = self.runtime_state.mode
+        elapsed = max(0, int(time.monotonic() - self._readiness_started))
+
+        def run() -> None:
+            try:
+                info = fetch_api_info(server, timeout=1.5)
+                parameters = validate_svc_api(info)
+                result = {
+                    "ready": True,
+                    "server": server,
+                    "parameters": parameters,
+                    "message": (
+                        f"SoulX API ready · {server} · "
+                        f"{len(parameters)} SVC controls detected"
+                    ),
+                }
+            except Exception as exc:
+                progress = (
+                    read_soulx_startup_progress()
+                    if mode == "server"
+                    else f"SoulX Client · waiting for remote API · {server}"
+                )
+                result = {
+                    "ready": False,
+                    "server": server,
+                    "message": f"{progress} · {elapsed}s",
+                    "error": str(exc),
+                }
+            self.readiness_checked.emit(result)
+
+        thread = threading.Thread(target=run, name="soulx-readiness", daemon=True)
+        self._threads.add(thread)
+        thread.start()
+
+    def _handle_readiness_result(self, result: object) -> None:
+        self._readiness_probe_running = False
+        self._threads = {item for item in self._threads if item.is_alive()}
+        if self._closed:
+            return
+        data = result if isinstance(result, dict) else {}
+        self.status_label.setText(str(data.get("message") or "SoulX API status unknown"))
+        if not data.get("ready"):
+            return
+        self._api_ready = True
+        self.readiness_timer.stop()
+        self.convert_button.setEnabled(not self._busy)
 
     def install_local_runtime(self) -> None:
         if self.runtime_state.mode == "server":
@@ -344,7 +434,7 @@ class SoulXSingerDialog(QDialog):
         overlay_message: str = "",
     ) -> None:
         self._busy = bool(busy)
-        self.convert_button.setEnabled(not busy)
+        self.convert_button.setEnabled(not busy and self._api_ready)
         self.test_button.setEnabled(not busy)
         self.install_local_button.setEnabled(
             not busy
@@ -463,12 +553,16 @@ class SoulXSingerDialog(QDialog):
                 f"Local SoulX installed · SERVER MODE · {self.runtime_state.api_url}"
             )
             self.runtime_mode_changed.emit(self.runtime_state)
+            self._start_readiness_monitor()
             return
         if kind == "connection":
             parameters = data.get("parameters") or []
             self.status_label.setText(
                 f"SoulX API ready · {self._server()} · {len(parameters)} SVC controls detected"
             )
+            self._api_ready = True
+            self.readiness_timer.stop()
+            self.convert_button.setEnabled(not self._busy)
             return
         output = Path(str(data.get("output") or ""))
         if not output.is_file():
@@ -545,19 +639,46 @@ class SoulXSingerDialog(QDialog):
         self.status_label.setText("Please wait for the active SoulX task to finish before closing")
         return True
 
+    def _release_before_close(self) -> None:
+        if self._close_release_completed:
+            return
+        self._close_unload_attempted = True
+        server = self._server()
+        self.status_label.setText(f"Leaving SoulX · unloading server models · {server}")
+        try:
+            result = request_server_unload(server, timeout=4.0)
+            if not result.get("unloaded"):
+                warning = str(result.get("warning") or "server did not confirm unload")
+                print(f"[SoulX] close unload warning: {warning}", flush=True)
+        except Exception as exc:
+            # Closing the independent workbench must remain possible if a
+            # remote server disappeared; preserve the diagnostic in stdout.
+            print(f"[SoulX] close unload failed: {exc}", flush=True)
+        if self.runtime_state.mode == "server":
+            try:
+                stop_local_soulx_server()
+                print("[SoulX] local server stopped after leaving SoulX", flush=True)
+            except Exception as exc:
+                print(f"[SoulX] local server stop failed: {exc}", flush=True)
+        self._close_release_completed = True
+
     def reject(self) -> None:
         if self._block_busy_close():
             return
-        self._closed = True
+        self.readiness_timer.stop()
         self.busy_overlay.stop()
         self.player.stop()
+        self._release_before_close()
+        self._closed = True
         super().reject()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._block_busy_close():
             event.ignore()
             return
-        self._closed = True
+        self.readiness_timer.stop()
         self.busy_overlay.stop()
         self.player.stop()
+        self._release_before_close()
+        self._closed = True
         super().closeEvent(event)
