@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from smart_render_worker import (
+    SingingLipSyncQCError,
     _patch_continuity,
     build_render_progress,
     build_assembly_command,
@@ -21,6 +22,71 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
+    def test_singing_lipsync_qc_hard_blocks_uncorrelated_segment(self):
+        root = PROJECT_ROOT / ".director_cache" / "smart_render_singing_qc_test"
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        audio = root / "a1.wav"
+        video.write_bytes(b"video")
+        audio.write_bytes(b"audio")
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "http_timeout": 1,
+            "segment_attempts": 2,
+            "segment_count": 1,
+            "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+            "ffmpeg": "ffmpeg",
+        }
+        segment = {
+            "segment_id": "seg-qc",
+            "index": 0,
+            "start_seconds": 21.0,
+            "end_seconds": 28.0,
+            "download_dir": str(root),
+            "singing_lipsync_qc": {
+                "enabled": True,
+                "reference_audio": str(audio),
+                "reference_offset_seconds": 0.0,
+                "duration_seconds": 7.0,
+                "timeline_start_seconds": 21.0,
+                "timeline_end_seconds": 28.0,
+            },
+        }
+        qc_result = {
+            "passed": False,
+            "status": "hard_block",
+            "message": "Singing Lip-Sync QC HARD BLOCK · tail lip-sync lock decayed.",
+        }
+        with (
+            patch(
+                "smart_render_worker._request_json",
+                side_effect=[{"prompt_id": "qc-1"}, {"prompt_id": "qc-2"}],
+            ),
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
+            patch(
+                "smart_render_worker.download_outputs",
+                return_value=[{"kind": "videos", "local_path": str(video)}],
+            ),
+            patch(
+                "smart_render_worker.analyze_singing_lipsync_alignment",
+                return_value=qc_result,
+            ) as analyzer,
+            patch("smart_render_worker.release_comfy_memory", return_value="released"),
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit"),
+        ):
+            with self.assertRaises(SingingLipSyncQCError):
+                queue_segment(job, segment, {}, [])
+        self.assertEqual(analyzer.call_count, 2)
+        self.assertEqual(
+            classify_generation_error(qc_result["message"]),
+            "singing_lipsync_qc",
+        )
+        video.unlink(missing_ok=True)
+        audio.unlink(missing_ok=True)
+        root.rmdir()
+
     def test_oom_is_classified_released_and_retried_without_quality_change(self):
         root = PROJECT_ROOT / ".director_cache" / "smart_render_oom_retry_test"
         root.mkdir(parents=True, exist_ok=True)

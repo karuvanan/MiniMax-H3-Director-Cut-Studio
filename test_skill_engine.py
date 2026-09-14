@@ -1131,6 +1131,31 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("Director clip instruction", prompt)
         self.assertIn("low tracking angle", prompt)
 
+    def test_mtv_suppresses_machine_transcript_but_keeps_beat_guidance(self):
+        asset = MediaAsset(
+            "30", "LoadAudio", "audio", "song.mp3", "<Audio 1>",
+            "ref_audios.ref_audio_0", start_seconds=0.0, end_seconds=7.0,
+            reference_id="A1",
+            recognition=(
+                "Beat estimate: 125.0 BPM · confidence 0.47\n"
+                "VAD voice ratio: 3.0%\n"
+                "WHISPER TRANSCRIPT · cuda\n"
+                "[00:00.33] What?\n"
+                "[00:01.32] MBC 뉴스 김지경입니다."
+            ),
+        )
+        prompt = build_ref2va_prompt(
+            PromptSpec(brief="P1 performs to A1.", shots=["P1 performs to camera."]),
+            [asset],
+            7.0,
+            self.profiles[DEFAULT_SKILL],
+            self.profiles["mtv-singing-h3"],
+        )
+        self.assertIn("125.0 BPM", prompt)
+        self.assertIn("VAD voice ratio", prompt)
+        self.assertNotIn("machine transcript", prompt)
+        self.assertNotIn("MBC", prompt)
+
     def test_video_soundtrack_audio_ordinal_is_explicit_in_h3_prompt(self):
         video = MediaAsset(
             "20", "LoadVideo", "video", "reference.mp4", "<Video 1>",

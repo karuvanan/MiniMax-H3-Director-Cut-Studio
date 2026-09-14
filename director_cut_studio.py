@@ -195,11 +195,17 @@ from fourdx_engine import (
     update_fourdx_requirement_block,
 )
 from music_video_engine import (
+    MTV_AUDIO_DRIVEN_MOUTH_CONTRACT,
+    MTV_MAX_LIPSYNC_SEGMENT_SECONDS,
     MTV_MASTER_AUDIO_CONTRACT,
+    MTV_SUPPORT_MOUTH_CONTRACT,
     exact_master_audio_asset,
     is_mtv_singing_skill,
     mtv_master_audio_duration,
+    mtv_reference_audio_window,
     replace_video_audio_with_exact_master,
+    sanitize_unverified_mtv_mouth_timing,
+    strip_mtv_transcript_guidance,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from smart_cut_engine import (
@@ -297,6 +303,7 @@ from segment_engine import (
     content_fingerprint,
     derive_named_segment_seed,
     normalize_speech_overlap_policy,
+    plan_balanced_render_segments,
     plan_render_segments,
     plan_speech_track_lanes,
     plan_shot_render_segments,
@@ -361,7 +368,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 22
+SMART_RENDER_POLICY_VERSION = 23
 
 _UNTRACKED_VISIBLE_TEXT_TOKEN_RE = re.compile(
     r"\b(?:text|words?|subtitle|caption|title|lower[- ]?third|hashtag|typography|legible)\b|"
@@ -14782,6 +14789,11 @@ class DirectorCutStudio(QMainWindow):
         end = float(self.clip_end.value())
         if end <= start:
             return []
+        max_segment_seconds = (
+            MTV_MAX_LIPSYNC_SEGMENT_SECONDS
+            if is_mtv_singing_skill(self.special_combo.currentData())
+            else MAX_NATIVE_SECONDS
+        )
         keyframe_boundaries = {start, end}
         if is_drone_special_skill(self.special_combo.currentData()):
             for asset in self.scan.timeline_assets():
@@ -14829,10 +14841,23 @@ class DirectorCutStudio(QMainWindow):
                 planned.extend(plan_render_segments(
                     range_start,
                     range_end,
-                    max_segment_seconds=MAX_NATIVE_SECONDS,
+                    max_segment_seconds=max_segment_seconds,
                     overlap_seconds=0.0,
                 ))
-        elif end - start > MAX_NATIVE_SECONDS + 1e-6:
+        elif (
+            is_mtv_singing_skill(self.special_combo.currentData())
+            and end - start > max_segment_seconds + 1e-6
+        ):
+            # Do not leave a 1-2 second final singing request merely because
+            # A1 ends off the seven-second cadence. Distribute the song across
+            # equally useful 5-7 second H3 windows instead.
+            planned = plan_balanced_render_segments(
+                start,
+                end,
+                max_segment_seconds=max_segment_seconds,
+                grid_seconds=TIMELINE_SNAP_SECONDS,
+            )
+        elif end - start > max_segment_seconds + 1e-6:
             shots = [
                 asdict(cue) for cue in self.director_cues
                 if cue.cue_type == "shot"
@@ -14867,22 +14892,22 @@ class DirectorCutStudio(QMainWindow):
                     # the same reference scene. Pack micro-Shots into the
                     # longest native window; a 45-second design becomes three
                     # coherent 15-second generation jobs.
-                    min_segment_seconds=MAX_NATIVE_SECONDS,
-                    max_segment_seconds=MAX_NATIVE_SECONDS,
+                    min_segment_seconds=max_segment_seconds,
+                    max_segment_seconds=max_segment_seconds,
                     overlap_seconds=0.0,
                 )
             else:
                 planned = plan_render_segments(
                     start,
                     end,
-                    max_segment_seconds=MAX_NATIVE_SECONDS,
+                    max_segment_seconds=max_segment_seconds,
                     overlap_seconds=0.0,
                 )
         else:
             planned = plan_render_segments(
                 start,
                 end,
-                max_segment_seconds=MAX_NATIVE_SECONDS,
+                max_segment_seconds=max_segment_seconds,
                 overlap_seconds=0.0,
             )
         for index, segment in enumerate(planned):
@@ -14924,14 +14949,14 @@ class DirectorCutStudio(QMainWindow):
             planned = protect_segment_boundaries_from_speech(
                 planned,
                 [asdict(layer) for layer in self.text_layers],
-                max_segment_seconds=MAX_NATIVE_SECONDS,
+                max_segment_seconds=max_segment_seconds,
                 tail_seconds=1.0,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
             planned = align_segments_to_dialogue_turns(
                 planned,
                 [asdict(layer) for layer in self.text_layers],
-                max_segment_seconds=MAX_NATIVE_SECONDS,
+                max_segment_seconds=max_segment_seconds,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
             # A named/signature technique is one indivisible H3 action chain.
@@ -14950,7 +14975,7 @@ class DirectorCutStudio(QMainWindow):
                         layer.start_seconds, layer.end_seconds, start, end
                     )
                 ],
-                max_segment_seconds=MAX_NATIVE_SECONDS,
+                max_segment_seconds=max_segment_seconds,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
         shots_in_area = self._coalesce_beat_synced_campus_bridge_cues([
@@ -20036,7 +20061,9 @@ class DirectorCutStudio(QMainWindow):
                 + " ".join(f'"{text}"' for text in voice_over_rows)
                 + "."
             )
-        elif transcript_rows:
+        elif transcript_rows and not is_mtv_singing_skill(
+            self.special_combo.currentData()
+        ):
             brief_parts.append(
                 "Use the active audio transcript as spoken narrative guidance: "
                 + compact(" ".join(transcript_rows), 1100)
@@ -20054,11 +20081,17 @@ class DirectorCutStudio(QMainWindow):
             brief_parts.append("Finish on the timeline Ending Hold marker.")
         synthesized_brief = " ".join(brief_parts)
         current_brief = self.prompt_panel.brief.toPlainText().strip()
+        sanitized_stale_mtv_brief = False
+        if is_mtv_singing_skill(self.special_combo.currentData()):
+            cleaned = strip_mtv_transcript_guidance(current_brief)
+            sanitized_stale_mtv_brief = cleaned != current_brief
+            current_brief = cleaned
         if (
             force
             or reconcile_brief
             or not current_brief
             or current_brief == self.prompt_panel.last_timeline_brief
+            or sanitized_stale_mtv_brief
         ):
             self.prompt_panel.brief.setPlainText(synthesized_brief)
         self.prompt_panel.last_timeline_brief = synthesized_brief
@@ -21175,6 +21208,32 @@ class DirectorCutStudio(QMainWindow):
             state["technical"] = "; ".join(
                 part for part in (state.get("technical", "").strip(), *technical_notes) if part
             )
+        if is_mtv_singing_skill(self.special_combo.currentData()):
+            # Compatibility guard for already-saved MTV projects. Older Design
+            # plans may contain guessed verse/chorus mouth poses or a false
+            # Whisper transcript even though no authored lyric timing exists.
+            state["brief"] = strip_mtv_transcript_guidance(state.get("brief", ""))
+            has_authored_lyrics = any(
+                layer.content_role == "lyrics" and layer.text.strip()
+                for layer in self.text_layers
+            )
+            if not has_authored_lyrics:
+                for field_name in (
+                    "brief", "style", "references", "audio", "music", "dialogue",
+                    "transition", "ending", "must_keep", "technical",
+                ):
+                    state[field_name] = sanitize_unverified_mtv_mouth_timing(
+                        state.get(field_name, "")
+                    )
+                state["shots"] = [
+                    sanitize_unverified_mtv_mouth_timing(value)
+                    for value in state.get("shots", [])
+                ]
+                for row in state.get("shot_ranges", []):
+                    if isinstance(row, dict):
+                        row["description"] = sanitize_unverified_mtv_mouth_timing(
+                            row.get("description", "")
+                        )
         return PromptSpec(**state)
 
     @staticmethod
@@ -21208,6 +21267,14 @@ class DirectorCutStudio(QMainWindow):
         """Build an H3 prompt whose timeline timestamps are local to one hidden segment."""
         campus_bridge = False
         campus_composite = False
+        mtv_singing_mode = bool(
+            is_mtv_singing_skill(self.special_combo.currentData())
+            and any(
+                asset.media_type == "audio"
+                and stable_reference_id(asset).strip().upper() == "A1"
+                for asset in assets
+            )
+        )
         spec = self._prompt_spec_with_director_cues(
             self.prompt_panel.spec(),
             window_start=start,
@@ -21554,6 +21621,17 @@ class DirectorCutStudio(QMainWindow):
                     "Only Timeline Dialogue, Voice-over or Lyrics Text Ranges may produce a "
                     "human voice; never improvise, repeat, paraphrase or start an unlisted word."
                 )
+            elif mtv_singing_mode:
+                brief_parts.append(
+                    "MTV A1 VOCAL EXCEPTION: the sung vocal already present in the current A1 "
+                    "source window is required performance audio, not unlisted dialogue. P1 must "
+                    "sing continuously whenever that A1 window contains vocals and rest the mouth "
+                    "naturally only during genuinely instrumental intervals. Generate no additional "
+                    "speaker, dialogue, narration, backing singer or replacement vocal. "
+                    + MTV_AUDIO_DRIVEN_MOUTH_CONTRACT
+                    + " "
+                    + MTV_SUPPORT_MOUTH_CONTRACT
+                )
             else:
                 brief_parts.append(
                     "This segment has no authored speech event. Generate no spoken word, vocal "
@@ -21581,16 +21659,25 @@ class DirectorCutStudio(QMainWindow):
                       "start, repeated word, translation, commentary, whisper, crowd voice or "
                       "telephone voice. Room tone, music and non-vocal Foley may continue."
                 )
-            brief_parts.append(
-                "AUDIO SEGMENT BOUNDARY CONTRACT: establish the location's continuous room tone "
-                "or outdoor ambience from the first frame and keep it stable through the final "
-                "frame. Complete every authored utterance by its exact Text Range end. Before an "
-                "internal edit boundary leave at least one second for natural breath, reverberation "
-                "decay and ambience only; at the final project endpoint use all available authored "
-                "tail without extending the Timeline. "
-                "Never begin a fresh sound, word, music cue or Foley transient in the final second; "
-                "never end the audio bed with an abrupt digital stop."
-            )
+            if mtv_singing_mode:
+                brief_parts.append(
+                    "MTV AUDIO SEGMENT BOUNDARY CONTRACT: local 00:00 is the exact current A1 "
+                    f"Timeline position {start:.3f}s, not the beginning of the song. Follow A1 at "
+                    "1x through the complete local window without restart, loop, fade, invented "
+                    "silence, early mouth closure or final-note guess. A Segment boundary is only "
+                    "an edit boundary and never a musical phrase boundary."
+                )
+            else:
+                brief_parts.append(
+                    "AUDIO SEGMENT BOUNDARY CONTRACT: establish the location's continuous room tone "
+                    "or outdoor ambience from the first frame and keep it stable through the final "
+                    "frame. Complete every authored utterance by its exact Text Range end. Before an "
+                    "internal edit boundary leave at least one second for natural breath, reverberation "
+                    "decay and ambience only; at the final project endpoint use all available authored "
+                    "tail without extending the Timeline. "
+                    "Never begin a fresh sound, word, music cue or Foley transient in the final second; "
+                    "never end the audio bed with an abrupt digital stop."
+                )
             if is_final_window and any(
                 cue.cue_type == "marker"
                 and ("ending" in cue.preset.lower() or "final" in cue.preset.lower())
@@ -22285,6 +22372,11 @@ class DirectorCutStudio(QMainWindow):
                     "download_dir": str(render_root / segment.segment_id),
                 }
             )
+            qc_spec = self._singing_lipsync_qc_spec(
+                assets, core_start, core_end
+            )
+            if qc_spec:
+                row["singing_lipsync_qc"] = qc_spec
             segment_rows.append(row)
 
         # Every Segment was already patched from its own active asset set.
@@ -22343,7 +22435,20 @@ class DirectorCutStudio(QMainWindow):
                 and str(cached.get("status", "")).lower()
                 in {"cached", "complete", "completed", "reusable"}
             )
-            if cached and not dirty and (fingerprint_match or approved_locked_range):
+            qc_reusable = bool(
+                not row.get("singing_lipsync_qc")
+                or (
+                    isinstance(cached, dict)
+                    and isinstance(cached.get("singing_lipsync_qc_result"), dict)
+                    and cached["singing_lipsync_qc_result"].get("passed") is True
+                )
+            )
+            if (
+                cached
+                and not dirty
+                and qc_reusable
+                and (fingerprint_match or approved_locked_range)
+            ):
                 row["status"] = "cached"
                 row["output_path"] = str(Path(cached["output_path"]).resolve())
                 row["reuse_reason"] = (
@@ -22484,24 +22589,45 @@ class DirectorCutStudio(QMainWindow):
                 or "AI DESIGN AUTHORED SPEECH TTS" in str(asset.recognition or "")
                 or float(asset.playback_speed or 1.0) != 1.0
                 or float(asset.start_seconds) > start + 1e-6
-                or float(asset.end_seconds) < end - 1e-6
             ):
+                continue
+            mtv_window = (
+                mtv_reference_audio_window(
+                    asset,
+                    timeline_start=start,
+                    timeline_end=end,
+                    maximum_tail_padding_seconds=TIMELINE_SNAP_SECONDS,
+                )
+                if is_mtv_singing_skill(self.special_combo.currentData())
+                else None
+            )
+            if float(asset.end_seconds) < end - 1e-6 and mtv_window is None:
                 continue
             source = Path(str(asset.local_path or ""))
             if not source.is_file():
                 continue
-            source_offset = max(
-                0.0,
-                float(asset.source_in_seconds or 0.0)
-                + start - float(asset.start_seconds or 0.0),
-            )
+            if mtv_window is not None:
+                source_offset = float(mtv_window["source_offset_seconds"])
+                playable_duration = float(mtv_window["playable_duration_seconds"])
+            else:
+                source_offset = max(
+                    0.0,
+                    float(asset.source_in_seconds or 0.0)
+                    + start - float(asset.start_seconds or 0.0),
+                )
+                playable_duration = duration
             # A full-span single H3 request already begins at the correct source
             # position and needs no extra lossless PCM cache copy.
-            if source_offset <= 1e-6 and abs(duration - float(asset.end_seconds - asset.start_seconds)) <= 1e-6:
+            if (
+                source_offset <= 1e-6
+                and abs(duration - float(asset.end_seconds - asset.start_seconds)) <= 1e-6
+                and abs(playable_duration - duration) <= 1e-6
+            ):
                 continue
             source_key = (
                 f"{source.resolve()}|{source.stat().st_mtime_ns}|"
-                f"{source_offset:.6f}|{duration:.6f}|{asset.reference_id}|{asset.node_id}"
+                f"{source_offset:.6f}|{playable_duration:.6f}|{duration:.6f}|"
+                f"{asset.reference_id}|{asset.node_id}"
             )
             digest = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:20]
             destination = cache / f"audio_{digest}_{start:.3f}-{end:.3f}.wav"
@@ -22510,7 +22636,11 @@ class DirectorCutStudio(QMainWindow):
                 completed = subprocess.run(
                     [
                         str(self.runtime.ffmpeg), "-y", "-ss", f"{source_offset:.6f}",
-                        "-i", str(source), "-af", f"apad=whole_dur={duration:.6f}",
+                        "-i", str(source), "-af",
+                        (
+                            f"atrim=duration={playable_duration:.6f},"
+                            f"apad=whole_dur={duration:.6f}"
+                        ),
                         "-t", f"{duration:.6f}", "-ar", "48000", "-ac", "2",
                         "-c:a", "pcm_s16le", str(destination),
                     ],
@@ -22532,6 +22662,33 @@ class DirectorCutStudio(QMainWindow):
             asset.start_seconds = start
             asset.end_seconds = end
         return clones
+
+    def _singing_lipsync_qc_spec(
+        self,
+        assets: list[MediaAsset],
+        start: float,
+        end: float,
+    ) -> dict:
+        """Return the untouched A1 window used to validate H3 singing timing."""
+
+        if not is_mtv_singing_skill(self.special_combo.currentData()):
+            return {}
+        for asset in assets:
+            if (
+                asset.media_type == "audio"
+                and stable_reference_id(asset).strip().upper() == "A1"
+                and Path(str(asset.local_path or "")).is_file()
+            ):
+                return {
+                    "enabled": True,
+                    "reference_audio": str(Path(asset.local_path).resolve()),
+                    "reference_offset_seconds": 0.0,
+                    "duration_seconds": max(0.01, float(end) - float(start)),
+                    "timeline_start_seconds": float(start),
+                    "timeline_end_seconds": float(end),
+                    "policy": "hard_block_before_accept",
+                }
+        return {}
 
     def _compiled_job(
         self,
@@ -22945,7 +23102,9 @@ class DirectorCutStudio(QMainWindow):
             self._read_settings_ui()
             self.generate_prompt(interactive=False)
             duration = self.clip_end.value() - self.clip_start.value()
-            is_smart_render = duration > MAX_NATIVE_SECONDS + 1e-6
+            # MTV singing uses shorter, A1-locked native windows even when the
+            # complete work area is below H3's ordinary 15-second limit.
+            is_smart_render = len(self._planned_render_segments()) > 1
             if is_smart_render:
                 job_path, segment_count = self._build_smart_render_job(
                     request_kind=request_kind,
@@ -23010,6 +23169,13 @@ class DirectorCutStudio(QMainWindow):
                     "ffmpeg": str(self.runtime.ffmpeg),
                     "ffprobe": str(self.runtime.ffprobe),
                 }
+                singing_qc_spec = self._singing_lipsync_qc_spec(
+                    assets,
+                    self.clip_start.value(),
+                    self.clip_end.value(),
+                )
+                if singing_qc_spec:
+                    job["singing_lipsync_qc"] = singing_qc_spec
                 job.update(
                     self._immutable_final_hold_spec(
                         self.clip_start.value(), self.clip_end.value()
@@ -23140,6 +23306,13 @@ class DirectorCutStudio(QMainWindow):
                 self._refresh_render_status_bar()
         if isinstance(payload.get("segment_completed"), dict):
             self._show_render_segment_preview(dict(payload["segment_completed"]))
+        singing_qc = payload.get("singing_lipsync_qc")
+        if isinstance(singing_qc, dict) and singing_qc:
+            self._apply_singing_lipsync_qc_status(
+                singing_qc,
+                float(payload.get("segment_start_seconds", self.clip_start.value())),
+                float(payload.get("segment_end_seconds", self.clip_end.value())),
+            )
         if isinstance(payload.get("partial_manifest"), dict):
             self.smart_render_manifest = dict(payload["partial_manifest"])
             cache_key = "preview" if self.submit_request_kind == "preview" else "production"
@@ -23169,6 +23342,30 @@ class DirectorCutStudio(QMainWindow):
                 )
         if payload.get("queued") or payload.get("error") or payload.get("completed"):
             self.submit_result = payload
+
+    def _apply_singing_lipsync_qc_status(
+        self,
+        result: dict,
+        range_start: float,
+        range_end: float,
+    ) -> None:
+        """Expose the pre-Accept A1 timing check in each affected Shot."""
+
+        message = str(result.get("message") or "Singing Lip-Sync QC unavailable")
+        for cue in self.director_cues:
+            if (
+                cue.cue_type == "shot"
+                and ranges_intersect(
+                    cue.start_seconds,
+                    cue.end_seconds,
+                    range_start,
+                    range_end,
+                )
+                and not cue.native_audio_qc_user_edited
+            ):
+                cue.native_audio_qc_status = message
+        self._refresh_director_cues()
+        self.statusBar().showMessage(message)
 
     def _show_render_segment_preview(self, segment: dict) -> None:
         """Play each completed Shot unit immediately while the next one renders."""
@@ -23686,7 +23883,10 @@ class DirectorCutStudio(QMainWindow):
         self.monitor_display_stack.setCurrentWidget(self.monitor_compare_splitter)
         if kind == "video":
             self._prepare_generated_monitor_video(path, autoplay=autoplay)
-            if self.render_settings.dialogue_tts_engine == "h3_native":
+            if (
+                self.render_settings.dialogue_tts_engine == "h3_native"
+                and not is_mtv_singing_skill(self.special_combo.currentData())
+            ):
                 self._start_native_audio_qc(
                     path,
                     self.generated_output_timeline_start,

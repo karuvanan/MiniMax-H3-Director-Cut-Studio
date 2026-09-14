@@ -29,13 +29,22 @@ from comfy_submit_worker import (
     upload_file,
     wait_for_history,
 )
+from music_video_engine import analyze_singing_lipsync_alignment
 from workflow_engine import validate_portable_media_manifest
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 22
+SMART_RENDER_POLICY_VERSION = 23
 AUDIO_JOIN_FADE_SECONDS = 0.04
+
+
+class SingingLipSyncQCError(RuntimeError):
+    """H3's untouched segment audio no longer follows the supplied A1 timing."""
+
+    def __init__(self, result: dict):
+        self.result = dict(result)
+        super().__init__(str(result.get("message") or "Singing Lip-Sync QC failed."))
 
 
 def emit(payload: dict) -> None:
@@ -280,6 +289,8 @@ def _write_manifest(path: Path, payload: dict) -> None:
 def classify_generation_error(error: object) -> str:
     """Classify retry/failure evidence without weakening output quality."""
     text = str(error or "").casefold()
+    if "singing lip-sync qc" in text:
+        return "singing_lipsync_qc"
     if any(
         marker in text
         for marker in (
@@ -733,6 +744,39 @@ def queue_segment(
             video = _primary_video(downloaded)
             if video is None:
                 raise RuntimeError(f"Segment {segment['index'] + 1} produced no downloadable video.")
+            singing_qc_result: dict = {}
+            singing_qc_spec = segment.get("singing_lipsync_qc") or {}
+            if singing_qc_spec.get("enabled"):
+                singing_qc_result = analyze_singing_lipsync_alignment(
+                    Path(job["ffmpeg"]),
+                    video,
+                    Path(str(singing_qc_spec["reference_audio"])),
+                    duration_seconds=float(
+                        singing_qc_spec.get(
+                            "duration_seconds",
+                            float(segment.get("end_seconds", 0.0))
+                            - float(segment.get("start_seconds", 0.0)),
+                        )
+                    ),
+                    reference_offset_seconds=float(
+                        singing_qc_spec.get("reference_offset_seconds", 0.0)
+                    ),
+                )
+                emit(
+                    {
+                        "progress": singing_qc_result["message"],
+                        "singing_lipsync_qc": singing_qc_result,
+                        "segment_id": segment.get("segment_id", ""),
+                        "segment_start_seconds": singing_qc_spec.get(
+                            "timeline_start_seconds", segment.get("start_seconds", 0.0)
+                        ),
+                        "segment_end_seconds": singing_qc_spec.get(
+                            "timeline_end_seconds", segment.get("end_seconds", 0.0)
+                        ),
+                    }
+                )
+                if not singing_qc_result.get("passed"):
+                    raise SingingLipSyncQCError(singing_qc_result)
             persisted_segment = {key: value for key, value in segment.items() if key != "workflow"}
             return {
                 **persisted_segment,
@@ -745,6 +789,7 @@ def queue_segment(
                 "error": "",
                 "attempts_used": attempt,
                 "failure_class": "",
+                "singing_lipsync_qc_result": singing_qc_result,
             }
         except Exception as exc:
             last_error = exc
@@ -777,6 +822,8 @@ def queue_segment(
                 time.sleep(2.0 if failure_class == "oom" else 1.0)
         finally:
             resume_existing = False
+    if isinstance(last_error, SingingLipSyncQCError):
+        raise last_error
     raise RuntimeError(str(last_error or "Unknown segment generation error"))
 
 
@@ -857,7 +904,18 @@ def main() -> int:
     previous_video: Path | None = None
     for index, segment in enumerate(segments):
         cached = Path(str(segment.get("output_path", "")))
-        if segment.get("status") == "cached" and cached.is_file():
+        cached_qc_reusable = bool(
+            not (segment.get("singing_lipsync_qc") or {}).get("enabled")
+            or (
+                isinstance(segment.get("singing_lipsync_qc_result"), dict)
+                and segment["singing_lipsync_qc_result"].get("passed") is True
+            )
+        )
+        if (
+            segment.get("status") == "cached"
+            and cached.is_file()
+            and cached_qc_reusable
+        ):
             segment["output_path"] = str(cached.resolve())
             completed.append({key: value for key, value in segment.items() if key != "workflow"})
             completed_indexes.add(index)
@@ -988,6 +1046,9 @@ def main() -> int:
                 failure_class=failure_class,
                 retry_budget=max(1, min(5, int(job.get("segment_attempts", 3)))),
             )
+            singing_qc_result = getattr(exc, "result", None)
+            if isinstance(singing_qc_result, dict):
+                failed["singing_lipsync_qc_result"] = dict(singing_qc_result)
             if accepted_prompt_id:
                 failed["prompt_id"] = accepted_prompt_id
             manifest = {
@@ -1015,6 +1076,13 @@ def main() -> int:
                     "error": str(exc),
                     "failure_class": failure_class,
                 },
+                "singing_lipsync_qc": (
+                    dict(singing_qc_result)
+                    if isinstance(singing_qc_result, dict)
+                    else None
+                ),
+                "segment_start_seconds": segment.get("core_start_seconds", segment.get("start_seconds", 0.0)),
+                "segment_end_seconds": segment.get("core_end_seconds", segment.get("end_seconds", 0.0)),
                 "partial_manifest": manifest,
                 "render_progress": build_render_progress(
                     job,

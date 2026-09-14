@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import re
 from typing import Any, Iterable, Mapping
 
@@ -336,6 +337,63 @@ def plan_render_segments(
     for index, row in enumerate(rows[:-1]):
         row.overlap_after_seconds = round(
             max(0.0, row.end_seconds - rows[index + 1].start_seconds), 6
+        )
+    return rows
+
+
+def plan_balanced_render_segments(
+    start_seconds: float,
+    end_seconds: float,
+    *,
+    max_segment_seconds: float = MAX_NATIVE_SECONDS,
+    grid_seconds: float = TIMELINE_GRID_SECONDS,
+) -> list[RenderSegment]:
+    """Spread a long range evenly so the final native request is not a tiny tail.
+
+    Singing lip sync is less stable when a one- or two-second final request has
+    to re-establish a face and song context. This planner keeps the same hard
+    maximum as ``plan_render_segments`` but distributes duration across the
+    minimum number of half-second-grid windows.
+    """
+
+    start = snap_seconds(start_seconds, grid_seconds)
+    end = snap_seconds(end_seconds, grid_seconds)
+    maximum = snap_seconds(max_segment_seconds, grid_seconds)
+    if end <= start:
+        raise ValueError("Work-area end must be later than its start.")
+    if maximum <= 0.0:
+        raise ValueError("Maximum segment duration must be positive.")
+    duration = end - start
+    count = max(1, int(math.ceil(duration / maximum - 1e-9)))
+    if count == 1:
+        return [RenderSegment(_segment_id(0, start, end), 0, start, end)]
+
+    boundaries = [start]
+    for index in range(1, count):
+        remaining = count - index
+        ideal = snap_seconds(start + duration * index / count, grid_seconds)
+        lower = boundaries[-1] + grid_seconds
+        upper = min(
+            boundaries[-1] + maximum,
+            end - remaining * grid_seconds,
+        )
+        # Leave no future interval longer than the same native maximum.
+        lower = max(lower, end - remaining * maximum)
+        boundaries.append(min(upper, max(lower, ideal)))
+    boundaries.append(end)
+
+    rows: list[RenderSegment] = []
+    for index, (segment_start, segment_end) in enumerate(
+        zip(boundaries, boundaries[1:])
+    ):
+        rows.append(
+            RenderSegment(
+                _segment_id(index, segment_start, segment_end),
+                index,
+                segment_start,
+                segment_end,
+                continuity_mode="none" if index == 0 else "match_action",
+            )
         )
     return rows
 
