@@ -15,6 +15,8 @@ Every user-visible correction receives an application version and a dated entry 
 - MTV 即使只有一个5–7秒Segment也统一交由Smart Render执行，使单段与长片都具备相同自动导演修复能力。五次仍未达标时显示 `WARNING` 并继续完成Job；该段可以立即预览，但不会被当成已通过QC的缓存复用，下次运行仍会重新修复。
 - 最终成片仍使用未经改写的精确 A1 主音轨；QC 只负责检测和决定是否重新生成，不对 H3 音频执行 TTS、变声、重混、时间拉伸或修复。
 - Smart Render policy 提升至 `23`，使旧版 14 秒 MTV 缓存和没有通过 Singing Lip-Sync QC 的缓存失效。Director Project 格式保持 `25`，现有 Project、Media Pool、Timeline 与已接受 Take 无需迁移。
+- 修正Windows ComfyUI AIMDO／DynamicVRAM在短Segment连续生成时频繁出现 `GetOverlappedResult error=1450`、`HostBuffer.read_file_slice failed` 的模型生命周期问题。同一个Smart Render Job现在让H3持续驻留；成功Segment及Singing QC自动重生之间不再调用 `/free`，只有被明确分类为真实CUDA OOM的中途失败才卸载清理，全部Segment完成并拼接Master后才统一调用一次 `/free`。
+- 新增独立 `aimdo_hostbuffer` 错误分类，覆盖Windows error 1450、`xfer_file_read*`及`HostBuffer.read_file_slice failed`。该类错误的重试保持当前H3模型状态，不执行会再次触发大型checkpoint映射的卸载／重载循环；ComfyUI主机仍可配合 `--disable-pinned-memory` 规避上游AIMDO问题。
 
 ### Verification
 

@@ -356,6 +356,23 @@ def classify_generation_error(error: object) -> str:
     if any(
         marker in text
         for marker in (
+            "hostbuffer.read_file_slice failed",
+            "hostbuf_read_file_slice",
+            "xfer_file_read_at",
+            "xfer_file_read",
+            "getoverlappedresult failed error=1450",
+            "error=1450",
+            "error 1450",
+            "error_no_system_resources",
+        )
+    ):
+        # AIMDO DynamicVRAM/pinned-memory staging failure. Unloading here
+        # immediately forces another large checkpoint remap and makes the
+        # Windows resource failure more likely, so it is not treated as OOM.
+        return "aimdo_hostbuffer"
+    if any(
+        marker in text
+        for marker in (
             "out of memory",
             "oom",
             "cuda oom",
@@ -390,8 +407,16 @@ def classify_generation_error(error: object) -> str:
 def preflight_smart_render(job: dict) -> dict:
     """Fail before media upload if a long render cannot complete on this host."""
     segments = list(job.get("segments") or [])
-    if len(segments) < 2:
-        raise ValueError("Smart Long Render requires at least two internal segments.")
+    if not segments:
+        raise ValueError("Smart Render requires at least one internal segment.")
+    if len(segments) < 2 and not any(
+        bool((segment.get("singing_lipsync_qc") or {}).get("enabled"))
+        for segment in segments
+    ):
+        raise ValueError(
+            "Smart Long Render requires at least two internal segments unless "
+            "MTV Singing Lip-Sync QC owns the Segment."
+        )
     for index, segment in enumerate(segments, 1):
         duration = float(segment.get("end_seconds", 0.0)) - float(
             segment.get("start_seconds", 0.0)
@@ -937,7 +962,16 @@ def queue_segment(
             # exceeded its recovery window; preserve prompt_id for later resume.
             if isinstance(exc, ComfyConnectionRecoveryTimeout):
                 raise
-            released = release_comfy_memory(server, http_timeout)
+            should_release = failure_class == "oom"
+            released = (
+                release_comfy_memory(server, http_timeout)
+                if should_release
+                else (
+                    "ComfyUI H3 model kept resident; AIMDO HostBuffer reload avoided"
+                    if failure_class == "aimdo_hostbuffer"
+                    else "ComfyUI H3 model kept resident for retry"
+                )
+            )
             emit({
                 "progress": (
                     f"{released} · retry class {failure_class}"
@@ -950,7 +984,13 @@ def queue_segment(
                 # OOM often needs a little longer for ComfyUI/PyTorch to return
                 # released allocations to the driver. Never lower megapixels
                 # or silently change the accepted quality contract.
-                time.sleep(2.0 if failure_class == "oom" else 1.0)
+                time.sleep(
+                    2.0
+                    if failure_class == "oom"
+                    else 1.5
+                    if failure_class == "aimdo_hostbuffer"
+                    else 1.0
+                )
         finally:
             resume_existing = False
     raise RuntimeError(str(last_error or "Unknown segment generation error"))
@@ -1257,7 +1297,10 @@ def main() -> int:
             "render_progress": build_render_progress(
                 job, segments, completed_indexes, stage="complete", current_index=index
             ),
-            "progress": f"Segment {index + 1}/{len(segments)} complete · " + release_comfy_memory(server, http_timeout),
+            "progress": (
+                f"Segment {index + 1}/{len(segments)} complete · "
+                "H3 model kept resident for the next Segment"
+            ),
         })
 
     emit({
@@ -1267,6 +1310,7 @@ def main() -> int:
         "progress": f"Preparing to assemble {len(completed)} completed segments",
     })
     master = assemble_master(job, completed)
+    final_cleanup = release_comfy_memory(server, http_timeout)
     final_manifest = {
         "format": "h3-smart-render-manifest",
         "version": 1,
@@ -1279,6 +1323,7 @@ def main() -> int:
         "megapixels": job.get("megapixels"),
         "target_duration_seconds": job.get("target_duration_seconds"),
         "master_output": str(master),
+        "final_comfy_cleanup": final_cleanup,
         "segments": completed,
     }
     _write_manifest(manifest_path, final_manifest)
@@ -1298,6 +1343,8 @@ def main() -> int:
         "render_progress": build_render_progress(
             job, segments, completed_indexes, stage="final"
         ),
+        "final_comfy_cleanup": final_cleanup,
+        "progress": f"Smart Render complete · {final_cleanup}",
     })
     return 0
 

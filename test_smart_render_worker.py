@@ -83,12 +83,15 @@ class SmartRenderWorkerTests(unittest.TestCase):
                 "smart_render_worker.analyze_singing_lipsync_alignment",
                 return_value=qc_result,
             ) as analyzer,
-            patch("smart_render_worker.release_comfy_memory", return_value="released"),
+            patch(
+                "smart_render_worker.release_comfy_memory", return_value="released"
+            ) as release,
             patch("smart_render_worker.time.sleep"),
             patch("smart_render_worker.emit", side_effect=events.append),
         ):
             result = queue_segment(job, segment, workflow, [])
         self.assertEqual(analyzer.call_count, 5)
+        release.assert_not_called()
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["singing_lipsync_qc_result"]["status"], "warning")
         self.assertFalse(result["singing_lipsync_qc_result"]["hard_block"])
@@ -234,6 +237,55 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertEqual(result["failure_class"], "")
         self.assertEqual(request_json.call_count, 3)
         self.assertEqual(release.call_count, 2)
+        video.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_aimdo_hostbuffer_1450_retries_without_unloading_h3(self):
+        root = PROJECT_ROOT / ".director_cache" / "smart_render_aimdo_retry_test"
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        video.write_bytes(b"video")
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "http_timeout": 1,
+            "segment_attempts": 3,
+            "segment_count": 1,
+            "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+        }
+        segment = {
+            "segment_id": "seg-aimdo",
+            "index": 0,
+            "download_dir": str(root),
+        }
+        aimdo_error = RuntimeError(
+            "GetOverlappedResult failed error=1450; "
+            "RuntimeError: HostBuffer.read_file_slice failed"
+        )
+        with (
+            patch(
+                "smart_render_worker._request_json",
+                side_effect=[aimdo_error, {"prompt_id": "recovered"}],
+            ),
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
+            patch(
+                "smart_render_worker.download_outputs",
+                return_value=[{"kind": "videos", "local_path": str(video)}],
+            ),
+            patch("smart_render_worker.release_comfy_memory") as release,
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit") as emit,
+        ):
+            result = queue_segment(job, segment, {}, [])
+        self.assertEqual(classify_generation_error(aimdo_error), "aimdo_hostbuffer")
+        release.assert_not_called()
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(
+            any(
+                event.get("failure_class") == "aimdo_hostbuffer"
+                for event in (call.args[0] for call in emit.call_args_list)
+            )
+        )
         video.unlink(missing_ok=True)
         root.rmdir()
 
@@ -491,6 +543,30 @@ class SmartRenderWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "Reference media is missing"):
             preflight_smart_render(job)
 
+    def test_preflight_accepts_one_mtv_qc_segment(self):
+        runtime = load_runtime_paths()
+        root = PROJECT_ROOT / ".director_cache" / "single_mtv_preflight"
+        shutil.rmtree(root, ignore_errors=True)
+        job = {
+            "segments": [
+                {
+                    "start_seconds": 0.0,
+                    "end_seconds": 6.0,
+                    "workflow": {},
+                    "singing_lipsync_qc": {"enabled": True},
+                }
+            ],
+            "media": [],
+            "ffmpeg": str(runtime.ffmpeg),
+            "ffprobe": str(runtime.ffprobe),
+            "master_output": str(root / "master.mp4"),
+            "server": "http://127.0.0.1:8188",
+        }
+        with patch("smart_render_worker._request_json", return_value={}):
+            result = preflight_smart_render(job)
+        self.assertEqual(result["segment_count"], 1)
+        shutil.rmtree(root, ignore_errors=True)
+
     def test_assembly_trims_each_leading_overlap(self):
         root = Path("assembly-test")
         paths = [root / f"segment{index}.mp4" for index in range(3)]
@@ -698,7 +774,9 @@ class SmartRenderWorkerTests(unittest.TestCase):
                 patch.object(sys, "argv", ["smart_render_worker.py", str(job_path)]),
                 patch("smart_render_worker.preflight_smart_render", return_value=preflight),
                 patch("smart_render_worker.queue_segment", return_value=second_result),
-                patch("smart_render_worker.release_comfy_memory", return_value="released"),
+                patch(
+                    "smart_render_worker.release_comfy_memory", return_value="released"
+                ) as release,
                 patch("smart_render_worker.assemble_master", return_value=master_output),
                 patch("smart_render_worker.emit", side_effect=events.append),
             ):
@@ -715,6 +793,7 @@ class SmartRenderWorkerTests(unittest.TestCase):
             self.assertEqual(progress_events[2]["percent_complete"], 40.0)
             self.assertEqual(progress_events[3]["percent_complete"], 100.0)
             self.assertEqual(progress_events[-1]["remaining_shots"], 0)
+            release.assert_called_once_with("http://127.0.0.1:8188", 30)
         finally:
             for path in (
                 job_path, root / "manifest.json", cached_output,
