@@ -2,30 +2,18 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
-## [0.3.5-alpha.2] - 2026-09-15
-
-### MTV Singing H3 对嘴可靠性
-
-- 将 `A1` 确立为没有人工歌词时间码时唯一的歌声与嘴形节奏依据。H3 Prompt 不再使用 Whisper／ASR 从混合歌曲识别出的文字作为歌词、对白或叙事提示，避免错误识别污染人物口型。
-- 清理已保存 MTV Project 中旧有的猜测式嘴形指令，包括自行推断的开口、闭口、主歌、高潮、尾音和结束姿势；重新打开旧项目即可在实际 Segment Prompt 编译时应用保护，不要求重新执行 Design。
-- 将 MTV 的隐藏 H3 生成窗口限制为最多 7 秒，并以约 5–7 秒的均衡窗口覆盖完整工作区。长歌曲不再使用容易在后半段脱离 A1 的 14 秒 Segment，也不会在结尾留下极短碎片窗口。
-- 强化 P1/P2/P3 演唱职责：P1 是唯一可见、可辨认的正面演唱者；P2/P3 只作无声陪衬，保持非发声嘴形。群像镜头不得让多个角色同时呈现可读的演唱嘴形。
-- 修正 A1 尾段处理：最后一个网格对齐窗口读取真实歌曲尾部，最多只为 H3 时间格补 0.5 秒静音；禁止从 A1 开头重新播放、循环、拉伸或伪造尾音。
-- 新增生成前置 `Singing Lip-Sync QC`。系统在 Segment 缓存之前，将 H3 未改写的原生输出音轨与该 Segment 的准确 A1 时间窗比较；通过时显示 `PASS`。节奏、尾段或起音明显漂移时不暂停Job，而是自动把该段调整为P1正面／清晰四分之三侧面演唱、嘴唇与下颌无遮挡、P2/P3静默非发声，再重新生成，最多五次。
-- MTV 即使只有一个5–7秒Segment也统一交由Smart Render执行，使单段与长片都具备相同自动导演修复能力。五次仍未达标时显示 `WARNING` 并继续完成Job；该段可以立即预览，但不会被当成已通过QC的缓存复用，下次运行仍会重新修复。
-- 最终成片仍使用未经改写的精确 A1 主音轨；QC 只负责检测和决定是否重新生成，不对 H3 音频执行 TTS、变声、重混、时间拉伸或修复。
-- Smart Render policy 提升至 `23`，使旧版 14 秒 MTV 缓存和没有通过 Singing Lip-Sync QC 的缓存失效。Director Project 格式保持 `25`，现有 Project、Media Pool、Timeline 与已接受 Take 无需迁移。
-- 修正Windows ComfyUI AIMDO／DynamicVRAM在短Segment连续生成时频繁出现 `GetOverlappedResult error=1450`、`HostBuffer.read_file_slice failed` 的模型生命周期问题。同一个Smart Render Job现在让H3持续驻留；成功Segment及Singing QC自动重生之间不再调用 `/free`，只有被明确分类为真实CUDA OOM的中途失败才卸载清理，全部Segment完成并拼接Master后才统一调用一次 `/free`。
-- 新增独立 `aimdo_hostbuffer` 错误分类，覆盖Windows error 1450、`xfer_file_read*`及`HostBuffer.read_file_slice failed`。该类错误的重试保持当前H3模型状态，不执行会再次触发大型checkpoint映射的卸载／重载循环；ComfyUI主机仍可配合 `--disable-pinned-memory` 规避上游AIMDO问题。
-
-### Verification
-
-- 通过 MTV 音频窗口、Prompt 污染清理、均衡分段、P1/P2/P3 发声职责、尾段静音、Smart Render五轮自动修复、不中断Warning回退与旧Native Submit兼容专项测试。
-- 使用真实 MTV Project 验证 A1 最终封装音轨：测试窗口节奏相关度 `1.00`、延迟 `0 ms`；旧 Project 的错误 ASR 文本及猜测式嘴形指令不会再进入新 H3 Segment Prompt。
-
 ## [0.3.5-alpha.1] - 2026-09-14
 
 ### SoulX-Singer 独立歌声克隆
+
+- 新增主页 `AUDIO SEPARATOR` 独立工作台（位于 `SOULX` 左边）：通过LAN Server API调用Kim_Vocal_2，一次输出Vocal、Music和未经改变的Mix，支持分别下载；`ADD TO A1 & A2`固定执行Music→A1、Vocal→A2，并把Mix保存为Project级最终MTV母带。
+- Audio Separator新增与SoulX一致的自动角色检测：具备CUDA GPU与完整本机安装时进入 `SERVER MODE` 并隐藏启动127.0.0.1:7862；未安装或无CUDA GPU的电脑进入 `CLIENT MODE` 并连接远端Server，无需保留手动BAT窗口。
+- Kim_Vocal_2改为强制 `onnxruntime-gpu 1.23.2`。启动时用真实模型Session验证 `CUDAExecutionProvider`，失败即保持操作按钮禁用并显示缺失项，禁止静默回退CPU；旧CPU runtime可由启动器自动原子升级，验证失败会保留原runtime。
+- Audio Separator分离继续使用一次性CUDA worker，完成三份输出后立即退出；关闭本机Server Mode窗口会停止项目所属的7862 API与残留worker，释放VRAM/DRAM，Client Mode不会终止远端共用Server。
+- 修复中文、繁体中文、日文或其他Unicode音频文件名在上传前触发 `'latin-1' codec can't encode characters` 的问题；文件名现在只通过UTF-8百分号编码的URL参数传递，不再写入仅允许Latin-1的HTTP Header。
+- 修复 `audio-separator 0.30.2` 的SoundFile写出分支把C-contiguous双声道浮点Vocal先截断成int16零值、再错误扁平化为双倍时长单声道的问题。一次性Worker现在强制以samples×channels浮点矩阵写入PCM，并在返回成功前验证Vocal/Music时长、声道、RMS与峰值；近静音Vocal会在工作区明确警告，不再以“文件存在”冒充有效输出。
+- 取消选择MTV Skill或加载A1时的静默自动分离。分离只由用户明确点击执行，避免完整A1残留人声与A2再次竞争而污染H3口型。
+- MTV分离模式会在每个Segment同步推进A1 Music与A2 Vocal的源时间，全部画面完成后才恢复未经改变的Mix；手动替换A1/A2会清除旧Mix绑定，防止跨歌曲母带污染。
 
 - 新增主页 `SOULX` 工作区：使用 Voice Reference 与 Source Song 调用 SoulX-Singer SVC，完成后试听并以 `SAVE AS MP3` 导出；结果不会未经确认自动写入 Media Pool、Timeline 或 MiniMax H3。
 - 增加 SoulX 运行模式检测：完整本机 runtime 与模型进入 `SERVER MODE`，自动使用 `127.0.0.1:7861`；未安装电脑保持 `CLIENT MODE`，默认连接 `192.168.0.185:7861`，不自动下载或安装。

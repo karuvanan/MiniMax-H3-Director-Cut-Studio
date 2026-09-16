@@ -14,11 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from music_video_engine import analyze_singing_lipsync_alignment
 from workflow_engine import validate_portable_media_manifest
-
-
-VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -398,66 +394,6 @@ def main() -> int:
             reconnect_timeout=reconnect_timeout,
             prompt_id=prompt_id,
         )
-    singing_qc_result: dict = {}
-    singing_qc_spec = job.get("singing_lipsync_qc") or {}
-    if singing_qc_spec.get("enabled"):
-        generated_video = next(
-            (
-                Path(str(item.get("local_path", "")))
-                for item in downloaded
-                if isinstance(item, dict)
-                and Path(str(item.get("local_path", ""))).is_file()
-                and Path(str(item.get("local_path", ""))).suffix.lower()
-                in VIDEO_SUFFIXES
-            ),
-            None,
-        )
-        if generated_video is None:
-            raise RuntimeError(
-                "Singing Lip-Sync QC could not run because the generated video is unavailable."
-            )
-        singing_qc_result = analyze_singing_lipsync_alignment(
-            Path(job["ffmpeg"]),
-            generated_video,
-            Path(str(singing_qc_spec["reference_audio"])),
-            duration_seconds=float(
-                singing_qc_spec.get(
-                    "duration_seconds", job.get("target_duration_seconds", 0.0)
-                )
-            ),
-            reference_offset_seconds=float(
-                singing_qc_spec.get("reference_offset_seconds", 0.0)
-            ),
-        )
-        if not singing_qc_result.get("passed"):
-            original_message = str(singing_qc_result.get("message") or "")
-            singing_qc_result = dict(singing_qc_result)
-            singing_qc_result.update(
-                status="warning",
-                hard_block=False,
-                original_message=original_message,
-                message=(
-                    "Singing Lip-Sync QC WARNING · this legacy native submission cannot "
-                    "self-repair in place, so the Job will continue for review. New MTV "
-                    "submissions are routed through Smart Render automatic Shot repair."
-                ),
-            )
-        print(
-            json.dumps(
-                {
-                    "progress": singing_qc_result["message"],
-                    "singing_lipsync_qc": singing_qc_result,
-                    "segment_start_seconds": singing_qc_spec.get(
-                        "timeline_start_seconds", 0.0
-                    ),
-                    "segment_end_seconds": singing_qc_spec.get(
-                        "timeline_end_seconds", job.get("target_duration_seconds", 0.0)
-                    ),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
     # Retired final_hold_* job metadata is deliberately ignored.
     print(
         json.dumps(
@@ -470,7 +406,6 @@ def main() -> int:
                 "request_kind": job.get("request_kind", "final"),
                 "seed": job.get("seed"),
                 "megapixels": job.get("megapixels"),
-                "singing_lipsync_qc": singing_qc_result,
             },
             ensure_ascii=False,
         ),

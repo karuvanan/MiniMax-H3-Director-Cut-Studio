@@ -92,6 +92,14 @@ from media_engine import (
 )
 from audio_engine import evaluate_native_audio_qc
 from ace_step_dialog import AceStepMusicCoverDialog
+from audio_separator_client import DEFAULT_AUDIO_SEPARATOR_SERVER
+from audio_separator_dialog import AudioSeparatorDialog
+from audio_separator_runtime import (
+    AudioSeparatorRuntimeState,
+    detect_audio_separator_runtime,
+    start_local_audio_separator_server_if_installed,
+    stop_local_audio_separator_server,
+)
 from ace_step_runtime import (
     AceStepRuntimeState,
     detect_ace_step_runtime,
@@ -195,17 +203,13 @@ from fourdx_engine import (
     update_fourdx_requirement_block,
 )
 from music_video_engine import (
-    MTV_AUDIO_DRIVEN_MOUTH_CONTRACT,
-    MTV_MAX_LIPSYNC_SEGMENT_SECONDS,
     MTV_MASTER_AUDIO_CONTRACT,
-    MTV_SUPPORT_MOUTH_CONTRACT,
+    MTV_SEPARATED_AUDIO_CONTRACT,
+    MTV_VOCAL_REFERENCE_CONTRACT,
     exact_master_audio_asset,
     is_mtv_singing_skill,
     mtv_master_audio_duration,
-    mtv_reference_audio_window,
     replace_video_audio_with_exact_master,
-    sanitize_unverified_mtv_mouth_timing,
-    strip_mtv_transcript_guidance,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from smart_cut_engine import (
@@ -303,7 +307,6 @@ from segment_engine import (
     content_fingerprint,
     derive_named_segment_seed,
     normalize_speech_overlap_policy,
-    plan_balanced_render_segments,
     plan_render_segments,
     plan_speech_track_lanes,
     plan_shot_render_segments,
@@ -368,7 +371,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 23
+SMART_RENDER_POLICY_VERSION = 22
 
 _UNTRACKED_VISIBLE_TEXT_TOKEN_RE = re.compile(
     r"\b(?:text|words?|subtitle|caption|title|lower[- ]?third|hashtag|typography|legible)\b|"
@@ -8780,6 +8783,11 @@ class DirectorCutStudio(QMainWindow):
         self.audio_runner = JsonLineProcess(self, "audio")
         self.audio_runner.message.connect(self._handle_audio_payload)
         self.audio_runner.finished.connect(self._audio_service_finished)
+        # Audio separation is deliberately explicit and server-scoped.  The
+        # Studio process never imports ONNX Runtime or silently rewrites A1.
+        self.audio_separator_server_url = DEFAULT_AUDIO_SEPARATOR_SERVER
+        self.audio_separator_mix_path: Path | None = None
+        self.audio_separator_manifest: dict = {}
         self.semantic_jobs: dict[str, dict] = {}
         self.semantic_errors: dict[str, str] = {}
         self.semantic_waiting_assets: set[str] = set()
@@ -8812,9 +8820,19 @@ class DirectorCutStudio(QMainWindow):
         self.soulx_local_start_requested = start_local_soulx_server_if_installed(
             self.soulx_runtime_state
         )
+        self.audio_separator_runtime_state = detect_audio_separator_runtime(
+            gpu_vram_gb=self.ace_step_runtime_state.gpu_vram_gb
+        )
+        self.audio_separator_server_url = self.audio_separator_runtime_state.api_url
+        self.audio_separator_local_start_requested = (
+            start_local_audio_separator_server_if_installed(
+                self.audio_separator_runtime_state
+            )
+        )
         # API keys remain memory-only for the lifetime of this Studio window.
         self.semantic_openai_api_key = ""
         self.active_soulx_dialog: SoulXSingerDialog | None = None
+        self.active_audio_separator_dialog: AudioSeparatorDialog | None = None
         self.active_music_cover_dialog: AceStepMusicCoverDialog | None = None
         self._closing = False
         self._timed_out_generations: set[tuple[str, int]] = set()
@@ -9024,7 +9042,7 @@ class DirectorCutStudio(QMainWindow):
         self.default_skill_combo = QComboBox()
         self.default_skill_combo.addItem(self.profiles[DEFAULT_SKILL].display_name, DEFAULT_SKILL)
         self.default_skill_combo.setEnabled(False)
-        self.default_skill_combo.setMinimumWidth(180)
+        self.default_skill_combo.setMinimumWidth(100)
         bar.addWidget(self.default_skill_combo)
         self.special_skill_label = QLabel("+ Special")
         bar.addWidget(self.special_skill_label)
@@ -9033,7 +9051,7 @@ class DirectorCutStudio(QMainWindow):
         for key, profile in sorted(self.profiles.items()):
             if profile.special:
                 self.special_combo.addItem(profile.display_name, key)
-        self.special_combo.setMinimumWidth(240)
+        self.special_combo.setMinimumWidth(180)
         bar.addWidget(self.special_combo)
         self.special_skill_creator_button = QPushButton("CREATOR")
         self.special_skill_creator_button.setObjectName("specialSkillCreatorButton")
@@ -9045,6 +9063,18 @@ class DirectorCutStudio(QMainWindow):
         toolbar_spacer = QWidget()
         toolbar_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         bar.addWidget(toolbar_spacer)
+        self.audio_separator_button = QPushButton("AUDIO SEPARATOR")
+        self.audio_separator_button.setObjectName("audioSeparatorButton")
+        self.audio_separator_button.setToolTip(
+            f"Open the explicit Kim_Vocal_2 CUDA workflow · "
+            f"{self.audio_separator_runtime_state.mode.upper()} MODE · "
+            f"API {self.audio_separator_runtime_state.api_url} · "
+            "download Vocal, Music and Mix · "
+            "ADD TO A1 & A2 maps Music to A1 and Vocal to A2"
+        )
+        self.audio_separator_button.setStyleSheet("background:#13758a; font-weight:700;")
+        self.audio_separator_button.clicked.connect(self.open_audio_separator)
+        bar.addWidget(self.audio_separator_button)
         self.soulx_button = QPushButton("SOULX")
         self.soulx_button.setObjectName("soulxButton")
         self.soulx_button.setToolTip(
@@ -10744,6 +10774,152 @@ class DirectorCutStudio(QMainWindow):
                 },
             },
         }
+
+    def open_audio_separator(self) -> None:
+        """Open the explicit LAN Audio Separator and bind accepted stems."""
+
+        dialog = AudioSeparatorDialog(
+            self,
+            server_url=self.audio_separator_server_url,
+            runtime_state=(
+                self.audio_separator_runtime_state
+                if self.audio_separator_runtime_state.mode == "server"
+                else AudioSeparatorRuntimeState(
+                    mode="client",
+                    api_url=self.audio_separator_server_url,
+                    installed=False,
+                    gpu_vram_gb=self.audio_separator_runtime_state.gpu_vram_gb,
+                    detail=self.audio_separator_runtime_state.detail,
+                )
+            ),
+        )
+        dialog.add_requested.connect(self._add_audio_separator_results)
+        self.active_audio_separator_dialog = dialog
+        self.statusBar().showMessage(
+            f"Audio Separator · {self.audio_separator_runtime_state.mode.upper()} MODE · "
+            f"CUDA API {dialog.server_url()} · explicit preprocessing"
+        )
+        dialog.exec()
+        self.audio_separator_server_url = dialog.server_url()
+        if self.active_audio_separator_dialog is dialog:
+            self.active_audio_separator_dialog = None
+        dialog.deleteLater()
+
+    def _ensure_audio_reference_asset(self, reference_id: str) -> MediaAsset:
+        asset = self._reference_asset(reference_id)
+        if asset is not None:
+            return asset
+        if not self.scan:
+            raise RuntimeError("No workflow is loaded")
+        asset = create_virtual_media_asset(
+            self.scan,
+            "audio",
+            reference_id=reference_id,
+        )
+        self._append_media_card(asset)
+        self._refresh_virtual_media_header()
+        return asset
+
+    def _add_audio_separator_results(
+        self,
+        music_path: str,
+        vocal_path: str,
+        mix_path: str,
+    ) -> None:
+        """Commit one reviewed separator set: Music→A1, Vocal→A2, Mix→master."""
+
+        if not self.scan:
+            QMessageBox.information(
+                self,
+                "Audio Separator",
+                "Vocal, Music and Mix are ready, but a workflow or Project must be open before "
+                "Music can be added to A1 and Vocal to A2.",
+            )
+            return
+        sources = {
+            "music": Path(music_path).resolve(),
+            "vocal": Path(vocal_path).resolve(),
+            "mix": Path(mix_path).resolve(),
+        }
+        if not all(path.is_file() for path in sources.values()):
+            QMessageBox.critical(
+                self,
+                "Audio Separator results missing",
+                "Vocal, Music and Mix must all exist before they can be added.",
+            )
+            return
+        try:
+            workspace = self._ensure_project_workspace()
+            job_name = slugify_project_name(sources["music"].parent.name, "separation")
+            destination_folder = workspace / "media" / "audio" / "separated" / job_name
+            destination_folder.mkdir(parents=True, exist_ok=True)
+            imported: dict[str, Path] = {}
+            for kind, source in sources.items():
+                destination = destination_folder / f"{kind}{source.suffix.casefold()}"
+                if source.resolve() != destination.resolve():
+                    link_or_copy(source, destination)
+                imported[kind] = destination.resolve()
+
+            a1 = self._ensure_audio_reference_asset("A1")
+            previous_a1_timing = {
+                "timeline_placed": bool(a1.timeline_placed),
+                "timeline_track_id": str(a1.timeline_track_id or "A1"),
+                "start_seconds": float(a1.start_seconds),
+                "end_seconds": float(a1.end_seconds),
+                "activation_mode": str(a1.activation_mode),
+            }
+            assign_local_media(self.scan, a1, imported["music"])
+            a1.recognition = (
+                "AUDIO SEPARATOR MUSIC STEM\n"
+                "Role: instrumental/accompaniment reference for @A1.\n"
+                "The exact untouched full Mix is retained by the Project for final MTV assembly."
+            )
+            a1.clip_prompt = (
+                "A1 is the separated instrumental/music stem. Use its beat, rhythm and dynamics; "
+                "do not infer sung phonemes from residual accompaniment."
+            )
+
+            a2 = self._ensure_audio_reference_asset("A2")
+            assign_local_media(self.scan, a2, imported["vocal"])
+            a2.recognition = (
+                "AUDIO SEPARATOR VOCAL STEM\n"
+                "Role: isolated singing-vocal timing and lyric-performance reference for @A2.\n"
+                "Only this stem may drive P1 mouth motion; it is not a second final soundtrack."
+            )
+            a2.clip_prompt = (
+                "A2 is the isolated vocal stem. Drive only P1 singing mouth, jaw, breath and "
+                "expression timing from A2; P2/P3 remain non-singing unless explicitly authored."
+            )
+            if previous_a1_timing["timeline_placed"]:
+                a2.timeline_placed = True
+                a2.timeline_track_id = "A2"
+                a2.start_seconds = previous_a1_timing["start_seconds"]
+                a2.end_seconds = previous_a1_timing["end_seconds"]
+                a2.activation_mode = previous_a1_timing["activation_mode"]
+
+            self.audio_separator_mix_path = imported["mix"]
+            self.audio_separator_manifest = {
+                "schema_version": 1,
+                "music_a1": str(imported["music"]),
+                "vocal_a2": str(imported["vocal"]),
+                "exact_mix": str(imported["mix"]),
+                "model": "Kim_Vocal_2.onnx",
+                "mapping": "Music→A1; Vocal→A2; Mix→exact final MTV master",
+            }
+            self._sync_timeline_clip_sources(a1)
+            self._sync_timeline_clip_sources(a2)
+            self.queue_media_preparation(a1, auto_analyze=False, preserve_recognition=True)
+            self.queue_media_preparation(a2, auto_analyze=False, preserve_recognition=True)
+            self.timeline.schedule_rebuild()
+            self._mark_all_render_segments_dirty()
+            self._mark_dirty()
+            self.schedule_prompt_generation()
+            self.statusBar().showMessage(
+                "Audio Separator added · Music→A1 · Vocal→A2 · untouched Mix retained as exact final master",
+                12000,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Add Audio Separator results failed", str(exc))
 
     def open_soulx_singer(self) -> None:
         """Open the independent SoulX-Singer voice-conversion workbench."""
@@ -14380,10 +14556,12 @@ class DirectorCutStudio(QMainWindow):
                 special_skill_key=str(self.special_combo.currentData()),
                 timeline_start=float(self.active_generation_timeline_start),
                 duration=float(self.active_generation_duration_seconds),
+                exact_mix_path=self.audio_separator_mix_path,
             )
             if master_spec is None:
                 raise RuntimeError(
-                    "MTV Singing H3 requires a locally available A1 Timeline Master Audio."
+                    "MTV Singing H3 requires a locally available exact Master Audio: combined A1, "
+                    "or the untouched Audio Separator Mix paired with Music A1 and Vocal A2."
                 )
         if master_spec is not None:
             replace_video_audio_with_exact_master(
@@ -14392,8 +14570,17 @@ class DirectorCutStudio(QMainWindow):
                 master_spec,
                 destination,
             )
-            archived[preferred_index]["exact_master_audio_id"] = "A1"
-            archived[preferred_index]["audio_policy"] = "exact_timeline_master"
+            using_separator_mix = bool(
+                self.audio_separator_mix_path
+                and Path(str(master_spec.get("path") or "")).resolve()
+                == self.audio_separator_mix_path.resolve()
+            )
+            archived[preferred_index]["exact_master_audio_id"] = (
+                "AUDIO_SEPARATOR_MIX" if using_separator_mix else "A1"
+            )
+            archived[preferred_index]["audio_policy"] = (
+                "exact_separator_mix" if using_separator_mix else "exact_timeline_master"
+            )
         elif source.resolve() != destination.resolve():
             link_or_copy(source, destination)
         archived[preferred_index]["local_path"] = str(destination.resolve())
@@ -14789,11 +14976,6 @@ class DirectorCutStudio(QMainWindow):
         end = float(self.clip_end.value())
         if end <= start:
             return []
-        max_segment_seconds = (
-            MTV_MAX_LIPSYNC_SEGMENT_SECONDS
-            if is_mtv_singing_skill(self.special_combo.currentData())
-            else MAX_NATIVE_SECONDS
-        )
         keyframe_boundaries = {start, end}
         if is_drone_special_skill(self.special_combo.currentData()):
             for asset in self.scan.timeline_assets():
@@ -14841,23 +15023,10 @@ class DirectorCutStudio(QMainWindow):
                 planned.extend(plan_render_segments(
                     range_start,
                     range_end,
-                    max_segment_seconds=max_segment_seconds,
+                    max_segment_seconds=MAX_NATIVE_SECONDS,
                     overlap_seconds=0.0,
                 ))
-        elif (
-            is_mtv_singing_skill(self.special_combo.currentData())
-            and end - start > max_segment_seconds + 1e-6
-        ):
-            # Do not leave a 1-2 second final singing request merely because
-            # A1 ends off the seven-second cadence. Distribute the song across
-            # equally useful 5-7 second H3 windows instead.
-            planned = plan_balanced_render_segments(
-                start,
-                end,
-                max_segment_seconds=max_segment_seconds,
-                grid_seconds=TIMELINE_SNAP_SECONDS,
-            )
-        elif end - start > max_segment_seconds + 1e-6:
+        elif end - start > MAX_NATIVE_SECONDS + 1e-6:
             shots = [
                 asdict(cue) for cue in self.director_cues
                 if cue.cue_type == "shot"
@@ -14892,22 +15061,22 @@ class DirectorCutStudio(QMainWindow):
                     # the same reference scene. Pack micro-Shots into the
                     # longest native window; a 45-second design becomes three
                     # coherent 15-second generation jobs.
-                    min_segment_seconds=max_segment_seconds,
-                    max_segment_seconds=max_segment_seconds,
+                    min_segment_seconds=MAX_NATIVE_SECONDS,
+                    max_segment_seconds=MAX_NATIVE_SECONDS,
                     overlap_seconds=0.0,
                 )
             else:
                 planned = plan_render_segments(
                     start,
                     end,
-                    max_segment_seconds=max_segment_seconds,
+                    max_segment_seconds=MAX_NATIVE_SECONDS,
                     overlap_seconds=0.0,
                 )
         else:
             planned = plan_render_segments(
                 start,
                 end,
-                max_segment_seconds=max_segment_seconds,
+                max_segment_seconds=MAX_NATIVE_SECONDS,
                 overlap_seconds=0.0,
             )
         for index, segment in enumerate(planned):
@@ -14949,14 +15118,14 @@ class DirectorCutStudio(QMainWindow):
             planned = protect_segment_boundaries_from_speech(
                 planned,
                 [asdict(layer) for layer in self.text_layers],
-                max_segment_seconds=max_segment_seconds,
+                max_segment_seconds=MAX_NATIVE_SECONDS,
                 tail_seconds=1.0,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
             planned = align_segments_to_dialogue_turns(
                 planned,
                 [asdict(layer) for layer in self.text_layers],
-                max_segment_seconds=max_segment_seconds,
+                max_segment_seconds=MAX_NATIVE_SECONDS,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
             # A named/signature technique is one indivisible H3 action chain.
@@ -14975,7 +15144,7 @@ class DirectorCutStudio(QMainWindow):
                         layer.start_seconds, layer.end_seconds, start, end
                     )
                 ],
-                max_segment_seconds=max_segment_seconds,
+                max_segment_seconds=MAX_NATIVE_SECONDS,
                 grid_seconds=TIMELINE_SNAP_SECONDS,
             )
         shots_in_area = self._coalesce_beat_synced_campus_bridge_cues([
@@ -15174,6 +15343,15 @@ class DirectorCutStudio(QMainWindow):
             "special_skill": self.special_combo.currentData(),
             "prompt_auto_sync": self.prompt_panel.auto_sync.isChecked(),
             "server_url": self.server_url.text().strip(),
+            "audio_separator": {
+                "server_url": self.audio_separator_server_url,
+                "mix_path": (
+                    str(self.audio_separator_mix_path)
+                    if self.audio_separator_mix_path and self.audio_separator_mix_path.is_file()
+                    else ""
+                ),
+                "manifest": deepcopy(self.audio_separator_manifest),
+            },
             "render_settings": asdict(self.render_settings),
             "prompt": prompt,
             "assets": assets,
@@ -15276,6 +15454,32 @@ class DirectorCutStudio(QMainWindow):
                 < WORKSPACE_LAYOUT_VERSION
             )
             workspace_root = locate_workspace_for_project(opened_project_path, payload)
+            separator_state = payload.get("audio_separator")
+            separator_state = separator_state if isinstance(separator_state, dict) else {}
+            self.audio_separator_server_url = str(
+                separator_state.get("server_url") or DEFAULT_AUDIO_SEPARATOR_SERVER
+            ).strip()
+            if self.audio_separator_runtime_state.mode == "server":
+                self.audio_separator_server_url = self.audio_separator_runtime_state.api_url
+            self.audio_separator_manifest = deepcopy(
+                separator_state.get("manifest")
+                if isinstance(separator_state.get("manifest"), dict)
+                else {}
+            )
+            saved_mix = Path(str(separator_state.get("mix_path") or ""))
+            resolved_mix: Path | None = saved_mix.resolve() if saved_mix.is_file() else None
+            if resolved_mix is None and saved_mix.name:
+                resolved_mix = next(
+                    (
+                        candidate.resolve()
+                        for candidate in (workspace_root / "media" / "audio" / "separated").glob(
+                            f"**/{saved_mix.name}"
+                        )
+                        if candidate.is_file()
+                    ),
+                    None,
+                )
+            self.audio_separator_mix_path = resolved_mix
             manifest = ensure_workspace_layout(
                 workspace_root,
                 display_name=opened_project_path.stem,
@@ -15787,6 +15991,8 @@ class DirectorCutStudio(QMainWindow):
         self.blip_jobs.clear()
         self.blip_results.clear()
         self.audio_jobs.clear()
+        self.audio_separator_mix_path = None
+        self.audio_separator_manifest = {}
         previous_lm_request = next(
             (
                 dict(job) for job in reversed(list(self.semantic_jobs.values()))
@@ -15912,6 +16118,12 @@ class DirectorCutStudio(QMainWindow):
             return
         try:
             source_path = Path(filename).expanduser().resolve()
+            if stable_reference_id(asset).upper() in {"A1", "A2"}:
+                # A separator Mix is valid only for the exact A1/A2 pair that
+                # created it. A later manual replacement must never publish a
+                # stale song from an older Project state.
+                self.audio_separator_mix_path = None
+                self.audio_separator_manifest = {}
             workspace = self._ensure_project_workspace()
             try:
                 source_path.relative_to(workspace)
@@ -16428,6 +16640,18 @@ class DirectorCutStudio(QMainWindow):
                 else:
                     self._maybe_auto_enrich(asset)
             self._refresh_recognition_inspector(asset if asset is self.selected_asset else None)
+
+    def _reference_asset(self, reference_id: str) -> MediaAsset | None:
+        if not self.scan:
+            return None
+        wanted = str(reference_id).strip().upper()
+        return next(
+            (
+                asset for asset in self.scan.assets
+                if stable_reference_id(asset).upper() == wanted
+            ),
+            None,
+        )
 
     def _audio_pan_key(self, asset: MediaAsset, track: TimelineTrack) -> str:
         return f"{asset.node_id}:{track.track_id}:{track.pan:.4f}"
@@ -19086,6 +19310,14 @@ class DirectorCutStudio(QMainWindow):
             and asset.paired_audio_binding
             and (using_compositor or visual is None or asset.node_id != visual.node_id)
         )
+        if is_mtv_singing_skill(self.special_combo.currentData()):
+            # A2 is an analysis/reference stem. Monitoring it together with
+            # the unchanged A1 master would double the singer and cause comb
+            # filtering; it remains active as an H3 reference.
+            supplemental_audio = [
+                asset for asset in supplemental_audio
+                if stable_reference_id(asset).upper() != "A2"
+            ]
         if (
             self.generated_output_locked
             and not self.storyboard_preview_active
@@ -19844,6 +20076,11 @@ class DirectorCutStudio(QMainWindow):
             except OSError:
                 pass
             self.generated_proxy_working = None
+        if self.audio_separator_runtime_state.mode == "server":
+            try:
+                stop_local_audio_separator_server()
+            except Exception as exc:
+                print(f"[Audio Separator] shutdown stop failed: {exc}", flush=True)
         super().closeEvent(event)
 
     def _sync_prompt_panel_from_timeline(
@@ -20061,9 +20298,7 @@ class DirectorCutStudio(QMainWindow):
                 + " ".join(f'"{text}"' for text in voice_over_rows)
                 + "."
             )
-        elif transcript_rows and not is_mtv_singing_skill(
-            self.special_combo.currentData()
-        ):
+        elif transcript_rows:
             brief_parts.append(
                 "Use the active audio transcript as spoken narrative guidance: "
                 + compact(" ".join(transcript_rows), 1100)
@@ -20081,17 +20316,11 @@ class DirectorCutStudio(QMainWindow):
             brief_parts.append("Finish on the timeline Ending Hold marker.")
         synthesized_brief = " ".join(brief_parts)
         current_brief = self.prompt_panel.brief.toPlainText().strip()
-        sanitized_stale_mtv_brief = False
-        if is_mtv_singing_skill(self.special_combo.currentData()):
-            cleaned = strip_mtv_transcript_guidance(current_brief)
-            sanitized_stale_mtv_brief = cleaned != current_brief
-            current_brief = cleaned
         if (
             force
             or reconcile_brief
             or not current_brief
             or current_brief == self.prompt_panel.last_timeline_brief
-            or sanitized_stale_mtv_brief
         ):
             self.prompt_panel.brief.setPlainText(synthesized_brief)
         self.prompt_panel.last_timeline_brief = synthesized_brief
@@ -20279,6 +20508,13 @@ class DirectorCutStudio(QMainWindow):
             == AI_MOVIE_MAKING_OF_4DX_SKILL
         )
         mtv_audio = is_mtv_singing_skill(self.special_combo.currentData())
+        mtv_vocal_reference = mtv_audio and any(
+            asset.media_type == "audio"
+            and stable_reference_id(asset).upper() == "A2"
+            and bool(asset.local_path)
+            and Path(asset.local_path).is_file()
+            for asset in assets
+        )
         previous_profile: NativeAudioProfile | None = None
         inherited_space: tuple[str, str] | None = None
         for cue in shots:
@@ -20431,7 +20667,16 @@ class DirectorCutStudio(QMainWindow):
                         phase=phase,
                     )["native_audio_direction"]
                 elif mtv_audio:
-                    cue.native_audio_direction = MTV_MASTER_AUDIO_CONTRACT
+                    cue.native_audio_direction = (
+                        (
+                            MTV_SEPARATED_AUDIO_CONTRACT
+                            if mtv_vocal_reference else MTV_MASTER_AUDIO_CONTRACT
+                        )
+                        + (
+                            " " + MTV_VOCAL_REFERENCE_CONTRACT
+                            if mtv_vocal_reference else ""
+                        )
+                    )
                 elif campus_composite:
                     cue.native_audio_direction = (
                         "Acoustic space remains the same open campus exterior established by the preceding "
@@ -20453,8 +20698,13 @@ class DirectorCutStudio(QMainWindow):
                     ]
                 elif mtv_audio:
                     cue.environment_continuity = (
-                        "Continue P4's visible acoustic space and advance A1 source time continuously "
-                        "across this cut. Never restart, loop, replace or time-stretch A1 at a Segment boundary."
+                        "Continue P4's visible acoustic space and advance "
+                        + (
+                            "A1 Music and A2 Vocal source time together"
+                            if mtv_vocal_reference else "A1 source time"
+                        )
+                        + " continuously across this cut. Never restart, loop, replace or time-stretch "
+                        "the song at a Segment boundary."
                     )
                 elif campus_composite:
                     cue.environment_continuity = (
@@ -20473,8 +20723,20 @@ class DirectorCutStudio(QMainWindow):
                     ]
                 elif mtv_audio:
                     cue.audio_reference_intent = (
-                        "@A1 is the exact performance-timing source and final Timeline Master Audio, "
-                        "not a mood, BPM or timbre suggestion. H3 must not synthesize a replacement singer."
+                        (
+                            "@A1 is the instrumental timing source, @A2 is the sole vocal-performance "
+                            "source, and the Project's untouched Audio Separator Mix is the exact final "
+                            "Master Audio. "
+                            if mtv_vocal_reference else
+                            "@A1 is the exact performance-timing source and final Timeline Master Audio, "
+                            "not a mood, BPM or timbre suggestion. "
+                        )
+                        + (
+                            "A2 drives P1 lip motion; instrumental events or bleed in A1 must not move the mouth. "
+                            if mtv_vocal_reference else
+                            "No A2 is active, so performance timing falls back to A1. "
+                        )
+                        + "H3 must not synthesize a replacement singer."
                     )
                 else:
                     cue.audio_reference_intent = audio_reference_intent_text(
@@ -21208,32 +21470,6 @@ class DirectorCutStudio(QMainWindow):
             state["technical"] = "; ".join(
                 part for part in (state.get("technical", "").strip(), *technical_notes) if part
             )
-        if is_mtv_singing_skill(self.special_combo.currentData()):
-            # Compatibility guard for already-saved MTV projects. Older Design
-            # plans may contain guessed verse/chorus mouth poses or a false
-            # Whisper transcript even though no authored lyric timing exists.
-            state["brief"] = strip_mtv_transcript_guidance(state.get("brief", ""))
-            has_authored_lyrics = any(
-                layer.content_role == "lyrics" and layer.text.strip()
-                for layer in self.text_layers
-            )
-            if not has_authored_lyrics:
-                for field_name in (
-                    "brief", "style", "references", "audio", "music", "dialogue",
-                    "transition", "ending", "must_keep", "technical",
-                ):
-                    state[field_name] = sanitize_unverified_mtv_mouth_timing(
-                        state.get(field_name, "")
-                    )
-                state["shots"] = [
-                    sanitize_unverified_mtv_mouth_timing(value)
-                    for value in state.get("shots", [])
-                ]
-                for row in state.get("shot_ranges", []):
-                    if isinstance(row, dict):
-                        row["description"] = sanitize_unverified_mtv_mouth_timing(
-                            row.get("description", "")
-                        )
         return PromptSpec(**state)
 
     @staticmethod
@@ -21267,14 +21503,6 @@ class DirectorCutStudio(QMainWindow):
         """Build an H3 prompt whose timeline timestamps are local to one hidden segment."""
         campus_bridge = False
         campus_composite = False
-        mtv_singing_mode = bool(
-            is_mtv_singing_skill(self.special_combo.currentData())
-            and any(
-                asset.media_type == "audio"
-                and stable_reference_id(asset).strip().upper() == "A1"
-                for asset in assets
-            )
-        )
         spec = self._prompt_spec_with_director_cues(
             self.prompt_panel.spec(),
             window_start=start,
@@ -21621,17 +21849,6 @@ class DirectorCutStudio(QMainWindow):
                     "Only Timeline Dialogue, Voice-over or Lyrics Text Ranges may produce a "
                     "human voice; never improvise, repeat, paraphrase or start an unlisted word."
                 )
-            elif mtv_singing_mode:
-                brief_parts.append(
-                    "MTV A1 VOCAL EXCEPTION: the sung vocal already present in the current A1 "
-                    "source window is required performance audio, not unlisted dialogue. P1 must "
-                    "sing continuously whenever that A1 window contains vocals and rest the mouth "
-                    "naturally only during genuinely instrumental intervals. Generate no additional "
-                    "speaker, dialogue, narration, backing singer or replacement vocal. "
-                    + MTV_AUDIO_DRIVEN_MOUTH_CONTRACT
-                    + " "
-                    + MTV_SUPPORT_MOUTH_CONTRACT
-                )
             else:
                 brief_parts.append(
                     "This segment has no authored speech event. Generate no spoken word, vocal "
@@ -21659,25 +21876,16 @@ class DirectorCutStudio(QMainWindow):
                       "start, repeated word, translation, commentary, whisper, crowd voice or "
                       "telephone voice. Room tone, music and non-vocal Foley may continue."
                 )
-            if mtv_singing_mode:
-                brief_parts.append(
-                    "MTV AUDIO SEGMENT BOUNDARY CONTRACT: local 00:00 is the exact current A1 "
-                    f"Timeline position {start:.3f}s, not the beginning of the song. Follow A1 at "
-                    "1x through the complete local window without restart, loop, fade, invented "
-                    "silence, early mouth closure or final-note guess. A Segment boundary is only "
-                    "an edit boundary and never a musical phrase boundary."
-                )
-            else:
-                brief_parts.append(
-                    "AUDIO SEGMENT BOUNDARY CONTRACT: establish the location's continuous room tone "
-                    "or outdoor ambience from the first frame and keep it stable through the final "
-                    "frame. Complete every authored utterance by its exact Text Range end. Before an "
-                    "internal edit boundary leave at least one second for natural breath, reverberation "
-                    "decay and ambience only; at the final project endpoint use all available authored "
-                    "tail without extending the Timeline. "
-                    "Never begin a fresh sound, word, music cue or Foley transient in the final second; "
-                    "never end the audio bed with an abrupt digital stop."
-                )
+            brief_parts.append(
+                "AUDIO SEGMENT BOUNDARY CONTRACT: establish the location's continuous room tone "
+                "or outdoor ambience from the first frame and keep it stable through the final "
+                "frame. Complete every authored utterance by its exact Text Range end. Before an "
+                "internal edit boundary leave at least one second for natural breath, reverberation "
+                "decay and ambience only; at the final project endpoint use all available authored "
+                "tail without extending the Timeline. "
+                "Never begin a fresh sound, word, music cue or Foley transient in the final second; "
+                "never end the audio bed with an abrupt digital stop."
+            )
             if is_final_window and any(
                 cue.cue_type == "marker"
                 and ("ending" in cue.preset.lower() or "final" in cue.preset.lower())
@@ -22372,11 +22580,6 @@ class DirectorCutStudio(QMainWindow):
                     "download_dir": str(render_root / segment.segment_id),
                 }
             )
-            qc_spec = self._singing_lipsync_qc_spec(
-                assets, core_start, core_end
-            )
-            if qc_spec:
-                row["singing_lipsync_qc"] = qc_spec
             segment_rows.append(row)
 
         # Every Segment was already patched from its own active asset set.
@@ -22435,20 +22638,7 @@ class DirectorCutStudio(QMainWindow):
                 and str(cached.get("status", "")).lower()
                 in {"cached", "complete", "completed", "reusable"}
             )
-            qc_reusable = bool(
-                not row.get("singing_lipsync_qc")
-                or (
-                    isinstance(cached, dict)
-                    and isinstance(cached.get("singing_lipsync_qc_result"), dict)
-                    and cached["singing_lipsync_qc_result"].get("passed") is True
-                )
-            )
-            if (
-                cached
-                and not dirty
-                and qc_reusable
-                and (fingerprint_match or approved_locked_range)
-            ):
+            if cached and not dirty and (fingerprint_match or approved_locked_range):
                 row["status"] = "cached"
                 row["output_path"] = str(Path(cached["output_path"]).resolve())
                 row["reuse_reason"] = (
@@ -22488,9 +22678,7 @@ class DirectorCutStudio(QMainWindow):
             "segments": segment_rows,
             "segment_count": len(segment_rows),
             "progress_shots": self._progress_shot_rows(start, end),
-            "segment_attempts": (
-                5 if is_mtv_singing_skill(self.special_combo.currentData()) else 3
-            ),
+            "segment_attempts": 3,
             "history_poll_interval": self.render_settings.history_poll_interval,
             "generation_timeout": self.render_settings.generation_timeout,
             "http_timeout": self.render_settings.http_request_timeout,
@@ -22591,45 +22779,24 @@ class DirectorCutStudio(QMainWindow):
                 or "AI DESIGN AUTHORED SPEECH TTS" in str(asset.recognition or "")
                 or float(asset.playback_speed or 1.0) != 1.0
                 or float(asset.start_seconds) > start + 1e-6
+                or float(asset.end_seconds) < end - 1e-6
             ):
-                continue
-            mtv_window = (
-                mtv_reference_audio_window(
-                    asset,
-                    timeline_start=start,
-                    timeline_end=end,
-                    maximum_tail_padding_seconds=TIMELINE_SNAP_SECONDS,
-                )
-                if is_mtv_singing_skill(self.special_combo.currentData())
-                else None
-            )
-            if float(asset.end_seconds) < end - 1e-6 and mtv_window is None:
                 continue
             source = Path(str(asset.local_path or ""))
             if not source.is_file():
                 continue
-            if mtv_window is not None:
-                source_offset = float(mtv_window["source_offset_seconds"])
-                playable_duration = float(mtv_window["playable_duration_seconds"])
-            else:
-                source_offset = max(
-                    0.0,
-                    float(asset.source_in_seconds or 0.0)
-                    + start - float(asset.start_seconds or 0.0),
-                )
-                playable_duration = duration
+            source_offset = max(
+                0.0,
+                float(asset.source_in_seconds or 0.0)
+                + start - float(asset.start_seconds or 0.0),
+            )
             # A full-span single H3 request already begins at the correct source
             # position and needs no extra lossless PCM cache copy.
-            if (
-                source_offset <= 1e-6
-                and abs(duration - float(asset.end_seconds - asset.start_seconds)) <= 1e-6
-                and abs(playable_duration - duration) <= 1e-6
-            ):
+            if source_offset <= 1e-6 and abs(duration - float(asset.end_seconds - asset.start_seconds)) <= 1e-6:
                 continue
             source_key = (
                 f"{source.resolve()}|{source.stat().st_mtime_ns}|"
-                f"{source_offset:.6f}|{playable_duration:.6f}|{duration:.6f}|"
-                f"{asset.reference_id}|{asset.node_id}"
+                f"{source_offset:.6f}|{duration:.6f}|{asset.reference_id}|{asset.node_id}"
             )
             digest = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:20]
             destination = cache / f"audio_{digest}_{start:.3f}-{end:.3f}.wav"
@@ -22638,11 +22805,7 @@ class DirectorCutStudio(QMainWindow):
                 completed = subprocess.run(
                     [
                         str(self.runtime.ffmpeg), "-y", "-ss", f"{source_offset:.6f}",
-                        "-i", str(source), "-af",
-                        (
-                            f"atrim=duration={playable_duration:.6f},"
-                            f"apad=whole_dur={duration:.6f}"
-                        ),
+                        "-i", str(source), "-af", f"apad=whole_dur={duration:.6f}",
                         "-t", f"{duration:.6f}", "-ar", "48000", "-ac", "2",
                         "-c:a", "pcm_s16le", str(destination),
                     ],
@@ -22664,33 +22827,6 @@ class DirectorCutStudio(QMainWindow):
             asset.start_seconds = start
             asset.end_seconds = end
         return clones
-
-    def _singing_lipsync_qc_spec(
-        self,
-        assets: list[MediaAsset],
-        start: float,
-        end: float,
-    ) -> dict:
-        """Return the untouched A1 window used to validate H3 singing timing."""
-
-        if not is_mtv_singing_skill(self.special_combo.currentData()):
-            return {}
-        for asset in assets:
-            if (
-                asset.media_type == "audio"
-                and stable_reference_id(asset).strip().upper() == "A1"
-                and Path(str(asset.local_path or "")).is_file()
-            ):
-                return {
-                    "enabled": True,
-                    "reference_audio": str(Path(asset.local_path).resolve()),
-                    "reference_offset_seconds": 0.0,
-                    "duration_seconds": max(0.01, float(end) - float(start)),
-                    "timeline_start_seconds": float(start),
-                    "timeline_end_seconds": float(end),
-                    "policy": "auto_director_repair_continue",
-                }
-        return {}
 
     def _compiled_job(
         self,
@@ -23087,15 +23223,17 @@ class DirectorCutStudio(QMainWindow):
                 special_skill_key=str(self.special_combo.currentData()),
                 timeline_start=float(self.clip_start.value()),
                 duration=float(self.clip_end.value() - self.clip_start.value()),
+                exact_mix_path=self.audio_separator_mix_path,
             )
             if master_spec is None:
                 QMessageBox.critical(
                     self,
                     "MTV Master Audio missing",
-                    "MTV Singing H3 requires a locally available @A1 clip covering the active "
-                    "Generation Work Area. Load A1 and place it across this range. If the physical "
-                    "A1 source is shorter than the range, shorten the Work Area or load a longer "
-                    "A1 file before running Preview or Final.",
+                    "MTV Singing H3 requires an exact audio master covering the active Generation "
+                    "Work Area. In legacy mode, load the combined song into A1. In separated mode, "
+                    "use AUDIO SEPARATOR and ADD TO A1 & A2 so Music, Vocal and the untouched Mix "
+                    "remain one matched set. If the source is shorter than the Work Area, shorten "
+                    "the range or use a longer source before Preview or Final.",
                 )
                 return
         is_smart_render = False
@@ -23104,12 +23242,7 @@ class DirectorCutStudio(QMainWindow):
             self._read_settings_ui()
             self.generate_prompt(interactive=False)
             duration = self.clip_end.value() - self.clip_start.value()
-            # MTV singing uses shorter, A1-locked native windows even when the
-            # complete work area is below H3's ordinary 15-second limit.
-            is_smart_render = (
-                bool(self.scan)
-                and is_mtv_singing_skill(self.special_combo.currentData())
-            ) or len(self._planned_render_segments()) > 1
+            is_smart_render = duration > MAX_NATIVE_SECONDS + 1e-6
             if is_smart_render:
                 job_path, segment_count = self._build_smart_render_job(
                     request_kind=request_kind,
@@ -23174,13 +23307,6 @@ class DirectorCutStudio(QMainWindow):
                     "ffmpeg": str(self.runtime.ffmpeg),
                     "ffprobe": str(self.runtime.ffprobe),
                 }
-                singing_qc_spec = self._singing_lipsync_qc_spec(
-                    assets,
-                    self.clip_start.value(),
-                    self.clip_end.value(),
-                )
-                if singing_qc_spec:
-                    job["singing_lipsync_qc"] = singing_qc_spec
                 job.update(
                     self._immutable_final_hold_spec(
                         self.clip_start.value(), self.clip_end.value()
@@ -23311,20 +23437,6 @@ class DirectorCutStudio(QMainWindow):
                 self._refresh_render_status_bar()
         if isinstance(payload.get("segment_completed"), dict):
             self._show_render_segment_preview(dict(payload["segment_completed"]))
-        singing_qc = payload.get("singing_lipsync_qc")
-        singing_auto_repair = payload.get("singing_lipsync_auto_repair")
-        if isinstance(singing_auto_repair, dict) and singing_auto_repair:
-            self._apply_singing_lipsync_auto_repair_to_shots(
-                singing_auto_repair,
-                float(payload.get("segment_start_seconds", self.clip_start.value())),
-                float(payload.get("segment_end_seconds", self.clip_end.value())),
-            )
-        if isinstance(singing_qc, dict) and singing_qc:
-            self._apply_singing_lipsync_qc_status(
-                singing_qc,
-                float(payload.get("segment_start_seconds", self.clip_start.value())),
-                float(payload.get("segment_end_seconds", self.clip_end.value())),
-            )
         if isinstance(payload.get("partial_manifest"), dict):
             self.smart_render_manifest = dict(payload["partial_manifest"])
             cache_key = "preview" if self.submit_request_kind == "preview" else "production"
@@ -23354,77 +23466,6 @@ class DirectorCutStudio(QMainWindow):
                 )
         if payload.get("queued") or payload.get("error") or payload.get("completed"):
             self.submit_result = payload
-
-    def _apply_singing_lipsync_auto_repair_to_shots(
-        self,
-        repair: dict,
-        range_start: float,
-        range_end: float,
-    ) -> None:
-        """Persist the runtime MTV restaging on the affected Timeline Shots."""
-
-        direction = str(repair.get("direction") or "").strip()
-        if not direction:
-            return
-        marker = "SINGING LIP-SYNC AUTO-DIRECTOR REPAIR"
-        repair_round = max(1, int(repair.get("round", 1) or 1))
-        changed = False
-        for cue in self.director_cues:
-            if cue.cue_type != "shot" or not ranges_intersect(
-                cue.start_seconds,
-                cue.end_seconds,
-                range_start,
-                range_end,
-            ):
-                continue
-            original_action = str(cue.authored_subject_action or cue.subject_action or "")
-            clean_action = original_action.split("\nMTV singing QC repair:", 1)[0].rstrip()
-            repair_action = (
-                "MTV singing QC repair: P1 remains front-facing or at a readable "
-                "three-quarter angle and sings continuously from the current A1 window; "
-                "P2/P3 remain silent with non-vocal mouths."
-            )
-            cue.authored_subject_action = "\n".join(
-                value for value in (clean_action, repair_action) if value
-            )
-            cue.subject_action = cue.authored_subject_action
-            clean_detail = str(cue.detail or "").split("\n" + marker, 1)[0].rstrip()
-            cue.detail = "\n".join(
-                value for value in (clean_detail, direction) if value
-            )
-            cue.framing = "Medium close-up" if repair_round <= 2 else "Close-up"
-            cue.camera_angle = "Eye level · frontal or readable three-quarter"
-            cue.camera_movement = "Locked stable follow"
-            cue.movement_speed = "Natural singing tempo"
-            cue.movement_amplitude = "Minimal"
-            changed = True
-        if changed:
-            self._refresh_director_cues()
-            self._mark_dirty()
-
-    def _apply_singing_lipsync_qc_status(
-        self,
-        result: dict,
-        range_start: float,
-        range_end: float,
-    ) -> None:
-        """Expose the pre-Accept A1 timing check in each affected Shot."""
-
-        message = str(result.get("message") or "Singing Lip-Sync QC unavailable")
-        for cue in self.director_cues:
-            if (
-                cue.cue_type == "shot"
-                and ranges_intersect(
-                    cue.start_seconds,
-                    cue.end_seconds,
-                    range_start,
-                    range_end,
-                )
-                and not cue.native_audio_qc_user_edited
-            ):
-                cue.native_audio_qc_status = message
-        self._refresh_director_cues()
-        self.statusBar().showMessage(message)
 
     def _show_render_segment_preview(self, segment: dict) -> None:
         """Play each completed Shot unit immediately while the next one renders."""
@@ -23942,10 +23983,7 @@ class DirectorCutStudio(QMainWindow):
         self.monitor_display_stack.setCurrentWidget(self.monitor_compare_splitter)
         if kind == "video":
             self._prepare_generated_monitor_video(path, autoplay=autoplay)
-            if (
-                self.render_settings.dialogue_tts_engine == "h3_native"
-                and not is_mtv_singing_skill(self.special_combo.currentData())
-            ):
+            if self.render_settings.dialogue_tts_engine == "h3_native":
                 self._start_native_audio_qc(
                     path,
                     self.generated_output_timeline_start,
