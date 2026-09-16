@@ -2,6 +2,27 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.5-alpha.3] - 2026-09-16
+
+### Audio Separator · CUDA 自动部署与输出完整性
+
+- 完成与 SoulX 一致的 Audio Separator 自动角色模式：具备 NVIDIA CUDA GPU、`Kim_Vocal_2.onnx`、模型资料及完整 runtime 的电脑进入本机 `SERVER MODE`，由 Studio 隐藏启动 `127.0.0.1:7862`；其他电脑保持 `CLIENT MODE` 并连接局域网主机，不会静默安装模型。
+- 固定使用 `onnxruntime-gpu 1.23.2`，并以真实 `Kim_Vocal_2.onnx` Session 验证 `CUDAExecutionProvider`。健康检查未确认 CUDA 时禁用分离操作，不再静默退回 CPU；旧 CPU runtime 可由安装器安全升级。
+- 每次分离在一次性 worker 中运行，Vocal、Music 与原始 Mix 写盘后立即结束 worker；关闭本机 Server Mode 窗口会停止本项目的 7862 API 与残留 worker，Client Mode 不会停止远端共用服务。
+- 修复中文、繁体中文、日文等 Unicode 源文件名写入 Latin-1 HTTP Header 时导致上传失败的问题；文件名改以 UTF-8 百分号编码参数传送。
+- 修复上游 `audio-separator 0.30.2` SoundFile 写出分支将 C-contiguous 双声道浮点 Vocal 错误截断、扁平化，产生双倍时长近静音单声道文件的问题。现在按 samples×channels 浮点 PCM 正确写出。
+- 成功返回前新增 Stem QC：检查 Vocal／Music 时长、声道、RMS 与峰值；时长或声道不一致会失败，近静音 Vocal 会明确警告，避免无效人声继续进入 A2。
+- Audio Separator 工作区提供 Vocal、Music、Mix 的独立 Play／Stop／Download，并以固定映射执行 `Music→A1`、`Vocal→A2`；Mix 作为未经改变的项目最终母带保存。
+
+### Documentation
+
+- 新增 `step4.md`，完整说明 Audio Separator / Kim_Vocal_2 的主机与副机部署、CUDA 验收、局域网连接、模型迁移、生命周期及故障排除。
+- 更新主 README 与 v0.3.5 重点功能说明，并把应用版本统一提升为 `v0.3.5-alpha.3`。
+
+### Verification
+
+- 通过 Audio Separator 自动模式、CUDA runtime、API、Unicode 上传、Stem 写出与 Project 映射的聚焦测试，以及相关 Director Timeline 回归测试。
+
 ## [0.3.5-alpha.1] - 2026-09-14
 
 ### SoulX-Singer 独立歌声克隆

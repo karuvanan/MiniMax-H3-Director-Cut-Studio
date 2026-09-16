@@ -9,7 +9,8 @@
 1. **所有电脑必须完成**：[`Step 1：部署 Studio Runtime、Qwen3-TTS 与 VoxCPM2`](step1.md)
 2. **规划音乐主机与副机**：[`Step 2：ACE-Step 1.5 Music Workbench 主机／副机部署`](step2.md)
 3. **规划歌声克隆主机与副机**：[`Step 3：SoulX-Singer 主机／副机部署`](step3.md)
-4. 完成后统一从项目根目录启动：
+4. **规划人声／伴奏分离主机与副机**：[`Step 4：Audio Separator / Kim_Vocal_2 主机／副机部署`](step4.md)
+5. 完成后统一从项目根目录启动：
 
    ```powershell
    .\run_h3_prompt_studio.bat
@@ -21,7 +22,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.5-alpha.1`](VERSION)
+- 当前应用版本：[`v0.3.5-alpha.3`](VERSION)
 - v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
 - v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
@@ -158,7 +159,9 @@ Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF
 .\start_audio_separator_server.bat
 ```
 
-正常由Studio自动启动时无需保留BAT窗口。副机不需要Kim模型，只需能访问Server的7862端口。完整操作与A1/A2映射见 [`v0.3.5 readme.md`](v0.3.5%20readme.md)。
+v0.3.5-alpha.3 另外修复Unicode文件名上传失败，以及双声道浮点Vocal被错误写成双倍时长近静音单声道的问题；成功前会校验Vocal／Music的时长、声道、RMS与峰值。旧版已经产生的无声Vocal必须用新版重新分离。
+
+正常由Studio自动启动时无需保留BAT窗口。副机不需要Kim模型，只需能访问Server的7862端口。主机／副机安装、CUDA验收、端口检查和故障排除见 [`Step 4：Audio Separator / Kim_Vocal_2 部署`](step4.md)；完整操作与A1/A2映射见 [`v0.3.5 readme.md`](v0.3.5%20readme.md)。
 
 ### SoulX 独立歌声克隆工作流
 
