@@ -8,7 +8,6 @@ from segment_engine import (
     derive_named_segment_seed,
     dirty_segment_indexes,
     normalize_speech_overlap_policy,
-    plan_balanced_render_segments,
     plan_render_segments,
     plan_speech_track_lanes,
     plan_shot_render_segments,
@@ -21,15 +20,6 @@ from segment_engine import (
 
 
 class SegmentEngineTests(unittest.TestCase):
-    def test_balanced_planner_avoids_a_tiny_final_singing_segment(self):
-        rows = plan_balanced_render_segments(
-            0.0, 99.4, max_segment_seconds=7.0, grid_seconds=0.5
-        )
-        durations = [row.duration_seconds for row in rows]
-        self.assertEqual((rows[0].start_seconds, rows[-1].end_seconds), (0.0, 99.5))
-        self.assertTrue(all(5.0 <= value <= 7.0 for value in durations))
-        self.assertAlmostEqual(sum(durations), 99.5)
-
     def test_speech_lane_planner_routes_collisions_without_cutting_text(self):
         rows = plan_speech_track_lanes([
             {

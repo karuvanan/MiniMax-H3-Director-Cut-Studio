@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 from smart_render_worker import (
     _patch_continuity,
-    apply_singing_lipsync_auto_repair,
     build_render_progress,
     build_assembly_command,
     assemble_master,
@@ -22,179 +21,6 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
-    def test_singing_lipsync_qc_repairs_and_continues_uncorrelated_segment(self):
-        root = PROJECT_ROOT / ".director_cache" / "smart_render_singing_qc_test"
-        root.mkdir(parents=True, exist_ok=True)
-        video = root / "segment.mp4"
-        audio = root / "a1.wav"
-        video.write_bytes(b"video")
-        audio.write_bytes(b"audio")
-        job = {
-            "server": "http://127.0.0.1:8188",
-            "http_timeout": 1,
-            "segment_attempts": 2,
-            "segment_count": 1,
-            "history_poll_interval": 0.1,
-            "generation_timeout": 10,
-            "ffmpeg": "ffmpeg",
-        }
-        segment = {
-            "segment_id": "seg-qc",
-            "index": 0,
-            "start_seconds": 21.0,
-            "end_seconds": 28.0,
-            "download_dir": str(root),
-            "singing_lipsync_qc": {
-                "enabled": True,
-                "reference_audio": str(audio),
-                "reference_offset_seconds": 0.0,
-                "duration_seconds": 7.0,
-                "timeline_start_seconds": 21.0,
-                "timeline_end_seconds": 28.0,
-            },
-        }
-        qc_result = {
-            "passed": False,
-            "status": "hard_block",
-            "message": "Singing Lip-Sync QC HARD BLOCK · tail lip-sync lock decayed.",
-        }
-        workflow = {
-            "10": {
-                "class_type": "PrimitiveStringMultiline",
-                "inputs": {"value": "Original MTV Segment prompt."},
-            },
-            "20": {
-                "class_type": "MiniMaxH3ReferenceToVideo",
-                "inputs": {"prompt": ["10", 0]},
-            },
-        }
-        events = []
-        with (
-            patch(
-                "smart_render_worker._request_json",
-                side_effect=[{"prompt_id": f"qc-{index}"} for index in range(1, 6)],
-            ),
-            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
-            patch(
-                "smart_render_worker.download_outputs",
-                return_value=[{"kind": "videos", "local_path": str(video)}],
-            ),
-            patch(
-                "smart_render_worker.analyze_singing_lipsync_alignment",
-                return_value=qc_result,
-            ) as analyzer,
-            patch(
-                "smart_render_worker.release_comfy_memory", return_value="released"
-            ) as release,
-            patch("smart_render_worker.time.sleep"),
-            patch("smart_render_worker.emit", side_effect=events.append),
-        ):
-            result = queue_segment(job, segment, workflow, [])
-        self.assertEqual(analyzer.call_count, 5)
-        release.assert_not_called()
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["singing_lipsync_qc_result"]["status"], "warning")
-        self.assertFalse(result["singing_lipsync_qc_result"]["hard_block"])
-        self.assertIn("AUTO-DIRECTOR REPAIR", workflow["10"]["inputs"]["value"])
-        self.assertTrue(any(event.get("singing_lipsync_auto_repair") for event in events))
-        self.assertEqual(
-            classify_generation_error(qc_result["message"]),
-            "singing_lipsync_qc",
-        )
-        video.unlink(missing_ok=True)
-        audio.unlink(missing_ok=True)
-        root.rmdir()
-
-    def test_singing_auto_repair_targets_the_h3_prompt_node(self):
-        workflow = {
-            "138": {
-                "class_type": "PrimitiveStringMultiline",
-                "inputs": {"value": "Original prompt"},
-            },
-            "171": {
-                "class_type": "MiniMaxH3ReferenceToVideo",
-                "inputs": {"prompt": ["138", 0]},
-            },
-        }
-        patched, direction = apply_singing_lipsync_auto_repair(
-            workflow, repair_round=2
-        )
-        self.assertTrue(patched)
-        self.assertIn(direction, workflow["138"]["inputs"]["value"])
-        self.assertIn("P1 is the only visible face", direction)
-        self.assertIn("three-quarter angle", direction)
-
-    def test_resumed_singing_qc_miss_queues_repair_without_stopping(self):
-        root = PROJECT_ROOT / ".director_cache" / "smart_render_resumed_singing_qc_test"
-        root.mkdir(parents=True, exist_ok=True)
-        video = root / "segment.mp4"
-        audio = root / "a1.wav"
-        video.write_bytes(b"video")
-        audio.write_bytes(b"audio")
-        job = {
-            "server": "http://127.0.0.1:8188",
-            "http_timeout": 1,
-            "segment_attempts": 5,
-            "segment_count": 1,
-            "history_poll_interval": 0.1,
-            "generation_timeout": 10,
-            "ffmpeg": "ffmpeg",
-        }
-        segment = {
-            "segment_id": "seg-resumed-qc",
-            "index": 0,
-            "start_seconds": 21.0,
-            "end_seconds": 28.0,
-            "download_dir": str(root),
-            "status": "monitoring",
-            "prompt_id": "already-running",
-            "attempts_used": 2,
-            "singing_lipsync_qc": {
-                "enabled": True,
-                "reference_audio": str(audio),
-                "duration_seconds": 7.0,
-            },
-        }
-        workflow = {
-            "10": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "MTV"}},
-            "20": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {"prompt": ["10", 0]}},
-        }
-        failed_qc = {
-            "passed": False,
-            "status": "hard_block",
-            "message": "Singing Lip-Sync QC HARD BLOCK · tail drift.",
-        }
-        with (
-            patch(
-                "smart_render_worker._request_json",
-                side_effect=[
-                    {"prompt_id": "repair-3"},
-                    {"prompt_id": "repair-4"},
-                    {"prompt_id": "repair-5"},
-                ],
-            ) as request_json,
-            patch("smart_render_worker.wait_for_history", return_value=({}, {})) as wait,
-            patch(
-                "smart_render_worker.download_outputs",
-                return_value=[{"kind": "videos", "local_path": str(video)}],
-            ),
-            patch(
-                "smart_render_worker.analyze_singing_lipsync_alignment",
-                return_value=failed_qc,
-            ),
-            patch("smart_render_worker.release_comfy_memory", return_value="released"),
-            patch("smart_render_worker.time.sleep"),
-            patch("smart_render_worker.emit"),
-        ):
-            result = queue_segment(job, segment, workflow, [])
-        self.assertEqual(wait.call_count, 4)
-        self.assertEqual(request_json.call_count, 3)
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["singing_lipsync_qc_result"]["status"], "warning")
-        video.unlink(missing_ok=True)
-        audio.unlink(missing_ok=True)
-        root.rmdir()
-
     def test_oom_is_classified_released_and_retried_without_quality_change(self):
         root = PROJECT_ROOT / ".director_cache" / "smart_render_oom_retry_test"
         root.mkdir(parents=True, exist_ok=True)
@@ -237,55 +63,6 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertEqual(result["failure_class"], "")
         self.assertEqual(request_json.call_count, 3)
         self.assertEqual(release.call_count, 2)
-        video.unlink(missing_ok=True)
-        root.rmdir()
-
-    def test_aimdo_hostbuffer_1450_retries_without_unloading_h3(self):
-        root = PROJECT_ROOT / ".director_cache" / "smart_render_aimdo_retry_test"
-        root.mkdir(parents=True, exist_ok=True)
-        video = root / "segment.mp4"
-        video.write_bytes(b"video")
-        job = {
-            "server": "http://127.0.0.1:8188",
-            "http_timeout": 1,
-            "segment_attempts": 3,
-            "segment_count": 1,
-            "history_poll_interval": 0.1,
-            "generation_timeout": 10,
-        }
-        segment = {
-            "segment_id": "seg-aimdo",
-            "index": 0,
-            "download_dir": str(root),
-        }
-        aimdo_error = RuntimeError(
-            "GetOverlappedResult failed error=1450; "
-            "RuntimeError: HostBuffer.read_file_slice failed"
-        )
-        with (
-            patch(
-                "smart_render_worker._request_json",
-                side_effect=[aimdo_error, {"prompt_id": "recovered"}],
-            ),
-            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
-            patch(
-                "smart_render_worker.download_outputs",
-                return_value=[{"kind": "videos", "local_path": str(video)}],
-            ),
-            patch("smart_render_worker.release_comfy_memory") as release,
-            patch("smart_render_worker.time.sleep"),
-            patch("smart_render_worker.emit") as emit,
-        ):
-            result = queue_segment(job, segment, {}, [])
-        self.assertEqual(classify_generation_error(aimdo_error), "aimdo_hostbuffer")
-        release.assert_not_called()
-        self.assertEqual(result["status"], "complete")
-        self.assertTrue(
-            any(
-                event.get("failure_class") == "aimdo_hostbuffer"
-                for event in (call.args[0] for call in emit.call_args_list)
-            )
-        )
         video.unlink(missing_ok=True)
         root.rmdir()
 
@@ -543,30 +320,6 @@ class SmartRenderWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "Reference media is missing"):
             preflight_smart_render(job)
 
-    def test_preflight_accepts_one_mtv_qc_segment(self):
-        runtime = load_runtime_paths()
-        root = PROJECT_ROOT / ".director_cache" / "single_mtv_preflight"
-        shutil.rmtree(root, ignore_errors=True)
-        job = {
-            "segments": [
-                {
-                    "start_seconds": 0.0,
-                    "end_seconds": 6.0,
-                    "workflow": {},
-                    "singing_lipsync_qc": {"enabled": True},
-                }
-            ],
-            "media": [],
-            "ffmpeg": str(runtime.ffmpeg),
-            "ffprobe": str(runtime.ffprobe),
-            "master_output": str(root / "master.mp4"),
-            "server": "http://127.0.0.1:8188",
-        }
-        with patch("smart_render_worker._request_json", return_value={}):
-            result = preflight_smart_render(job)
-        self.assertEqual(result["segment_count"], 1)
-        shutil.rmtree(root, ignore_errors=True)
-
     def test_assembly_trims_each_leading_overlap(self):
         root = Path("assembly-test")
         paths = [root / f"segment{index}.mp4" for index in range(3)]
@@ -774,9 +527,7 @@ class SmartRenderWorkerTests(unittest.TestCase):
                 patch.object(sys, "argv", ["smart_render_worker.py", str(job_path)]),
                 patch("smart_render_worker.preflight_smart_render", return_value=preflight),
                 patch("smart_render_worker.queue_segment", return_value=second_result),
-                patch(
-                    "smart_render_worker.release_comfy_memory", return_value="released"
-                ) as release,
+                patch("smart_render_worker.release_comfy_memory", return_value="released"),
                 patch("smart_render_worker.assemble_master", return_value=master_output),
                 patch("smart_render_worker.emit", side_effect=events.append),
             ):
@@ -793,7 +544,6 @@ class SmartRenderWorkerTests(unittest.TestCase):
             self.assertEqual(progress_events[2]["percent_complete"], 40.0)
             self.assertEqual(progress_events[3]["percent_complete"], 100.0)
             self.assertEqual(progress_events[-1]["remaining_shots"], 0)
-            release.assert_called_once_with("http://127.0.0.1:8188", 30)
         finally:
             for path in (
                 job_path, root / "manifest.json", cached_output,

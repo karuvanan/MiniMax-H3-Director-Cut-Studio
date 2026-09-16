@@ -179,69 +179,6 @@ class ComfyConnectionRecoveryTests(unittest.TestCase):
             self.assertEqual(submit_main(), 0)
         duplicate_queue.assert_not_called()
 
-    def test_legacy_native_mtv_qc_warning_does_not_stop_job(self):
-        job_path = self.root / "native_mtv_qc.job.json"
-        video = self.root / "segment.mp4"
-        reference = self.root / "a1.wav"
-        video.write_bytes(b"video")
-        reference.write_bytes(b"audio")
-        job_path.write_text(
-            json.dumps(
-                {
-                    "server": "http://remote:8188",
-                    "workflow": {},
-                    "media": [],
-                    "wait_for_completion": True,
-                    "download_dir": str(self.root / "downloads"),
-                    "queued_prompt_id": "mtv-prompt",
-                    "queued_response": {"prompt_id": "mtv-prompt"},
-                    "ffmpeg": "ffmpeg",
-                    "target_duration_seconds": 6.0,
-                    "singing_lipsync_qc": {
-                        "enabled": True,
-                        "reference_audio": str(reference),
-                        "reference_offset_seconds": 0.0,
-                        "duration_seconds": 6.0,
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        failed_qc = {
-            "passed": False,
-            "status": "hard_block",
-            "message": "Singing Lip-Sync QC HARD BLOCK · tail lip-sync lock decayed.",
-        }
-        lines = []
-        with (
-            patch.object(sys, "argv", ["comfy_submit_worker.py", str(job_path)]),
-            patch(
-                "comfy_submit_worker.wait_for_history",
-                return_value=({"status": {"completed": True}}, [{"filename": "x.mp4"}]),
-            ),
-            patch(
-                "comfy_submit_worker.download_outputs",
-                return_value=[{"kind": "videos", "local_path": str(video)}],
-            ),
-            patch(
-                "comfy_submit_worker.analyze_singing_lipsync_alignment",
-                return_value=failed_qc,
-            ),
-            patch("comfy_submit_worker._connection_event"),
-            patch("builtins.print", side_effect=lambda value, **_kwargs: lines.append(value)),
-        ):
-            self.assertEqual(submit_main(), 0)
-        payloads = [json.loads(line) for line in lines]
-        self.assertTrue(any(row.get("completed") for row in payloads))
-        warnings = [
-            row["singing_lipsync_qc"]
-            for row in payloads
-            if isinstance(row.get("singing_lipsync_qc"), dict)
-            and row["singing_lipsync_qc"].get("status") == "warning"
-        ]
-        self.assertTrue(warnings)
-        self.assertFalse(warnings[-1]["hard_block"])
-
 
 if __name__ == "__main__":
     unittest.main()

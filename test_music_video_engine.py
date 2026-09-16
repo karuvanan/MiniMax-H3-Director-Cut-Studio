@@ -4,19 +4,12 @@ from pathlib import Path
 from design_engine import normalize_design_plan, render_special_design_requirement_template
 from skill_engine import load_skill_profiles
 from music_video_engine import (
-    MTV_AUDIO_DRIVEN_MOUTH_CONTRACT,
-    MTV_MAX_LIPSYNC_SEGMENT_SECONDS,
-    MTV_SUPPORT_MOUTH_CONTRACT,
     MTV_SINGING_SPECIAL_SKILL,
     build_exact_master_audio_command,
     enforce_mtv_scene_keyframes,
     enforce_mtv_singing_plan,
     exact_master_audio_asset,
-    evaluate_singing_lipsync_envelopes,
     mtv_master_audio_duration,
-    mtv_reference_audio_window,
-    sanitize_unverified_mtv_mouth_timing,
-    strip_mtv_transcript_guidance,
 )
 
 
@@ -100,61 +93,59 @@ class MusicVideoEngineTests(unittest.TestCase):
         self.assertEqual(uses["A1"]["requirement_id"], "mtv_a1_exact_master_audio")
         self.assertEqual(plan["text_layers"], [])
         self.assertIn("sole lead singer", plan["shots"][0]["subject_action"])
-        self.assertIn(MTV_AUDIO_DRIVEN_MOUTH_CONTRACT, plan["shots"][0]["subject_action"])
-        self.assertIn(MTV_SUPPORT_MOUTH_CONTRACT, plan["shots"][0]["additional_direction"])
-        self.assertEqual(
-            plan["mtv_audio_policy"]["lip_sync_generation_max_seconds"],
-            MTV_MAX_LIPSYNC_SEGMENT_SECONDS,
-        )
-        self.assertEqual(
-            plan["mtv_audio_policy"]["singing_lipsync_qc"],
-            "auto_director_repair_continue",
-        )
         self.assertEqual(plan["mtv_audio_policy"]["final_audio_mode"], "replace_h3_with_exact_timeline_master")
 
-    def test_unverified_model_mouth_timing_is_removed_when_lyrics_are_not_authored(self):
-        plan = _plan()
-        plan["text_layers"] = []
-        plan["shots"][0].update(
-            subject_action="P1 sings the climactic phrase from A1, mouth open on the phrase.",
-            additional_direction="Mouth closed between phrases.",
+    def test_optional_a2_activates_explicit_separated_audio_contract(self):
+        media = [
+            _media("P1", "image"), _media("P2", "image"),
+            _media("P3", "image"), _media("P4", "image"),
+            _media("A1", "audio"), _media("A2", "audio"),
+        ]
+        plan = enforce_mtv_singing_plan(
+            _plan(), media, special_skill_key=MTV_SINGING_SPECIAL_SKILL,
+            authored_requirement="人物@P1，歌曲@A1，分离人声@A2",
         )
-        result = enforce_mtv_singing_plan(
-            plan,
-            [],
-            special_skill_key=MTV_SINGING_SPECIAL_SKILL,
-            authored_requirement="人物参考@P1，歌曲参考@A1",
+        uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
+        self.assertEqual(
+            uses["A2"]["requirement_id"],
+            "mtv_a2_vocal_performance_reference",
         )
-        shot_text = " ".join(
-            str(result["shots"][0].get(key, ""))
-            for key in ("subject_action", "additional_direction")
-        ).casefold()
-        self.assertNotIn("climactic phrase", shot_text)
-        self.assertNotIn("mouth closed between phrases", shot_text)
-        self.assertIn("a1 audio-driven", shot_text)
+        policy = plan["mtv_audio_policy"]
+        self.assertEqual(policy["master_audio_id"], "AUDIO_SEPARATOR_MIX")
+        self.assertEqual(policy["vocal_reference_id"], "A2")
+        self.assertEqual(
+            policy["vocal_reference_mode"],
+            "lip_motion_only_excluded_from_final_mix",
+        )
+        self.assertEqual(
+            policy["final_audio_mode"],
+            "replace_h3_with_separator_exact_mix",
+        )
+        self.assertIn("@A1 is the instrumental/music stem", plan["overall_soundscape"])
+        self.assertIn("during A2 silence", plan["shots"][0]["subject_action"])
 
-    def test_mixed_song_whisper_transcript_is_not_prompt_narrative(self):
-        contaminated = (
-            "Keep P1 stable. Use the active audio transcript as spoken narrative guidance: "
-            "[00:00.33] What? [00:01.32] MBC 뉴스 김지경입니다. "
-            "Preserve temporal continuity across shots."
+    def test_empty_a2_retains_a1_only_fallback(self):
+        media = [_media("P1", "image"), _media("A1", "audio")]
+        source_plan = _plan()
+        source_plan["existing_media_uses"] = [{
+            "requirement_id": "hallucinated_optional_a2",
+            "media_id": "A2",
+            "media_type": "audio",
+            "start_seconds": 0.0,
+            "end_seconds": 12.0,
+        }]
+        plan = enforce_mtv_singing_plan(
+            source_plan, media, special_skill_key=MTV_SINGING_SPECIAL_SKILL,
+            authored_requirement="人物@P1，歌曲@A1",
         )
-        cleaned = strip_mtv_transcript_guidance(contaminated)
-        self.assertNotIn("MBC", cleaned)
-        self.assertNotIn("spoken narrative guidance", cleaned)
-        self.assertIn("Preserve temporal continuity", cleaned)
-
-    def test_old_mtv_phrase_guesses_and_duplicate_contracts_are_compacted(self):
-        repeated = (
-            "P1 sings a quiet bridge phrase from A1. P1 keeps a readable face for the "
-            "climactic phrase. P1 holds the final resolved pose from A1's ending. "
-            "P2 does not sing. P2 does not sing."
+        self.assertFalse(any(
+            row.get("media_id") == "A2"
+            for row in plan["existing_media_uses"]
+        ))
+        self.assertEqual(
+            plan["mtv_audio_policy"]["vocal_reference_mode"],
+            "fallback_to_a1",
         )
-        cleaned = sanitize_unverified_mtv_mouth_timing(repeated).casefold()
-        self.assertNotIn("quiet bridge", cleaned)
-        self.assertNotIn("climactic phrase", cleaned)
-        self.assertNotIn("final resolved pose", cleaned)
-        self.assertEqual(cleaned.count("p2 does not sing"), 1)
 
     def test_authored_lyrics_are_kept_as_p1_lip_sync_metadata(self):
         plan = _plan()
@@ -206,6 +197,16 @@ class MusicVideoEngineTests(unittest.TestCase):
         self.assertEqual(spec["source_offset_seconds"], 12.0)
         self.assertEqual(spec["duration_seconds"], 8.0)
 
+    def test_exact_master_asset_uses_separator_mix_but_keeps_a1_timing(self):
+        asset = _media("A1", "audio", __file__)
+        asset.update(start_seconds=3.0, end_seconds=30.0, source_in_seconds=5.0)
+        spec = exact_master_audio_asset(
+            [asset], special_skill_key=MTV_SINGING_SPECIAL_SKILL,
+            timeline_start=10.0, duration=8.0, exact_mix_path=__file__,
+        )
+        self.assertEqual(Path(spec["path"]), Path(__file__).resolve())
+        self.assertEqual(spec["source_offset_seconds"], 12.0)
+
     def test_exact_master_asset_rejects_a_timeline_range_beyond_source_audio(self):
         asset = _media("A1", "audio", __file__)
         asset.update(
@@ -217,39 +218,13 @@ class MusicVideoEngineTests(unittest.TestCase):
             timeline_start=0.0, duration=22.0,
         ))
 
-    def test_final_grid_window_keeps_a1_tail_and_pads_only_the_remainder(self):
+    def test_separated_music_stem_without_saved_mix_cannot_publish_instrumental_only(self):
         asset = _media("A1", "audio", __file__)
-        asset.update(
-            start_seconds=0.0,
-            end_seconds=99.402,
-            source_duration_seconds=99.402,
-        )
-        window = mtv_reference_audio_window(
-            asset,
-            timeline_start=98.0,
-            timeline_end=99.5,
-        )
-        self.assertEqual(window["source_offset_seconds"], 98.0)
-        self.assertEqual(window["playable_duration_seconds"], 1.402)
-        self.assertEqual(window["padding_seconds"], 0.098)
-        master = exact_master_audio_asset(
-            [asset],
-            special_skill_key=MTV_SINGING_SPECIAL_SKILL,
-            timeline_start=0.0,
-            duration=99.5,
-        )
-        self.assertEqual(master["playable_duration_seconds"], 99.402)
-        self.assertEqual(master["padding_seconds"], 0.098)
-
-    def test_singing_lipsync_qc_detects_late_window_drift(self):
-        reference = [0.05, 0.4, 0.1, 0.8, 0.2] * 20
-        matching = evaluate_singing_lipsync_envelopes(reference, list(reference))
-        self.assertTrue(matching["passed"])
-        drifted = list(reference)
-        drifted[60:] = [0.9 if index % 2 else 0.0 for index in range(40)]
-        failed = evaluate_singing_lipsync_envelopes(reference, drifted)
-        self.assertFalse(failed["passed"])
-        self.assertEqual(failed["status"], "hard_block")
+        asset["recognition"] = "AUDIO SEPARATOR MUSIC STEM"
+        self.assertIsNone(exact_master_audio_asset(
+            [asset], special_skill_key=MTV_SINGING_SPECIAL_SKILL,
+            timeline_start=0.0, duration=8.0,
+        ))
 
     def test_normalize_pipeline_applies_mtv_roles_before_speech_extension(self):
         payload = {
