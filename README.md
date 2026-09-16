@@ -21,7 +21,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.5-alpha.2`](VERSION)
+- 当前应用版本：[`v0.3.5-alpha.1`](VERSION)
 - v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
 - v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
@@ -146,6 +146,19 @@ mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
 Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF 已删除、改量化版本或被 LM Studio 改成短 alias，会自动选择同系列可用模型并保存修复后的 ID。生成结束时只卸载 `/api/v1/models` 明确列在 `loaded_instances` 的实际实例；未加载／已删除模型直接视为已释放，不会重复产生 `model_not_found`，也不会误卸载其他模型。
 
 主页顶部的 `UNLOAD ALL` 会一次释放 Studio runtime cache、ComfyUI、LM Studio，以及当前 Server／Client API 所连接的 ACE-Step 1.5 DiT、VAE、文字编码器和 LM；如果 SoulX Server 提供卸载 endpoint，也会一并请求释放 SoulX 模型。ACE-Step API 进程会继续运行；下一次分析或生成时自动重新载入所需模型。若音乐任务仍在排队或生成，服务器会拒绝卸载，避免破坏进行中的成品。
+
+### Audio Separator · Kim_Vocal_2 CUDA 自动模式
+
+主页的 `AUDIO SEPARATOR` 会自动判断本机角色：具有CUDA GPU及完整 `models/audio-separator` 模型与runtime的电脑进入 `SERVER MODE`，隐藏启动本机 `127.0.0.1:7862`；没有本机安装或没有CUDA GPU的电脑进入 `CLIENT MODE`，使用远端局域网API。Server启动器会自动把旧CPU版ONNX Runtime修复为 `onnxruntime-gpu 1.23.2`，并以真实 `Kim_Vocal_2.onnx` Session验证 `CUDAExecutionProvider`；验证失败时按钮保持禁用，不会静默回退CPU。
+
+每次分离由独立worker执行，输出Vocal、Music与原始Mix后立即退出并释放模型。关闭本机Server Mode窗口还会停止项目所属的7862 API进程；Client Mode不会关闭远端Server。需要手动部署或修复Server时执行：
+
+```powershell
+.\install_audio_separator_cuda_runtime.bat
+.\start_audio_separator_server.bat
+```
+
+正常由Studio自动启动时无需保留BAT窗口。副机不需要Kim模型，只需能访问Server的7862端口。完整操作与A1/A2映射见 [`v0.3.5 readme.md`](v0.3.5%20readme.md)。
 
 ### SoulX 独立歌声克隆工作流
 

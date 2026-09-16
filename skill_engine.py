@@ -408,7 +408,6 @@ def _asset_definition(
     source_assets: list[MediaAsset] | None = None,
     effective_assets: list[MediaAsset] | None = None,
     paired_audio_tag: str = "",
-    suppress_machine_transcript: bool = False,
 ) -> str:
     def display(value: str) -> str:
         if source_assets is None or effective_assets is None:
@@ -433,7 +432,7 @@ def _asset_definition(
     for raw in asset.recognition.splitlines():
         line = raw.strip()
         if line.startswith("WHISPER TRANSCRIPT"):
-            include_transcript = not suppress_machine_transcript
+            include_transcript = True
             continue
         if line.startswith("[") and include_transcript:
             analyzed_rows.append("machine transcript: " + display(line))
@@ -562,10 +561,6 @@ def build_ref2va_prompt(
     for asset in assets:
         grouped.setdefault(source_key(asset), []).append(asset)
     unique_assets = [instances[0] for instances in grouped.values()]
-    suppress_machine_transcript = bool(
-        special_profile is not None
-        and special_profile.key.strip().casefold() == "mtv-singing-h3"
-    )
     paired_audio_tags = paired_audio_reference_tags(unique_assets)
     visual_assets = [asset for asset in unique_assets if asset.media_type in ("image", "video")]
     audio_assets = [asset for asset in unique_assets if asset.media_type == "audio"]
@@ -644,7 +639,6 @@ def build_ref2va_prompt(
             source_assets,
             assets,
             paired_audio_tag,
-            suppress_machine_transcript,
         )
         if len(instances) > 1:
             uses = "; ".join(

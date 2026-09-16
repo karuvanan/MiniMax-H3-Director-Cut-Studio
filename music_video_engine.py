@@ -2,33 +2,14 @@
 
 from __future__ import annotations
 
-from array import array
 from copy import deepcopy
-import math
 from pathlib import Path
 import re
 import subprocess
-import sys
 
 
 MTV_SINGING_SPECIAL_SKILL = "mtv-singing-h3"
 MTV_A1_DURATION_TEMPLATE_TOKEN = "{{MTV_A1_DURATION}}"
-MTV_MAX_LIPSYNC_SEGMENT_SECONDS = 7.0
-
-MTV_AUDIO_DRIVEN_MOUTH_CONTRACT = (
-    "A1 AUDIO-DRIVEN MOUTH CONTRACT: P1 performs every audible sung vocal in the current "
-    "A1 Timeline window with continuous, frame-matched mouth, jaw, breath and expression "
-    "motion. When the current A1 window is instrumental, P1's lips rest naturally. Never "
-    "guess a phrase boundary, final note, open-mouth pose or closed-mouth pose from the Shot "
-    "description; A1 alone decides visible vocal timing."
-)
-
-MTV_SUPPORT_MOUTH_CONTRACT = (
-    "P2 and P3 are silent support performers: keep their lips naturally closed or in a "
-    "clearly non-vocal neutral reaction. In group shots, only P1 may present a readable "
-    "front-facing singing mouth; place P2/P3 in three-quarter/profile view or lower visual "
-    "salience and never give them singing-like open-mouth motion."
-)
 
 MTV_MASTER_AUDIO_CONTRACT = (
     "A1 EXACT MASTER AUDIO: @A1 is the only soundtrack and the authoritative sung "
@@ -39,103 +20,33 @@ MTV_MASTER_AUDIO_CONTRACT = (
     "original A1 Timeline window instead of H3's newly synthesized song audio."
 )
 
+MTV_VOCAL_REFERENCE_CONTRACT = (
+    "A2 ISOLATED VOCAL REFERENCE: @A2 contains the isolated vocal stem. "
+    "Use A2 only to determine when S1/P1 is actually singing and to drive P1's visible "
+    "phoneme, mouth, jaw, breath and expression timing. Instrument-only intervals in A1 "
+    "must keep P1's mouth naturally closed or non-singing. @A2 is not a second soundtrack, "
+    "and P2 and P3 remain non-singing unless separately authored."
+)
+
+MTV_SEPARATED_AUDIO_CONTRACT = (
+    "SEPARATED MTV AUDIO: @A1 is the instrumental/music stem and @A2 is the isolated vocal "
+    "stem from the same exact Mix. Use A1 only for beat, tempo, melody, instrumentation and "
+    "edit timing. Use A2 only for S1/P1's audible lyric, phoneme, mouth, jaw, breath and "
+    "expression timing. Never make P1 lip-sync to instrumental transients or residual bleed, "
+    "never create another singer, and never mix A1 and A2 as two competing performances. "
+    "Studio restores the untouched separator Mix as the sole final soundtrack."
+)
+
 MTV_CAST_SCENE_CONTRACT = (
     "MTV REFERENCE ROLE LOCK: S1 is exactly @P1 and is the sole lead singer. Preserve P1's "
     "recognizable face, age, hair, body, complete wardrobe and accessories in every frame; keep "
-    "P1's mouth, jaw, breath, expression and gestures visibly synchronized to A1. @P2 and @P3 "
+    "P1's mouth, jaw, breath, expression and gestures synchronized to A2 when an isolated A2 "
+    "vocal reference exists, otherwise to A1. @P2 and @P3 "
     "are supporting people only and must keep their own identities; they do not sing or copy P1's "
-    "mouth motion unless separately authored. Keep their lips naturally closed or in a clearly "
-    "non-vocal reaction; only P1 may show a readable front-facing singing mouth. @P4 is the "
-    "authoritative scene plate for geometry, "
+    "mouth motion unless separately authored. @P4 is the authoritative scene plate for geometry, "
     "camera axis, colour, colour temperature, weather, lighting and atmosphere. Never exchange "
     "the roles of P1-P4 and never generate a substitute lead singer."
 )
-
-
-_MTV_TRANSCRIPT_GUIDANCE_RE = re.compile(
-    r"\s*Use the active audio transcript as spoken narrative guidance:\s*.*?"
-    r"(?=\s+Reuse and synchronize the active Timeline audio reference\(s\)|"
-    r"\s+Preserve temporal continuity|\s+Preserve the timeline-authored dialogue|"
-    r"\s+Finish on the timeline Ending Hold marker|$)",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-
-
-def strip_mtv_transcript_guidance(value: object) -> str:
-    """Remove speech-ASR prose that must never steer a master-song MTV."""
-
-    return re.sub(r"\s+", " ", _MTV_TRANSCRIPT_GUIDANCE_RE.sub(" ", str(value or ""))).strip()
-
-
-def sanitize_unverified_mtv_mouth_timing(value: object) -> str:
-    """Remove model-guessed mouth poses while preserving physical continuity prose."""
-
-    text = str(value or "").strip()
-    if not text:
-        return text
-    text = re.sub(
-        r"(?:,\s*|;\s*)?mouth\s+(?:closed|open)\b[^,;.]*[,.]?",
-        ", ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:,\s*|;\s*)?@?A1(?:'s)?\s+(?:final|ending|quiet|soft|softer|verse|"
-        r"bridge|building|rising|climactic|resolving)\s+(?:note|phrase)\s+"
-        r"(?:active|continues|decays\s+to\s+silence)[,.]?",
-        ", ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"\bsings\s+(?:a|the)\s+[^.;]{0,45}?\s+phrase\s+(?:from|of)\s+@?A1\b",
-        "performs the audible sung vocal in the current A1 Timeline window",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"@?P1\s+holds?\s+(?:the\s+)?final\s+(?:resolved\s+)?pose\s+from\s+"
-        r"(?:the\s+)?(?:current\s+)?@?A1(?:'s)?\s+ending\b",
-        "P1 performs the audible sung vocal in the current A1 Timeline window",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"@?A1(?:'s)?\s+(?:opening|final|ending|quiet|soft|softer|verse|bridge|"
-        r"building|rising|lifted|climactic|resolving)\s+(?:note|phrase|delivery|ending)\b",
-        "the current A1 Timeline window",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"\b(?:the\s+)?(?:opening|final|ending|quiet|soft|softer|verse|bridge|"
-        r"building|rising|lifted|climactic|resolving)\s+(?:note|phrase|delivery)\b",
-        "the current A1 vocal",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"\ball\s+(?:three|supporting)\s+(?:figures|performers)\s+hold\s+stable\s+"
-        r"poses?\s+without\s+new\s+action\b",
-        "support performers react naturally without singing",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"\s+,", ",", text)
-    text = re.sub(r",\s*,+", ",", text)
-    text = re.sub(r"\s{2,}", " ", text)
-    # Old projects may contain the same MTV contract twice after repeated
-    # Design Apply. Remove exact repeated sentences so the musical timing rule
-    # is not buried under redundant prose.
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip(" ,"))
-    unique: list[str] = []
-    seen: set[str] = set()
-    for sentence in sentences:
-        key = re.sub(r"\s+", " ", sentence).strip().casefold()
-        if key and key not in seen:
-            unique.append(sentence.strip())
-            seen.add(key)
-    return " ".join(unique).strip(" ,")
 
 
 def is_mtv_singing_skill(value: object) -> bool:
@@ -289,6 +200,7 @@ def enforce_mtv_singing_plan(
     duration = max(0.5, float(plan.get("duration_seconds", 12.0) or 12.0))
     inventory = _inventory(existing_media)
     uses = [deepcopy(row) for row in plan.get("existing_media_uses") or [] if isinstance(row, dict)]
+    has_a2_vocal_reference = _loaded(inventory.get("A2"))
 
     _upsert_use(
         uses, inventory, media_id="P1", media_type="image", duration=duration,
@@ -321,8 +233,20 @@ def enforce_mtv_singing_plan(
     _upsert_use(
         uses, inventory, media_id="A1", media_type="audio", duration=duration,
         track="A1", requirement_id="mtv_a1_exact_master_audio",
-        instruction=MTV_MASTER_AUDIO_CONTRACT,
+        instruction=(
+            MTV_SEPARATED_AUDIO_CONTRACT
+            if has_a2_vocal_reference else MTV_MASTER_AUDIO_CONTRACT
+        ),
     )
+    # A2 is optional. Remove a model-hallucinated A2 requirement before
+    # preflight so an empty slot never becomes a Hard Block.
+    uses = [row for row in uses if _media_id(row.get("media_id")) != "A2"]
+    if has_a2_vocal_reference:
+        _upsert_use(
+            uses, inventory, media_id="A2", media_type="audio", duration=duration,
+            track="A2", requirement_id="mtv_a2_vocal_performance_reference",
+            instruction=MTV_VOCAL_REFERENCE_CONTRACT,
+        )
     plan["existing_media_uses"] = uses
 
     retained_text: list[dict] = []
@@ -353,71 +277,96 @@ def enforce_mtv_singing_plan(
     plan["creative_brief"] = _append_once(
         plan.get("creative_brief"), MTV_CAST_SCENE_CONTRACT
     )
-    plan["overall_soundscape"] = MTV_MASTER_AUDIO_CONTRACT
+    audio_contract = (
+        MTV_SEPARATED_AUDIO_CONTRACT if has_a2_vocal_reference
+        else MTV_MASTER_AUDIO_CONTRACT
+    )
+    plan["overall_soundscape"] = audio_contract
     plan["non_diegetic_music"] = (
-        "@A1 exact Timeline Master Audio only. Preserve the original recording at 1x and use no "
-        "generated replacement song, added singer, TTS vocal, pitch correction or alternate score."
+        (
+            "Use @A1 for instrumental timing and @A2 for the sole vocal performance. Studio will "
+            "restore the untouched separator Mix at 1x during final assembly. "
+            if has_a2_vocal_reference else
+            "@A1 exact Timeline Master Audio only. Preserve the original recording at 1x. "
+        )
+        + "Use no generated replacement song, added singer, TTS vocal, pitch correction or alternate score."
     )
     plan["constraints"] = _append_once(
         plan.get("constraints"),
-        MTV_MASTER_AUDIO_CONTRACT + " " + MTV_CAST_SCENE_CONTRACT,
-    )
-    authored_lyric_timing = any(
-        isinstance(row, dict)
-        and str(row.get("role", "")).strip().lower() == "lyrics"
-        and str(row.get("content", "")).strip()
-        for row in retained_text
+        audio_contract + " " + MTV_CAST_SCENE_CONTRACT,
     )
     for shot in plan.get("shots") or []:
         if not isinstance(shot, dict):
             continue
-        if not authored_lyric_timing:
-            for field_name in (
-                "subject_action",
-                "additional_direction",
-                "continuity_state",
-                "optional_flourish",
-            ):
-                if field_name in shot:
-                    shot[field_name] = sanitize_unverified_mtv_mouth_timing(
-                        shot.get(field_name)
-                    )
         shot["subject_action"] = _append_once(
             shot.get("subject_action"),
-            "S1 is P1, the sole lead singer. " + MTV_AUDIO_DRIVEN_MOUTH_CONTRACT,
+            "S1 is P1, the sole lead singer. "
+            + (
+                "P1 sings only during audible A2 vocal phrases, with clearly visible frame-matched mouth shapes, jaw motion, breaths, eye expression and musical gestures; during A2 silence P1 remains visibly non-singing. "
+                if has_a2_vocal_reference else
+                "P1 performs the current A1 source window with clearly visible, frame-matched mouth shapes, jaw motion, breaths, eye expression and musical gestures. "
+            )
+            + "P2 and P3 remain non-singing support performers when visible.",
         )
         shot["additional_direction"] = _append_once(
             shot.get("additional_direction"),
             "Synchronize all visible performance accents and editorial beats to the matching A1 "
-            "Timeline window. P4 owns the scene; never replace the singer, scene or soundtrack. "
-            + MTV_SUPPORT_MOUTH_CONTRACT,
+            "Timeline window. P4 owns the scene; never replace the singer, scene or soundtrack.",
         )
-        shot["native_audio_direction"] = MTV_MASTER_AUDIO_CONTRACT
+        shot["native_audio_direction"] = (
+            audio_contract
+            + (" " + MTV_VOCAL_REFERENCE_CONTRACT if has_a2_vocal_reference else "")
+        )
         shot["environment_continuity"] = (
-            "Continue P4's visible acoustic space and advance A1 source time continuously across "
-            "the cut; never restart A1 at a Segment boundary."
+            "Continue P4's visible acoustic space and advance "
+            + (
+                "A1 Music and A2 Vocal source time together"
+                if has_a2_vocal_reference else "A1 source time"
+            )
+            + " continuously across the cut; never restart audio at a Segment boundary."
         )
         shot["audio_reference_intent"] = (
-            "@A1 is performance timing and the exact final Master Audio, not a timbre suggestion. "
-            "Do not copy it into a newly synthesized voice; use it unchanged in final assembly."
+            (
+                "@A1 is the instrumental reference and @A2 is the sole vocal-performance reference; "
+                "the untouched separator Mix is the exact final Master Audio. "
+                if has_a2_vocal_reference else
+                "@A1 is the exact final Master Audio, not a timbre suggestion. "
+            )
+            + (
+                "Never drive mouth motion from A1 accompaniment or vocal residue. "
+                if has_a2_vocal_reference else
+                "With no A2 loaded, use A1 for performance timing. "
+            )
+            + (
+                "Do not synthesize a replacement voice; restore the untouched separator Mix in final assembly."
+                if has_a2_vocal_reference else
+                "Do not synthesize a replacement voice; use A1 unchanged in final assembly."
+            )
         )
     if removed_speech:
         warnings = [str(value) for value in plan.get("design_warnings") or []]
         warnings.append(
-            f"Removed {removed_speech} model-invented speech/lyric layer(s); A1 remains the sole "
-            "vocal and music source. Add exact lyrics to the Design Requirement only when editable "
+            f"Removed {removed_speech} model-invented speech/lyric layer(s); the loaded audio contract remains authoritative. "
+            "Add exact lyrics to the Design Requirement only when editable "
             "lyric timing is required."
         )
         plan["design_warnings"] = list(dict.fromkeys(warnings))
     plan["mtv_audio_policy"] = {
-        "schema_version": 2,
-        "master_audio_id": "A1",
-        "final_audio_mode": "replace_h3_with_exact_timeline_master",
-        "lip_sync_generation_max_seconds": MTV_MAX_LIPSYNC_SEGMENT_SECONDS,
-        "lyric_timing_mode": (
-            "authored_text_layers" if authored_lyric_timing else "audio_driven_only"
+        "schema_version": 3,
+        "master_audio_id": (
+            "AUDIO_SEPARATOR_MIX" if has_a2_vocal_reference else "A1"
         ),
-        "singing_lipsync_qc": "auto_director_repair_continue",
+        "instrumental_reference_id": "A1" if has_a2_vocal_reference else "",
+        "final_audio_mode": (
+            "replace_h3_with_separator_exact_mix"
+            if has_a2_vocal_reference else
+            "replace_h3_with_exact_timeline_master"
+        ),
+        "vocal_reference_id": "A2" if has_a2_vocal_reference else "",
+        "vocal_reference_mode": (
+            "lip_motion_only_excluded_from_final_mix"
+            if has_a2_vocal_reference else "fallback_to_a1"
+        ),
         "lead_singer_id": "P1",
         "support_ids": ["P2", "P3"],
         "scene_master_id": "P4",
@@ -509,256 +458,52 @@ def enforce_mtv_scene_keyframes(
     return plan
 
 
-def mtv_reference_audio_window(
-    asset: object,
-    *,
-    timeline_start: float,
-    timeline_end: float,
-    maximum_tail_padding_seconds: float = 0.5,
-) -> dict | None:
-    """Describe an A1 slice, allowing only final grid-rounding silence padding.
-
-    H3 duration controls use a half-second grid, while a probed recording can
-    end at an arbitrary sample.  The last hidden request may therefore extend
-    a fraction of a second beyond A1.  Returning the opening of A1 in that case
-    destroys end-of-song lip sync; the correct behaviour is to keep the final
-    source window and pad only the tiny grid remainder with silence.
-    """
-
-    media_id = _media_id(
-        _row_value(asset, "reference_id", "")
-        or _row_value(asset, "media_id", "")
-    )
-    if media_id != "A1" or str(_row_value(asset, "media_type", "")).lower() != "audio":
-        return None
-    start = float(timeline_start)
-    end = float(timeline_end)
-    asset_start = float(_row_value(asset, "start_seconds", 0.0) or 0.0)
-    asset_end = float(_row_value(asset, "end_seconds", 0.0) or 0.0)
-    if end <= start or start < asset_start - 1e-6 or start >= asset_end - 1e-6:
-        return None
-    padding = max(0.0, end - asset_end)
-    if padding > max(0.0, float(maximum_tail_padding_seconds)) + 1e-6:
-        return None
-    source_in = max(0.0, float(_row_value(asset, "source_in_seconds", 0.0) or 0.0))
-    source_offset = source_in + start - asset_start
-    playable = max(0.0, min(end, asset_end) - start)
-    if playable <= 0.0:
-        return None
-    return {
-        "source_offset_seconds": round(source_offset, 6),
-        "playable_duration_seconds": round(playable, 6),
-        "output_duration_seconds": round(end - start, 6),
-        "padding_seconds": round(padding, 6),
-    }
-
-
-def _pearson(left: list[float], right: list[float]) -> float:
-    count = min(len(left), len(right))
-    if count < 3:
-        return 0.0
-    left = left[:count]
-    right = right[:count]
-    mean_left = sum(left) / count
-    mean_right = sum(right) / count
-    numerator = sum(
-        (a - mean_left) * (b - mean_right) for a, b in zip(left, right)
-    )
-    left_energy = sum((value - mean_left) ** 2 for value in left)
-    right_energy = sum((value - mean_right) ** 2 for value in right)
-    denominator = math.sqrt(left_energy * right_energy)
-    if denominator <= 1e-12:
-        return 1.0 if abs(mean_left - mean_right) <= 1e-6 else 0.0
-    return max(-1.0, min(1.0, numerator / denominator))
-
-
-def evaluate_singing_lipsync_envelopes(
-    reference_envelope: list[float],
-    generated_envelope: list[float],
-    *,
-    envelope_fps: float = 50.0,
-    max_lag_seconds: float = 0.12,
-    minimum_overall_correlation: float = 0.55,
-    minimum_tail_correlation: float = 0.45,
-    minimum_onset_correlation: float = 0.20,
-) -> dict:
-    """Evaluate timing similarity without requiring identical voice timbre."""
-
-    maximum_lag = max(0, round(max_lag_seconds * envelope_fps))
-    best: tuple[float, int, list[float], list[float]] | None = None
-    for lag in range(-maximum_lag, maximum_lag + 1):
-        if lag < 0:
-            reference = reference_envelope[-lag:]
-            generated = generated_envelope[: len(reference)]
-        elif lag > 0:
-            generated = generated_envelope[lag:]
-            reference = reference_envelope[: len(generated)]
-        else:
-            count = min(len(reference_envelope), len(generated_envelope))
-            reference = reference_envelope[:count]
-            generated = generated_envelope[:count]
-        count = min(len(reference), len(generated))
-        reference = reference[:count]
-        generated = generated[:count]
-        correlation = _pearson(reference, generated)
-        if best is None or correlation > best[0]:
-            best = (correlation, lag, reference, generated)
-    if best is None:
-        return {
-            "passed": False,
-            "status": "hard_block",
-            "message": "Singing Lip-Sync QC HARD BLOCK · audio could not be compared.",
-        }
-    overall, lag, reference, generated = best
-    tail_start = max(0, int(len(reference) * 0.6))
-    tail = _pearson(reference[tail_start:], generated[tail_start:])
-    reference_onsets = [
-        max(0.0, right - left) for left, right in zip(reference, reference[1:])
-    ]
-    generated_onsets = [
-        max(0.0, right - left) for left, right in zip(generated, generated[1:])
-    ]
-    onsets = _pearson(reference_onsets, generated_onsets)
-    lag_seconds = lag / max(1e-6, float(envelope_fps))
-    reasons: list[str] = []
-    if overall < minimum_overall_correlation:
-        reasons.append("whole-window rhythm diverged")
-    if tail < minimum_tail_correlation:
-        reasons.append("tail lip-sync lock decayed")
-    if onsets < minimum_onset_correlation:
-        reasons.append("vocal/music onsets diverged")
-    if abs(lag_seconds) > max_lag_seconds + 1e-9:
-        reasons.append("timing offset exceeded tolerance")
-    passed = not reasons
-    status = "pass" if passed else "hard_block"
-    message = (
-        f"Singing Lip-Sync QC {'PASS' if passed else 'HARD BLOCK'} · "
-        f"A1 rhythm {overall:.2f} · tail {tail:.2f} · onsets {onsets:.2f} · "
-        f"lag {lag_seconds * 1000:+.0f}ms"
-    )
-    if reasons:
-        message += " · " + "; ".join(reasons) + ". Regenerate this Segment."
-    return {
-        "passed": passed,
-        "status": status,
-        "overall_correlation": round(overall, 4),
-        "tail_correlation": round(tail, 4),
-        "onset_correlation": round(onsets, 4),
-        "lag_seconds": round(lag_seconds, 4),
-        "message": message,
-    }
-
-
-def _decode_audio_envelope(
-    ffmpeg: str | Path,
-    source: str | Path,
-    *,
-    duration_seconds: float,
-    source_offset_seconds: float = 0.0,
-    sample_rate: int = 16000,
-    envelope_fps: int = 50,
-) -> list[float]:
-    command = [str(ffmpeg), "-hide_banner", "-loglevel", "error"]
-    if source_offset_seconds > 1e-6:
-        command.extend(("-ss", f"{source_offset_seconds:.6f}"))
-    command.extend((
-        "-i", str(source), "-t", f"{max(0.01, duration_seconds):.6f}",
-        "-vn", "-ac", "1", "-ar", str(sample_rate), "-f", "f32le", "pipe:1",
-    ))
-    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
-    if completed.returncode:
-        raise RuntimeError(
-            "Singing Lip-Sync QC could not decode audio: "
-            + completed.stderr.decode("utf-8", errors="replace")[-800:]
-        )
-    samples = array("f")
-    samples.frombytes(completed.stdout)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    frame_samples = max(1, round(sample_rate / envelope_fps))
-    envelope: list[float] = []
-    for start in range(0, len(samples) - frame_samples + 1, frame_samples):
-        frame = samples[start : start + frame_samples]
-        envelope.append(math.sqrt(sum(value * value for value in frame) / frame_samples))
-    return envelope
-
-
-def analyze_singing_lipsync_alignment(
-    ffmpeg: str | Path,
-    generated_video: str | Path,
-    reference_audio: str | Path,
-    *,
-    duration_seconds: float,
-    reference_offset_seconds: float = 0.0,
-) -> dict:
-    """Compare H3's untouched generated audio with its exact A1 window."""
-
-    reference = _decode_audio_envelope(
-        ffmpeg,
-        reference_audio,
-        duration_seconds=duration_seconds,
-        source_offset_seconds=reference_offset_seconds,
-    )
-    generated = _decode_audio_envelope(
-        ffmpeg,
-        generated_video,
-        duration_seconds=duration_seconds,
-    )
-    result = evaluate_singing_lipsync_envelopes(reference, generated)
-    result.update(
-        duration_seconds=round(float(duration_seconds), 6),
-        reference_audio=str(reference_audio),
-    )
-    return result
-
-
 def exact_master_audio_asset(
     assets: list[object],
     *,
     special_skill_key: str,
     timeline_start: float,
     duration: float,
+    exact_mix_path: str | Path | None = None,
 ) -> dict | None:
-    """Return the physical A1 slice that must replace generated H3 audio."""
+    """Return the exact Mix/A1 slice that must replace generated H3 audio."""
 
     if not is_mtv_singing_skill(special_skill_key):
         return None
+    override = Path(str(exact_mix_path or ""))
     for asset in assets or []:
         media_id = _media_id(
             _row_value(asset, "reference_id", "") or _row_value(asset, "media_id", "")
         )
         if media_id != "A1" or str(_row_value(asset, "media_type", "")).lower() != "audio":
             continue
-        path = Path(str(_row_value(asset, "local_path", "") or ""))
-        if not path.is_file():
+        a1_path = Path(str(_row_value(asset, "local_path", "") or ""))
+        if not a1_path.is_file():
             continue
-        requested_end = float(timeline_start) + float(duration)
-        window = mtv_reference_audio_window(
-            asset,
-            timeline_start=float(timeline_start),
-            timeline_end=requested_end,
-            maximum_tail_padding_seconds=0.5,
-        )
-        if window is None:
-            continue
+        if (
+            "AUDIO SEPARATOR MUSIC STEM"
+            in str(_row_value(asset, "recognition", "") or "")
+            and not override.is_file()
+        ):
+            # Publishing this A1 alone would silently remove the singer. The
+            # Project must retain the untouched Mix created with this stem set.
+            return None
+        path = override if override.is_file() else a1_path
         asset_start = float(_row_value(asset, "start_seconds", 0.0) or 0.0)
         asset_end = float(_row_value(asset, "end_seconds", 0.0) or 0.0)
         if asset_end <= timeline_start or asset_start >= timeline_start + duration:
             continue
         source_in = float(_row_value(asset, "source_in_seconds", 0.0) or 0.0)
-        source_offset = float(window["source_offset_seconds"])
+        source_offset = max(0.0, source_in + timeline_start - asset_start)
         source_out = float(_row_value(asset, "source_out_seconds", 0.0) or 0.0)
         source_duration = float(_row_value(asset, "source_duration_seconds", 0.0) or 0.0)
         available_end = source_out if source_out > source_in else source_duration
-        playable_duration = float(window["playable_duration_seconds"])
-        if available_end > 0.0 and source_offset + playable_duration > available_end + 0.05:
+        if available_end > 0.0 and source_offset + duration > available_end + 0.05:
             continue
         return {
             "path": str(path.resolve()),
             "source_offset_seconds": source_offset,
             "duration_seconds": max(0.01, float(duration)),
-            "playable_duration_seconds": playable_duration,
-            "padding_seconds": float(window["padding_seconds"]),
         }
     return None
 

@@ -29,84 +29,13 @@ from comfy_submit_worker import (
     upload_file,
     wait_for_history,
 )
-from music_video_engine import analyze_singing_lipsync_alignment
 from workflow_engine import validate_portable_media_manifest
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 23
+SMART_RENDER_POLICY_VERSION = 22
 AUDIO_JOIN_FADE_SECONDS = 0.04
-
-
-class SingingLipSyncQCError(RuntimeError):
-    """H3's untouched segment audio no longer follows the supplied A1 timing."""
-
-    def __init__(self, result: dict):
-        self.result = dict(result)
-        super().__init__(str(result.get("message") or "Singing Lip-Sync QC failed."))
-
-
-SINGING_LIPSYNC_AUTO_REPAIR_MARKER = "SINGING LIP-SYNC AUTO-DIRECTOR REPAIR"
-
-
-def apply_singing_lipsync_auto_repair(
-    workflow: dict,
-    *,
-    repair_round: int,
-) -> tuple[bool, str]:
-    """Strengthen the actual H3 prompt after an MTV timing-QC miss."""
-
-    round_number = max(1, int(repair_round))
-    support_rule = (
-        "P2 and P3 may remain only as silent background support with closed, "
-        "non-vocal mouths"
-        if round_number == 1
-        else "Remove P2 and P3 from readable facial coverage; P1 is the only visible face"
-    )
-    framing = (
-        "stable medium close-up"
-        if round_number <= 2
-        else "stable close-up with P1's full face, lips and jaw unobstructed"
-    )
-    direction = (
-        f"{SINGING_LIPSYNC_AUTO_REPAIR_MARKER} · round {round_number}. "
-        f"Re-stage this exact Segment as one continuous {framing}. "
-        "Keep P1 facing the camera frontally or at a readable three-quarter angle for "
-        "the entire vocal interval. P1's lips, jaw and both mouth corners remain sharp, "
-        "well lit and never covered by hair, hands, props, foreground objects or motion blur. "
-        "P1 continuously performs only the exact current A1 Timeline window; local 00:00 "
-        "continues from that A1 position and never restarts the song. "
-        f"{support_rule}. No other person speaks, sings, lip-syncs or opens their mouth as a "
-        "performer. No profile turn, back turn, walking away, face exit, cutaway, rapid orbit, "
-        "whip pan, zoom, montage, slow motion or shot transition during this recovery Segment. "
-        "Preserve P1 identity, clothing, scene and A1 audio exactly; change only staging and "
-        "camera readability to recover singing lip synchronization."
-    )
-
-    prompt_nodes: list[dict] = []
-    for node in workflow.values():
-        if not isinstance(node, dict) or node.get("class_type") != "MiniMaxH3ReferenceToVideo":
-            continue
-        prompt_ref = (node.get("inputs") or {}).get("prompt")
-        if isinstance(prompt_ref, (list, tuple)) and prompt_ref:
-            target = workflow.get(str(prompt_ref[0]))
-            if target is None:
-                target = workflow.get(prompt_ref[0])
-            if isinstance(target, dict):
-                prompt_nodes.append(target)
-        elif isinstance(prompt_ref, str):
-            node.setdefault("inputs", {})["prompt"] = prompt_ref.rstrip() + "\n\n" + direction
-            return True, direction
-
-    for node in prompt_nodes:
-        inputs = node.setdefault("inputs", {})
-        for key in ("value", "text", "prompt"):
-            current = inputs.get(key)
-            if isinstance(current, str):
-                inputs[key] = current.rstrip() + "\n\n" + direction
-                return True, direction
-    return False, direction
 
 
 def emit(payload: dict) -> None:
@@ -351,25 +280,6 @@ def _write_manifest(path: Path, payload: dict) -> None:
 def classify_generation_error(error: object) -> str:
     """Classify retry/failure evidence without weakening output quality."""
     text = str(error or "").casefold()
-    if "singing lip-sync qc" in text:
-        return "singing_lipsync_qc"
-    if any(
-        marker in text
-        for marker in (
-            "hostbuffer.read_file_slice failed",
-            "hostbuf_read_file_slice",
-            "xfer_file_read_at",
-            "xfer_file_read",
-            "getoverlappedresult failed error=1450",
-            "error=1450",
-            "error 1450",
-            "error_no_system_resources",
-        )
-    ):
-        # AIMDO DynamicVRAM/pinned-memory staging failure. Unloading here
-        # immediately forces another large checkpoint remap and makes the
-        # Windows resource failure more likely, so it is not treated as OOM.
-        return "aimdo_hostbuffer"
     if any(
         marker in text
         for marker in (
@@ -407,16 +317,8 @@ def classify_generation_error(error: object) -> str:
 def preflight_smart_render(job: dict) -> dict:
     """Fail before media upload if a long render cannot complete on this host."""
     segments = list(job.get("segments") or [])
-    if not segments:
-        raise ValueError("Smart Render requires at least one internal segment.")
-    if len(segments) < 2 and not any(
-        bool((segment.get("singing_lipsync_qc") or {}).get("enabled"))
-        for segment in segments
-    ):
-        raise ValueError(
-            "Smart Long Render requires at least two internal segments unless "
-            "MTV Singing Lip-Sync QC owns the Segment."
-        )
+    if len(segments) < 2:
+        raise ValueError("Smart Long Render requires at least two internal segments.")
     for index, segment in enumerate(segments, 1):
         duration = float(segment.get("end_seconds", 0.0)) - float(
             segment.get("start_seconds", 0.0)
@@ -757,10 +659,7 @@ def queue_segment(
 ) -> dict:
     server = job["server"].rstrip("/")
     http_timeout = max(1, int(job.get("http_timeout", 30)))
-    singing_qc_enabled = bool((segment.get("singing_lipsync_qc") or {}).get("enabled"))
     attempts = max(1, min(5, int(job.get("segment_attempts", 3))))
-    if singing_qc_enabled:
-        attempts = max(attempts, 5)
     reconnect_timeout = max(
         1,
         int(job.get("connection_recovery_timeout", DEFAULT_RECONNECT_TIMEOUT_SECONDS)),
@@ -773,11 +672,7 @@ def queue_segment(
         and resume_status in {"queued", "monitoring", "reconnecting", "running"}
     )
     first_attempt = max(1, int(segment.get("attempts_used", 1) or 1))
-    attempt_range = (
-        range(first_attempt, attempts + 1)
-        if resume_existing
-        else range(1, attempts + 1)
-    )
+    attempt_range = [first_attempt] if resume_existing else range(1, attempts + 1)
     for attempt in attempt_range:
         prompt_id = resumed_prompt_id if resume_existing else ""
         try:
@@ -838,95 +733,6 @@ def queue_segment(
             video = _primary_video(downloaded)
             if video is None:
                 raise RuntimeError(f"Segment {segment['index'] + 1} produced no downloadable video.")
-            singing_qc_result: dict = {}
-            singing_qc_spec = segment.get("singing_lipsync_qc") or {}
-            if singing_qc_spec.get("enabled"):
-                singing_qc_result = analyze_singing_lipsync_alignment(
-                    Path(job["ffmpeg"]),
-                    video,
-                    Path(str(singing_qc_spec["reference_audio"])),
-                    duration_seconds=float(
-                        singing_qc_spec.get(
-                            "duration_seconds",
-                            float(segment.get("end_seconds", 0.0))
-                            - float(segment.get("start_seconds", 0.0)),
-                        )
-                    ),
-                    reference_offset_seconds=float(
-                        singing_qc_spec.get("reference_offset_seconds", 0.0)
-                    ),
-                )
-                if not singing_qc_result.get("passed"):
-                    original_message = str(singing_qc_result.get("message") or "")
-                    has_more_attempts = attempt < attempts
-                    prompt_patched = False
-                    repair_direction = ""
-                    if has_more_attempts:
-                        prompt_patched, repair_direction = apply_singing_lipsync_auto_repair(
-                            workflow,
-                            repair_round=attempt,
-                        )
-                    singing_qc_result = dict(singing_qc_result)
-                    singing_qc_result.update(
-                        status="auto_repair" if has_more_attempts else "warning",
-                        hard_block=False,
-                        original_message=original_message,
-                        auto_repair_round=attempt,
-                        auto_repair_attempt_limit=attempts,
-                        auto_repair_will_retry=has_more_attempts,
-                        prompt_patched=prompt_patched,
-                    )
-                    if has_more_attempts:
-                        singing_qc_result["message"] = (
-                            "Singing Lip-Sync QC AUTO-REPAIR · timing did not meet the target; "
-                            "P1 front/three-quarter singing coverage applied and Segment will "
-                            f"regenerate automatically ({attempt}/{attempts})."
-                        )
-                    else:
-                        singing_qc_result["message"] = (
-                            "Singing Lip-Sync QC WARNING · automatic Shot repair reached its "
-                            f"{attempts}-attempt safety limit; the Job will continue with this "
-                            "Segment for review. It will not be reused as a passed QC cache."
-                        )
-                    emit(
-                        {
-                            "progress": singing_qc_result["message"],
-                            "singing_lipsync_qc": singing_qc_result,
-                            "singing_lipsync_auto_repair": (
-                                {
-                                    "round": attempt,
-                                    "attempt_limit": attempts,
-                                    "prompt_patched": prompt_patched,
-                                    "direction": repair_direction,
-                                }
-                                if has_more_attempts
-                                else None
-                            ),
-                            "segment_id": segment.get("segment_id", ""),
-                            "segment_start_seconds": singing_qc_spec.get(
-                                "timeline_start_seconds", segment.get("start_seconds", 0.0)
-                            ),
-                            "segment_end_seconds": singing_qc_spec.get(
-                                "timeline_end_seconds", segment.get("end_seconds", 0.0)
-                            ),
-                        }
-                    )
-                    if has_more_attempts:
-                        raise SingingLipSyncQCError(singing_qc_result)
-                else:
-                    emit(
-                        {
-                            "progress": singing_qc_result["message"],
-                            "singing_lipsync_qc": singing_qc_result,
-                            "segment_id": segment.get("segment_id", ""),
-                            "segment_start_seconds": singing_qc_spec.get(
-                                "timeline_start_seconds", segment.get("start_seconds", 0.0)
-                            ),
-                            "segment_end_seconds": singing_qc_spec.get(
-                                "timeline_end_seconds", segment.get("end_seconds", 0.0)
-                            ),
-                        }
-                    )
             persisted_segment = {key: value for key, value in segment.items() if key != "workflow"}
             return {
                 **persisted_segment,
@@ -939,19 +745,12 @@ def queue_segment(
                 "error": "",
                 "attempts_used": attempt,
                 "failure_class": "",
-                "singing_lipsync_qc_result": singing_qc_result,
             }
         except Exception as exc:
             last_error = exc
             failure_class = classify_generation_error(exc)
-            retrying_qc = isinstance(exc, SingingLipSyncQCError)
             emit({
-                "progress": (
-                    f"Segment {segment['index'] + 1} applying automatic singing Shot repair "
-                    f"before attempt {attempt + 1}/{attempts}"
-                    if retrying_qc and attempt < attempts
-                    else f"Segment {segment['index'] + 1} attempt {attempt}/{attempts} failed: {exc}"
-                ),
+                "progress": f"Segment {segment['index'] + 1} attempt {attempt}/{attempts} failed: {exc}",
                 "segment_index": segment["index"],
                 "failure_class": failure_class,
                 "attempt": attempt,
@@ -962,16 +761,7 @@ def queue_segment(
             # exceeded its recovery window; preserve prompt_id for later resume.
             if isinstance(exc, ComfyConnectionRecoveryTimeout):
                 raise
-            should_release = failure_class == "oom"
-            released = (
-                release_comfy_memory(server, http_timeout)
-                if should_release
-                else (
-                    "ComfyUI H3 model kept resident; AIMDO HostBuffer reload avoided"
-                    if failure_class == "aimdo_hostbuffer"
-                    else "ComfyUI H3 model kept resident for retry"
-                )
-            )
+            released = release_comfy_memory(server, http_timeout)
             emit({
                 "progress": (
                     f"{released} · retry class {failure_class}"
@@ -984,13 +774,7 @@ def queue_segment(
                 # OOM often needs a little longer for ComfyUI/PyTorch to return
                 # released allocations to the driver. Never lower megapixels
                 # or silently change the accepted quality contract.
-                time.sleep(
-                    2.0
-                    if failure_class == "oom"
-                    else 1.5
-                    if failure_class == "aimdo_hostbuffer"
-                    else 1.0
-                )
+                time.sleep(2.0 if failure_class == "oom" else 1.0)
         finally:
             resume_existing = False
     raise RuntimeError(str(last_error or "Unknown segment generation error"))
@@ -1073,18 +857,7 @@ def main() -> int:
     previous_video: Path | None = None
     for index, segment in enumerate(segments):
         cached = Path(str(segment.get("output_path", "")))
-        cached_qc_reusable = bool(
-            not (segment.get("singing_lipsync_qc") or {}).get("enabled")
-            or (
-                isinstance(segment.get("singing_lipsync_qc_result"), dict)
-                and segment["singing_lipsync_qc_result"].get("passed") is True
-            )
-        )
-        if (
-            segment.get("status") == "cached"
-            and cached.is_file()
-            and cached_qc_reusable
-        ):
+        if segment.get("status") == "cached" and cached.is_file():
             segment["output_path"] = str(cached.resolve())
             completed.append({key: value for key, value in segment.items() if key != "workflow"})
             completed_indexes.add(index)
@@ -1215,9 +988,6 @@ def main() -> int:
                 failure_class=failure_class,
                 retry_budget=max(1, min(5, int(job.get("segment_attempts", 3)))),
             )
-            singing_qc_result = getattr(exc, "result", None)
-            if isinstance(singing_qc_result, dict):
-                failed["singing_lipsync_qc_result"] = dict(singing_qc_result)
             if accepted_prompt_id:
                 failed["prompt_id"] = accepted_prompt_id
             manifest = {
@@ -1245,13 +1015,6 @@ def main() -> int:
                     "error": str(exc),
                     "failure_class": failure_class,
                 },
-                "singing_lipsync_qc": (
-                    dict(singing_qc_result)
-                    if isinstance(singing_qc_result, dict)
-                    else None
-                ),
-                "segment_start_seconds": segment.get("core_start_seconds", segment.get("start_seconds", 0.0)),
-                "segment_end_seconds": segment.get("core_end_seconds", segment.get("end_seconds", 0.0)),
                 "partial_manifest": manifest,
                 "render_progress": build_render_progress(
                     job,
@@ -1297,10 +1060,7 @@ def main() -> int:
             "render_progress": build_render_progress(
                 job, segments, completed_indexes, stage="complete", current_index=index
             ),
-            "progress": (
-                f"Segment {index + 1}/{len(segments)} complete · "
-                "H3 model kept resident for the next Segment"
-            ),
+            "progress": f"Segment {index + 1}/{len(segments)} complete · " + release_comfy_memory(server, http_timeout),
         })
 
     emit({
@@ -1310,7 +1070,6 @@ def main() -> int:
         "progress": f"Preparing to assemble {len(completed)} completed segments",
     })
     master = assemble_master(job, completed)
-    final_cleanup = release_comfy_memory(server, http_timeout)
     final_manifest = {
         "format": "h3-smart-render-manifest",
         "version": 1,
@@ -1323,7 +1082,6 @@ def main() -> int:
         "megapixels": job.get("megapixels"),
         "target_duration_seconds": job.get("target_duration_seconds"),
         "master_output": str(master),
-        "final_comfy_cleanup": final_cleanup,
         "segments": completed,
     }
     _write_manifest(manifest_path, final_manifest)
@@ -1343,8 +1101,6 @@ def main() -> int:
         "render_progress": build_render_progress(
             job, segments, completed_indexes, stage="final"
         ),
-        "final_comfy_cleanup": final_cleanup,
-        "progress": f"Smart Render complete · {final_cleanup}",
     })
     return 0
 
