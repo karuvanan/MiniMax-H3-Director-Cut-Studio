@@ -1,8 +1,10 @@
 name: MTV Singing H3
-version: 1.1.0
+version: 1.2.0
 category: music-video
 duration_source: A1
 duration_policy: exact_playable_source_window
 required_media: [P1, P2, P3, P4, A1]
+optional_media: [A2]
+auto_vocal_reference: Kim_Vocal_2.onnx
 generated_media: [P5, P6, P7, P8, P9]
 master_audio: A1

@@ -1,7 +1,7 @@
 ---
 name: mtv-singing-h3
 description: |
-  Create a MiniMax H3 singing music video with P1 as the exact lead singer, P2/P3 as identity-locked supporting people, P4 as the scene master, A1 as the unchanged song and final Master Audio, and exactly five P4-derived scene-state references in P5-P9. Use for lip-synced MTV, performance video, singing video, music performance, 对嘴唱歌, 唱歌视频 and 音乐MV requests.
+  Create a MiniMax H3 singing music video with P1 as the exact lead singer, P2/P3 as identity-locked supporting people, P4 as the scene master, explicit Audio Separator Music→A1 and Vocal→A2 stems when used, an untouched Mix as final Master Audio, and exactly five P4-derived scene-state references in P5-P9. Use for lip-synced MTV, performance video, singing video, music performance, 对嘴唱歌, 唱歌视频 and 音乐MV requests.
 ---
 
 # MTV Singing H3
@@ -13,31 +13,38 @@ Apply this Special Skill with the bound Default H3 Prompt Writing Skill. The tas
 - `@P1` is S1 and the only lead singer. Preserve P1's exact recognizable face, age, skin, hairstyle, body, full wardrobe and accessories in every frame.
 - `@P2` and `@P3` are distinct supporting people. Preserve each identity separately. They may react, dance or share the scene, but they do not sing, inherit P1's face or copy P1's lip motion unless the user explicitly authors another singer.
 - `@P4` is the scene master. It owns location geometry, camera axis, perspective, colour, colour temperature, weather, surface materials, practical-light direction and atmosphere. It owns no P1-P3 identity.
-- `@A1` is the only continuous Master Audio and the authoritative sung performance.
+- Without explicit separation, `@A1` is the continuous combined Master Audio and authoritative sung performance.
+- After using Audio Separator, `@A1` is the Music stem, `@A2` is the Vocal stem, and the untouched separator Mix is the Project's exact final Master Audio.
 
 Studio must derive the Design duration from A1's playable source window. A1's probed source duration overrides the old workspace duration and every numeric duration left in a reusable template. If the user explicitly trims A1 with source-in/source-out, that selected source window becomes the duration. Do not start Design until A1 duration metadata is available.
 
 If any explicitly referenced source is not loaded, report the exact missing ID before Apply. Never substitute another slot.
 
-## A1 exact-master rule
+## Exact-master rule
 
-Use the original A1 recording without changing its singer, lyrics, melody, pitch, key, tempo, rhythm, phrasing, breaths, instrumentation or selected Timeline window. A1 is not merely a BPM, mood, timbre or composition suggestion.
+If Audio Separator has not been used, preserve the original combined A1 recording without changing its singer, lyrics, melody, pitch, key, tempo, rhythm, phrasing, breaths, instrumentation or selected Timeline window.
+
+If Audio Separator has been used, never send the combined Mix to H3 as A1. Music goes to A1 and Vocal goes to A2 so residual/instrumental events cannot compete with the true singing reference. The untouched Mix is stored outside the H3 reference slots and restored as the sole final soundtrack during final assembly.
 
 H3 receives the matching A1 source window to drive performance timing. P1's visible mouth shapes, jaw, breaths, eye expression, head accents and gestures follow that exact window. After generation, the Studio replaces H3's synthesized audio stream with the unchanged A1 Timeline master. Do not regenerate, imitate, transpose, pitch-correct, time-stretch, loop, restart, remix or layer a second song, singer, TTS voice or score over A1.
 
 When a later hidden Segment starts, its A1 source time equals that Segment's Timeline start. Never replay the beginning of A1 at a cut.
 
-Render lip-sync in hidden H3 windows no longer than 7 seconds. Prefer 5-7 seconds and align a boundary to an authored Shot when possible. Every window receives its exact local A1 slice; a Segment boundary is not a lyric, phrase or breath boundary.
+## Explicit Audio Separator rule
 
-Every Shot, media-use range, generated P5-P9 state, Generation Work Area and final assembly must cover `0.000` through the resolved A1 ending. The final Shot may end at a non-half-second timestamp when required to preserve the exact audio ending. Never shorten, loop or time-stretch A1 to fit the previous Timeline. If H3's duration grid extends the final window by at most 0.5 seconds, preserve the real A1 tail and pad only the post-song grid remainder with silence; never restart A1.
+Audio separation is never automatic. The user opens `AUDIO SEPARATOR`, sends a source Mix to the Server API, reviews/downloads Vocal, Music and Mix, then explicitly clicks `ADD TO A1 & A2`.
+
+That action maps Music to A1, Vocal to A2 and stores the untouched Mix in the Project. Use A2 only to detect actual vocal phrases and drive P1's phoneme, mouth, jaw, breath and expression timing. Instrument-only passages in A1 must keep P1 visibly non-singing. A2 must not be monitored as a second audible track. If A2 is empty, retain the legacy combined-A1 behavior.
+
+Every Shot, media-use range, generated P5-P9 state, Generation Work Area and final assembly must cover `0.000` through the resolved A1 ending. The final Shot may end at a non-half-second timestamp when required to preserve the exact audio ending. Never shorten, loop, time-stretch or silence-pad A1 to fit the previous Timeline.
 
 ## Lyrics and lip-sync
 
-Do not invent lyrics from the scene or from an instrumental analysis. Mixed-song Whisper/ASR output is analysis metadata only and must never become spoken narrative guidance, dialogue or lyrics. If the user did not write exact lyrics in the Design Requirement, create no Lyrics, Dialogue or Voice-over Text Layer; follow A1 acoustically and visually. A1 alone controls continuous mouth timing: do not guess verse/chorus/final-phrase boundaries or author mouth-open/mouth-closed timing from visual semantics.
+Do not invent lyrics from the scene or from an instrumental analysis. If the user did not write exact lyrics in the Design Requirement, create no Lyrics, Dialogue or Voice-over Text Layer; follow A1 acoustically and visually.
 
 If the user supplies exact lyrics, preserve them verbatim in independent `lyrics` Text Layers on A6, assign `speaker=S1`, `lip_sync=true`, and align them to A1. Never use TTS to replace the sung performance. A lyric layer is timing/edit metadata; A1 remains the audible master.
 
-Keep P1's face and mouth readable during active vocals. Use frontal or three-quarter close-up and medium framing for key phrases, with natural performance coverage between them. P2/P3 keep neutral, closed or clearly non-vocal mouths whenever P1 sings. In group Shots, only P1 may have a readable front-facing singing mouth unless the user explicitly authors another singer.
+Keep P1's face and mouth readable during active vocals. Use frontal or three-quarter close-up and medium framing for key phrases, with natural performance coverage between them. Never make P2/P3 appear to sing P1's line.
 
 ## P5-P9 scene-state generation
 
@@ -65,10 +72,8 @@ Before returning Studio Director Design JSON, verify:
 - `lip_sync=true` for every user-authored lyric layer;
 - P2/P3 remain support identities and do not replace or merge with P1;
 - P4 controls the scene and P5-P9 are P4-derived environment states;
-- A1 is the sole exact final soundtrack, not a style reference;
+- A1 is the sole exact final soundtrack, not a style reference; A2, when present, is lip-motion timing only and is excluded from monitoring and final mixing;
 - no invented lyrics, second singer, TTS vocal or replacement score exists;
 - target duration equals the automatically resolved A1 playable duration, regardless of the previous Timeline or template duration, and is not extended by invented lyrics;
 - Shots cover the complete duration without gaps or overlap;
 - final hold is stable and A1 is never restarted at Segment boundaries.
-
-Before a generated Segment becomes reusable, run Singing Lip-Sync QC against H3's untouched output audio and the exact A1 window. Compare whole-window rhythm, vocal/music onsets, tail lock and timing offset without altering either audio stream. If a check misses, do not pause the Job: automatically restage that Segment with P1 frontal or readable three-quarter singing coverage, an unobstructed mouth and jaw, P2/P3 silent with non-vocal mouths, then regenerate it. Use up to five automatic repair attempts. If all attempts miss, continue the Job with a visible warning and keep that Segment ineligible for passed-QC cache reuse. This QC never remixes, repairs or replaces H3 audio.
