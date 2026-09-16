@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ProjectRoot,
-    [int]$Port = 7861,
+    [int]$Port = 7862,
     [int]$WaitSeconds = 20
 )
 
@@ -14,22 +14,12 @@ function Test-ContainsRoot {
     return $Value -and $Value.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
-function Test-ProjectOwnedProcess {
-    param($Process)
-    return (Test-ContainsRoot ([string]$Process.CommandLine)) -or
-        (Test-ContainsRoot ([string]$Process.ExecutablePath))
-}
-
-function Test-SoulXProcess {
+function Test-ProjectAudioSeparatorProcess {
     param($Process)
     $command = [string]$Process.CommandLine
-    $executable = [string]$Process.ExecutablePath
-    $soulxRuntime = Join-Path $root "models\SoulX-Singer-main"
-    return (Test-ProjectOwnedProcess $Process) -and (
-        $command -like "*soulx_server.py*" -or
-        $command -like "*webui_svc.py*" -or
-        $command -like "*SoulX-Singer-main*" -or
-        ($executable -and $executable.IndexOf($soulxRuntime, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    return (Test-ContainsRoot $command) -and (
+        $command -like "*audio_separator_server.py*" -or
+        $command -like "*vocal_separator_service.py*"
     )
 }
 
@@ -60,45 +50,42 @@ function Stop-ProcessTreeSafe {
     if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
         return
     }
-    & "$env:SystemRoot\System32\taskkill.exe" /PID $ProcessId /T /F | Out-Host
+    & "$env:SystemRoot\System32\taskkill.exe" /PID $ProcessId /T /F | Out-Null
     if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
-        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        # The process may exit between the second lookup and Stop-Process.
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "[SoulX] Stopped project-owned process tree PID $ProcessId"
+    Write-Host "[Audio Separator] Stopped project-owned process tree PID $ProcessId"
 }
 
-$initialProcesses = @(
+$projectProcesses = @(
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { Test-SoulXProcess $_ }
+        Where-Object { Test-ProjectAudioSeparatorProcess $_ }
 )
-foreach ($process in $initialProcesses) {
+foreach ($process in $projectProcesses) {
     Stop-ProcessTreeSafe ([int]$process.ProcessId)
 }
 
 $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(5, $WaitSeconds))
 do {
-    $listeners = @(Get-ListeningProcessIds)
-    foreach ($listenerId in $listeners) {
+    foreach ($listenerId in @(Get-ListeningProcessIds)) {
         $listener = Get-ProcessByIdSafe ([int]$listenerId)
         if (-not $listener) {
             continue
         }
-        if (-not (Test-ProjectOwnedProcess $listener)) {
-            $name = [string]$listener.Name
-            $path = [string]$listener.ExecutablePath
-            throw "Port $Port is owned by unrelated process PID $listenerId ($name) $path. It was not stopped."
+        if (-not (Test-ContainsRoot ([string]$listener.CommandLine))) {
+            throw "Port $Port belongs to unrelated process PID $listenerId and was not stopped."
         }
         Stop-ProcessTreeSafe ([int]$listenerId)
     }
-
     if (@(Get-ListeningProcessIds).Count -eq 0) {
         $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $Port)
         try {
             $probe.Start()
-            Write-Host "[SoulX] Port $Port is free."
+            Write-Host "[Audio Separator] Port $Port is free. CUDA model memory is released."
             exit 0
         } catch {
-            # The socket can remain unavailable briefly after its process exits.
+            # Windows may retain a socket briefly after process exit.
         } finally {
             $probe.Stop()
         }
