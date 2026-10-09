@@ -601,6 +601,7 @@ def compile_active_workflow(
     prompt: str | None = None,
     generation: dict[str, Any] | None = None,
     preserve_loader_node_ids: set[str] | None = None,
+    preferred_audio_reference_id: str = "",
 ) -> tuple[dict[str, dict[str, Any]], list[MediaAsset]]:
     """Compile a copy containing only references relevant to a generation time window.
 
@@ -678,7 +679,16 @@ def compile_active_workflow(
             match = re.search(r"(\d+)$", stable_reference_id(row[1]))
             return (int(match.group(1)) if match else 10_000, row[0][1])
 
-        logical_rows.sort(key=logical_number)
+        preferred_audio = str(preferred_audio_reference_id or "").strip().upper()
+        logical_rows.sort(
+            key=lambda row: (
+                0
+                if kind == "audio"
+                and stable_reference_id(row[1]).upper() == preferred_audio
+                else 1,
+                *logical_number(row),
+            )
+        )
         templates = physical_by_type[kind]
         if len(logical_rows) > len(templates):
             ids = ", ".join(stable_reference_id(row[1]) for row in logical_rows)

@@ -19,6 +19,31 @@ from workflow_engine import (
 
 
 class WorkflowEngineTests(unittest.TestCase):
+    def test_mtv_a2_can_be_first_h3_audio_without_changing_stable_ids(self):
+        path = Path(__file__).parent / "video_minimax_h3_r2v_9image_3audio_3video_api.json"
+        scan = load_workflow(path)
+        for asset in scan.assets:
+            asset.enabled = asset.media_type == "audio" and stable_reference_id(asset) in {"A1", "A2"}
+            if asset.enabled:
+                asset.timeline_placed = True
+                asset.start_seconds = 0.0
+                asset.end_seconds = 5.0
+
+        compiled, active = compile_active_workflow(
+            scan, 0.0, 5.0, preferred_audio_reference_id="A2"
+        )
+        by_id = {stable_reference_id(asset): asset for asset in active}
+        self.assertEqual(by_id["A2"].request_binding, "ref_audios.ref_audio_0")
+        self.assertEqual(by_id["A1"].request_binding, "ref_audios.ref_audio_1")
+        effective, _ = effective_reference_assets(active)
+        self.assertEqual(
+            remap_reference_tokens("Mouth @A2; beat @A1", scan.assets, effective),
+            "Mouth <Audio 1>; beat <Audio 2>",
+        )
+        h3_inputs = compiled[scan.h3_node_ids[0]]["inputs"]
+        self.assertIn("ref_audios.ref_audio_0", h3_inputs)
+        self.assertIn("ref_audios.ref_audio_1", h3_inputs)
+
     def test_scans_direct_image_audio_and_video_graph(self):
         payload = {
             "1": {"class_type": "LoadImage", "inputs": {"image": "hero.png"}},

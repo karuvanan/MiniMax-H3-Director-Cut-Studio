@@ -49,6 +49,22 @@ MTV_CAST_SCENE_CONTRACT = (
 )
 
 
+def retarget_legacy_mtv_lip_instruction(value: object, *, use_a2: bool) -> str:
+    """Correct the old P1→A1 lip instruction in saved MTV projects at prompt time.
+
+    This leaves all other authored direction and the saved project untouched.
+    """
+    text = str(value or "")
+    if not use_a2:
+        return text
+    return re.sub(
+        r"(\bP1\s+performs directly to\s+)@?A1(\s+with readable mouth, jaw, breath, facial and gesture timing)",
+        r"\g<1>@A2\g<2>",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def is_mtv_singing_skill(value: object) -> bool:
     return str(value or "").strip().casefold() == MTV_SINGING_SPECIAL_SKILL
 
@@ -201,6 +217,7 @@ def enforce_mtv_singing_plan(
     inventory = _inventory(existing_media)
     uses = [deepcopy(row) for row in plan.get("existing_media_uses") or [] if isinstance(row, dict)]
     has_a2_vocal_reference = _loaded(inventory.get("A2"))
+    lip_sync_source = "A2" if has_a2_vocal_reference else "A1"
 
     _upsert_use(
         uses, inventory, media_id="P1", media_type="image", duration=duration,
@@ -208,7 +225,13 @@ def enforce_mtv_singing_plan(
         instruction=(
             "Use @P1 as S1, the sole authoritative lead-singer identity for the complete MV. "
             "Preserve the exact face, hair, body, clothing and accessories. P1 performs directly "
-            "to A1 with readable mouth, jaw, breath, facial and gesture timing."
+            f"to @{lip_sync_source} as the sole lip-sync source, with readable mouth, jaw, breath, "
+            "facial and gesture timing. "
+            + (
+                "@A1 supplies accompaniment and edit rhythm only; it must not drive mouth motion."
+                if has_a2_vocal_reference else
+                "No separate vocal reference is loaded, so @A1 alone drives mouth motion."
+            )
         ), identity_anchor=True,
     )
     for media_id, track in (("P2", "V2"), ("P3", "V3")):

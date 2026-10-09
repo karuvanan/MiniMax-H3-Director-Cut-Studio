@@ -93,6 +93,7 @@ class MusicVideoEngineTests(unittest.TestCase):
         self.assertEqual(uses["A1"]["requirement_id"], "mtv_a1_exact_master_audio")
         self.assertEqual(plan["text_layers"], [])
         self.assertIn("sole lead singer", plan["shots"][0]["subject_action"])
+        self.assertIn("@A1 as the sole lip-sync source", uses["P1"]["instruction"])
         self.assertEqual(plan["mtv_audio_policy"]["final_audio_mode"], "replace_h3_with_exact_timeline_master")
 
     def test_optional_a2_activates_explicit_separated_audio_contract(self):
@@ -123,6 +124,9 @@ class MusicVideoEngineTests(unittest.TestCase):
         )
         self.assertIn("@A1 is the instrumental/music stem", plan["overall_soundscape"])
         self.assertIn("during A2 silence", plan["shots"][0]["subject_action"])
+        self.assertIn("@A2 as the sole lip-sync source", uses["P1"]["instruction"])
+        self.assertIn("@A1 supplies accompaniment", uses["P1"]["instruction"])
+        self.assertNotIn("to @A1 as the sole lip-sync source", uses["P1"]["instruction"])
 
     def test_empty_a2_retains_a1_only_fallback(self):
         media = [_media("P1", "image"), _media("A1", "audio")]
