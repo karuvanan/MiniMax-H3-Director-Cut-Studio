@@ -76,6 +76,30 @@ from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_mtv_supplied_speech_uses_a2_then_a1_without_activity_analysis(self):
+        loaded = str(Path(__file__).resolve())
+        a1 = MediaAsset(
+            "audio-1", "LoadAudio", "audio", "music.wav",
+            tag="<Audio 1>", reference_id="A1", local_path=loaded,
+        )
+        a2 = MediaAsset(
+            "audio-2", "LoadAudio", "audio", "vocal.wav",
+            tag="<Audio 2>", reference_id="A2", local_path=loaded,
+        )
+        self.assertEqual(
+            DirectorCutStudio._supplied_speech_audio_tag(
+                [a1, a2], prefer_mtv_vocal=True,
+            ),
+            "@A2",
+        )
+        a2.local_path = ""
+        self.assertEqual(
+            DirectorCutStudio._supplied_speech_audio_tag(
+                [a1, a2], prefer_mtv_vocal=True,
+            ),
+            "@A1",
+        )
+
     def test_hong_kong_comic_environment_fields_reach_h3_without_market_contract(self):
         cue = DirectorCue(
             "S1", "shot", 0.0, 3.0, "Mountain collision",
@@ -821,6 +845,32 @@ class DirectorTimelineDragTests(unittest.TestCase):
             with_audio.text_ranges[0]["supplied_audio_tag"], "<Audio 2>"
         )
         self.assertNotIn(window.text_layers[0].text, with_audio.shots[0])
+        window.project_dirty = False
+        window.close()
+
+    def test_silent_tail_of_speech_shot_cannot_inherit_conversation_state(self):
+        window = DirectorCutStudio()
+        window.director_cues = [DirectorCue(
+            "S1", "shot", 0.0, 10.0, "Interview then silent action", track_id="V1",
+            framing="Medium", subject_action="The woman speaks, then closes a laptop.",
+        )]
+        window.text_layers = [TextLayer(
+            "T1", "前半段对白。", 0.0, 5.0, "D1",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            shot_id="S1",
+        )]
+        full = window._prompt_spec_with_director_cues(window.prompt_panel.spec())
+        self.assertIn(
+            "natural conversational volume",
+            full.native_audio_ranges[0]["native_audio_direction"],
+        )
+        tail = window._prompt_spec_with_director_cues(
+            window.prompt_panel.spec(), window_start=5.0, window_end=10.0,
+        )
+        direction = tail.native_audio_ranges[0]["native_audio_direction"]
+        self.assertIn("HUMAN VOCAL CHANNEL: EMPTY", direction)
+        self.assertNotIn("natural conversational volume", direction)
+        self.assertEqual(tail.text_ranges, [])
         window.project_dirty = False
         window.close()
 
@@ -6274,6 +6324,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIsNotNone(asset)
         self.assertTrue(asset.timeline_placed)
         self.assertIn("AI DESIGN AUTHORED SPEECH TTS", asset.recognition)
+        self.assertIn("NATIVE SPEECH-ENVIRONMENT FUSION", asset.clip_prompt)
+        self.assertIn("never replaces, gates, mutes, resets or fades", asset.clip_prompt)
+        self.assertIn("never to ambience or Foley", asset.clip_prompt)
 
         window.render_settings.dialogue_tts_engine = "h3_native"
         window._use_h3_native_dialogue()

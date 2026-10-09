@@ -2,6 +2,35 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.5-alpha.5] - 2026-10-09
+
+### Native Speech–Environment Fusion
+
+- 修复对白或旁白开始时，H3把持续环境底噪一起降低或完全移除的问题。旧自动Production Mix同时要求环境声与音乐在人声期间降低约6 dB，现改为只有非叙事音乐可以Ducking。
+- 新增统一的`NATIVE SPEECH-ENVIRONMENT FUSION`合约：人声必须叠加在持续diegetic environment bed之上，不得替换、门限静音、重置或淡出该底噪；允许自然听觉遮蔽，但禁止对环境声执行增益Ducking。
+- 画面同步Foley与有可见原因的one-shot效果在人声期间继续存在；对白结束时不再重新启动环境声，因为环境底噪从未停止。
+- H3 Native Dialogue、VoxCPM2、Qwen3-TTS与Edge TTS的Speech Stem统一使用相同融合规则。外部TTS只授权文字、说话者、时序与嘴形，不能成为完整声轨或覆盖现场声。
+- Full、Batch及长片Segment使用同一合约；跨段继续继承同一地点的环境底噪，不新增FFmpeg混音、EQ、卷积混响或其他改写H3输出的处理链。
+
+### Verification
+
+- 新增环境声不Ducking、Foley持续、仅音乐可Ducking、Native Audio Direction与外部TTS Prompt合约回归测试。
+
+## [0.3.5-alpha.4] - 2026-10-09
+
+### H3 空人声通道与提示词防朗读
+
+- 修复一个Shot跨越有声与无声区间时，静音Segment仍继承Shot级`natural conversational volume`，与Segment级“无对白”规则互相冲突的问题。
+- Full与Batch统一以当前编译窗口内实际存在的Dialogue、Voice-over、Lyrics Text Layer作为唯一生成式人声白名单；没有授权语音时加入`HUMAN VOCAL CHANNEL: EMPTY`硬约束。
+- 旧`PromptSpec.dialogue`只保留为设计输入，不再拥有H3发声权限；即使其中残留旧台词，只要对应Text Layer已删除或不在当前窗口，编译Prompt便不会携带或朗读该文字。
+- 无语音窗口会从Prompt副本移除Speaker、Speaking State、Dialogue、Narration、Lyrics等发声方向，禁止H3朗读、翻译、拼读或演唱提示词、区段标题、标签、元数据、文件名、参考说明及导演指令。
+- 修复只在分段路径写入无语音规则、完整Work Area路径缺少同等保护的问题；旧Project无需迁移，重新生成Prompt即应用新规则。
+- 空人声锁不会关闭环境底噪、音乐或画面同步非人声Foley，也不会改写用户保存的Shot Native Audio Direction。
+
+### Verification
+
+- 新增静音尾段、Full Prompt、离线结构化Prompt、保留环境声／Foley及有对白窗口不被误锁的回归测试。
+
 ## [0.3.5-alpha.3] - 2026-09-16
 
 ### Audio Separator · CUDA 自动部署与输出完整性

@@ -28,6 +28,7 @@ from music_video_engine import (
     enforce_mtv_singing_plan,
     mtv_master_audio_duration,
 )
+from native_audio_engine import SPEECH_ENVIRONMENT_FUSION_CONTRACT
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
@@ -3661,8 +3662,10 @@ def automatic_background_soundscape(plan: dict) -> str:
           "Foley and ambience according to their visible distance. Crossfade smoothly when the camera "
           "moves between spaces; do not carry an earlier room tail into a later exterior Shot. Acoustic "
           "echo means only physically plausible reflections, never a second performance or repeated words. "
-          "Reduce ambience and non-diegetic music by about 6 dB during speech but never mute them; "
-          "restore their level naturally between phrases. Keep ambience audible in silent gaps. "
+          f"{SPEECH_ENVIRONMENT_FUSION_CONTRACT} "
+          "Keep the environment bed continuous across phrase boundaries and restore no bed that "
+          "was never lowered. Duck only non-diegetic music under speech and let only that music "
+          "return naturally between phrases. "
           "Do not duplicate, echo, paraphrase or mask authored words, and do not add generic impacts "
           "without a visible cause."
     )
@@ -7145,7 +7148,8 @@ def build_design_system_prompt(context: dict) -> str:
         "ordinary interiors, longer controlled tails for large halls, directional returns for corridors/caves, very short roof/surface "
         "reflections for covered semi-outdoor spaces, and almost no reverb with reduced low-mid fullness for open exteriors. Never carry "
         "a previous room's tail across a location change. Keep "
-        "dialogue in the foreground, duck ambience beneath speech without muting it, and never replace or echo authored dialogue. "
+        "dialogue in the foreground without ducking, gating, muting or replacing the continuous ambience; only non-diegetic music "
+        "may duck under speech. Keep contact Foley audible through spoken lines and never replace or echo authored dialogue. "
         "Never leave constraints blank. It must explicitly state that core actions and continuity states outrank optional "
         "flourishes, and that optional detail is dropped before a Shot is delayed or replayed. "
         "Media requests are reference requirements, not final generated media. "

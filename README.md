@@ -22,7 +22,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.5-alpha.3`](VERSION)
+- 当前应用版本：[`v0.3.5-alpha.5`](VERSION)
 - v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
 - v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
@@ -160,6 +160,10 @@ Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF
 ```
 
 v0.3.5-alpha.3 另外修复Unicode文件名上传失败，以及双声道浮点Vocal被错误写成双倍时长近静音单声道的问题；成功前会校验Vocal／Music的时长、声道、RMS与峰值。旧版已经产生的无声Vocal必须用新版重新分离。
+
+v0.3.5-alpha.4 修复空人声Track仍可能产生隐藏对白／旁白的问题。每个Full或Batch生成窗口现在只允许当前Timeline中实际存在的Dialogue、Voice-over或Lyrics Text Layer发声；旧Dialogue表单残留不再具有发声权限。没有语音事件时启用`HUMAN VOCAL CHANNEL: EMPTY`，移除从较长Shot继承的说话状态，并禁止H3朗读提示词、标签、文件名或导演说明。环境声、音乐及非人声Foley不会因此被静音。
+
+v0.3.5-alpha.5 加入 `Native Speech–Environment Fusion`。对白或旁白现在叠加在持续的现场环境底噪之上，不得替换、门限静音、重置或淡出环境声；画面同步Foley在说话期间继续存在。只有非叙事背景音乐可以在人声期间降低，环境声与Foley不再套用旧版约6 dB Ducking。该规则同时覆盖H3原生对白、VoxCPM2、Qwen3-TTS、Edge TTS、Full、Batch与长片Segment，并保持纯H3生成、不新增FFmpeg重混、EQ或混响链。
 
 正常由Studio自动启动时无需保留BAT窗口。副机不需要Kim模型，只需能访问Server的7862端口。主机／副机安装、CUDA验收、端口检查和故障排除见 [`Step 4：Audio Separator / Kim_Vocal_2 部署`](step4.md)；完整操作与A1/A2映射见 [`v0.3.5 readme.md`](v0.3.5%20readme.md)。
 
@@ -690,7 +694,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - `SUB OFF / SUB ON` 与 `LANG` 同排，默认 `SUB OFF`。关闭时 Dialogue／Voice-over 仍完整出现在 A Track，但不会建立字幕、烧录字幕或自动主题 hashtag；开启时 Studio 会根据每一条语音 Text Layer 的原文和时间码建立可编辑 V4+ 字幕层。状态保存在 `design_ai.env` 的 `H3_DESIGN_SUBTITLES_ENABLED`。
 - Design Requirement 同排新增 `MUSIC: AUTO / OFF / TIMELINE`，默认 `AUTO`。`AUTO` 让 Qwen 按每个场景的类型、情绪、节奏与转折规划合适配乐，并把实际音乐方向送入 H3 原生音画 Prompt；`OFF` 强制 `non_diegetic_music: N/A`；`TIMELINE` 只有当前 Segment 存在 Music Cue 时才启用音乐。选择会随 Apply 写入项目 `render_settings.music_mode` 及 `.env` 的 `H3_MUSIC_MODE`，旧项目缺少字段时安全使用 `AUTO`。
 - `Ori` 不建立 authored WAV，H3 Prompt 会从当前时间窗内的 `D1+ / VO1+ / L1+` Type Clips 生成独立 `TIMELINE TYPE / SPEECH TRACK EVENTS`，每句只出现一次，按 Clip 的时间码、Track、Speaker、Language、Delivery、Overlap Policy 和 Lip Sync 执行。实际 Prompt 会列出合法的 `AUTHORIZED SPEECH OVERLAPS`，同时禁止合并、换序、重复、翻译或发明台词；逐字台词不再复制或混入 Shot Action Prompt。编辑 Speech Clip 会直接重新编译 Ori Prompt，并令对应 Segment 失效待重算。切换到 `Vox`／`Qwen`／`Etts` 后，Preview／Run 会建立或重建逻辑 Audio 素材（必要时自动成为 A4+），放回 Timeline 并在当前 Segment 动态装入实体 Audio slot；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 和 Qwen3-TTS 只使用项目 `models/` 内的完整 snapshot，按 Speaker 保持确定性声音，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会静默转用其他 TTS。Timeline 中修改对白、Speaker、时间、Delivery 或 Overlap Policy 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
-- Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白期间环境声约降低 6 dB、配乐约降低 8 dB但不会静音；对白结束、转场或情绪节点会自然恢复。背景声音由 H3 原生生成，不额外占用最多 3 个 Audio reference slots，也不会复制、改写或再次朗读对白。
+- Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白／旁白只叠加在环境底噪之上，环境声和Foley不会在人声开始时降低、静音或重置；只有非叙事配乐会在人声期间降低约8 dB并在句间自然恢复。背景声音由H3原生生成，不额外占用最多3个Audio reference slots，也不会复制、改写或再次朗读对白。
 - 每个 Shot 都会按照画面和已分析素材生成 `SHOT SPATIAL ACOUSTICS`：小房间／办公室使用短而较明亮的 `0.18–0.45s` 反射；普通室内使用中等扩散；大厅使用受控的 `0.9–1.8s` 长尾；走廊、楼梯间、洞穴使用有方向性的反射；车内使用极短软包空间反射；雨棚／摊位只保留附近屋顶、墙壁和柜台的 `0.12–0.32s` 短反射；户外则接近无混响、没有离散 Echo，并适度减少低中频饱满感。没有换地点的 Close-up／Cut 会继承上一 Shot 声场，真正换景时才平滑 crossfade。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、必须完成的 Core Action、必须保持的 Continuity State、Required Environment Response、可以省略的 Optional Flourish、Additional Direction 与 Shot Prompt Preset。

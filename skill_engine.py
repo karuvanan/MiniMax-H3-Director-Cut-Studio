@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 
 from media_semantic_enrichment import enrichment_fingerprint
+from music_video_engine import retarget_legacy_mtv_lip_instruction
+from native_audio_engine import (
+    NO_AUTHORED_SPEECH_CONTRACT,
+    SPEECH_ENVIRONMENT_FUSION_CONTRACT,
+    enforce_no_authored_speech,
+    strip_unauthorized_speech_direction,
+)
 from prompt_engine import PromptSpec
 from workflow_engine import (
     MediaAsset,
@@ -543,10 +551,56 @@ def build_ref2va_prompt(
     source_assets: list[MediaAsset] | None = None,
 ) -> str:
     """Deterministically build the six sections required by h3-prompt-writing."""
+    if special_profile is not None and special_profile.key == "mtv-singing-h3":
+        use_a2 = any(
+            asset.media_type == "audio" and stable_reference_id(asset).upper() == "A2"
+            for asset in assets
+        )
+        if use_a2:
+            spec = PromptSpec(**{
+                name: retarget_legacy_mtv_lip_instruction(value, use_a2=True)
+                if isinstance(value, str) else value
+                for name, value in asdict(spec).items()
+            })
+            assets = [deepcopy(asset) for asset in assets]
+            for asset in assets:
+                asset.clip_prompt = retarget_legacy_mtv_lip_instruction(
+                    asset.clip_prompt, use_a2=True,
+                )
     if source_assets is not None:
         spec = PromptSpec(
             **remap_reference_value(asdict(spec), source_assets, assets)
         )
+
+    speech_roles = {"dialogue", "voice_over", "lyrics"}
+    has_authored_speech = any(
+        str(row.get("text", "")).strip()
+        and str(row.get("content_role", "")).strip().casefold() in speech_roles
+        for row in spec.text_ranges
+        if isinstance(row, dict)
+    )
+    if not has_authored_speech:
+        # Text Layers are the speech authorization ledger. Old projects may
+        # retain a Shot-wide conversational direction even when this compiled
+        # window is only its silent tail. Sanitize only this prompt copy.
+        state = asdict(spec)
+        # ``dialogue`` is a legacy form field, not a Timeline authorization
+        # source. Keeping it here allowed removed/missing Type clips to remain
+        # audible as hidden prompt text.
+        state["dialogue"] = ""
+        state["audio"] = strip_unauthorized_speech_direction(state.get("audio", ""))
+        sanitized_ranges: list[dict] = []
+        for raw in state.get("native_audio_ranges", []):
+            row = dict(raw)
+            row["native_audio_direction"] = enforce_no_authored_speech(
+                row.get("native_audio_direction", "")
+            )
+            row["audio_reference_intent"] = strip_unauthorized_speech_direction(
+                row.get("audio_reference_intent", "")
+            )
+            sanitized_ranges.append(row)
+        state["native_audio_ranges"] = sanitized_ranges
+        spec = PromptSpec(**state)
 
     def source_key(asset: MediaAsset) -> tuple[str, str, str]:
         stable_id = stable_reference_id(asset)
@@ -671,6 +725,8 @@ def build_ref2va_prompt(
         f"[{task_types}] The target is a {duration:.2f}-second {profile_phrase}. "
         f"{spec.brief.strip()}"
     )
+    if not has_authored_speech:
+        summary += " " + NO_AUTHORED_SPEECH_CONTRACT
     if subject_faces:
         summary += " " + " ".join(
             f"<Subject {subject_number}>'s identity comes exclusively from {face.tag};"
@@ -731,7 +787,8 @@ def build_ref2va_prompt(
                 "into the visible location with camera-distance perspective, natural early "
                 "reflections and low environmental bleed, then generate clearly audible "
                 "diegetic ambience, synchronized Foley/SFX and ducked non-diegetic music around "
-                "it. Never duplicate, paraphrase, echo or replace the supplied voice."
+                f"it. {SPEECH_ENVIRONMENT_FUSION_CONTRACT} Never duplicate, paraphrase, echo or "
+                "replace the supplied voice."
             )
         elif asset.tag in acoustic_reference_tags:
             retention_rows.append(
@@ -778,6 +835,8 @@ def build_ref2va_prompt(
     detailed_rows: list[str] = []
     style = spec.style.strip() or "The target uses a coherent, concrete visual style."
     detailed_rows.append(style.rstrip(".。") + ".")
+    if not has_authored_speech:
+        detailed_rows.append(NO_AUTHORED_SPEECH_CONTRACT)
     if subject_faces:
         for subject_number, face in sorted(subject_faces.items()):
             other = 2 if subject_number == 1 else 1
@@ -910,14 +969,21 @@ def build_ref2va_prompt(
                 f"<d>[{language}] {text}</d> {source}."
             )
     if spec.native_audio_ranges:
-        detailed_rows.append(
-            "NATIVE H3 AUDIO EXECUTION CONTRACT - Generate the soundtrack together with the "
-            "picture inside MiniMax H3. The following instructions describe sources in the filmed "
-            "world and are not requests for TTS replacement, source separation, convolution, EQ, "
-            "echo, reverb plug-ins or post-production remixing. Keep every exact Timeline dialogue "
-            "event synchronized with its matching visual interval. Never use the preceding generated "
-            "segment's audio as a reference, and never copy an earlier utterance across a boundary."
-        )
+        if has_authored_speech:
+            detailed_rows.append(
+                "NATIVE H3 AUDIO EXECUTION CONTRACT - Generate the soundtrack together with the "
+                "picture inside MiniMax H3. The following instructions describe sources in the filmed "
+                "world and are not requests for TTS replacement, source separation, convolution, EQ, "
+                "echo, reverb plug-ins or post-production remixing. Keep every exact Timeline dialogue "
+                "event synchronized with its matching visual interval. Never use the preceding generated "
+                "segment's audio as a reference, and never copy an earlier utterance across a boundary."
+            )
+        else:
+            detailed_rows.append(
+                "NATIVE H3 AUDIO EXECUTION CONTRACT - NON-VOCAL WINDOW. Generate only filmed-world ambience, "
+                "authorized music and picture-synchronous non-vocal Foley together with the picture. "
+                "Never convert production prose or reference metadata into an audible performance."
+            )
         detailed_rows.append(
             "Use the timestamped Native Audio schedule in overall_soundscape exactly once; "
             "do not duplicate or paraphrase it inside visual Shot prose."
@@ -986,6 +1052,8 @@ def build_ref2va_prompt(
         soundscape = authored_soundscape + "\n" + native_soundscape
     else:
         soundscape = native_soundscape or authored_soundscape or "N/A"
+    if not has_authored_speech and NO_AUTHORED_SPEECH_CONTRACT not in soundscape:
+        soundscape = NO_AUTHORED_SPEECH_CONTRACT + "\n" + soundscape
     music = spec.music.strip() or (
         "Around 100 BPM with crisp pluck, restrained kick and sub-bass, airy noise, tactile wooden percussion, and no vocals."
         if special_profile is not None and special_profile.key == SPECIAL_SKILL

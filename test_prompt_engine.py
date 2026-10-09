@@ -28,22 +28,50 @@ class PromptEngineTests(unittest.TestCase):
         self.assertEqual(split_shots(text), ["First shot", "第二镜头"])
 
     def test_offline_prompt_has_ordered_structure(self):
+        self.spec.text_ranges = [{
+            "layer_id": "T1", "track_id": "D1",
+            "start_seconds": 0.0, "end_seconds": 2.0,
+            "content_role": "dialogue", "speaker": "S1",
+            "language": "English", "delivery": "Firm", "text": "READY",
+        }]
         result = build_structured_prompt(self.spec)
         self.assertLess(result.index("CUT 1:"), result.index("TRANSITION:"))
         self.assertLess(result.index("TRANSITION:"), result.index("CUT 2:"))
-        self.assertIn('"READY"', result)
+        self.assertIn("<d>[English] READY</d>", result)
+        self.assertNotIn("ROAR", result)
         self.assertIn("END:", result)
 
-    def test_dialogue_without_audio_requests_exact_native_generation(self):
+    def test_legacy_dialogue_without_text_layer_is_not_speech_authority(self):
         result = build_structured_prompt(self.spec)
-        self.assertIn("Generate the exact spoken dialogue", result)
-        self.assertIn("natural native voice", result)
-        self.assertNotIn("to the supplied audio", result)
+        self.assertIn("HUMAN VOCAL CHANNEL: EMPTY", result)
+        self.assertNotIn("READY", result)
+        self.assertNotIn("ROAR", result)
 
-    def test_dialogue_with_audio_requests_exact_supplied_sync(self):
+    def test_supplied_audio_cannot_reactivate_legacy_dialogue(self):
         self.spec.has_supplied_dialogue_audio = True
         result = build_structured_prompt(self.spec)
-        self.assertIn("phoneme timing to the supplied audio", result)
+        self.assertIn("HUMAN VOCAL CHANNEL: EMPTY", result)
+        self.assertNotIn("phoneme timing to the supplied audio", result)
+
+    def test_empty_speech_timeline_cannot_turn_prompt_prose_into_voice(self):
+        self.spec.dialogue = "1|HIDDEN LEGACY DIALOGUE"
+        self.spec.audio = (
+            "Office room tone. Speaking state: natural conversational volume."
+        )
+        self.spec.native_audio_ranges = [{
+            "start_seconds": 0.0, "end_seconds": 5.0,
+            "native_audio_direction": (
+                "Continuous environment: computer fan. "
+                "Speaking state: natural conversational volume."
+            ),
+            "environment_continuity": "Continue the office room tone.",
+            "audio_reference_intent": "No reference audio is used.",
+        }]
+        result = build_structured_prompt(self.spec)
+        self.assertIn("HUMAN VOCAL CHANNEL: EMPTY", result)
+        self.assertIn("computer fan", result)
+        self.assertNotIn("natural conversational volume", result)
+        self.assertNotIn("HIDDEN LEGACY DIALOGUE", result)
 
     def test_independent_speech_tracks_preserve_authored_overlap(self):
         self.spec.dialogue = ""

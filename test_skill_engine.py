@@ -40,6 +40,33 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("subject_definitions", self.profiles[DEFAULT_SKILL].h3_reference_guide)
         self.assertIn("Typography Rules", self.profiles[SPECIAL_SKILL].instruction)
 
+    def test_saved_mtv_a1_lip_instruction_is_retargeted_to_active_a2(self):
+        old = "@P1 performs directly to @A1 with readable mouth, jaw, breath, facial and gesture timing."
+        p1 = MediaAsset(
+            node_id="1", class_type="LoadImage", media_type="image",
+            filename="singer.png", tag="<Picture 1>", reference_id="P1",
+            binding="ref_images.ref_image_0", clip_prompt=old,
+        )
+        a1 = MediaAsset(
+            node_id="2", class_type="LoadAudio", media_type="audio",
+            filename="music.wav", tag="<Audio 2>", reference_id="A1",
+            binding="ref_audios.ref_audio_0", request_binding="ref_audios.ref_audio_1",
+        )
+        a2 = MediaAsset(
+            node_id="3", class_type="LoadAudio", media_type="audio",
+            filename="vocal.wav", tag="<Audio 1>", reference_id="A2",
+            binding="ref_audios.ref_audio_1", request_binding="ref_audios.ref_audio_0",
+        )
+        assets = [p1, a1, a2]
+        prompt = build_ref2va_prompt(
+            PromptSpec(brief=old), assets, 5.0,
+            self.profiles[DEFAULT_SKILL], self.profiles["mtv-singing-h3"],
+            source_assets=assets,
+        )
+        self.assertNotIn("performs directly to <Audio 2>", prompt)
+        self.assertIn("performs directly to <Audio 1>", prompt)
+        self.assertEqual(p1.clip_prompt, old)
+
     def test_timed_dialogue_track_is_independent_and_emitted_once(self):
         spec = PromptSpec(
             brief="A woman speaks directly to camera.",
@@ -73,6 +100,57 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("[Dialogue Track A4/T1", prompt)
         self.assertEqual(prompt.count("你好，这句话不能改。"), 1)
         self.assertIn("increasing speaking pace rather than editing words", prompt)
+
+    def test_no_text_layer_hard_locks_vocal_channel_without_muting_foley(self):
+        spec = PromptSpec(
+            brief="A silent office action with no authored speech.",
+            dialogue="1|THIS LEGACY LINE MUST NOT BE SPOKEN",
+            audio="Computer fan and keyboard Foley. Natural conversational speech.",
+            shots=["A woman closes a laptop."],
+            native_audio_ranges=[{
+                "cue_id": "S1",
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "native_audio_direction": (
+                    "Acoustic space: furnished office interior. Speaking state: natural "
+                    "conversational volume. Continuous environment: computer fan. "
+                    "Picture-synchronous Foley: laptop hinge click."
+                ),
+                "environment_continuity": "Continue the office room tone.",
+                "audio_reference_intent": "No reference audio is used.",
+            }],
+        )
+        prompt = build_ref2va_prompt(
+            spec, [], 5.0, self.profiles[DEFAULT_SKILL]
+        )
+        self.assertGreaterEqual(prompt.count("HUMAN VOCAL CHANNEL: EMPTY"), 3)
+        self.assertIn("computer fan", prompt)
+        self.assertIn("laptop hinge click", prompt)
+        self.assertNotIn("natural conversational volume", prompt)
+        self.assertNotIn("THIS LEGACY LINE MUST NOT BE SPOKEN", prompt)
+
+    def test_authored_dialogue_keeps_speaking_direction_enabled(self):
+        spec = PromptSpec(
+            brief="An authored interview.",
+            shots=["The speaker answers."],
+            text_ranges=[{
+                "layer_id": "T1", "track_id": "D1",
+                "start_seconds": 0.0, "end_seconds": 5.0,
+                "content_role": "dialogue", "text": "你好。",
+                "speaker": "S1", "language": "Mandarin Chinese",
+            }],
+            native_audio_ranges=[{
+                "cue_id": "S1", "start_seconds": 0.0, "end_seconds": 5.0,
+                "native_audio_direction": "Speaking state: natural conversational volume.",
+                "environment_continuity": "Continue room tone.",
+                "audio_reference_intent": "No reference audio is used.",
+            }],
+        )
+        prompt = build_ref2va_prompt(
+            spec, [], 5.0, self.profiles[DEFAULT_SKILL]
+        )
+        self.assertIn("natural conversational volume", prompt)
+        self.assertNotIn("HUMAN VOCAL CHANNEL: EMPTY", prompt)
 
     def test_special_profile_metadata_comes_from_each_folder(self):
         profile = self.profiles["music-video-subtitle-generator"]
@@ -1102,6 +1180,9 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("diegetic ambience", prompt)
         self.assertIn("synchronized Foley/SFX", prompt)
         self.assertIn("ducked non-diegetic music", prompt)
+        self.assertIn("NATIVE SPEECH-ENVIRONMENT FUSION", prompt)
+        self.assertIn("never replaces, gates, mutes, resets or fades", prompt)
+        self.assertIn("never to ambience or Foley", prompt)
 
     def test_media_recognition_is_embedded_as_planning_guidance(self):
         asset = MediaAsset(

@@ -113,10 +113,13 @@ from soulx_runtime import (
 )
 from native_audio_engine import (
     NativeAudioProfile,
+    SPEECH_ENVIRONMENT_FUSION_CONTRACT,
     audio_reference_intent_text,
     build_native_audio_profile,
+    enforce_no_authored_speech,
     environment_continuity_text,
     native_audio_direction_text,
+    strip_unauthorized_speech_direction,
 )
 from combat_environment_engine import (
     CAUSALITY_CONTRACT,
@@ -210,6 +213,7 @@ from music_video_engine import (
     is_mtv_singing_skill,
     mtv_master_audio_duration,
     replace_video_audio_with_exact_master,
+    retarget_legacy_mtv_lip_instruction,
 )
 from design_settings import DesignAISettings, load_design_settings, save_design_settings
 from smart_cut_engine import (
@@ -11958,7 +11962,8 @@ class DirectorCutStudio(QMainWindow):
             "wording, speaker identity, timing and lip sync. Spatialize it as live on-location "
             "production sound, then generate audible diegetic ambience, contact-synchronized "
             "Foley/SFX and dialogue-ducked background music around it. Never treat this dry stem "
-            "as the complete soundtrack and never duplicate the voice."
+            "as the complete soundtrack and never duplicate the voice. "
+            + SPEECH_ENVIRONMENT_FUSION_CONTRACT
         )
         if asset is not None:
             asset.clip_prompt = authored_stem_prompt
@@ -12830,7 +12835,10 @@ class DirectorCutStudio(QMainWindow):
                 "speaker identity and phoneme rhythm for lip sync. This is not the complete "
                 "soundtrack: spatialize it as live on-location production dialogue and generate "
                 "audible diegetic ambience, exact contact Foley/SFX and dialogue-ducked background "
-                "music around it. Never duplicate the voice:\n" + transcript
+                "music around it. Never duplicate the voice. "
+                + SPEECH_ENVIRONMENT_FUSION_CONTRACT
+                + "\n"
+                + transcript
             ),
         }
         first_audio = next(
@@ -20417,10 +20425,18 @@ class DirectorCutStudio(QMainWindow):
                     asset, audio_solo=audio_solo
                 )
             start, end = self.clip_start.value(), self.clip_end.value()
-            _, assets = compile_active_workflow(self.scan, start, end)
+            _, assets = compile_active_workflow(
+                self.scan, start, end,
+                preferred_audio_reference_id=(
+                    "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
+                ),
+            )
             spec = self._prompt_spec_with_director_cues(
                 base_spec,
-                supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(assets),
+                supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
+                    assets,
+                    prefer_mtv_vocal=is_mtv_singing_skill(self.special_combo.currentData()),
+                ),
             )
             if start > 1e-6 or end < self.scan.duration_seconds - 1e-6:
                 output = self._prompt_for_window(
@@ -20766,6 +20782,21 @@ class DirectorCutStudio(QMainWindow):
         """Merge timeline-authored direction into the six-section H3 prompt input."""
         self._refresh_native_audio_directions(reference_assets)
         state = asdict(spec)
+        mtv_audio = is_mtv_singing_skill(self.special_combo.currentData())
+        if mtv_audio:
+            has_a2 = any(
+                asset.media_type == "audio"
+                and stable_reference_id(asset).upper() == "A2"
+                and bool(asset.local_path)
+                and Path(asset.local_path).is_file()
+                for asset in (reference_assets or (self.scan.assets if self.scan else []))
+            )
+            if has_a2:
+                for name, value in state.items():
+                    if isinstance(value, str):
+                        state[name] = retarget_legacy_mtv_lip_instruction(
+                            value, use_a2=True,
+                        )
         active_reference_assets = reference_assets or []
         has_p5_population_plate = (
             str(self.special_combo.currentData() or "").strip().casefold()
@@ -21138,8 +21169,28 @@ class DirectorCutStudio(QMainWindow):
                         compacted = compacted[: limit - 1].rstrip(" ,;:") + "…"
                     return compacted
 
+                cue_window_start = max(
+                    cue.start_seconds,
+                    window_start if window_start is not None else cue.start_seconds,
+                )
+                cue_window_end = min(
+                    cue.end_seconds,
+                    window_end if window_end is not None else cue.end_seconds,
+                )
+                cue_has_authored_speech = mtv_audio or any(
+                    layer.text.strip()
+                    and layer.content_role in {"dialogue", "voice_over", "lyrics"}
+                    and ranges_intersect(
+                        layer.start_seconds,
+                        layer.end_seconds,
+                        cue_window_start,
+                        cue_window_end,
+                    )
+                    for layer in self.text_layers
+                )
                 native_audio_direction = cue.native_audio_direction
                 environment_continuity = cue.environment_continuity
+                audio_reference_intent = cue.audio_reference_intent
                 if reference_scene_reset:
                     environment_continuity = (
                         "Establish only the location tone implied by the active Picture from frame one; "
@@ -21167,6 +21218,16 @@ class DirectorCutStudio(QMainWindow):
                         "Continue the preceding campus ambience, acoustic openness and distance without a "
                         "room-tone reset while the new visible subjects appear after the wipe."
                     )
+                if not cue_has_authored_speech:
+                    # A Shot can contain speech earlier while the compiled H3
+                    # Segment covers only its silent tail. Never inherit that
+                    # Shot-wide speaking state into the prompt-local interval.
+                    native_audio_direction = enforce_no_authored_speech(
+                        native_audio_direction
+                    )
+                    audio_reference_intent = strip_unauthorized_speech_direction(
+                        audio_reference_intent
+                    )
                 parts.append(
                     "NATIVE AUDIO DIRECTION - "
                     + compact_native_audio(native_audio_direction, 360)
@@ -21178,7 +21239,7 @@ class DirectorCutStudio(QMainWindow):
                 )
                 parts.append(
                     "AUDIO REFERENCE INTENT - "
-                    + compact_native_audio(cue.audio_reference_intent, 220)
+                    + compact_native_audio(audio_reference_intent, 220)
                 )
                 cue_detail = cue.detail
                 if reference_scene_reset:
@@ -21290,7 +21351,7 @@ class DirectorCutStudio(QMainWindow):
                         ),
                         "native_audio_direction": native_audio_direction,
                         "environment_continuity": environment_continuity,
-                        "audio_reference_intent": cue.audio_reference_intent,
+                        "audio_reference_intent": audio_reference_intent,
                     }
                 )
             state["shots"] = shots
@@ -21338,10 +21399,11 @@ class DirectorCutStudio(QMainWindow):
                 )
             )
         ]
-        if self.prompt_panel.auto_sync.isChecked() and self.text_layers:
-            # The visible Dialogue panel mirrors Type clips. The compiler emits
-            # only text_ranges, preventing duplicate or competing speech.
-            state["dialogue"] = ""
+        # The visible Dialogue panel and legacy PromptSpec.dialogue are design
+        # input, never an H3 speech authority. The compiler emits only current
+        # Timeline text_ranges, preventing removed clips from surviving as
+        # hidden dialogue or being read when every speech Track is empty.
+        state["dialogue"] = ""
 
         visible_text_rows = [
             row for row in state["text_ranges"]
@@ -21473,7 +21535,9 @@ class DirectorCutStudio(QMainWindow):
         return PromptSpec(**state)
 
     @staticmethod
-    def _supplied_speech_audio_tag(assets: list[MediaAsset]) -> str:
+    def _supplied_speech_audio_tag(
+        assets: list[MediaAsset], *, prefer_mtv_vocal: bool = False,
+    ) -> str:
         """Return the exact active Audio tag, preferring generated authored TTS."""
         valid: list[MediaAsset] = []
         for asset in assets:
@@ -21482,14 +21546,36 @@ class DirectorCutStudio(QMainWindow):
             path = Path(str(asset.local_path or ""))
             if path.is_file() and path.stat().st_size > 44:
                 valid.append(asset)
-        preferred = next(
-            (
-                asset for asset in valid
-                if "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
-            ),
-            valid[0] if valid else None,
+        preferred = None
+        if prefer_mtv_vocal:
+            preferred = next(
+                (asset for asset in valid if stable_reference_id(asset).upper() == "A2"),
+                None,
+            )
+            if preferred is None:
+                preferred = next(
+                    (asset for asset in valid if stable_reference_id(asset).upper() == "A1"),
+                    None,
+                )
+        if preferred is None:
+            preferred = next(
+                (
+                    asset for asset in valid
+                    if "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
+                ),
+                valid[0] if valid else None,
+            )
+        if preferred is None:
+            return ""
+        if prefer_mtv_vocal:
+            # Keep the permanent Media Pool ID until build_ref2va_prompt remaps
+            # it to this request's effective H3 audio ordinal.
+            return "@" + stable_reference_id(preferred)
+        effective, _ = effective_reference_assets(valid)
+        return next(
+            (asset.tag for asset in effective if stable_reference_id(asset) == stable_reference_id(preferred)),
+            preferred.tag,
         )
-        return preferred.tag if preferred else ""
 
     def _prompt_for_window(
         self,
@@ -21508,7 +21594,10 @@ class DirectorCutStudio(QMainWindow):
             window_start=start,
             window_end=end,
             is_final_window=is_final_window,
-            supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(assets),
+            supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
+                assets,
+                prefer_mtv_vocal=is_mtv_singing_skill(self.special_combo.currentData()),
+            ),
             reference_assets=assets,
         )
         if start is not None and end is not None:
@@ -22424,12 +22513,22 @@ class DirectorCutStudio(QMainWindow):
                 ):
                     asset.enabled = False
 
-            _, assets = compile_active_workflow(self.scan, start, end)
+            _, assets = compile_active_workflow(
+                self.scan, start, end,
+                preferred_audio_reference_id=(
+                    "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
+                ),
+            )
             released_for_continuity = self._reserve_continuity_video_slot(
                 assets, continuity_mode
             )
             if released_for_continuity is not None:
-                _, assets = compile_active_workflow(self.scan, start, end)
+                _, assets = compile_active_workflow(
+                    self.scan, start, end,
+                    preferred_audio_reference_id=(
+                        "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
+                    ),
+                )
             continuity = self._continuity_slot(assets, continuity_mode)
             if continuity and released_for_continuity is not None:
                 continuity["reserved_from_media"] = media_shortcut(
@@ -22481,12 +22580,20 @@ class DirectorCutStudio(QMainWindow):
                     if continuity and continuity.get("loader_node_id")
                     else None
                 ),
+                preferred_audio_reference_id=(
+                    "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
+                ),
             )
             fingerprint_workflow = compiled
             fingerprint_assets = assets
             core_start = max(start, float(fingerprint_start or start))
             if core_start > start + 1e-6:
-                _, fingerprint_assets = compile_active_workflow(self.scan, core_start, end)
+                _, fingerprint_assets = compile_active_workflow(
+                    self.scan, core_start, end,
+                    preferred_audio_reference_id=(
+                        "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
+                    ),
+                )
                 core_prompt = self._prompt_for_window(
                     core_start,
                     end,
@@ -22508,6 +22615,9 @@ class DirectorCutStudio(QMainWindow):
                         {str(continuity.get("loader_node_id"))}
                         if continuity and continuity.get("loader_node_id")
                         else None
+                    ),
+                    preferred_audio_reference_id=(
+                        "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
                     ),
                 )
             fingerprint = content_fingerprint(
@@ -22857,7 +22967,12 @@ class DirectorCutStudio(QMainWindow):
                 asset.enabled = was_enabled and self._track_allows_reference(
                     asset, audio_solo=audio_solo
                 )
-            _, prompt_sources = compile_active_workflow(self.scan, start, end)
+            _, prompt_sources = compile_active_workflow(
+                self.scan, start, end,
+                preferred_audio_reference_id=(
+                    "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
+                ),
+            )
             is_partial_window = (
                 start > 1e-6 or end < self.scan.duration_seconds - 1e-6
             )
@@ -22876,7 +22991,10 @@ class DirectorCutStudio(QMainWindow):
                     self._prompt_spec_with_director_cues(
                         self.prompt_panel.spec(),
                         supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
-                            prompt_sources
+                            prompt_sources,
+                            prefer_mtv_vocal=is_mtv_singing_skill(
+                                self.special_combo.currentData()
+                            ),
                         ),
                     ),
                     prompt_assets,
@@ -22895,6 +23013,9 @@ class DirectorCutStudio(QMainWindow):
                     megapixels=megapixels,
                     seed=seed,
                     enable_rtx_vsr=enable_rtx_vsr,
+                ),
+                preferred_audio_reference_id=(
+                    "A2" if is_mtv_singing_skill(self.special_combo.currentData()) else ""
                 ),
             )
             compiled_assets = self._prepare_windowed_tts_audio(

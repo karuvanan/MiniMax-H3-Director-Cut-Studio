@@ -2,8 +2,11 @@ import unittest
 
 from audio_engine import evaluate_native_audio_qc
 from native_audio_engine import (
+    NO_AUTHORED_SPEECH_CONTRACT,
+    SPEECH_ENVIRONMENT_FUSION_CONTRACT,
     audio_reference_intent_text,
     build_native_audio_profile,
+    enforce_no_authored_speech,
     environment_continuity_text,
     infer_acoustic_space,
     native_audio_direction_text,
@@ -11,6 +14,23 @@ from native_audio_engine import (
 
 
 class NativeAudioDirectionTests(unittest.TestCase):
+    def test_empty_vocal_channel_keeps_ambience_and_removes_speech_priming(self):
+        direction = (
+            "Acoustic space: furnished office interior. "
+            "Speaker-to-camera distance: one metre. "
+            "Speaking state: natural conversational volume. "
+            "Continuous environment: stable computer-fan room tone. "
+            "Picture-synchronous Foley: keyboard taps and cloth movement. "
+            "No narration or extra dialogue is permitted."
+        )
+        locked = enforce_no_authored_speech(direction)
+        self.assertIn("furnished office interior", locked)
+        self.assertIn("computer-fan room tone", locked)
+        self.assertIn("keyboard taps", locked)
+        self.assertIn(NO_AUTHORED_SPEECH_CONTRACT, locked)
+        self.assertNotIn("Speaker-to-camera", locked)
+        self.assertNotIn("natural conversational volume", locked)
+
     def test_close_indoor_dialogue_contains_required_native_contract(self):
         profile = build_native_audio_profile(
             {
@@ -28,6 +48,9 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertIn("recording-booth close-mic", prompt)
         self.assertIn("dry studio voice", prompt)
         self.assertIn("Generate no background music", prompt)
+        self.assertIn(SPEECH_ENVIRONMENT_FUSION_CONTRACT, prompt)
+        self.assertIn("ordinary acoustic masking rather than gain ducking", prompt)
+        self.assertIn("never to ambience or Foley", prompt)
 
     def test_wide_outdoor_dialogue_has_distance_attenuation_and_open_bed(self):
         profile = build_native_audio_profile(

@@ -1340,6 +1340,10 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("live production audio", soundscape)
         self.assertIn("Spatial acoustics contract", soundscape)
         self.assertIn("small furnished room", soundscape)
+        self.assertIn("NATIVE SPEECH-ENVIRONMENT FUSION", soundscape)
+        self.assertIn("never replaces, gates, mutes, resets or fades", soundscape)
+        self.assertIn("Apply dialogue ducking only to non-diegetic music", soundscape)
+        self.assertNotIn("Reduce ambience", soundscape)
         music = automatic_background_music({
             "creative_brief": "A tense police chase through city streets.",
             "non_diegetic_music": "",
@@ -1413,6 +1417,8 @@ On-screen text: "EXACT TITLE"'''
         self.assertEqual(first_sound, second_sound)
         self.assertIn("footsteps, landings and surface contact", first_sound)
         self.assertIn("weapon movement", first_sound)
+        self.assertIn("stable natural perceptual level", first_sound)
+        self.assertIn("Duck only non-diegetic music", first_sound)
         first_music = automatic_background_music(plan)
         second_music = automatic_background_music({
             **plan, "non_diegetic_music": first_music,

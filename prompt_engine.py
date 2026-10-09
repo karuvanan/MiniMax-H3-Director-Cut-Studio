@@ -8,6 +8,12 @@ import re
 from typing import Iterable
 from urllib import error, request
 
+from native_audio_engine import (
+    NO_AUTHORED_SPEECH_CONTRACT,
+    enforce_no_authored_speech,
+    strip_unauthorized_speech_direction,
+)
+
 
 DEFAULT_SYSTEM_PROMPT = """You are a professional prompt architect for MiniMax H3 reference-to-video generation.
 Turn the user's production brief into ONE polished, production-ready video prompt in English.
@@ -105,14 +111,28 @@ def _dialogue_by_cut(text: str) -> dict[int, list[str]]:
 
 def build_structured_prompt(spec: PromptSpec) -> str:
     """Create a deterministic H3-ready structure without translating user content."""
+    speech_roles = {"dialogue", "voice_over", "lyrics"}
+    has_authored_speech = any(
+        str(row.get("text", "")).strip()
+        and str(row.get("content_role", "")).strip().casefold() in speech_roles
+        for row in spec.text_ranges
+        if isinstance(row, dict)
+    )
     blocks: list[str] = []
     blocks.append(_sentence(spec.style or "cinematic, cohesive visual direction"))
+    if not has_authored_speech:
+        blocks.append(NO_AUTHORED_SPEECH_CONTRACT)
 
     setup: list[str] = []
     if spec.references.strip():
         setup.append(_sentence(spec.references))
-    if spec.audio.strip():
-        setup.append(_sentence(spec.audio))
+    audio_direction = (
+        spec.audio.strip()
+        if has_authored_speech else
+        strip_unauthorized_speech_direction(spec.audio)
+    )
+    if audio_direction:
+        setup.append(_sentence(audio_direction))
     if spec.technical.strip():
         setup.append(_sentence(spec.technical))
     if setup:
@@ -198,15 +218,24 @@ def build_structured_prompt(spec: PromptSpec) -> str:
         ):
             start = float(item.get("start_seconds", 0.0))
             end = float(item.get("end_seconds", start))
+            native_direction = str(item.get("native_audio_direction", "")).strip()
+            audio_reference_intent = str(item.get("audio_reference_intent", "")).strip()
+            if not has_authored_speech:
+                native_direction = enforce_no_authored_speech(native_direction)
+                audio_reference_intent = strip_unauthorized_speech_direction(
+                    audio_reference_intent
+                )
             rows.append(
-                f"[{start:.3f}-{end:.3f}s] {str(item.get('native_audio_direction', '')).strip()} "
+                f"[{start:.3f}-{end:.3f}s] {native_direction} "
                 f"{str(item.get('environment_continuity', '')).strip()} "
-                f"{str(item.get('audio_reference_intent', '')).strip()}"
+                f"{audio_reference_intent}"
             )
         blocks.append("\n".join(rows))
 
     shots = spec.shots or [spec.brief.strip() or "Describe the intended shot action."]
-    dialogue = _dialogue_by_cut(spec.dialogue)
+    # Legacy free-form dialogue is design input only. H3 speech authority is
+    # carried exclusively by independently timed Timeline Text Layers above.
+    dialogue: dict[int, list[str]] = {}
     for index, shot in enumerate(shots, start=1):
         cut_parts = [_sentence(shot)]
         if index in dialogue:

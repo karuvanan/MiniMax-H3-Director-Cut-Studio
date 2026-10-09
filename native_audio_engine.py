@@ -12,6 +12,61 @@ import re
 from typing import Iterable, Mapping
 
 
+NO_AUTHORED_SPEECH_CONTRACT = (
+    "HUMAN VOCAL CHANNEL: EMPTY. Generate only the authorized ambience, music and "
+    "non-vocal picture-synchronous Foley. Do not speak, whisper, narrate, announce, "
+    "chant, sing, vocalize, recite, quote, translate, spell or read aloud any prompt "
+    "text, section heading, label, metadata, filename, reference description or "
+    "production instruction. All visible people keep a natural non-speaking mouth; "
+    "expressions and breathing may continue without syllabic articulation."
+)
+
+SPEECH_ENVIRONMENT_FUSION_CONTRACT = (
+    "NATIVE SPEECH-ENVIRONMENT FUSION: foreground speech overlays the continuous "
+    "diegetic environment bed; it never replaces, gates, mutes, resets or fades that "
+    "bed when a line begins or ends. Keep location ambience continuously audible at a "
+    "stable natural perceptual level before, during and after speech, allowing only "
+    "ordinary acoustic masking rather than gain ducking. Keep picture-synchronous Foley "
+    "and motivated one-shot effects audible during speech. Apply dialogue ducking only "
+    "to non-diegetic music, never to ambience or Foley."
+)
+
+_SPEECH_DIRECTION_RE = re.compile(
+    r"\b(?:speak(?:er|ing|s)?|voice|speech|spoken|dialogue|voice[ -]?over|narrat(?:ion|or)|"
+    r"announcer|vocal|lyric|sing(?:ing|s)?|phoneme|mouth|jaw|conversation)\b|"
+    r"人声|人聲|说话|說話|对白|對白|旁白|朗读|朗讀|歌声|歌聲|歌词|歌詞|口型|嘴形",
+    re.I,
+)
+
+
+def strip_unauthorized_speech_direction(value: object) -> str:
+    """Remove speech-bearing prompt sentences while retaining ambience and Foley.
+
+    This is applied only to a compiled Timeline interval whose speech whitelist is
+    empty. It never mutates the editable Shot field stored in the project.
+    """
+
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    sentences = re.split(r"(?<=[.!?。！？])\s+", text)
+    retained = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip() and not _SPEECH_DIRECTION_RE.search(sentence)
+    ]
+    return " ".join(retained).strip()
+
+
+def enforce_no_authored_speech(value: object) -> str:
+    """Return a prompt-local ambience/Foley direction with an empty vocal channel."""
+
+    retained = strip_unauthorized_speech_direction(value)
+    if NO_AUTHORED_SPEECH_CONTRACT.casefold() in retained.casefold():
+        return retained
+    return (retained + (" " if retained else "") + NO_AUTHORED_SPEECH_CONTRACT).strip()
+
+
 @dataclass(frozen=True, slots=True)
 class NativeAudioProfile:
     acoustic_space: str
@@ -301,7 +356,7 @@ def native_audio_direction_text(
         "except an explicitly authored Voice-over or Music Timeline event. Preserve natural production-sound perspective, "
         "location bleed and physically plausible early reflections. Never use an intimate recording-booth close-mic sound, "
         "dry studio voice, announcer delivery, artificial word echo or repeated performance. "
-        f"{narration_rule} {music_rule}"
+        f"{SPEECH_ENVIRONMENT_FUSION_CONTRACT} {narration_rule} {music_rule}"
     )
 
 
