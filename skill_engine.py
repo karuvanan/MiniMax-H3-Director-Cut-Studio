@@ -28,6 +28,7 @@ from workflow_engine import (
 DEFAULT_SKILL = "h3-prompt-writing"
 SPECIAL_SKILL = "minimalist-product-ad-generator"
 NONE_SPECIAL = "__none__"
+COMIC_TALK_SHOW_SPECIAL_SKILL = "comic-talk-show-h3"
 
 
 _SUPPORT_FACE_MARKER = "supporting environment or action-state reference only"
@@ -618,6 +619,18 @@ def build_ref2va_prompt(
     paired_audio_tags = paired_audio_reference_tags(unique_assets)
     visual_assets = [asset for asset in unique_assets if asset.media_type in ("image", "video")]
     audio_assets = [asset for asset in unique_assets if asset.media_type == "audio"]
+    comic_group_mode = bool(
+        special_profile is not None
+        and special_profile.key == COMIC_TALK_SHOW_SPECIAL_SKILL
+    )
+    group_cast_plate = next(
+        (
+            asset for asset in visual_assets
+            if asset.media_type == "image"
+            and stable_reference_id(asset).upper() == "P1"
+        ),
+        None,
+    ) if comic_group_mode else None
     has_reference_audio = bool(audio_assets or any(a.paired_audio_binding for a in assets))
     acoustic_reference_tags = {
         tag
@@ -651,13 +664,27 @@ def build_ref2va_prompt(
         ),
         None,
     )
+    if comic_group_mode:
+        # P1 is an ensemble plate. Treating it as the ordinary one-face anchor
+        # rewrites every other person as background and destroys group casting.
+        subject_faces = {}
+        authoritative_face = None
     support_pictures = [
         asset for asset in visual_assets
         if asset.media_type == "image"
         and _picture_face_role(asset.clip_prompt) == "support"
     ]
     definition_rows: list[str] = []
-    if subject_faces:
+    if comic_group_mode and group_cast_plate is not None:
+        definition_rows.append(
+            f"<P1 Group Cast> is the complete intentional principal ensemble visible in "
+            f"{group_cast_plate.tag}. Count only complete principal people and number them once "
+            "from image-left to image-right as S1 through SN; ignore cropped edge fragments, "
+            "background passers-by, reflections, posters, statues and mannequins. Preserve every "
+            "principal's exact face, age, hair, body, wardrobe, accessories, relative order, "
+            "location and P1 source medium. Never replace, merge, duplicate or reorder them."
+        )
+    elif subject_faces:
         for subject_number in sorted(subject_faces):
             face = subject_faces[subject_number]
             other = 2 if subject_number == 1 else 1
@@ -727,7 +754,13 @@ def build_ref2va_prompt(
     )
     if not has_authored_speech:
         summary += " " + NO_AUTHORED_SPEECH_CONTRACT
-    if subject_faces:
+    if comic_group_mode and group_cast_plate is not None:
+        summary += (
+            f" {group_cast_plate.tag} is the immutable whole-group cast and source-medium plate; "
+            "use its actual complete-person count and stable left-to-right S1-through-SN mapping, "
+            "with no substitute actor or generated person."
+        )
+    elif subject_faces:
         summary += " " + " ".join(
             f"<Subject {subject_number}>'s identity comes exclusively from {face.tag};"
             for subject_number, face in sorted(subject_faces.items())
@@ -747,7 +780,12 @@ def build_ref2va_prompt(
         face_role = _picture_face_role(asset.clip_prompt)
         subject_number = _picture_subject_number(asset.clip_prompt)
         role = "visual identity, composition, and referenced attributes are retained"
-        if asset.media_type == "image" and subject_number is not None:
+        if comic_group_mode and group_cast_plate is asset:
+            role = (
+                "this is the immutable whole-group cast and source-medium plate; retain every "
+                "complete principal, face, wardrobe, relative order, original location and medium"
+            )
+        elif asset.media_type == "image" and subject_number is not None:
             other = 2 if subject_number == 1 else 1
             role = (
                 f"this is the exclusive authoritative identity source for <Subject {subject_number}>; "
@@ -783,9 +821,10 @@ def build_ref2va_prompt(
             retention_rows.append(
                 f"{asset.tag}: authored_dialogue_stem - preserve every spoken word, speaker "
                 f"identity, timing and phoneme rhythm during its {ranges} timeline range. Treat "
-                "this as a clean foreground speech stem, not a finished full mix: spatialize it "
-                "into the visible location with camera-distance perspective, natural early "
-                "reflections and low environmental bleed, then generate clearly audible "
+                "this only as performance and lip-sync control, not a final dry waveform or "
+                "finished full mix: obligatorily re-render it into the visible location with "
+                "camera-distance perspective, scene-matched direct-to-ambient ratio, natural "
+                "early reflections and clearly audible environmental bleed, then generate clearly audible "
                 "diegetic ambience, synchronized Foley/SFX and ducked non-diegetic music around "
                 f"it. {SPEECH_ENVIRONMENT_FUSION_CONTRACT} Never duplicate, paraphrase, echo or "
                 "replace the supplied voice."
@@ -837,7 +876,17 @@ def build_ref2va_prompt(
     detailed_rows.append(style.rstrip(".。") + ".")
     if not has_authored_speech:
         detailed_rows.append(NO_AUTHORED_SPEECH_CONTRACT)
-    if subject_faces:
+    if comic_group_mode and group_cast_plate is not None:
+        detailed_rows.append(
+            "DYNAMIC P1 ENSEMBLE CONTRACT - Count only complete intentional principal people in "
+            f"{group_cast_plate.tag}, number them once from image-left to image-right as S1 through "
+            "SN, and preserve that mapping through all reframes. Match P1's exact photographic, "
+            "comic, illustrated, 3D or stylized medium. Only the Speaker assigned by the active "
+            "Dialogue Text Layer articulates lips and jaw; all other visible principals keep "
+            "non-speaking mouth shapes and react silently. Never create, replace, merge, duplicate, "
+            "reorder or crop away a principal cast identity."
+        )
+    elif subject_faces:
         for subject_number, face in sorted(subject_faces.items()):
             other = 2 if subject_number == 1 else 1
             detailed_rows.append(

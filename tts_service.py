@@ -39,6 +39,12 @@ TTS_ENGINE_LABELS = {
     "qwen3_tts_local": "Qwen3-TTS Local offline neural TTS",
 }
 
+# Normalize each isolated spoken event before it is delayed into the Timeline.
+# Doing this per utterance (rather than over the mostly-silent full Timeline)
+# keeps short Dialogue and Voice-over references equally intelligible without
+# turning room tone or the eventual H3 soundtrack into a mastered mix.
+TTS_DIALOGUE_LOUDNESS_PROFILE = "dialogue_loudnorm_i-16_tp-1.5_lra7_v1"
+
 
 def normalize_tts_engine(value: object) -> str:
     engine = str(value or "edge_tts").strip().lower()
@@ -74,6 +80,17 @@ def atempo_filters(speed: float) -> list[str]:
     return [f"atempo={value:.6f}" for value in values if abs(value - 1.0) > 1e-6]
 
 
+def tts_voice_filter_chain(speed: float) -> list[str]:
+    """Return the shared timing and dialogue-loudness chain for one utterance."""
+
+    filters = atempo_filters(speed)
+    filters.extend((
+        "loudnorm=I=-16:TP=-1.5:LRA=7",
+        "aresample=24000",
+    ))
+    return filters
+
+
 def _powershell() -> str:
     return shutil.which("powershell.exe") or shutil.which("powershell") or ""
 
@@ -86,18 +103,27 @@ def synthesize_line(
     script: Path,
     ffmpeg: Path,
     speaker: str = "S1",
+    voice_gender: str = "auto",
     delivery: str = "Natural",
 ) -> None:
     edge_error = ""
+    gender = str(voice_gender or "auto").strip().casefold()
+    if gender not in {"auto", "male", "female"}:
+        gender = "auto"
     try:
         import edge_tts
 
         encoded = output.with_suffix(".mp3")
-        voice_name = (
-            "zh-CN-YunxiNeural"
-            if str(speaker).upper() == "S2"
-            else "zh-CN-XiaoxiaoNeural"
-        )
+        if gender == "male":
+            voice_name = "zh-CN-YunxiNeural"
+        elif gender == "female":
+            voice_name = "zh-CN-XiaoxiaoNeural"
+        else:
+            voice_name = (
+                "zh-CN-YunxiNeural"
+                if str(speaker).upper() == "S2"
+                else "zh-CN-XiaoxiaoNeural"
+            )
         performance = str(delivery or "").lower()
         if any(word in performance for word in ("fast", "urgent", "excited", "angry", "快速", "急", "激动", "激動", "愤怒", "憤怒")):
             rate, pitch = "+4%", "+2Hz"
@@ -156,6 +182,8 @@ def synthesize_line(
             str(output),
             "-Language",
             language,
+            "-Gender",
+            gender,
         ],
         capture_output=True,
         text=True,
@@ -177,11 +205,10 @@ def voxcpm_voice_control(layer: dict) -> str:
     speaker = str(layer.get("speaker", "S1")).strip().upper() or "S1"
     digits = "".join(character for character in speaker if character.isdigit())
     speaker_number = int(digits) if digits else 1
-    identity = (
-        "A young adult Mandarin Chinese male voice"
-        if speaker_number % 2 == 0
-        else "A young adult Mandarin Chinese female voice"
-    )
+    gender = str(layer.get("voice_gender", "auto")).strip().casefold()
+    if gender not in {"male", "female"}:
+        gender = "male" if speaker_number % 2 == 0 else "female"
+    identity = f"A young adult Mandarin Chinese {gender} voice"
     delivery = str(layer.get("delivery", "")).replace("(", "").replace(")", "")
     delivery = " ".join(delivery.split())[:160]
     parts = [
@@ -203,14 +230,17 @@ def voxcpm_speaker_seed(speaker: object) -> int:
     return 1000 + int.from_bytes(digest[:4], "big") % 2_000_000_000
 
 
-def qwen3_tts_speaker(speaker: object) -> str:
+def qwen3_tts_speaker(speaker: object, voice_gender: object = "auto") -> str:
     """Map stable Studio speaker IDs to Qwen's native Mandarin voices."""
     raw = str(speaker or "S1").strip().upper() or "S1"
     digits = "".join(character for character in raw if character.isdigit())
     number = max(1, int(digits) if digits else 1)
     female = ("Vivian", "Serena")
     male = ("Uncle_Fu", "Dylan")
-    voices = male if number % 2 == 0 else female
+    gender = str(voice_gender or "auto").strip().casefold()
+    voices = male if gender == "male" else female if gender == "female" else (
+        male if number % 2 == 0 else female
+    )
     return voices[((number - 1) // 2) % len(voices)]
 
 
@@ -378,7 +408,9 @@ class Qwen3TTSLocalSynthesizer:
         return self.model.generate_custom_voice(
             text=str(layer.get("content", "")).strip(),
             language=qwen3_tts_language(layer.get("language")),
-            speaker=qwen3_tts_speaker(layer.get("speaker", "S1")),
+            speaker=qwen3_tts_speaker(
+                layer.get("speaker", "S1"), layer.get("voice_gender", "auto")
+            ),
             instruct=delivery or None,
         )
 
@@ -619,6 +651,7 @@ class EdgeTTSSynthesizer:
             script=self.script,
             ffmpeg=self.ffmpeg,
             speaker=str(layer.get("speaker", "S1")),
+            voice_gender=str(layer.get("voice_gender", "auto")),
             delivery=str(layer.get("delivery", "Natural")),
         )
 
@@ -679,11 +712,8 @@ def synthesize_timeline(job: dict) -> dict:
             spoken_duration = wav_duration(utterance)
             available = max(0.1, end - start)
             speed = max(1.0, spoken_duration / max(0.1, available * 0.96))
-            chain = atempo_filters(speed)
-            chain.extend((
-                "aresample=24000",
-                f"adelay={max(0, round(start * 1000))}:all=1",
-            ))
+            chain = tts_voice_filter_chain(speed)
+            chain.append(f"adelay={max(0, round(start * 1000))}:all=1")
             filters.append(f"[{index}:a]" + ",".join(chain) + f"[speech{index}]")
             inputs.append(utterance)
             transcript_rows.append({
@@ -691,11 +721,13 @@ def synthesize_timeline(job: dict) -> dict:
                 "end_seconds": end,
                 "role": layer.get("role"),
                 "speaker": layer.get("speaker", "S1"),
+                "voice_gender": layer.get("voice_gender", "auto"),
                 "language": language,
                 "content": text,
                 "native_duration_seconds": round(spoken_duration, 4),
                 "tempo_factor": round(speed, 4),
                 "tts_engine": engine,
+                "loudness_profile": TTS_DIALOGUE_LOUDNESS_PROFILE,
             })
 
         # Local neural models are no longer needed once all source utterances
@@ -733,6 +765,7 @@ def synthesize_timeline(job: dict) -> dict:
             "duration_seconds": duration,
             "transcript": transcript_rows,
             "engine": TTS_ENGINE_LABELS[engine],
+            "loudness_profile": TTS_DIALOGUE_LOUDNESS_PROFILE,
         }
     finally:
         if synthesizer is not None:

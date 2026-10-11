@@ -28,7 +28,10 @@ from music_video_engine import (
     enforce_mtv_singing_plan,
     mtv_master_audio_duration,
 )
-from native_audio_engine import SPEECH_ENVIRONMENT_FUSION_CONTRACT
+from native_audio_engine import (
+    CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT,
+    SPEECH_ENVIRONMENT_FUSION_CONTRACT,
+)
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
@@ -46,6 +49,7 @@ ANALYSIS_ONLY_MEDIA_USAGES = frozenset({
 STREET_FIGHTER_SPECIAL_SKILL = "street-fighter-live-action-h3"
 HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL = "hong-kong-comic-fighter"
 BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL = "beat-synced-entrance-18s"
+COMIC_TALK_SHOW_SPECIAL_SKILL = "comic-talk-show-h3"
 COMBAT_ACTION_SPECIAL_SKILLS = frozenset({
     STREET_FIGHTER_SPECIAL_SKILL,
     HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL,
@@ -89,6 +93,29 @@ STREET_FIGHTER_P1_P2_PIXEL_LOCK = (
     "swap identities or clothes, blend faces, change gender presentation, duplicate P1/P2 or let "
     "any Z-Image person redefine either fighter."
 )
+
+COMIC_TALK_SHOW_GROUP_CONTRACT = (
+    "DYNAMIC P1 GROUP CAST LOCK: inspect the complete principal foreground people established "
+    "by P1 and never assume a fixed cast count. Ignore cropped edge fragments, background "
+    "passers-by, reflections, portraits, statues and mannequins. Number the complete principal "
+    "cast once from left to right in P1 as S1, S2, S3 and onward. Each ID permanently owns that "
+    "same P1 face, hair, age appearance, body, complete wardrobe, footwear and accessories; IDs "
+    "never change with camera position, Shot order or gender. P1 remains the only actor, group, "
+    "composition and source-medium authority in every Segment."
+)
+COMIC_TALK_SHOW_MEDIUM_CONTRACT = (
+    "P1 SOURCE-MEDIUM LOCK: preserve P1's actual photographic, 2D comic, illustration or 3D "
+    "rendering medium, line language, palette, lighting logic, location, object layout and cast "
+    "design. Natural performance never authorizes converting a comic to live action, a photograph "
+    "to a cartoon, or the supplied cast into generic substitute actors."
+)
+
+
+def normalize_dynamic_speaker_id(value: object) -> str:
+    """Return a stable S1...SN speaker ID without collapsing larger casts."""
+
+    speaker = str(value or "S1").strip().upper()
+    return speaker if re.fullmatch(r"S[1-9]\d*", speaker) else "S1"
 
 
 def _compact_character_evidence(value: object, limit: int = 320) -> str:
@@ -1733,6 +1760,66 @@ def auto_adjust_speech_shot_timing(plan: dict) -> dict:
     return ensure_complete_shot_coverage(result)
 
 
+def compact_generated_speech_authorization_windows(plan: dict) -> dict:
+    """End generated Dialogue/Voice-over clips when their words should end.
+
+    Design models often make one short line occupy its complete six- or
+    seven-second camera Shot.  H3 then treats the unused tail as an authorized
+    vocal interval and may fill it with repetitions, translations or invented
+    words.  Keep an explicitly authored timecode untouched, but compact every
+    other generated Dialogue/Voice-over range to the deterministic speech
+    budget.  The owning Shot remains unchanged so the released tail becomes
+    reaction, ambience and Foley time instead of disappearing from the edit.
+
+    Lyrics are intentionally excluded: their timing is normally owned by an
+    A1/A2 performance reference rather than this prose-rate estimate.
+    """
+
+    result = plan
+    warnings = [str(value) for value in result.get("design_warnings") or []]
+    for layer in result.get("text_layers") or []:
+        if not isinstance(layer, dict):
+            continue
+        if str(layer.get("role", "")).strip().casefold() not in {
+            "dialogue", "voice_over",
+        }:
+            continue
+        if bool(layer.get("authored_timing_locked", False)):
+            continue
+        content = str(layer.get("content", "")).strip()
+        if not content:
+            continue
+        start = float(layer.get("start_seconds", 0.0) or 0.0)
+        end = float(layer.get("end_seconds", start) or start)
+        allocated = max(0.0, end - start)
+        budget = speech_timing_budget(
+            content,
+            layer.get("language", ""),
+            layer.get("delivery", ""),
+            allocated,
+        )
+        required = max(0.5, float(budget.get("required_seconds", 0.5) or 0.5))
+        if allocated <= required + 0.25:
+            layer["speech_budget"] = dict(budget)
+            continue
+        compact_end = round(min(end, start + required), 6)
+        layer["end_seconds"] = compact_end
+        layer["speech_window_auto_compacted"] = True
+        layer["speech_budget"] = speech_timing_budget(
+            content,
+            layer.get("language", ""),
+            layer.get("delivery", ""),
+            compact_end - start,
+        )
+        warnings.append(
+            f"Compacted generated {str(layer.get('role', 'speech')).replace('_', ' ')} "
+            f"at {start:.2f}-{end:.2f}s to {start:.2f}-{compact_end:.2f}s; "
+            "the released Shot tail is now vocal silence for reactions, ambience and Foley."
+        )
+    result["design_warnings"] = list(dict.fromkeys(warnings))
+    return ensure_complete_shot_coverage(result)
+
+
 _VISIBLE_PERSON_RE = re.compile(
     r"\b(?:woman|man|girl|boy|female|male|person|protagonist|hero|heroine|actor|character)\b|"
     r"女人|女子|女性|男人|男子|男性|女孩|男孩|主角|人物|角色|刺客|将军|將軍",
@@ -2135,6 +2222,247 @@ def _scope_generated_environment_reference(plan: dict, request: dict) -> None:
     plan["design_warnings"] = warnings
 
 
+def enforce_comic_talk_show_plan(
+    plan: dict,
+    existing_media: list[dict] | None,
+    special_skill_key: object,
+) -> dict:
+    """Keep a dynamic P1 ensemble authoritative and retain one speaker per cast beat.
+
+    Independent T2I stills cannot preserve several identities extracted from one
+    group plate.  For this Skill H3 therefore receives P1 throughout and performs
+    reframing, expression and lip motion directly from that plate.
+    """
+
+    if str(special_skill_key or "").strip().casefold() != COMIC_TALK_SHOW_SPECIAL_SKILL:
+        return plan
+
+    duration = float(plan.get("duration_seconds", 0.0) or 0.0)
+    inventory_p1 = next(
+        (
+            row for row in existing_media or []
+            if isinstance(row, dict)
+            and bool(row.get("loaded", False))
+            and str(row.get("media_id", "")).strip().upper().lstrip("@") == "P1"
+            and str(row.get("media_type", row.get("type", ""))).strip().lower() == "image"
+        ),
+        None,
+    )
+    uses = [
+        row for row in plan.get("existing_media_uses") or []
+        if isinstance(row, dict)
+    ]
+    p1_use = next(
+        (
+            row for row in uses
+            if str(row.get("media_id", "")).strip().upper().lstrip("@") == "P1"
+            and str(row.get("media_type", "image")).strip().lower() == "image"
+        ),
+        None,
+    )
+    if p1_use is None and inventory_p1 is not None:
+        p1_use = {
+            "requirement_id": "comic_talk_show_p1_group_plate",
+            "media_id": "P1",
+            "media_type": "image",
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "track": "V1",
+            "subject_keywords": [
+                "dynamic complete principal cast",
+                "left-to-right speaker ledger",
+                "source medium",
+                "original group composition",
+            ],
+            "instruction": "",
+        }
+        uses.append(p1_use)
+    if p1_use is not None:
+        p1_use.update({
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "track": str(p1_use.get("track", "V1") or "V1"),
+        })
+        # This is deliberately a group-cast plate, not the generic single-face
+        # identity anchor handled by stabilize_generated_identity_references.
+        p1_use.pop("identity_anchor", None)
+        p1_use.pop("character_continuity_contract", None)
+        instruction = str(p1_use.get("instruction", "")).strip()
+        for contract in (
+            COMIC_TALK_SHOW_GROUP_CONTRACT,
+            COMIC_TALK_SHOW_MEDIUM_CONTRACT,
+            "Every H3 Segment retains @P1. Do not crop away, replace, duplicate or merge a principal cast identity.",
+        ):
+            if contract not in instruction:
+                instruction = instruction.rstrip(" .") + (". " if instruction else "") + contract
+        p1_use["instruction"] = instruction
+    plan["existing_media_uses"] = uses
+
+    # Free T2I people were the direct cause of the source cast being replaced.
+    # Keep non-image needs intact, but no generated Picture may compete with P1.
+    removed_image_requests = [
+        row for row in plan.get("media_requests") or []
+        if isinstance(row, dict) and str(row.get("media_type", "image")).lower() == "image"
+    ]
+    plan["media_requests"] = [
+        row for row in plan.get("media_requests") or []
+        if not (
+            isinstance(row, dict)
+            and str(row.get("media_type", "image")).lower() == "image"
+        )
+    ]
+
+    for field, contract in (
+        ("global_visual_style", COMIC_TALK_SHOW_MEDIUM_CONTRACT),
+        ("constraints", COMIC_TALK_SHOW_GROUP_CONTRACT),
+        (
+            "constraints",
+            "COMIC TALK SHOW REFERENCE CONTRACT: P1 is the only principal-person Picture; image media_requests remain empty and no generated Picture may introduce a substitute actor.",
+        ),
+    ):
+        value = str(plan.get(field, "")).strip()
+        if contract not in value:
+            value = value.rstrip(" .") + (". " if value else "") + contract
+        plan[field] = value
+
+    dialogue = sorted(
+        (
+            row for row in plan.get("text_layers") or []
+            if isinstance(row, dict)
+            and str(row.get("role", row.get("content_role", ""))).casefold() == "dialogue"
+        ),
+        key=lambda row: (
+            float(row.get("start_seconds", 0.0) or 0.0),
+            float(row.get("end_seconds", 0.0) or 0.0),
+        ),
+    )
+    for row in dialogue:
+        row["speaker"] = normalize_dynamic_speaker_id(row.get("speaker", "S1"))
+
+    cast_evidence = " ".join(
+        str(value or "")
+        for value in (
+            plan.get("creative_brief"),
+            (inventory_p1 or {}).get("analysis_summary"),
+            (inventory_p1 or {}).get("raw_analysis_summary"),
+            (inventory_p1 or {}).get("recognition"),
+        )
+    ).casefold()
+    cast_count: int | None = None
+    word_counts = {
+        "one": 1, "single": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        "ten": 10,
+    }
+    numeric_match = re.search(
+        r"\b([1-9]|1[0-6])\s*(?:-?person|people|persons|principals|characters|cast members)\b",
+        cast_evidence,
+    )
+    if numeric_match:
+        cast_count = int(numeric_match.group(1))
+    if cast_count is None:
+        word_match = re.search(
+            r"\b(" + "|".join(word_counts) + r")\s*(?:-?person|people|persons|principals|characters|cast members)\b",
+            cast_evidence,
+        )
+        if word_match:
+            cast_count = word_counts[word_match.group(1)]
+    if cast_count is None:
+        cjk_match = re.search(r"([一二两兩三四五六七八九十])\s*(?:人|位|名)(?:主角|人物|角色)?", cast_evidence)
+        if cjk_match:
+            cast_count = {
+                "一": 1, "二": 2, "两": 2, "兩": 2, "三": 3, "四": 4,
+                "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+            }[cjk_match.group(1)]
+
+    if cast_count:
+        for index, row in enumerate(dialogue):
+            speaker_number = int(str(row["speaker"])[1:])
+            if speaker_number > cast_count:
+                row["speaker"] = f"S{index % cast_count + 1}"
+
+    # Older/two-speaker-biased planners often return S1/S2 for an ensemble.
+    # One main speaker beat per chronological Shot is the Skill's explicit
+    # grammar, so recover S3+ deterministically when three or more dialogue
+    # Shots exist but the returned IDs were collapsed.
+    shots = [row for row in plan.get("shots") or [] if isinstance(row, dict)]
+
+    def owning_shot_index(layer: dict) -> int:
+        midpoint = (
+            float(layer.get("start_seconds", 0.0) or 0.0)
+            + float(layer.get("end_seconds", 0.0) or 0.0)
+        ) / 2.0
+        for index, shot in enumerate(shots):
+            if (
+                float(shot.get("start_seconds", 0.0) or 0.0) - 1e-6
+                <= midpoint
+                <= float(shot.get("end_seconds", 0.0) or 0.0) + 1e-6
+            ):
+                return index
+        return max(0, len(shots) - 1)
+
+    dialogue_shot_order: list[int] = []
+    for layer in dialogue:
+        shot_index = owning_shot_index(layer)
+        if shot_index not in dialogue_shot_order:
+            dialogue_shot_order.append(shot_index)
+    distinct_returned = {str(row.get("speaker", "S1")) for row in dialogue}
+    if cast_count is None and len(dialogue_shot_order) >= 3 and len(distinct_returned) <= 2:
+        speaker_by_shot = {
+            shot_index: f"S{index + 1}"
+            for index, shot_index in enumerate(dialogue_shot_order)
+        }
+        for layer in dialogue:
+            layer["speaker"] = speaker_by_shot[owning_shot_index(layer)]
+
+    speakers_by_shot: dict[int, list[str]] = {}
+    for layer in dialogue:
+        index = owning_shot_index(layer)
+        speaker = normalize_dynamic_speaker_id(layer.get("speaker", "S1"))
+        speakers_by_shot.setdefault(index, [])
+        if speaker not in speakers_by_shot[index]:
+            speakers_by_shot[index].append(speaker)
+    for index, speakers in speakers_by_shot.items():
+        if index >= len(shots):
+            continue
+        direction = str(shots[index].get("additional_direction", "")).strip()
+        schedule = ", ".join(
+            f"{speaker}=the {int(speaker[1:])}{'st' if speaker == 'S1' else 'nd' if speaker == 'S2' else 'rd' if speaker == 'S3' else 'th'} complete P1 principal from the left"
+            for speaker in speakers
+        )
+        lock = (
+            "P1 GROUP SPEAKER LOCK: " + schedule + ". Only the active Speaker moves lips and jaw; "
+            "all other visible P1 principals keep non-speaking mouth shapes and react silently."
+        )
+        if lock not in direction:
+            direction = direction.rstrip(" .") + (". " if direction else "") + lock
+        shots[index]["additional_direction"] = direction
+
+    warnings = [str(value) for value in plan.get("design_warnings") or []]
+    if inventory_p1 is None:
+        warnings.append(
+            "Comic Talk Show requires a loaded P1 group Picture before Apply; no substitute cast was generated."
+        )
+    if removed_image_requests:
+        warnings.append(
+            f"Removed {len(removed_image_requests)} generated Picture request(s): Comic Talk Show keeps P1 as the only principal-person and source-medium plate."
+        )
+    if cast_count:
+        warnings.append(
+            f"Comic Talk Show detected {cast_count} principal P1 cast member(s); "
+            f"Dialogue Speaker IDs are constrained to S1-S{cast_count}."
+        )
+    warnings.append(
+        "Comic Talk Show uses a dynamic left-to-right P1 cast ledger and supports S1 through SN without a fixed five-person assumption."
+    )
+    plan["design_warnings"] = list(dict.fromkeys(warnings))
+    return plan
+
+
 def stabilize_generated_identity_references(
     plan: dict,
     special_skill_key: object = "",
@@ -2147,7 +2475,12 @@ def stabilize_generated_identity_references(
     later reference requests become environment/pose support and may not
     introduce a competing face.
     """
-    if str(special_skill_key or "").strip().casefold() == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL:
+    normalized_special = str(special_skill_key or "").strip().casefold()
+    if normalized_special == COMIC_TALK_SHOW_SPECIAL_SKILL:
+        # P1 is a multi-person plate. Never rewrite it as the generic single
+        # recurring face anchor or append no-people guards to its cast.
+        return plan
+    if normalized_special == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL:
         # P1 intentionally owns two disjoint beats while P2 and P3 own one
         # entrance each. A whole-design promotion would leak one identity into
         # the other entrances and into the P4 ending.
@@ -2983,7 +3316,7 @@ _TIMED_TEXT_RANGE_RE = re.compile(
 )
 _TIMED_TEXT_LABEL_RE = re.compile(
     r"^\s*(?:[-*#>]+\s*)?"
-    r"(?:(?P<speaker>S[12])\s*)?"
+    r"(?:(?P<speaker>S[1-9]\d*)\s*)?"
     r"(?P<label>"
     r"(?:(?:普通话|普通話|国语|國語|Mandarin)\s*)?(?:对白|對白|台词|台詞|dialogue)"
     r"|(?:(?:普通话|普通話|国语|國語|Mandarin)\s*)?(?:旁白|画外音|畫外音|voice[\s-]*over|voiceover|narration)"
@@ -3235,7 +3568,7 @@ def extract_explicit_timed_text_layers(
                 re.sub(r"年轻|年輕|的?回声|的?回聲|心声|心聲|内心|內心|young|echo|inner", "", label, flags=re.I).strip(),
             ) or label
             if canonical_name not in named_speakers:
-                named_speakers[canonical_name] = "S1" if not named_speakers else "S2"
+                named_speakers[canonical_name] = f"S{len(named_speakers) + 1}"
             speaker = named_speakers[canonical_name]
             speaker_explicit = True
         language = (
@@ -3312,9 +3645,9 @@ def authored_text_layers_with_plan_assignments(
             ),
         )
         speaker = str(best.get("speaker", "")).strip().upper()
-        if speaker in {"S1", "S2"}:
+        if re.fullmatch(r"S[1-9]\d*", speaker):
             authored["speaker"] = speaker
-        for key in ("delivery", "language"):
+        for key in ("delivery", "language", "voice_gender"):
             value = str(best.get(key, "")).strip()
             if value:
                 authored[key] = value
@@ -3480,16 +3813,32 @@ def _location_ambience(evidence: str) -> str:
 def _foley_priorities(evidence: str) -> list[str]:
     priorities: list[str] = []
 
+    def contains(word: str) -> bool:
+        token = str(word or "").lower().strip()
+        if not token:
+            return False
+        if token.isascii():
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", evidence))
+        return token in evidence
+
     def add(label: str, words: tuple[str, ...]) -> None:
-        if any(word in evidence for word in words) and label not in priorities:
+        if any(contains(word) for word in words) and label not in priorities:
             priorities.append(label)
 
-    add("footsteps, landings and surface contact", ("walk", "run", "step", "jump", "land", "追", "跑", "走", "跳", "踏"))
+    add(
+        "footsteps, landings and surface contact",
+        (
+            "walk", "walks", "walking", "run", "runs", "running", "step", "steps",
+            "jump", "jumps", "jumping", "land", "lands", "landing", "追", "跑", "走", "跳", "踏",
+        ),
+    )
     add("cloth, costume and body-movement rustle", ("cloth", "cape", "coat", "dress", "robe", "衣", "披风", "披風", "裙"))
     add("weapon movement, metallic contact and impact transients", ("sword", "spear", "knife", "dart", "weapon", "gun", "blade", "剑", "劍", "刀", "枪", "槍", "暗器"))
     add("vehicle engine, tires, brakes and door contact", ("vehicle", "car", "taxi", "van", "drive", "车", "車", "驾驶", "駕駛"))
     add("water splashes, droplets and surface disturbance", ("water", "pond", "river", "rain", "pool", "水", "雨", "池", "河"))
-    add("doors, latches and object handling", ("door", "handle", "open", "close", "门", "門", "开门", "開門"))
+    # Generic production prose contains ``open-air`` and ``close-up``.  Those
+    # camera/acoustic phrases must never manufacture door Foley.
+    add("doors, latches and object handling", ("door", "door handle", "latch", "门", "門", "开门", "開門"))
     add("phone taps, handling and interface cues", ("phone", "smartphone", "手机", "手機"))
     add("glass, bottle, can and liquid handling", ("glass", "bottle", "can", "drink", "pour", "杯", "瓶", "罐", "喝", "倒"))
     add("fire, debris and pressure impacts", ("fire", "explosion", "debris", "spark", "火", "爆炸", "碎片", "火花"))
@@ -3573,15 +3922,27 @@ def spatial_acoustics_profile(evidence: object) -> tuple[str, str]:
             "at 3-6% wetness; keep the street-facing side open with no long enclosed-room tail",
         )
     if has(
+        "rain", "rainy", "storm", "stormy", "puddle", "downpour",
+        "雨", "暴雨", "水洼", "水窪",
+    ):
+        return (
+            "open rainy exterior",
+            "use no invented indoor reverb, discrete echo or enclosed tail; keep short diffuse reflections "
+            "from visible wet ground and nearby surfaces, atmospheric absorption, distance-dependent high-frequency "
+            "loss and directionality. Embed every voice inside continuously audible open-air rain, wind, water "
+            "movement and wet-surface detail instead of placing a clean dry voice above them",
+        )
+    if has(
         "open exterior", "outdoor", "exterior", "street", "road", "courtyard", "rooftop", "field", "forest",
         "mountain", "beach", "garden", "pond", "户外", "街道", "道路", "庭院", "屋顶",
         "田野", "森林", "山", "海边", "花园", "池塘",
     ):
         return (
             "open exterior",
-            "use almost no reverb (0-0.15s, 0-3% wetness), no discrete echo and no enclosed tail; "
-            "reduce low-mid body and proximity fullness slightly, preserving a thinner direct voice "
-            "with distance, wind and open-air diffusion",
+            "use no invented indoor reverb, discrete echo or enclosed tail; retain weak reflections from visible "
+            "ground, walls or facades plus atmospheric absorption and open-air diffusion. Reduce voice level, "
+            "low-mid proximity fullness and high-frequency detail with distance while raising the natural "
+            "environment-to-voice ratio",
         )
     return (
         "neutral visible location",
@@ -3598,7 +3959,8 @@ def spatial_acoustics_schedule(plan: dict) -> str:
         return f"{profile}: {direction}."
 
     rows: list[dict] = []
-    for shot in shots:
+    duration = max(0.0, float(plan.get("duration_seconds", 0.0) or 0.0))
+    for index, shot in enumerate(shots):
         evidence = " ".join(
             str(shot.get(field, "") or "")
             for field in (
@@ -3612,6 +3974,13 @@ def spatial_acoustics_schedule(plan: dict) -> str:
             direction = rows[-1]["direction"]
         start = float(shot.get("start_seconds", 0.0) or 0.0)
         end = float(shot.get("end_seconds", start) or start)
+        if end <= start:
+            next_start = 0.0
+            if index + 1 < len(shots):
+                next_start = float(shots[index + 1].get("start_seconds", 0.0) or 0.0)
+            end = next_start if next_start > start else duration
+        if end <= start:
+            end = start + 0.5
         if rows and rows[-1]["profile"] == profile and abs(rows[-1]["end"] - start) <= 0.05:
             rows[-1]["end"] = end
         else:
@@ -3656,8 +4025,8 @@ def automatic_background_soundscape(plan: dict) -> str:
         "and foreground speech when authored."
         + foley
         + " On-screen dialogue sounds like live production audio captured in the visible space: "
-          "natural breath, conversational micro-pauses, matching camera distance, subtle early "
-          "reflections and low environmental bleed; never a dry announcer or studio voice-over. "
+           "natural breath, conversational micro-pauses, matching camera distance, subtle early "
+           "reflections and clearly audible natural environmental bleed; never a dry announcer or studio voice-over. "
         + f" {_SPATIAL_ACOUSTICS_MARKER} {spatial} Apply this profile separately to direct speech, "
           "Foley and ambience according to their visible distance. Crossfade smoothly when the camera "
           "moves between spaces; do not carry an earlier room tail into a later exterior Shot. Acoustic "
@@ -3668,6 +4037,7 @@ def automatic_background_soundscape(plan: dict) -> str:
           "return naturally between phrases. "
           "Do not duplicate, echo, paraphrase or mask authored words, and do not add generic impacts "
           "without a visible cause."
+        + " " + CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT
     )
     return base.rstrip(". ") + "." + contract
 
@@ -3852,7 +4222,7 @@ DESIGN_JSON_SCHEMA = {
                 "additionalProperties": False,
                 "required": [
                     "start_seconds", "end_seconds", "track", "content", "role",
-                    "speaker", "language", "delivery", "lip_sync",
+                    "speaker", "language", "voice_gender", "delivery", "lip_sync",
                     "explicit_user_requested",
                 ],
                 "properties": {
@@ -3864,8 +4234,15 @@ DESIGN_JSON_SCHEMA = {
                         "type": "string",
                         "enum": ["on_screen_text", "dialogue", "voice_over", "lyrics"],
                     },
-                    "speaker": {"type": "string", "enum": ["S1", "S2"]},
+                    "speaker": {
+                        "type": "string",
+                        "pattern": "^S[1-9][0-9]*$",
+                    },
                     "language": {"type": "string"},
+                    "voice_gender": {
+                        "type": "string",
+                        "enum": ["auto", "male", "female"],
+                    },
                     "delivery": {"type": "string"},
                     "lip_sync": {"type": "boolean"},
                     "overlap_policy": {
@@ -6126,18 +6503,29 @@ def normalize_design_plan(
         content = str(raw.get("content", "")).strip()
         language = str(raw.get("language", "English")).strip() or "English"
         if re.search(r"[\u3400-\u9fff]", content) and language.lower() in {
-            "english", "original language", "auto",
+            "english", "original language", "auto", "chinese", "中文",
         }:
             language = "Mandarin Chinese"
+        voice_gender = str(raw.get("voice_gender", "auto")).strip().casefold()
+        if voice_gender not in {"auto", "male", "female"}:
+            voice_gender = "auto"
+        delivery = str(raw.get("delivery", "Natural")).strip() or "Natural"
+        if voice_gender == "auto":
+            delivery_evidence = delivery.casefold()
+            if re.search(r"\b(?:male|man|boy)\b|男声|男聲|男性", delivery_evidence):
+                voice_gender = "male"
+            elif re.search(r"\b(?:female|woman|girl)\b|女声|女聲|女性", delivery_evidence):
+                voice_gender = "female"
         normalized_layer = {
             "start_seconds": start,
             "end_seconds": end,
             "track": track,
             "content": content,
             "role": role,
-            "speaker": str(raw.get("speaker", "S1")) if str(raw.get("speaker", "S1")) in {"S1", "S2"} else "S1",
+            "speaker": normalize_dynamic_speaker_id(raw.get("speaker", "S1")),
             "language": language,
-            "delivery": str(raw.get("delivery", "Natural")).strip() or "Natural",
+            "voice_gender": voice_gender,
+            "delivery": delivery,
             "lip_sync": role == "dialogue" and bool(raw.get("lip_sync", False)),
             "overlap_policy": normalize_speech_overlap_policy(
                 raw.get("overlap_policy", "auto")
@@ -6667,6 +7055,11 @@ def normalize_design_plan(
         ]
     if str(special_skill_key).strip().casefold() == "dark-rescue-h3":
         enforce_dark_rescue_first_person(plan)
+    enforce_comic_talk_show_plan(
+        plan,
+        existing_media,
+        special_skill_key,
+    )
     stabilize_generated_identity_references(plan, special_skill_key)
     enforce_hong_kong_comic_generated_source_plates(
         plan,
@@ -6679,6 +7072,7 @@ def normalize_design_plan(
         special_skill_key,
     )
     plan = auto_adjust_speech_shot_timing(plan)
+    plan = compact_generated_speech_authorization_windows(plan)
     plan = apply_combat_action_continuity(
         plan,
         special_skill_key=special_skill_key,
@@ -6690,6 +7084,14 @@ def normalize_design_plan(
         special_skill_key=special_skill_key,
         existing_media=existing_media,
         authored_requirement=authored_requirement,
+    )
+    # Speech budgeting can ripple the final duration after the first group
+    # guard. Re-apply idempotently so permanent P1 always reaches the actual
+    # last frame and no later helper can reintroduce a substitute Picture.
+    enforce_comic_talk_show_plan(
+        plan,
+        existing_media,
+        special_skill_key,
     )
     return enforce_making_of_fourdx_plan(
         plan,
@@ -6874,7 +7276,38 @@ def build_design_system_prompt(context: dict) -> str:
                 "and appearance directly; BLIP/AI descriptions are metadata only. Do not generate "
                 "a substitute man/woman pair or person-bearing Z-Image action reference. "
             )
-    if selected_special_key == STREET_FIGHTER_SPECIAL_SKILL:
+    if selected_special_key == COMIC_TALK_SHOW_SPECIAL_SKILL:
+        ending_contract = (
+            "COMIC TALK SHOW DYNAMIC GROUP CONTRACT: @P1 is required and is the immutable whole-group "
+            "cast and source-medium plate. Count only complete, intentional principal people visible in P1; "
+            "ignore cropped edge fragments, posters, reflections, screens, statues and background passers-by. "
+            "Number that detected cast once from image-left to image-right as S1 through SN, where N is the "
+            "actual detected count; never assume five people or any other fixed cast size. Open with one readable "
+            "group beat, give every detected principal exactly one main comic speaking/reaction beat in that same "
+            "stable order, and resolve with the group still recognizably together. Preserve P1's photographic, "
+            "comic, illustrated, 3D or stylized medium exactly instead of converting it to live action. Keep P1 "
+            "active as a whole-design h3_reference for every Shot. Do not create any image media_request, actor "
+            "portrait, replacement group or substitute person: H3 must reframe and animate the actual P1 cast. "
+        )
+        speaker_gender_contract = (
+            "COMIC TALK SHOW SPEAKER CONTRACT: S1 is the leftmost complete P1 principal, S2 the next complete "
+            "principal, continuing through SN. This spatial identity ledger overrides every generic S1-female / "
+            "S2-male convention. Create one separate editable dialogue Text Layer for each final joke line and "
+            "assign its actual S1-SN Speaker. Set each speech text_layer.voice_gender to male or female only from "
+            "that exact P1 person's visible identity or an explicit user instruction; otherwise use auto. Never infer "
+            "gender from an odd/even Speaker number. Only the currently assigned Speaker may articulate lips and jaw; "
+            "all other visible principals keep closed or neutral non-speaking mouth shapes while reacting. Do not "
+            "merge two speakers, invent an off-image host, or let narration speak through a P1 face. Keep total "
+            "speech concise enough for the requested duration; shorten AI-authored joke wording before extending "
+            "the film. Preserve user-authored exact words when supplied. "
+        )
+        environmental_combat_contract = (
+            "COMIC TALK SHOW STAGING CONTRACT: retain the location, composition, props, lighting, palette, "
+            "wardrobe, face, hairstyle, body type and relative seating/standing order visible in P1. Camera "
+            "reframes may isolate the active speaker but may not remove, duplicate, merge, redesign or reorder "
+            "the ensemble. Every reaction must follow the spoken line that causes it. "
+        )
+    elif selected_special_key == STREET_FIGHTER_SPECIAL_SKILL:
         ending_contract = (
             "STREET FIGHTER ENDING CONTRACT: complete the last authored technique at real-time full "
             "speed, show its recoil and displacement, then settle both fighters into one readable, "
@@ -6987,10 +7420,10 @@ def build_design_system_prompt(context: dict) -> str:
         )
         speaker_gender_contract = (
             "For every dialogue text_layer, infer the gender of the speaking on-screen character from "
-            "the user's story, Shot action and reference-media evidence. Assign S1 to a female speaker "
-            "and S2 to a male speaker, keep the assignment consistent across every Shot, and never use "
-            "the narrator's gender when the visible character is speaking. If the user explicitly writes "
-            "S1 or S2, preserve that explicit assignment. Put the intended emotion and pace in delivery "
+            "the user's story, Shot action and reference-media evidence. Preserve the authored Speaker ID "
+            "without remapping it by gender; set text_layers.voice_gender to male or female only when that "
+            "character evidence is clear, otherwise use auto. Keep the setting consistent across every Shot "
+            "and never borrow the narrator's gender for a visible character. Put emotion and pace in delivery "
             "without changing the authored words. "
         )
         environmental_combat_contract = ""
@@ -7002,11 +7435,11 @@ def build_design_system_prompt(context: dict) -> str:
         )
         speaker_gender_contract = (
             "For every dialogue text_layer, infer the gender of the speaking on-screen character from "
-            "the user's story, Shot action and reference-media evidence. Assign S1 to a female speaker "
-            "and S2 to a male speaker, keep the assignment consistent across every Shot, and never use "
-            "the narrator's gender when the visible character is speaking. If the user explicitly writes "
-            "S1 or S2, preserve that explicit assignment. Put the intended emotion and pace in delivery "
-            "without changing the authored words. "
+            "the user's story, Shot action and reference-media evidence. Preserve the authored Speaker ID "
+            "without remapping it by gender, and set text_layers.voice_gender to male or female only when "
+            "the corresponding character evidence is clear; otherwise use auto. Keep that setting consistent "
+            "across every Shot and never borrow the narrator's gender for a visible character. Put emotion "
+            "and pace in delivery without changing the authored words. "
         )
         environmental_combat_contract = ""
     return (
@@ -7091,7 +7524,8 @@ def build_design_system_prompt(context: dict) -> str:
         "composition, action-state or boundary-continuity references are also valid when they reduce ambiguity between story phases. "
         "Choose the useful count and exact timeline ranges yourself. Never force one image per Shot, never fill all available slots merely "
         "because they exist, and never make redundant copies; distinct temporal states of the same subject are allowed when they prevent "
-        "a later segment from replaying an earlier action. Do not return zero image references when the plan has visual Shots and empty "
+        "a later segment from replaying an earlier action. Except when the selected Special Skill explicitly locks a supplied whole-design "
+        "group plate and forbids generated person references, do not return zero image references when the plan has visual Shots and empty "
         "Picture capacity. As a coverage floor, provide approximately one useful image state per five seconds, never more than one per "
         "Shot, while counting genuinely reused Picture assets toward that floor and staying within the per-Segment physical capacity. "
         "For a recurring human character, designate one clear face-bearing Picture as the whole-design identity anchor. A user-supplied "
@@ -7131,6 +7565,8 @@ def build_design_system_prompt(context: dict) -> str:
         "When the user asks for Dialogue, Voice-over, narration or Lyrics, create editable text_layers for every spoken line, set "
         "explicit_user_requested=true, and keep the spoken words exclusively in those text_layers. Never hide, quote or paraphrase spoken "
         "words inside Shot subject_action, environment_response, continuity_state, optional_flourish or additional_direction. "
+        "For every speech text_layer set voice_gender to male, female or auto. Use male/female only when the assigned character or explicit "
+        "request establishes it; auto is the safe fallback. Voice gender belongs to the speech event and must never change its Speaker ID. "
         "Set text_layers.overlap_policy to auto by default, overlap only when simultaneous speech is narratively intentional, or sequential "
         "when the later line must wait. Never merge two spoken lines into one text_layer merely because their times overlap; the Studio "
         "routes colliding Dialogue, Voice-over and Lyrics clips onto independent audio tracks. "
@@ -7143,10 +7579,12 @@ def build_design_system_prompt(context: dict) -> str:
         "Always design a useful overall_soundscape with three audible layers: continuous diegetic location ambience, exact-frame "
         "contact-synchronized Foley/one-shot SFX, and foreground speech. On-screen Dialogue must sound like live production audio "
         "captured in the visible location, with natural breath, conversational micro-pauses, camera-distance perspective, subtle room "
-        "or outdoor reflections and low environmental bleed; never request a dry announcer or studio voice-over performance. Infer a "
+        "or outdoor reflections and clearly audible environmental bleed around and beneath the voice; never request a dry announcer, "
+        "ADR dub or studio voice-over performance. Infer a "
         "time-scoped acoustic profile from every visible Shot: short bright decay for small furnished rooms, moderate diffuse decay for "
         "ordinary interiors, longer controlled tails for large halls, directional returns for corridors/caves, very short roof/surface "
-        "reflections for covered semi-outdoor spaces, and almost no reverb with reduced low-mid fullness for open exteriors. Never carry "
+        "reflections for covered semi-outdoor spaces, and no invented indoor tail for open exteriors while retaining ground/facade "
+        "reflections, atmospheric absorption, distance high-frequency loss and a higher environment-to-voice ratio. Never carry "
         "a previous room's tail across a location change. Keep "
         "dialogue in the foreground without ducking, gating, muting or replacing the continuous ambience; only non-diegetic music "
         "may duck under speech. Keep contact Foley audible through spoken lines and never replace or echo authored dialogue. "

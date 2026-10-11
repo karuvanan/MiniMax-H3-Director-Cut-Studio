@@ -46,7 +46,7 @@ class SegmentEngineTests(unittest.TestCase):
         by_id = {row["layer_id"]: row for row in rows}
         self.assertEqual(by_id["T1"]["lane_number"], 1)
         self.assertEqual(by_id["T2"]["lane_number"], 2)
-        self.assertEqual(by_id["T3"]["lane_number"], 1)
+        self.assertEqual(by_id["T3"]["lane_number"], 3)
         self.assertEqual(by_id["T4"]["lane_number"], 1)
         self.assertEqual((by_id["T2"]["start_seconds"], by_id["T2"]["end_seconds"]), (4.0, 7.0))
 
@@ -63,7 +63,7 @@ class SegmentEngineTests(unittest.TestCase):
             },
         ])
         self.assertEqual(normalize_speech_overlap_policy("no overlap"), "sequential")
-        self.assertEqual(rows[1]["lane_number"], 1)
+        self.assertEqual(rows[1]["lane_number"], 2)
         self.assertEqual((rows[1]["start_seconds"], rows[1]["end_seconds"]), (5.0, 7.0))
         self.assertTrue(rows[1]["timing_adjusted"])
 

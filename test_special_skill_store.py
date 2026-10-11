@@ -184,6 +184,20 @@ class SpecialSkillStoreTests(unittest.TestCase):
         self.assertIn("只有语音却没有Shot", template)
         self.assertIn("不得虚构素材编号", template)
 
+    def test_comic_talk_show_skill_uses_dynamic_p1_cast_and_no_generated_actors(self):
+        root = Path(__file__).parent / "skill special" / "comic-talk-show-h3"
+        document = load_special_skill_document(root)
+        validate_special_skill_document(document)
+        english = (root / "SKILL.md").read_text(encoding="utf-8")
+        chinese = (root / "SKILL.cn.md").read_text(encoding="utf-8")
+        template = (root / "DESIGN_REQUIREMENT.txt").read_text(encoding="utf-8")
+        self.assertEqual(document.key, "comic-talk-show-h3")
+        self.assertIn("Never assume five people", english)
+        self.assertIn("S1...SN", english)
+        self.assertIn("S1...SN", chinese)
+        self.assertIn("图片media_requests保持为空", template)
+        self.assertIn("@P1", template)
+
     def test_beat_synced_entrance_skill_locks_master_audio_and_reference_roles(self):
         root = Path(__file__).parent / "skill special" / "beat-synced-entrance-18s"
         document = load_special_skill_document(root)

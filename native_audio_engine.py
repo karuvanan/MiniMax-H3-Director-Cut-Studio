@@ -21,14 +21,40 @@ NO_AUTHORED_SPEECH_CONTRACT = (
     "expressions and breathing may continue without syllabic articulation."
 )
 
+CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT = (
+    "CINEMATIC DIALOGUE ACOUSTIC INTEGRATION — MANDATORY. Every spoken line must sound "
+    "physically emitted by the visible character and captured together with the scene, never "
+    "like ADR, dubbing, narration or a clean studio track layered over the picture. Match the "
+    "visible location's size, materials, furnishings, openings and weather with physically "
+    "plausible early reflections, reverberant decay, absorption, obstruction and acoustic "
+    "colouration. An exterior has no invented indoor tail, but still has atmospheric absorption, "
+    "distance loss, nearby ground or facade reflections and audible wind, rain, traffic or crowd "
+    "bleed around the voice. Match the direct-to-ambient ratio, level, high-frequency detail and "
+    "reflection balance to camera distance: close views retain breath and subtle mouth detail "
+    "without becoming isolated; medium views sound conversational; wide views are lower, less "
+    "bright and more embedded in the location bed. Preserve continuous perspective through camera "
+    "movement. Perform as spontaneous human speech with natural breath, subtle vocal imperfections, "
+    "conversational rhythm, realistic pauses and emotion appropriate to the character. Couple "
+    "performance to visible action and orientation: running or fighting affects "
+    "breath and effort, turning away changes directionality, and shouting projects into the actual "
+    "space. Keep exact authored words and add no new line or syllabic vocalization. Voice, ambience "
+    "and Foley share one coherent air, reflection field and depth plane; do not noise-gate, over-compress, "
+    "over-isolate or unnaturally clarify dialogue. FINAL AUDIO PRIORITY: the audience perceives the "
+    "voice as originating inside the filmed environment, not as a separately generated voice layer."
+)
+
 SPEECH_ENVIRONMENT_FUSION_CONTRACT = (
-    "NATIVE SPEECH-ENVIRONMENT FUSION: foreground speech overlays the continuous "
-    "diegetic environment bed; it never replaces, gates, mutes, resets or fades that "
-    "bed when a line begins or ends. Keep location ambience continuously audible at a "
-    "stable natural perceptual level before, during and after speech, allowing only "
-    "ordinary acoustic masking rather than gain ducking. Keep picture-synchronous Foley "
-    "and motivated one-shot effects audible during speech. Apply dialogue ducking only "
-    "to non-diegetic music, never to ambience or Foley."
+    "NATIVE SPEECH-ENVIRONMENT FUSION: render foreground speech and the continuous diegetic "
+    "environment as one coherent on-location acoustic event, sharing the same air, distance, "
+    "directionality, obstruction and reflection field. Speech never replaces, gates, mutes, resets "
+    "or fades the location bed when a line begins or ends. Keep ambience continuously audible at a "
+    "stable natural perceptual level before, during and after speech, with natural environmental bleed "
+    "around and beneath the voice; allow ordinary acoustic masking rather than gain ducking, and never "
+    "gain-duck ambience or Foley. Match voice level, brightness, "
+    "direct-to-ambient ratio and early reflections to the visible camera distance. Avoid ADR-like "
+    "centre isolation, excessive compression, noise-gating and pristine studio clarity. Keep "
+    "picture-synchronous Foley and motivated one-shot effects audible during speech. Apply dialogue "
+    "ducking only to non-diegetic music, never to ambience or Foley."
 )
 
 _SPEECH_DIRECTION_RE = re.compile(
@@ -75,6 +101,7 @@ class NativeAudioProfile:
     speech_state: str
     ambience: str
     foley: str
+    vocal_action_response: str
 
 
 def _evidence(shot: Mapping[str, object]) -> str:
@@ -160,6 +187,21 @@ def infer_acoustic_space(evidence: str) -> tuple[str, str]:
         return (
             "open waterside exterior",
             "continuous wind and water movement with distance-correct shoreline reflections and spray",
+        )
+    rainy_evidence = has(
+        "rain", "rainy", "storm", "stormy", "puddle", "downpour",
+        "雨", "暴雨", "水洼", "水窪",
+    )
+    enclosed_evidence = has(
+        "wet market", "indoor_seafood_aisle", "fish_vegetable_junction",
+        "market_loading_threshold", "corridor", "hallway", "office", "interior",
+        "inside", "room", "室内", "室內", "走廊", "办公室", "辦公室",
+        "湿滑鱼", "濕滑魚", "海鲜通道", "海鮮通道", "鱼档", "魚檔",
+    )
+    if rainy_evidence and not enclosed_evidence:
+        return (
+            "open rainy exterior",
+            "continuous open-air rain and wind, water movement and wet-surface detail with no enclosed-room tail",
         )
     if has("forest", "woodland", "jungle", "森林", "树林", "樹林", "丛林", "叢林"):
         return (
@@ -263,12 +305,73 @@ def infer_speech_state(evidence: str, dialogue_rows: Iterable[Mapping[str, objec
     return "no human speech unless an exact Timeline Dialogue, Voice-over or Lyrics event is present"
 
 
+def infer_vocal_action_response(evidence: str) -> str:
+    """Describe physical vocal changes without authorizing extra dialogue."""
+
+    text = str(evidence or "").lower()
+
+    def has(*words: str) -> bool:
+        for word in words:
+            token = str(word or "").lower().strip()
+            if not token:
+                continue
+            if token.isascii():
+                if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text):
+                    return True
+            elif token in text:
+                return True
+        return False
+
+    rows: list[str] = []
+    if has("run", "runs", "running", "sprint", "chase", "跑", "冲刺", "衝刺", "追逐"):
+        rows.append(
+            "running and body motion naturally shape breath support, projection and phrase rhythm"
+        )
+    if has(
+        "fight", "fighting", "combat", "punch", "kick", "strike", "grapple",
+        "格斗", "格鬥", "战斗", "戰鬥", "拳", "踢", "攻击", "攻擊",
+    ):
+        rows.append(
+            "effort, impacts and changing posture produce believable breath strain and momentary projection changes"
+        )
+    if has(
+        "turn", "turns", "turning", "looks away", "faces away", "back to camera",
+        "转头", "轉頭", "转身", "轉身", "背对", "背對",
+    ):
+        rows.append(
+            "head and body turns create continuous off-axis directionality and a subtle high-frequency loss"
+        )
+    if has("shout", "shouts", "yell", "scream", "大喊", "吼", "呼救"):
+        rows.append(
+            "the projected voice excites only the physically present surfaces and decays naturally in that space"
+        )
+    if not rows:
+        rows.append(
+            "visible posture, head orientation, gesture and effort subtly shape breath, projection and directionality"
+        )
+    return "; ".join(rows) + ", without adding any unauthorised word or syllabic vocalization"
+
+
 def infer_foley(evidence: str) -> str:
     text = evidence.lower()
     rows: list[str] = []
 
+    def contains(word: str) -> bool:
+        """Match Latin Foley evidence lexically and CJK evidence as phrases.
+
+        Foley is generated from prose that also contains words such as
+        ``stands``, ``punchline`` and ``speaker lock``.  Substring matching made
+        those harmless words request sand, combat and door-lock sounds.
+        """
+        token = str(word or "").lower().strip()
+        if not token:
+            return False
+        if token.isascii():
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text))
+        return token in text
+
     def add(label: str, *words: str) -> None:
-        if any(word in text for word in words) and label not in rows:
+        if any(contains(word) for word in words) and label not in rows:
             rows.append(label)
 
     # Put combat transients first so the four-item cap cannot discard the move
@@ -298,10 +401,16 @@ def infer_foley(evidence: str) -> str:
         "solar-corona charge, plasma release and heat-pressure flare anchored to the technique",
         "solar", "corona", "plasma", "sun-powered", "太阳", "太陽", "日冕", "等离子", "等離子",
     )
-    add("footsteps, landings and surface contact", "walk", "run", "step", "foot", "跑", "走", "踏", "脚步", "腳步")
+    add(
+        "footsteps, landings and surface contact",
+        "walk", "walks", "walking", "run", "runs", "running", "step", "steps", "foot",
+        "land", "lands", "landing", "跑", "走", "踏", "脚步", "腳步",
+    )
     add("cloth and body-movement rustle", "coat", "dress", "cloth", "shirt", "衣", "裙", "外套")
     add("phone handling, taps and authored interface cues", "phone", "smartphone", "手机", "手機")
-    add("doors, locks, latches and handle contact", "door", "lock", "latch", "门", "門", "门锁", "門鎖")
+    # ``lock`` alone is production-language noise (speaker/identity/camera lock).
+    # A door/latch/handle or explicit CJK door-lock phrase is required.
+    add("doors, locks, latches and handle contact", "door", "latch", "door handle", "门", "門", "门锁", "門鎖")
     add("keyboard, desk and object handling", "keyboard", "desk", "computer", "键盘", "鍵盤", "桌", "电脑", "電腦")
     add("vehicle controls, doors, engine and tire contact", "car", "vehicle", "taxi", "drive", "车", "車", "驾驶", "駕駛")
     add("water, rain and wet-surface contact", "water", "rain", "pond", "river", "水", "雨", "池", "河")
@@ -328,6 +437,7 @@ def build_native_audio_profile(
         speech_state=infer_speech_state(evidence, dialogue_rows),
         ambience=ambience,
         foley=infer_foley(evidence),
+        vocal_action_response=infer_vocal_action_response(evidence),
     )
 
 
@@ -352,6 +462,7 @@ def native_audio_direction_text(
         f"Acoustic space: {profile.acoustic_space}. Speaker-to-camera distance: {profile.camera_distance}. "
         f"Speaker screen position: {profile.screen_position}. Speaking state: {profile.speech_state}. "
         f"Continuous environment: {profile.ambience}. Picture-synchronous Foley: {profile.foley}. "
+        f"Physical vocal response: {profile.vocal_action_response}. "
         "Every voice, ambience and Foley event is diegetic sound emitted by a real source inside the visible scene, "
         "except an explicitly authored Voice-over or Music Timeline event. Preserve natural production-sound perspective, "
         "location bleed and physically plausible early reflections. Never use an intimate recording-booth close-mic sound, "
@@ -395,12 +506,35 @@ def environment_continuity_text(
 
 def audio_reference_intent_text(
     references: bool | Iterable[str],
+    *,
+    authored_speech_references: Iterable[str] = (),
 ) -> str:
     if isinstance(references, bool):
         tags: list[str] = ["the active reference"] if references else []
     else:
         tags = [str(item).strip() for item in references if str(item).strip()]
+    speech_tags = [
+        str(item).strip() for item in authored_speech_references if str(item).strip()
+    ]
+    speech_contract = ""
+    if speech_tags:
+        speech_contract = (
+            " Authored speech reference(s): " + ", ".join(speech_tags) + ". "
+            "Use each supplied TTS/audio speech stem only as performance and lip-sync control for the exact "
+            "authored words, assigned Speaker, source timing, voice identity and phoneme rhythm. It is not "
+            "a final dry waveform mix or an immutable acoustic rendering. Preserve its words, timing and voice "
+            "identity, but obligatorily re-render its perspective as diegetic production sound at the visible "
+            "camera distance, with scene-matched direct-to-ambient ratio, atmospheric colouration, natural "
+            "location bleed and physically plausible early reflections. The speech stem is not the complete "
+            "soundtrack: keep generating the continuous visible ambience and exact-frame Foley. "
+            "Digital silence between supplied utterances authorizes no human voice, but it is not "
+            "a silent-soundtrack instruction: fill every such interval with the same continuous "
+            "native location bed and visible non-vocal Foley, and keep that bed audible beneath speech. "
+            "Never preserve a dry recording-booth acoustic and never duplicate or replace the voice."
+        )
     if not tags:
+        if speech_contract:
+            return speech_contract.strip()
         return "No Audio or Video reference is used as a sound source for this Shot."
     return (
         "Active acoustic references: " + ", ".join(tags) + ". "
@@ -408,6 +542,7 @@ def audio_reference_intent_text(
         "speaker distance and on-location texture. Do not copy, replay or imitate any words from the reference. "
         "Do not use a reference character's voice or timbre to replace the Timeline Speaker/Dialogue, and do not treat "
         "a preceding generated segment as an audio reference."
+        + speech_contract
     )
 
 

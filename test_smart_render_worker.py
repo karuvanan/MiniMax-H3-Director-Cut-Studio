@@ -7,20 +7,295 @@ from pathlib import Path
 from unittest.mock import patch
 
 from smart_render_worker import (
+    _mix_complete_location_reference,
     _patch_continuity,
+    build_native_ambience_workflow,
     build_render_progress,
     build_assembly_command,
     assemble_master,
     classify_generation_error,
     extract_tail_frames,
     main,
+    patch_complete_location_reference,
     preflight_smart_render,
     queue_segment,
+    speech_guard_result_score,
 )
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
+    @staticmethod
+    def _location_sound_workflow():
+        return {
+            "10": {
+                "class_type": "MiniMaxH3ReferenceToVideo",
+                "inputs": {
+                    "prompt": ["11", 0],
+                    "ref_images.ref_image_0": ["12", 0],
+                    "ref_audios.ref_audio_0": ["13", 0],
+                    "ref_video_audios.ref_video_audio_0": ["14", 2],
+                },
+            },
+            "11": {
+                "class_type": "Text Multiline",
+                "inputs": {
+                    "value": (
+                        "subject_definitions:\n"
+                        "<Picture 1> is the rainy street.\n"
+                        "<Audio 1> contains exact dialogue.\n\n"
+                        "summary:\nA person speaks in rain.\n\n"
+                        "overall_soundscape:\nHeavy rain, wind and puddle splashes.\n"
+                        "[Native Audio S1 | 00:00.000-00:03.000] exact dialogue.\n\n"
+                        "non_diegetic_music:\nSoft score."
+                    )
+                },
+            },
+            "12": {"class_type": "LoadImage", "inputs": {"image": "p1.png"}},
+            "13": {"class_type": "LoadAudio", "inputs": {"audio": "dry.wav"}},
+            "14": {"class_type": "LoadVideo", "inputs": {"video": "v1.mp4"}},
+            "15": {
+                "class_type": "Resolution",
+                "inputs": {"megapixels": 1.0, "resize_type.scale": 2.0},
+            },
+            "16": {
+                "class_type": "SaveVideo",
+                "inputs": {"filename_prefix": "video/original"},
+            },
+        }
+
+    def test_native_ambience_pass_removes_audio_references_and_forbids_voice(self):
+        original = self._location_sound_workflow()
+        result = build_native_ambience_workflow(
+            original, duration_seconds=3.0, cache_token="abc123"
+        )
+        h3_inputs = result["10"]["inputs"]
+        self.assertIn("ref_images.ref_image_0", h3_inputs)
+        self.assertNotIn("ref_audios.ref_audio_0", h3_inputs)
+        self.assertNotIn("ref_video_audios.ref_video_audio_0", h3_inputs)
+        prompt = result["11"]["inputs"]["value"]
+        self.assertIn("HUMAN VOCAL CHANNEL: EMPTY", prompt)
+        self.assertIn("Heavy rain, wind and puddle splashes", prompt)
+        self.assertNotIn("exact dialogue", prompt)
+        self.assertEqual(result["15"]["inputs"]["megapixels"], 0.2)
+        self.assertEqual(result["15"]["inputs"]["resize_type.scale"], 1.0)
+        self.assertEqual(
+            result["16"]["inputs"]["filename_prefix"],
+            "video/H3_native_ambience_abc123",
+        )
+        self.assertEqual(original["13"]["inputs"]["audio"], "dry.wav")
+
+    def test_complete_location_reference_replaces_dry_tts_and_injects_contract(self):
+        workflow = self._location_sound_workflow()
+        patch_complete_location_reference(
+            workflow,
+            loader_node_id="13",
+            upload_name="complete_location.wav",
+        )
+        self.assertEqual(workflow["13"]["inputs"]["audio"], "complete_location.wav")
+        prompt = workflow["11"]["inputs"]["value"]
+        self.assertIn("COMPLETE LOCATION-SOUND REFERENCE CONTRACT", prompt)
+        self.assertIn("CINEMATIC DIALOGUE ACOUSTIC INTEGRATION", prompt)
+
+    def test_native_speech_guard_retries_with_fresh_seed_without_hard_block(self):
+        root = PROJECT_ROOT / ".director_cache" / "smart_render_speech_guard_test"
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        video.write_bytes(b"video")
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "http_timeout": 1,
+            "segment_attempts": 3,
+            "native_speech_guard_retries": 2,
+            "segment_count": 1,
+            "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+        }
+        segment = {
+            "segment_id": "seg-speech",
+            "index": 0,
+            "seed": 123,
+            "download_dir": str(root),
+            "native_speech_guard": {
+                "enabled": True,
+                "silence_windows": [[4.0, 5.0]],
+            },
+        }
+        workflow = {
+            "1": {
+                "class_type": "RandomNoise",
+                "inputs": {"noise_seed": 123},
+            }
+        }
+
+        class Guard:
+            def __init__(self):
+                self.calls = 0
+
+            def inspect(self, _video, _spec):
+                self.calls += 1
+                return {
+                    "passed": self.calls > 1,
+                    "violations": (
+                        [] if self.calls > 1
+                        else [{"transcript": "额外对白"}]
+                    ),
+                }
+
+        guard = Guard()
+        queued_workflows = []
+
+        def queue(request, _timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            queued_workflows.append(payload["prompt"])
+            return {"prompt_id": f"p{len(queued_workflows)}"}
+
+        with (
+            patch("smart_render_worker._request_json", side_effect=queue),
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
+            patch(
+                "smart_render_worker.download_outputs",
+                return_value=[{"kind": "videos", "local_path": str(video)}],
+            ),
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit"),
+        ):
+            result = queue_segment(
+                job, segment, workflow, [], speech_guard=guard
+            )
+        self.assertEqual(guard.calls, 2)
+        self.assertEqual(result["attempts_used"], 2)
+        self.assertTrue(result["native_speech_guard_result"]["passed"])
+        self.assertNotEqual(
+            queued_workflows[0]["1"]["inputs"]["noise_seed"],
+            queued_workflows[1]["1"]["inputs"]["noise_seed"],
+        )
+        video.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_native_speech_guard_allows_two_regenerations_then_warns(self):
+        root = PROJECT_ROOT / ".director_cache" / "smart_render_speech_guard_budget_test"
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        video.write_bytes(b"video")
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "http_timeout": 1,
+            "segment_attempts": 3,
+            "native_speech_guard_retries": 2,
+            "segment_count": 1,
+            "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+        }
+        segment = {
+            "segment_id": "seg-speech-budget",
+            "index": 0,
+            "seed": 123,
+            "download_dir": str(root),
+            "native_speech_guard": {
+                "enabled": True,
+                "silence_windows": [[4.0, 5.0]],
+            },
+        }
+        workflow = {
+            "1": {"class_type": "RandomNoise", "inputs": {"noise_seed": 123}}
+        }
+
+        class Guard:
+            def __init__(self):
+                self.calls = 0
+
+            def inspect(self, _video, _spec):
+                self.calls += 1
+                return {
+                    "passed": False,
+                    "violations": [{"transcript": "额外对白"}],
+                }
+
+        guard = Guard()
+        emitted = []
+        with (
+            patch(
+                "smart_render_worker._request_json",
+                side_effect=lambda *_args: {"prompt_id": f"p{guard.calls + 1}"},
+            ),
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
+            patch(
+                "smart_render_worker.download_outputs",
+                return_value=[{"kind": "videos", "local_path": str(video)}],
+            ),
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit", side_effect=emitted.append),
+        ):
+            result = queue_segment(job, segment, workflow, [], speech_guard=guard)
+        self.assertEqual(guard.calls, 3)
+        self.assertEqual(result["attempts_used"], 3)
+        self.assertFalse(result["native_speech_guard_result"]["passed"])
+        self.assertTrue(
+            any("without Hard Block" in str(row.get("progress", "")) for row in emitted)
+        )
+        video.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_retry_exhaustion_keeps_lowest_risk_guarded_take(self):
+        root = PROJECT_ROOT / ".director_cache" / "smart_render_best_speech_take_test"
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        job = {
+            "server": "http://127.0.0.1:8188", "http_timeout": 1,
+            "segment_attempts": 3, "native_speech_guard_retries": 2,
+            "segment_count": 1, "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+        }
+        segment = {
+            "segment_id": "seg-best", "index": 0, "seed": 123,
+            "download_dir": str(root),
+            "native_speech_guard": {"enabled": True, "silence_windows": [[4.0, 5.0]]},
+        }
+
+        class Guard:
+            calls = 0
+
+            def inspect(self, _video, _spec):
+                self.calls += 1
+                transcripts = ["啊", "这是很长而且完全不相干的额外对白", "又一条不相干对白"]
+                return {
+                    "passed": False,
+                    "violations": [{
+                        "kind": "unauthorized_speech_in_silence_window",
+                        "transcript": transcripts[self.calls - 1],
+                        "voice_ratio": [0.08, 0.8, 0.4][self.calls - 1],
+                    }],
+                }
+
+        guard = Guard()
+
+        def download(*_args, **_kwargs):
+            video.write_bytes(f"attempt-{guard.calls + 1}".encode("ascii"))
+            return [{"kind": "videos", "local_path": str(video)}]
+
+        with (
+            patch("smart_render_worker._request_json", side_effect=lambda *_: {"prompt_id": f"p{guard.calls + 1}"}),
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
+            patch("smart_render_worker.download_outputs", side_effect=download),
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit"),
+        ):
+            result = queue_segment(job, segment, {"1": {"inputs": {"seed": 123}}}, [], speech_guard=guard)
+        self.assertEqual(result["attempts_used"], 3)
+        self.assertEqual(result["selected_guard_attempt"], 1)
+        self.assertEqual(video.read_bytes(), b"attempt-1")
+        self.assertLess(
+            speech_guard_result_score({"passed": False, "violations": [{
+                "kind": "unauthorized_speech_in_silence_window", "transcript": "啊", "voice_ratio": 0.08,
+            }]}),
+            speech_guard_result_score({"passed": False, "violations": [{
+                "kind": "unauthorized_speech_in_silence_window", "transcript": "很长的不相干对白", "voice_ratio": 0.8,
+            }]}),
+        )
+        video.unlink(missing_ok=True)
+        root.rmdir()
+
     def test_oom_is_classified_released_and_retried_without_quality_change(self):
         root = PROJECT_ROOT / ".director_cache" / "smart_render_oom_retry_test"
         root.mkdir(parents=True, exist_ok=True)

@@ -923,17 +923,16 @@ def plan_speech_track_lanes(
     grid_seconds: float = TIMELINE_GRID_SECONDS,
     guard_seconds: float = 1.0,
 ) -> list[dict[str, Any]]:
-    """Assign independent speech clips to the lowest collision-free role lane.
+    """Assign every authored speech event to its own visible role lane.
 
-    AUTO and OVERLAP preserve authored timing and route a colliding or
-    immediately adjacent clip onto another Dialogue/Voice-over/Lyrics lane.
-    The short lane guard represents natural breath/reverberation decay and
-    prevents a long generated performance from visually hiding its successor.
-    SEQUENTIAL is the sole policy
-    allowed to move a clip: it shifts that clip after all earlier clips of the
-    same role while preserving its duration.  The function is deterministic
-    and UI-independent so project migration and regression tests use the exact
-    same rules.
+    A native H3 soundtrack is still one generated mix, but reusing one visual
+    Timeline lane made neighbouring events look continuous and made edits easy
+    to apply to the wrong turn.  One event per lane makes speaker ownership and
+    overlap intent explicit. AUTO and OVERLAP preserve authored timing here;
+    the pre-run native-speech scheduler owns release gaps and Timeline ripple.
+    Explicit SEQUENTIAL remains allowed to move a colliding clip while
+    preserving its duration. The function is deterministic and UI-independent
+    so project migration and regression tests use the same lane identities.
     """
 
     prepared: list[dict[str, Any]] = []
@@ -964,8 +963,8 @@ def plan_speech_track_lanes(
             row["start_seconds"], row["end_seconds"], row["layer_id"], row["source_index"]
         )
     )
-    guard = max(0.0, snap_seconds(guard_seconds, grid_seconds))
-    lane_ends: dict[str, list[float]] = {role: [] for role in SPEECH_CONTENT_ROLES}
+    _guard = max(0.0, snap_seconds(guard_seconds, grid_seconds))
+    role_lane_count: dict[str, int] = {role: 0 for role in SPEECH_CONTENT_ROLES}
     role_latest_end: dict[str, float] = {role: 0.0 for role in SPEECH_CONTENT_ROLES}
     result: list[dict[str, Any]] = []
     for row in prepared:
@@ -979,22 +978,8 @@ def plan_speech_track_lanes(
             end = snap_seconds(start + duration, grid_seconds)
             adjusted = True
 
-        lane_index = next(
-            (
-                index for index, occupied_until in enumerate(lane_ends[role])
-                if (
-                    occupied_until - (
-                        guard if row["overlap_policy"] == "sequential" else 0.0
-                    )
-                    <= start + 1e-6
-                )
-            ),
-            len(lane_ends[role]),
-        )
-        if lane_index == len(lane_ends[role]):
-            lane_ends[role].append(end + guard)
-        else:
-            lane_ends[role][lane_index] = end + guard
+        lane_index = role_lane_count[role]
+        role_lane_count[role] += 1
         role_latest_end[role] = max(role_latest_end[role], end)
         result.append({
             **row,

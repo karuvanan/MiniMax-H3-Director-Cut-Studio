@@ -22,7 +22,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.5-alpha.5`](VERSION)
+- 当前应用版本：[`v0.3.5-alpha.15`](VERSION)
 - v0.3.5 重点功能：[`v0.3.5 readme.md`](v0.3.5%20readme.md)
 - v0.3.3 AI Movie Making-of / 4DX：[`v0.3.3 readme.md`](v0.3.3%20readme.md)
 - v0.3.2 历史功能与长片流程：[`v0.3.2 readme.md`](v0.3.2%20readme.md)
@@ -164,6 +164,26 @@ v0.3.5-alpha.3 另外修复Unicode文件名上传失败，以及双声道浮点V
 v0.3.5-alpha.4 修复空人声Track仍可能产生隐藏对白／旁白的问题。每个Full或Batch生成窗口现在只允许当前Timeline中实际存在的Dialogue、Voice-over或Lyrics Text Layer发声；旧Dialogue表单残留不再具有发声权限。没有语音事件时启用`HUMAN VOCAL CHANNEL: EMPTY`，移除从较长Shot继承的说话状态，并禁止H3朗读提示词、标签、文件名或导演说明。环境声、音乐及非人声Foley不会因此被静音。
 
 v0.3.5-alpha.5 加入 `Native Speech–Environment Fusion`。对白或旁白现在叠加在持续的现场环境底噪之上，不得替换、门限静音、重置或淡出环境声；画面同步Foley在说话期间继续存在。只有非叙事背景音乐可以在人声期间降低，环境声与Foley不再套用旧版约6 dB Ducking。该规则同时覆盖H3原生对白、VoxCPM2、Qwen3-TTS、Edge TTS、Full、Batch与长片Segment，并保持纯H3生成、不新增FFmpeg重混、EQ或混响链。
+
+v0.3.5-alpha.6 新增 `comic-talk-show-h3` 动态群像喜剧 Special Skill。Design 会直接读取 P1 像素并估算完整前景主角人数，建立从左到右稳定的 `S1…SN` 身份账本；人数不再固定为五人，普通两人图、多人漫画、照片、3D 与插画都按 P1 实际内容编排。每名主角获得独立、可编辑的对白 Text Layer，只有当前 Speaker 可以开口。P1 同时作为全片人物、排列与原始媒介风格的唯一视觉母版；普通 Talk Show 不再自动申请 P2–P9 人物图，避免 Z-Image 生成陌生角色或把漫画改成真人。视觉模型无法读取图片时会自动退回文字设计并显示人数复核警告，而不会让 Design 整体失败。
+
+v0.3.5-alpha.7 修复短对白占满整个 Shot 时，H3 在台词结束后的空档继续即兴、重复、翻译或生成无来源对白的问题。系统现在把 Dialogue／Voice-over 的“镜头容器时间”和“实际发声授权时间”分开：自动生成的短台词按语速预算收紧发声窗口，但 Shot、表情反应、现场环境声与 Foley 仍持续到原镜头结束；每个生成窗口会明确列出人声静默区间。旧 Project 无需迁移，重新 Preview／Generate 即会使用新编译规则。`comic-talk-show-h3` 另有逐句 Turn-End Lock，当前 Speaker 说完原句后立即闭嘴，其他人物始终只能作无声反应。
+
+v0.3.5-alpha.14 新增全局`CINEMATIC DIALOGUE ACOUSTIC INTEGRATION`强制合约。所有H3 Native及外部TTS对白必须与场景共享空气、距离、方向、遮挡、反射与环境底噪，禁止ADR／配音棚式干声叠加。室内按空间大小、材质与陈设建立早期反射和衰减；室外不虚构室内长混响，但必须保留空气吸收、湿地／地面／建筑短反射、风雨渗漏和距离高频衰减。近、中、远景会改变直达声与环境声比例，人物转头、跑动、格斗或喊叫会同步改变呼吸、投射与方向性，但不会增加未授权台词。外部TTS只作为原文、音色、时序与口型控制，不再作为不可改变的最终干声混音。Render Policy提升至29。
+
+v0.3.5-alpha.15 以真实ComfyUI API验证并修复“外部TTS令背景现场声消失”的根因。实测确认：只改Prompt或把TTS／雨声拆成两条Audio Reference都不能阻止H3把对白空档压成静音。现在含画面内Dialogue的外部TTS Segment会先以同一视觉与声景生成一条空人声H3原生环境床，再把精确TTS与该环境床组成一条完整现场录音参考后提交最终H3。环境床按Segment fingerprint缓存；最终MP4仍由H3生成，不在成片后替换音轨。Render Policy提升至30，重新Preview／Generate会重建旧的Policy 29 Segment。
+
+v0.3.5-alpha.13 修复同一份Timeline TTS在Design套用与语音刷新竞态中被登记为两份有效Audio Reference的问题。生成前现在会保留签名最新的一份，把其余重复stem设为`bypass`而不删除备份；H3不会再把两份相同的全片干声误当成完整声轨并压制原生环境声。TTS数字静音区被明确解释为“没有人声，但必须持续雨、风、水面、空间底噪与可见Foley”。同时撤销alpha.12过强的天气音乐压低规则，MUSIC AUTO恢复清晰可闻、对白下约8 dB duck、对白空档自然回升的标准行为；环境声与Foley仍须全程可闻。Render Policy提升至28，重新Preview会重建受影响Segment。
+
+v0.3.5-alpha.12 修复外部TTS对白与H3现场环境声融合的编译漏洞。Shot声学时间不再错误写成`0.00–0.00s`；Foley改用完整英文词／短语匹配，`stands`、`punchline`、`speaker lock`、`close-up`、`open-air`不会再误触发沙石、拳击、门锁或开门声。每个Shot会把A1干净TTS明确声明为“台词、Speaker、时间与口型参考”，并要求H3继续产生持续雨声、风声、水面与可见动作Foley。Render Policy提升至27，重新Preview会重建受影响Segment。
+
+v0.3.5-alpha.11 修复Native H3重试耗尽后错误保留最后一次随机take：现在比较三次结果并保留额外语音风险最低的一次，仍不Hard Block。相同时间、相同文字的明确齐声Text Layer只向H3提交一次共享台词，避免同一句被当成两次发言；不相关改写也会被守卫发现。外部TTS的每条干净对白stem统一到约-16 LUFS与-1.5 dB True Peak，只改善对白可懂度，不提高环境声或音乐。重新Preview会因Render Policy 26及新TTS签名自动重建受影响素材。
+
+v0.3.5-alpha.10 把Speech Guard从“只检查无对白空档”扩展为“空档 + 每句授权对白”。Studio会逐条比较Text Layer原文与本机Whisper转写，在容许简繁体、同音字及少量识别误差的同时，识别H3在合法发声窗口内重复句尾、重说整句或擅自加入额外短句。命中后自动换Seed重生对应Segment，最多两次，不Hard Block整项Job。`two_people_in_a_red_background_with_swords_4`的T1复读已由新规则实际检出。
+
+v0.3.5-alpha.9 加入结构化 `Voice Gender: AUTO / MALE / FEMALE`。每条 Dialogue／Voice-over 都可以独立锁定男声或女声，并把同一个设定传给 H3 Native、Edge TTS、Qwen3-TTS、VoxCPM2 与 SAPI 后备；Design 不再按 S1／S2 奇偶编号猜性别，人物证据不清楚时保留 AUTO，用户选择 MALE／FEMALE 后则覆盖旧的自动声线后备。中文台词会锁定为 `Mandarin Chinese`。Native Speech Guard 也扩展到外部 TTS 和完全没有台词的尾段，能在最后一句之后捕捉日文、旁白、复读或其他无来源人声并自动换 Seed 重生，不 Hard Block 整项 Job。旧的两人 Comic Talk Show 若错误产生 S3，会在重新打开时依实际人数修回有效 Speaker。
+
+v0.3.5-alpha.8 加入 `Native H3 Speech Guard · AUTO RETRY`。每个 Dialogue／Voice-over 事件使用独立可见 Timeline 轨道；普通 `AUTO` 轮流对白会在句间自动保留 1.0 秒闭嘴释放区并顺延后续 Text Layer、Shot 与项目时长，只有明确 `OVERLAP` 才可同时说话。H3 生成完成后，Studio 只用本机 CPU Whisper 检查授权对白以外的静默窗口；发现可辨识的额外对白时，以新 Seed 自动重生同一 Segment，最多两次，不 Hard Block、不停止整项 Job，也不卸载 H3。若重试仍未清除，只显示警告并继续拼接。Lyrics 与 MTV 时序不受此规则改变。
 
 正常由Studio自动启动时无需保留BAT窗口。副机不需要Kim模型，只需能访问Server的7862端口。主机／副机安装、CUDA验收、端口检查和故障排除见 [`Step 4：Audio Separator / Kim_Vocal_2 部署`](step4.md)；完整操作与A1/A2映射见 [`v0.3.5 readme.md`](v0.3.5%20readme.md)。
 
@@ -694,7 +714,7 @@ H3_DESIGN_IMAGE_CFG=1.0
 - `SUB OFF / SUB ON` 与 `LANG` 同排，默认 `SUB OFF`。关闭时 Dialogue／Voice-over 仍完整出现在 A Track，但不会建立字幕、烧录字幕或自动主题 hashtag；开启时 Studio 会根据每一条语音 Text Layer 的原文和时间码建立可编辑 V4+ 字幕层。状态保存在 `design_ai.env` 的 `H3_DESIGN_SUBTITLES_ENABLED`。
 - Design Requirement 同排新增 `MUSIC: AUTO / OFF / TIMELINE`，默认 `AUTO`。`AUTO` 让 Qwen 按每个场景的类型、情绪、节奏与转折规划合适配乐，并把实际音乐方向送入 H3 原生音画 Prompt；`OFF` 强制 `non_diegetic_music: N/A`；`TIMELINE` 只有当前 Segment 存在 Music Cue 时才启用音乐。选择会随 Apply 写入项目 `render_settings.music_mode` 及 `.env` 的 `H3_MUSIC_MODE`，旧项目缺少字段时安全使用 `AUTO`。
 - `Ori` 不建立 authored WAV，H3 Prompt 会从当前时间窗内的 `D1+ / VO1+ / L1+` Type Clips 生成独立 `TIMELINE TYPE / SPEECH TRACK EVENTS`，每句只出现一次，按 Clip 的时间码、Track、Speaker、Language、Delivery、Overlap Policy 和 Lip Sync 执行。实际 Prompt 会列出合法的 `AUTHORIZED SPEECH OVERLAPS`，同时禁止合并、换序、重复、翻译或发明台词；逐字台词不再复制或混入 Shot Action Prompt。编辑 Speech Clip 会直接重新编译 Ori Prompt，并令对应 Segment 失效待重算。切换到 `Vox`／`Qwen`／`Etts` 后，Preview／Run 会建立或重建逻辑 Audio 素材（必要时自动成为 A4+），放回 Timeline 并在当前 Segment 动态装入实体 Audio slot；即使 Design 最初使用 Ori 或用户曾删除 A1，也不必重做 Design。Edge 使用 `zh-CN-XiaoxiaoNeural`（S1）／`zh-CN-YunxiNeural`（S2），失败时尝试 Windows SAPI；VoxCPM2 和 Qwen3-TTS 只使用项目 `models/` 内的完整 snapshot，按 Speaker 保持确定性声音，同一批台词只加载一次模型。`auto` 模式只要 PyTorch 检测到 CUDA 就优先在 GPU 加载；若模型加载或任一句对白推理发生 CUDA／显存错误，worker 会释放 CUDA cache、在 CPU 重载模型并自动重试当前对白，不会静默转用其他 TTS。Timeline 中修改对白、Speaker、时间、Delivery 或 Overlap Policy 后，旧 WAV 会自动失效；Preview／Run 只会使用最后一次编辑对应的 WAV。
-- Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白／旁白只叠加在环境底噪之上，环境声和Foley不会在人声开始时降低、静音或重置；只有非叙事配乐会在人声期间降低约8 dB并在句间自然恢复。背景声音由H3原生生成，不额外占用最多3个Audio reference slots，也不会复制、改写或再次朗读对白。
+- Design 会自动建立三层 Production Mix：连续且符合地点的 diegetic ambience、严格对应画面接触瞬间的 Foley／one-shot SFX，以及位于前景的逐字对白。对白／旁白只叠加在环境底噪之上，环境声和Foley不会在人声开始时降低、静音或重置；只有非叙事配乐会在人声期间降低约8 dB并在句间自然恢复。H3 Native Dialogue直接生成上述声场；外部TTS的画面内Dialogue则从alpha.15起先建立并缓存H3原生空人声环境床，再与精确TTS组成单一完整现场Audio reference供最终H3生成，不额外占用第二个Audio slot，也不会在成片后覆盖音轨。
 - 每个 Shot 都会按照画面和已分析素材生成 `SHOT SPATIAL ACOUSTICS`：小房间／办公室使用短而较明亮的 `0.18–0.45s` 反射；普通室内使用中等扩散；大厅使用受控的 `0.9–1.8s` 长尾；走廊、楼梯间、洞穴使用有方向性的反射；车内使用极短软包空间反射；雨棚／摊位只保留附近屋顶、墙壁和柜台的 `0.12–0.32s` 短反射；户外则接近无混响、没有离散 Echo，并适度减少低中频饱满感。没有换地点的 Close-up／Cut 会继承上一 Shot 声场，真正换景时才平滑 crossfade。
 - Type clip 两端使用高亮边缘进行 trimming，支持 Timeline snap、Undo 与 Redo。
 - Shot Tool 在视觉轨拖出时间范围，定义 Framing、Camera angle、Camera movement、必须完成的 Core Action、必须保持的 Continuity State、Required Environment Response、可以省略的 Optional Flourish、Additional Direction 与 Shot Prompt Preset。
@@ -764,6 +784,7 @@ skill special/
 - 顶部工具栏的 `CREATOR` 与 Default / Special 选择器位于同一排。它可以新建或编辑 Special Skill、选择 `Default + Special` 或 Standalone 绑定、维护英文 `SKILL.md`、可选中文 `SKILL.cn.md` 及 `DESIGN_REQUIREMENT.txt` 起始模板，并在 `SAVE + APPLY` 后立即刷新及选中该 Skill。选择带模板的 Special Skill 后点击 `DESIGN`，空白的 Design Requirement 会自动填入模板且仍可自由编辑；已有文字不会被覆盖。Folder/key 只允许小写英文字母、数字及单连字符；Default Skill 名称受保护，不能覆盖。
 - Studio 内置的每一个 Special Skill 都附带与自身工作流对应的 `DESIGN_REQUIREMENT.txt`，可作为直接测试的范例，也可以在生成前替换其中的人物、产品、主题、时长、画幅、对白和素材要求。
 - `beat-synced-entrance-18s` 当前执行19秒五段实体因果链：P1走到并绕过第一个走廊转角遇见P2，P2再绕过第二个转角遇见P3，随后由视线切回P1。系统只自动建立一张P5 Z-Image校外生活环境母版，包含校园出口、道路、巴士站及背书包放学、等车、聊天、观察道路和过马路的背景人物。12.00–14.00秒是不可省略的独立过场Segment：P1正面走出校园、显示惊讶，再以墙面／门框遮满画面。14.00–19.00秒由P5独占建筑、地面、日光、镜头轴线与背景生活，P4只锁定前景主体身份、外观、数量及排列并舍弃原背景；过场最后24帧只延续遮挡时机与摄影机运动，不再冒充校园环境。固定生成窗口为0.00–12.00、12.00–14.00及14.00–19.00秒；P4主体以45–60%体感速度、极慢水平横移和最后0.5秒Final Hold收尾，A1始终按Timeline Source Window以1倍速连续播放。
+- `comic-talk-show-h3` 会根据 P1 实际可见的完整前景主角动态建立 `S1…SN`，不会预设一定是五人。角色按画面从左到右登记，跨 Shot 保持身份、脸、服装、排列与原始照片／漫画／3D／插画媒介；裁切边缘残影、海报、反射、雕像及背景路人不计入主角。每名主角各有一个主要喜剧发言 Beat 和独立 Text Layer，非当前 Speaker 只能作无声反应。v0.3.5-alpha.9 起，每条语音还拥有独立 `Voice Gender`，两人项目不会再误建 S3；每个语音事件拥有独立可见轨道，普通 AUTO 对白句间保留 1.0 秒闭嘴释放区。短台词不会再把整段 Shot 都视为可发声，原句结束后禁止即兴、复读、翻译、提早接话、含字笑声、耳语和背景交谈。Studio 会在原生 H3及外部TTS项目的无对白空档与完整静音尾段检查额外人声，并自动重生异常 Segment。普通模式把 P1 作为全片唯一人物母版，不建立人物类 `media_requests`，因此不会用 P2–P9 或 Z-Image 陌生人替换原角色。使用时加载群像图为 P1，选择该 Skill 后点击 `DESIGN`，在自动模板末尾填写主题，再执行 Create JSON；Apply 前检查 Speaker Ledger、`S1…SN` 与每条 Text Layer 的 Voice Gender 即可。
 - `cinematic-story-60s-director` 用于把用户粘贴的长篇故事、背景资料或粗略构思改编成约60秒写实电影短剧。它先提炼核心冲突和反转，再规划8至12个连续Shot，自动生成简洁普通话对白／旁白并写入独立Text Layer；默认使用AUTO多轨，允许真实剧情重叠，语音确实无法继续压缩时同步延长Shot与Timeline，避免出现无Shot Segment。明确指定的Media Pool素材始终高于自动人物／场景设计。
 - `short-drama-h3-director` 是适配 Studio 的短剧 Special Skill，默认采用 `Default + Special`。它把短剧冲突、人物因果、伏笔反转、集尾钩子及竖屏构图转换为完整时间范围的 Shot Blocks，同时逐字保护 `text_layers`，优先复用 `existing_media_uses`，仅为缺失证据建立 `media_requests`，并遵守每 5 秒动作预算、环境因果、声音层与 Final Hold 规则。英文主文件、中文对照版及第三方许可证均位于 `skill special/short-drama-h3-director/`。
 - `long-form-h3-director` 是长片 Default-bound Special Skill。它输出一份覆盖完整总时长的 Design JSON，而不是每批一份 JSON；默认按约 30 秒规划安全批准点，保持 15 秒原生 Segment 的 Incoming／Outgoing State、上一段最后 24 帧运动上下文、逐字对白、稳定 Reference ID 与唯一项目终点 Final Hold。选择它会让主页自动采用 Incremental production；不选择时仍保留 Full Range 一次过处理。

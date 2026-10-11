@@ -158,7 +158,11 @@ def build_structured_prompt(spec: PromptSpec) -> str:
             ),
         )
         speech_rows: list[dict] = []
-        for item in ordered_text_ranges:
+        handled_unison_indexes: set[int] = set()
+        unison_rows: list[str] = []
+        for item_index, item in enumerate(ordered_text_ranges):
+            if item_index in handled_unison_indexes:
+                continue
             start = float(item.get("start_seconds", 0.0))
             end = float(item.get("end_seconds", start))
             role = str(item.get("content_role", "on_screen_text"))
@@ -172,12 +176,65 @@ def build_structured_prompt(spec: PromptSpec) -> str:
             else:
                 speaker = str(item.get("speaker", "S1"))
                 language = str(item.get("language", "Original"))
+                voice_gender = str(item.get("voice_gender", "auto")).strip().lower()
+                voice_gender = (
+                    voice_gender if voice_gender in {"auto", "male", "female"} else "auto"
+                )
                 delivery = str(item.get("delivery", "Natural"))
                 overlap_policy = str(item.get("overlap_policy", "auto")).strip().lower()
+                unison_items = [item]
+                if overlap_policy == "overlap":
+                    for other_index in range(item_index + 1, len(ordered_text_ranges)):
+                        other = ordered_text_ranges[other_index]
+                        if other_index in handled_unison_indexes:
+                            continue
+                        if (
+                            str(other.get("content_role", "on_screen_text")) == role
+                            and str(other.get("overlap_policy", "auto")).strip().lower()
+                            == "overlap"
+                            and abs(float(other.get("start_seconds", 0.0)) - start) <= 1e-6
+                            and abs(float(other.get("end_seconds", start)) - end) <= 1e-6
+                            and str(other.get("language", "Original")) == language
+                            and str(other.get("text", "")).strip() == text
+                        ):
+                            unison_items.append(other)
+                            handled_unison_indexes.add(other_index)
+                if len(unison_items) > 1:
+                    speakers = [str(row.get("speaker", "S1")) for row in unison_items]
+                    tracks = [str(row.get("track_id", "Type")) for row in unison_items]
+                    layer_ids = [str(row.get("layer_id", "Text")) for row in unison_items]
+                    rows.append(
+                        f"[{'/'.join(tracks)} {'/'.join(layer_ids)} {start:.3f}-{end:.3f}s] "
+                        f"({role}; {'+'.join(speakers)}; {language}; synchronized unison; "
+                        f"{delivery}; overlap=overlap) <d>[{language}] {text}</d> "
+                        "SYNCHRONIZED UNISON LOCK: all assigned speakers pronounce this one shared "
+                        "utterance once, together; never serialize it, repeat it, echo it or add a reply."
+                    )
+                    unison_rows.append(
+                        f"{start:.3f}-{end:.3f}s: {'/'.join(layer_ids)} on "
+                        f"{'/'.join(tracks)} by {'+'.join(speakers)}"
+                    )
+                    speech_rows.append({
+                        "layer_id": "/".join(layer_ids),
+                        "track_id": "/".join(tracks),
+                        "start_seconds": start,
+                        "end_seconds": end,
+                        "content_role": role,
+                        "speaker": "+".join(speakers),
+                        "overlap_policy": "unison",
+                    })
+                    continue
                 rows.append(
                     f"[{track} {layer_id} {start:.3f}-{end:.3f}s] "
-                    f"({role}; {speaker}; {language}; {delivery}; overlap={overlap_policy}) "
+                    f"({role}; {speaker}; {language}; voice_gender={voice_gender}; "
+                    f"{delivery}; overlap={overlap_policy}) "
                     f"<d>[{language}] {text}</d>"
+                    + (
+                        f" VOICE GENDER LOCK: render this event with one consistent {voice_gender} "
+                        "voice matching the assigned character; never switch gender or borrow another speaker's voice."
+                        if voice_gender in {"male", "female"}
+                        else ""
+                    )
                 )
                 speech_rows.append({
                     "layer_id": layer_id,
@@ -188,6 +245,11 @@ def build_structured_prompt(spec: PromptSpec) -> str:
                     "speaker": speaker,
                     "overlap_policy": overlap_policy,
                 })
+        if unison_rows:
+            rows.append(
+                "AUTHORIZED SYNCHRONIZED UNISON: " + "; ".join(unison_rows) + ". "
+                "Each group is one shared spoken event, not one performance per Text Layer."
+            )
         overlap_pairs: list[str] = []
         for index, left in enumerate(speech_rows):
             for right in speech_rows[index + 1:]:

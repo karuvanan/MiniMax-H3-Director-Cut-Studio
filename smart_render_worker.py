@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -18,6 +19,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+from native_speech_guard import NativeSpeechGuard
 from datetime import datetime, timezone
 
 from comfy_submit_worker import (
@@ -29,13 +32,26 @@ from comfy_submit_worker import (
     upload_file,
     wait_for_history,
 )
+from native_audio_engine import CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT
 from workflow_engine import validate_portable_media_manifest
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 22
+SMART_RENDER_POLICY_VERSION = 30
 AUDIO_JOIN_FADE_SECONDS = 0.04
+LOCATION_SOUND_REFERENCE_VERSION = 1
+COMPLETE_LOCATION_SOUND_CONTRACT = (
+    "COMPLETE LOCATION-SOUND REFERENCE CONTRACT — MANDATORY. The supplied authored "
+    "speech Audio reference is one authoritative, already synchronized production "
+    "recording containing the exact authored words together with continuous native "
+    "ambience and physical Foley in one acoustic space. Preserve the entire reference "
+    "soundtrack continuously, including its environment before, under, between and "
+    "after spoken words. Never isolate the voice, denoise or gate the ambience, replace "
+    "non-speech intervals with silence, duplicate dialogue, paraphrase words or invent "
+    "narration. Additional visible contact sounds may be generated only when physically "
+    "required by the picture and must join the same acoustic space. "
+)
 
 
 def emit(payload: dict) -> None:
@@ -317,8 +333,8 @@ def classify_generation_error(error: object) -> str:
 def preflight_smart_render(job: dict) -> dict:
     """Fail before media upload if a long render cannot complete on this host."""
     segments = list(job.get("segments") or [])
-    if len(segments) < 2:
-        raise ValueError("Smart Long Render requires at least two internal segments.")
+    if not segments:
+        raise ValueError("Smart Render requires at least one internal segment.")
     for index, segment in enumerate(segments, 1):
         duration = float(segment.get("end_seconds", 0.0)) - float(
             segment.get("start_seconds", 0.0)
@@ -466,6 +482,379 @@ def _canonicalize_reference_input_order(h3_node: dict) -> None:
             for request_index, (_name, value) in enumerate(rows)
         )
     h3_node["inputs"] = dict(ordinary + references)
+
+
+def _h3_prompt_nodes(workflow: dict) -> tuple[dict, dict] | tuple[None, None]:
+    """Return the H3 generation node and its connected text node."""
+
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        if "MiniMaxH3" not in str(node.get("class_type", "")):
+            continue
+        connection = (node.get("inputs") or {}).get("prompt")
+        if not isinstance(connection, list) or not connection:
+            continue
+        prompt_node = workflow.get(str(connection[0]))
+        if isinstance(prompt_node, dict):
+            return node, prompt_node
+    return None, None
+
+
+def _prompt_section(prompt: str, heading: str) -> str:
+    pattern = re.compile(
+        rf"(?ims)^{re.escape(heading)}:\s*(.*?)(?=^[a-z_]+:\s*$|\Z)"
+    )
+    match = pattern.search(str(prompt or ""))
+    return match.group(1).strip() if match else ""
+
+
+def build_native_ambience_workflow(
+    workflow: dict,
+    *,
+    duration_seconds: float,
+    cache_token: str,
+) -> dict:
+    """Create a low-cost, speech-free H3 pass that generates native location sound.
+
+    A dry TTS stem is a strong acoustic condition: real H3 tests showed that merely
+    asking for ambience, or even adding a second ambience Audio reference, still lets
+    the dry stem gate the location bed.  This auxiliary pass deliberately has no Audio
+    reference.  Its output audio becomes part of one complete reference before the
+    final H3 request.
+    """
+
+    result = deepcopy(workflow)
+    h3_node, prompt_node = _h3_prompt_nodes(result)
+    if h3_node is None or prompt_node is None:
+        raise RuntimeError("Could not locate the MiniMax H3 prompt connection.")
+
+    h3_inputs = h3_node.setdefault("inputs", {})
+    for key in list(h3_inputs):
+        if key.startswith("ref_audios.ref_audio_") or key.startswith(
+            "ref_video_audios.ref_video_audio_"
+        ):
+            h3_inputs.pop(key, None)
+    _canonicalize_reference_input_order(h3_node)
+
+    original = str((prompt_node.get("inputs") or {}).get("value", ""))
+    visual_definitions = "\n".join(
+        line
+        for line in _prompt_section(original, "subject_definitions").splitlines()
+        if not re.match(r"\s*<Audio\s+\d+>", line, re.I)
+    ).strip()
+    soundscape = _prompt_section(original, "overall_soundscape")
+    # The opening soundscape paragraph carries the scene acoustics. Timestamped
+    # Native Audio blocks also repeat authored-speaker instructions, so they are
+    # intentionally excluded from this speech-free pass.
+    soundscape = re.split(r"(?im)^\[Native Audio\b", soundscape, maxsplit=1)[0].strip()
+    if not soundscape:
+        soundscape = (
+            "Continuous room tone or outdoor atmosphere derived from the visible "
+            "location, with picture-motivated movement, surface contact and object Foley."
+        )
+    duration = max(0.01, float(duration_seconds))
+    prompt_node.setdefault("inputs", {})["value"] = (
+        "subject_definitions:\n"
+        + visual_definitions
+        + "\n\nsummary:\nCreate a speech-free native location-sound pass for the exact "
+        f"same scene and duration ({duration:.3f} seconds). All visible people remain "
+        "silent with closed non-speaking mouths. Preserve the active visual references "
+        "only to infer the correct physical environment and synchronized non-vocal Foley.\n\n"
+        "detailed_description:\nHUMAN VOCAL CHANNEL: EMPTY. No dialogue, narration, "
+        "voice-over, lyrics, singing, whisper, gasp, laugh, chant, intelligible crowd "
+        "voice or spoken word in any language. Generate only real diegetic atmosphere, "
+        "weather, room tone, material contact, movement and object sounds. The continuous "
+        "environment bed begins on frame one, remains clearly audible through every frame "
+        "and never gates or drops to digital silence. No non-diegetic music.\n\n"
+        "overall_soundscape:\n"
+        + soundscape
+        + "\nContinuous non-vocal ambience and physically synchronized Foley only; no human voice.\n\n"
+        "non_diegetic_music:\nN/A"
+    )
+
+    # Audio behavior is independent of final image resolution.  The verified 0.2 MP
+    # pass is materially faster and its picture is discarded after audio extraction.
+    for node in result.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        if isinstance(inputs.get("megapixels"), (int, float)):
+            inputs["megapixels"] = min(0.2, float(inputs["megapixels"]))
+        if isinstance(inputs.get("resize_type.scale"), (int, float)):
+            inputs["resize_type.scale"] = 1.0
+        if str(node.get("class_type", "")) == "SaveVideo":
+            inputs["filename_prefix"] = f"video/H3_native_ambience_{cache_token}"
+    return result
+
+
+def patch_complete_location_reference(
+    workflow: dict,
+    *,
+    loader_node_id: str,
+    upload_name: str,
+) -> None:
+    """Replace the dry TTS loader with one complete on-location audio reference."""
+
+    loader = workflow.get(str(loader_node_id))
+    if not isinstance(loader, dict) or str(loader.get("class_type", "")) != "LoadAudio":
+        raise RuntimeError("The authored TTS LoadAudio node is unavailable.")
+    loader.setdefault("inputs", {})["audio"] = str(upload_name)
+    _h3_node, prompt_node = _h3_prompt_nodes(workflow)
+    if prompt_node is None:
+        raise RuntimeError("Could not locate the MiniMax H3 prompt text node.")
+    original = str((prompt_node.get("inputs") or {}).get("value", ""))
+    if "COMPLETE LOCATION-SOUND REFERENCE CONTRACT" not in original:
+        prompt_node.setdefault("inputs", {})["value"] = (
+            COMPLETE_LOCATION_SOUND_CONTRACT
+            + CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT
+            + "\n\n"
+            + original
+        )
+
+
+def _extract_video_audio(ffmpeg: Path, source: Path, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source), "-vn", "-ac", "2", "-ar", "32000",
+            "-c:a", "pcm_s16le", str(destination),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode or not destination.is_file() or destination.stat().st_size <= 44:
+        detail = completed.stderr.decode("utf-8", errors="replace")[-1200:]
+        raise RuntimeError("Could not extract H3 native ambience: " + detail)
+    return destination
+
+
+def _audio_mean_volume_db(ffmpeg: Path, source: Path) -> float:
+    completed = subprocess.run(
+        [
+            str(ffmpeg), "-hide_banner", "-i", str(source),
+            "-af", "volumedetect", "-f", "null", "NUL",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    report = completed.stderr.decode("utf-8", errors="replace")
+    match = re.search(r"mean_volume:\s*(-?(?:inf|\d+(?:\.\d+)?))\s*dB", report, re.I)
+    if not match or match.group(1).casefold() == "-inf":
+        return float("-inf")
+    return float(match.group(1))
+
+
+def _mix_complete_location_reference(
+    ffmpeg: Path,
+    *,
+    speech: Path,
+    ambience: Path,
+    destination: Path,
+    duration_seconds: float,
+    ambience_gain: float,
+) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.01, float(duration_seconds))
+    gain = max(0.05, min(1.5, float(ambience_gain)))
+    filter_graph = (
+        f"[0:a]aresample=32000,apad=whole_dur={duration:.6f},"
+        f"atrim=duration={duration:.6f},volume=1.0[voice];"
+        f"[1:a]aresample=32000,apad=whole_dur={duration:.6f},"
+        f"atrim=duration={duration:.6f},volume={gain:.4f}[amb];"
+        "[voice][amb]amix=inputs=2:duration=longest:normalize=0,"
+        "alimiter=limit=0.95[mix]"
+    )
+    completed = subprocess.run(
+        [
+            str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(speech), "-i", str(ambience),
+            "-filter_complex", filter_graph, "-map", "[mix]", "-t", f"{duration:.6f}",
+            "-ac", "2", "-ar", "32000", "-c:a", "pcm_s16le", str(destination),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode or not destination.is_file() or destination.stat().st_size <= 44:
+        detail = completed.stderr.decode("utf-8", errors="replace")[-1200:]
+        raise RuntimeError("Could not build complete location-sound reference: " + detail)
+    return destination
+
+
+def _queue_auxiliary_workflow(
+    job: dict,
+    segment: dict,
+    workflow: dict,
+    destination: Path,
+) -> Path:
+    server = str(job["server"]).rstrip("/")
+    http_timeout = max(1, int(job.get("http_timeout", 30)))
+    reconnect_timeout = max(
+        1, int(job.get("connection_recovery_timeout", DEFAULT_RECONNECT_TIMEOUT_SECONDS))
+    )
+    payload = json.dumps(
+        {"prompt": workflow, "client_id": "h3-native-ambience-" + uuid.uuid4().hex},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    queued = _request_json(
+        urllib.request.Request(
+            server + "/prompt",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        ),
+        http_timeout,
+    )
+    prompt_id = str(queued.get("prompt_id", ""))
+    if not prompt_id:
+        raise RuntimeError("ComfyUI did not return a prompt_id for native ambience.")
+    emit({
+        "progress": (
+            f"Segment {segment['index'] + 1}/{job['segment_count']} · "
+            f"native ambience pass queued · {prompt_id}"
+        ),
+        "segment_index": segment["index"],
+        "native_ambience_prompt_id": prompt_id,
+    })
+    _history, outputs = wait_for_history(
+        server,
+        prompt_id,
+        poll_interval=max(0.1, float(job.get("history_poll_interval", 1.0))),
+        generation_timeout=max(10, int(job.get("generation_timeout", 1800))),
+        http_timeout=http_timeout,
+        reconnect_timeout=reconnect_timeout,
+        segment_id=str(segment.get("segment_id", "")) + ":native-ambience",
+    )
+    downloaded = download_outputs(
+        server,
+        outputs,
+        destination,
+        http_timeout,
+        reconnect_timeout=reconnect_timeout,
+        prompt_id=prompt_id,
+        segment_id=str(segment.get("segment_id", "")) + ":native-ambience",
+    )
+    video = _primary_video(downloaded)
+    if video is None:
+        raise RuntimeError("Native ambience pass produced no downloadable video.")
+    return video
+
+
+def prepare_complete_location_sound_reference(
+    job: dict,
+    segment: dict,
+    workflow: dict,
+) -> dict | None:
+    """Generate/cache ambience, combine it with TTS, and patch the final H3 graph."""
+
+    spec = dict(segment.get("location_sound_reference") or {})
+    if not bool(spec.get("enabled")):
+        return None
+    speech = Path(str(spec.get("speech_path", "")))
+    if not speech.is_file() or speech.stat().st_size <= 44:
+        raise FileNotFoundError("Authored segment TTS is missing: " + str(speech))
+    ambience = Path(str(spec.get("ambience_cache_path", "")))
+    complete = Path(str(spec.get("complete_cache_path", "")))
+    duration = max(0.01, float(spec.get("duration_seconds", 0.0)))
+    token = str(spec.get("cache_token", "location"))
+    ffmpeg = Path(str(job.get("ffmpeg", "")))
+
+    ambience_valid = (
+        ambience.is_file()
+        and ambience.stat().st_size > 44
+        and _audio_mean_volume_db(ffmpeg, ambience) > -55.0
+    )
+    if not ambience_valid:
+        ambience.unlink(missing_ok=True)
+        last_ambience_error: Exception | None = None
+        for ambience_attempt in range(1, 3):
+            try:
+                ambience_workflow = build_native_ambience_workflow(
+                    workflow, duration_seconds=duration, cache_token=token
+                )
+                ambience_workflow = _workflow_for_attempt(
+                    ambience_workflow,
+                    int(segment.get("seed", 0) or 0),
+                    ambience_attempt,
+                )
+                auxiliary_dir = ambience.parent / (
+                    ambience.stem + f"_render_{ambience_attempt}"
+                )
+                video = _queue_auxiliary_workflow(
+                    job, segment, ambience_workflow, auxiliary_dir
+                )
+                _extract_video_audio(ffmpeg, video, ambience)
+                mean_db = _audio_mean_volume_db(ffmpeg, ambience)
+                if mean_db <= -55.0:
+                    raise RuntimeError(
+                        f"H3 native ambience is effectively silent ({mean_db:.1f} dB)."
+                    )
+                emit({
+                    "progress": (
+                        f"Segment {segment['index'] + 1}/{job['segment_count']} · "
+                        f"native ambience cached ({mean_db:.1f} dB mean)"
+                    ),
+                    "segment_index": segment["index"],
+                })
+                last_ambience_error = None
+                break
+            except Exception as exc:
+                last_ambience_error = exc
+                ambience.unlink(missing_ok=True)
+                if ambience_attempt < 2:
+                    emit({
+                        "progress": (
+                            f"Segment {segment['index'] + 1}/{job['segment_count']} · "
+                            "native ambience was unavailable or silent; retrying once"
+                        ),
+                        "segment_index": segment["index"],
+                    })
+        if last_ambience_error is not None:
+            raise RuntimeError(
+                "Could not create an audible native location bed after two attempts: "
+                + str(last_ambience_error)
+            )
+
+    if not complete.is_file() or complete.stat().st_size <= 44:
+        _mix_complete_location_reference(
+            ffmpeg,
+            speech=speech,
+            ambience=ambience,
+            destination=complete,
+            duration_seconds=duration,
+            ambience_gain=float(spec.get("ambience_gain", 0.55)),
+        )
+
+    server = str(job["server"]).rstrip("/")
+    http_timeout = max(1, int(job.get("http_timeout", 30)))
+    desired_name = str(spec.get("upload_name") or complete.name)
+    uploaded = upload_file(server, complete, http_timeout, desired_name)
+    remote_name = str((uploaded or {}).get("name") or desired_name)
+    patch_complete_location_reference(
+        workflow,
+        loader_node_id=str(spec.get("loader_node_id", "")),
+        upload_name=remote_name,
+    )
+    emit({
+        "progress": (
+            f"Segment {segment['index'] + 1}/{job['segment_count']} · "
+            "complete dialogue + location-sound reference attached"
+        ),
+        "segment_index": segment["index"],
+    })
+    return {
+        "file": complete.name,
+        "upload_name": remote_name,
+        "result": uploaded,
+        "kind": "complete_location_sound_reference",
+    }
 
 
 def extract_tail_frames(
@@ -649,6 +1038,55 @@ def assemble_master(job: dict, segments: list[dict]) -> Path:
     return destination.resolve()
 
 
+def _workflow_for_attempt(workflow: dict, base_seed: int, attempt: int) -> dict:
+    """Return a deterministic fresh-seed workflow for a speech-guard retry."""
+
+    result = deepcopy(workflow)
+    if attempt <= 1:
+        return result
+    digest = hashlib.sha256(
+        f"native-speech-guard:{int(base_seed)}:{int(attempt)}".encode("utf-8")
+    ).digest()
+    retry_seed = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+    for node in result.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+        if isinstance(inputs.get("noise_seed"), int):
+            inputs["noise_seed"] = retry_seed
+        elif isinstance(inputs.get("seed"), int):
+            inputs["seed"] = retry_seed
+    return result
+
+
+def speech_guard_result_score(result: dict) -> float:
+    """Rank failed guarded takes so retry exhaustion keeps the least-bad take.
+
+    The guard remains non-blocking, but returning the final random retry made a
+    mildly imperfect first take regress into a take with a long invented line.
+    Lower scores are better; a passing take always wins immediately.
+    """
+
+    if bool(result.get("passed", True)):
+        return 0.0
+    score = 0.0
+    weights = {
+        "unauthorized_speech_in_silence_window": 200.0,
+        "materially_changed_or_unrelated_authored_line": 175.0,
+        "unauthorized_extra_inside_authored_window": 125.0,
+        "repeated_authored_phrase": 100.0,
+    }
+    violations = [row for row in (result.get("violations") or []) if isinstance(row, dict)]
+    for row in violations:
+        score += weights.get(str(row.get("kind", "")), 150.0)
+        transcript = re.sub(r"\s+", "", str(row.get("transcript", "")))
+        score += min(80.0, float(len(transcript)) * 2.0)
+        score += min(30.0, max(0.0, float(row.get("voice_ratio", 0.0))) * 30.0)
+    return score if violations else 1.0
+
+
 def queue_segment(
     job: dict,
     segment: dict,
@@ -656,6 +1094,7 @@ def queue_segment(
     uploaded: list[dict],
     *,
     on_queued=None,
+    speech_guard: NativeSpeechGuard | None = None,
 ) -> dict:
     server = job["server"].rstrip("/")
     http_timeout = max(1, int(job.get("http_timeout", 30)))
@@ -673,8 +1112,12 @@ def queue_segment(
     )
     first_attempt = max(1, int(segment.get("attempts_used", 1) or 1))
     attempt_range = [first_attempt] if resume_existing else range(1, attempts + 1)
+    guarded_candidates: list[dict] = []
     for attempt in attempt_range:
         prompt_id = resumed_prompt_id if resume_existing else ""
+        attempt_workflow = _workflow_for_attempt(
+            workflow, int(segment.get("seed", 0) or 0), attempt
+        )
         try:
             if resume_existing:
                 emit({
@@ -692,7 +1135,10 @@ def queue_segment(
                 })
             else:
                 payload = json.dumps(
-                    {"prompt": workflow, "client_id": "h3-smart-render-" + uuid.uuid4().hex},
+                    {
+                        "prompt": attempt_workflow,
+                        "client_id": "h3-smart-render-" + uuid.uuid4().hex,
+                    },
                     ensure_ascii=False,
                 ).encode("utf-8")
                 request = urllib.request.Request(
@@ -733,6 +1179,93 @@ def queue_segment(
             video = _primary_video(downloaded)
             if video is None:
                 raise RuntimeError(f"Segment {segment['index'] + 1} produced no downloadable video.")
+            speech_guard_result: dict = {}
+            speech_guard_spec = dict(segment.get("native_speech_guard") or {})
+            if speech_guard is not None and speech_guard_spec.get("enabled"):
+                emit({
+                    "progress": (
+                        f"Segment {segment['index'] + 1}/{job['segment_count']} · "
+                        "checking authored-line fidelity and unauthorized speech gaps"
+                    ),
+                    "segment_index": segment["index"],
+                })
+                speech_guard_result = speech_guard.inspect(video, speech_guard_spec)
+                if not bool(speech_guard_result.get("passed", True)):
+                    snapshot = Path(segment["download_dir"]) / (
+                        f".speech_guard_attempt_{attempt}_{Path(video).name}"
+                    )
+                    shutil.copy2(video, snapshot)
+                    guarded_candidates.append({
+                        "attempt": attempt,
+                        "score": speech_guard_result_score(speech_guard_result),
+                        "snapshot": snapshot,
+                        "prompt_id": prompt_id,
+                        "history_status": history.get("status", {}),
+                        "result": deepcopy(speech_guard_result),
+                    })
+                guard_retries = max(
+                    0,
+                    min(
+                        attempts - 1,
+                        int(
+                            job.get(
+                                "native_speech_guard_retries",
+                                job.get("native_speech_guard_attempts", 2),
+                            )
+                        ),
+                    ),
+                )
+                guard_attempts = 1 + guard_retries
+                if not bool(speech_guard_result.get("passed", True)):
+                    violation_preview = "; ".join(
+                        str(row.get("transcript", ""))[:80]
+                        for row in speech_guard_result.get("violations") or []
+                    )
+                    if attempt < guard_attempts and not resume_existing:
+                        emit({
+                            "progress": (
+                                f"Segment {segment['index'] + 1}/{job['segment_count']} "
+                                "contained repeated or unauthorized H3 speech; retrying with a fresh seed · "
+                                + violation_preview
+                            ),
+                            "segment_index": segment["index"],
+                            "native_speech_guard": speech_guard_result,
+                            "attempt": attempt,
+                            "attempts": guard_attempts,
+                        })
+                        time.sleep(0.25)
+                        continue
+                    emit({
+                        "progress": (
+                            f"Segment {segment['index'] + 1}/{job['segment_count']} "
+                            "speech guard warning; retry budget exhausted, continuing without "
+                            "Hard Block"
+                        ),
+                        "segment_index": segment["index"],
+                        "native_speech_guard": speech_guard_result,
+                    })
+                    best = min(
+                        guarded_candidates,
+                        key=lambda row: (float(row["score"]), int(row["attempt"])),
+                    )
+                    shutil.copy2(best["snapshot"], video)
+                    prompt_id = str(best["prompt_id"])
+                    speech_guard_result = dict(best["result"])
+                    history = {"status": dict(best["history_status"])}
+                    emit({
+                        "progress": (
+                            f"Segment {segment['index'] + 1}/{job['segment_count']} "
+                            f"kept guarded take {best['attempt']} as the least-risk result "
+                            f"after {attempt} attempts"
+                        ),
+                        "segment_index": segment["index"],
+                        "selected_guard_attempt": int(best["attempt"]),
+                        "native_speech_guard": speech_guard_result,
+                    })
+                else:
+                    best = None
+                for candidate in guarded_candidates:
+                    Path(candidate["snapshot"]).unlink(missing_ok=True)
             persisted_segment = {key: value for key, value in segment.items() if key != "workflow"}
             return {
                 **persisted_segment,
@@ -744,7 +1277,11 @@ def queue_segment(
                 "uploaded": uploaded,
                 "error": "",
                 "attempts_used": attempt,
+                "selected_guard_attempt": (
+                    int(best["attempt"]) if speech_guard_result and best is not None else attempt
+                ),
                 "failure_class": "",
+                "native_speech_guard_result": speech_guard_result,
             }
         except Exception as exc:
             last_error = exc
@@ -853,6 +1390,22 @@ def main() -> int:
             })
             emit({"progress": f"Uploaded {path.name} as {upload_name}"})
 
+    speech_guard: NativeSpeechGuard | None = None
+    if any(
+        bool((segment.get("native_speech_guard") or {}).get("enabled"))
+        for segment in segments
+    ):
+        speech_guard = NativeSpeechGuard(
+            str(job.get("native_speech_guard_model", "")),
+            str(job.get("ffmpeg", "")),
+        )
+        emit({
+            "progress": (
+                "Native Speech Guard armed · Whisper checks only unauthorized "
+                "human-vocal gaps · no Hard Block"
+            )
+        })
+
     completed: list[dict] = []
     previous_video: Path | None = None
     for index, segment in enumerate(segments):
@@ -906,6 +1459,18 @@ def main() -> int:
             _patch_continuity(workflow, continuity, uploaded_name)
             label = "24-frame motion tail" if kind == "video" else "last-frame still"
             emit({"progress": f"Segment {index + 1}: previous {label} continuity attached"})
+
+        # External authored TTS is intentionally dry and, in real H3 API tests,
+        # suppresses native ambience even when the prompt explicitly requires it.
+        # Before queuing the final Segment, create one complete production-sound
+        # reference (exact TTS + H3-native speech-free ambience). A reconnecting
+        # final prompt is already accepted by ComfyUI and must not be altered.
+        if not resume_existing:
+            location_upload = prepare_complete_location_sound_reference(
+                job, segment, workflow
+            )
+            if location_upload is not None:
+                uploaded.append(location_upload)
 
         emit({
             "segment_status": {
@@ -971,6 +1536,7 @@ def main() -> int:
                 workflow,
                 uploaded_media_for_workflow(workflow, uploaded),
                 on_queued=checkpoint_queued,
+                speech_guard=speech_guard,
             )
         except Exception as exc:
             failure_class = classify_generation_error(exc)

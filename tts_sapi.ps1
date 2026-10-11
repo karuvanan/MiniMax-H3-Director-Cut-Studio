@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$TextFile,
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [string]$Language = "Mandarin Chinese",
+    [ValidateSet("auto", "male", "female")][string]$Gender = "auto",
     [int]$Rate = 0
 )
 
@@ -19,7 +20,10 @@ try {
         $token = $tokens.Item($index)
         $description = $token.GetDescription()
         $descriptions += $description
-        if ($Language -match "Mandarin|Chinese|普通|国语|國語" -and
+        $tokenGender = ""
+        try { $tokenGender = [string]$token.GetAttribute("Gender") } catch {}
+        $genderMatches = ($Gender -eq "auto" -or $tokenGender -match "^$Gender$")
+        if ($genderMatches -and $Language -match "Mandarin|Chinese|普通|国语|國語" -and
             $description -match "Huihui|Yaoyao|Kangkang|Hanhan|Chinese|Mandarin|中文") {
             $voice.Voice = $token
             break

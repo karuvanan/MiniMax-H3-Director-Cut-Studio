@@ -10,6 +10,7 @@ from design_ai_service import handle as handle_design_ai_job, select_available_m
 from drone_route_engine import analyse_red_route
 from design_engine import (
     BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
+    COMIC_TALK_SHOW_SPECIAL_SKILL,
     DESIGN_JSON_SCHEMA,
     DRONE_FIREWORKS_STILL_CONTRACT,
     DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT,
@@ -143,6 +144,110 @@ def sample_design() -> dict:
 
 
 class DesignEngineTests(unittest.TestCase):
+    def test_comic_talk_show_keeps_p1_and_recovers_dynamic_speakers(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        base = payload["shots"][0]
+        payload["shots"] = [
+            {
+                **base,
+                "start_seconds": float(index * 3),
+                "end_seconds": float((index + 1) * 3),
+                "subject_action": f"Principal {index + 1} delivers one short joke.",
+            }
+            for index in range(4)
+        ]
+        payload["text_layers"] = [
+            {
+                "start_seconds": index * 3 + 0.5,
+                "end_seconds": index * 3 + 1.5,
+                "track": f"A{4 + index}",
+                "content": f"短句{index + 1}",
+                "role": "dialogue",
+                "speaker": "S1" if index % 2 == 0 else "S2",
+                "language": "Chinese",
+                "delivery": "Natural",
+                "lip_sync": True,
+                "explicit_user_requested": True,
+            }
+            for index in range(4)
+        ]
+        payload["media_requests"] = [payload["media_requests"][0]]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "analysis_summary": "A stylized ensemble group picture.",
+            }],
+            special_skill_key=COMIC_TALK_SHOW_SPECIAL_SKILL,
+        )
+        self.assertFalse(any(
+            row["media_type"] == "image" for row in plan["media_requests"]
+        ))
+        p1 = next(row for row in plan["existing_media_uses"] if row["media_id"] == "P1")
+        self.assertEqual(p1["reuse_policy"], "whole_design")
+        self.assertEqual((p1["start_seconds"], p1["end_seconds"]), (0.0, plan["duration_seconds"]))
+        self.assertEqual(
+            [row["speaker"] for row in plan["text_layers"]],
+            ["S1", "S2", "S3", "S4"],
+        )
+        self.assertIn("P1 SOURCE-MEDIUM LOCK", plan["global_visual_style"])
+        self.assertIn("dynamic left-to-right P1 cast ledger", " ".join(plan["design_warnings"]))
+
+    def test_comic_talk_show_design_prompt_overrides_two_gender_speaker_rule(self):
+        prompt = build_design_system_prompt({
+            "bound_h3_skills": {
+                "special": {"key": COMIC_TALK_SHOW_SPECIAL_SKILL},
+            },
+        })
+        self.assertIn("actual detected count", prompt)
+        self.assertIn("S1 through SN", prompt)
+        self.assertIn("never assume five people", prompt)
+        self.assertIn("overrides every generic S1-female / S2-male convention", prompt)
+        self.assertIn("text_layer.voice_gender", prompt)
+
+    def test_two_person_talk_show_never_invents_s3_for_a_third_joke(self):
+        payload = sample_design()
+        payload["creative_brief"] = "A two-person comic talk show using the two people in P1."
+        payload["duration_seconds"] = 12.0
+        base = payload["shots"][0]
+        payload["shots"] = [
+            {**base, "start_seconds": index * 4.0, "end_seconds": (index + 1) * 4.0}
+            for index in range(3)
+        ]
+        payload["text_layers"] = [
+            {
+                "start_seconds": index * 4.0 + 0.5,
+                "end_seconds": index * 4.0 + 2.0,
+                "track": f"A{index + 4}",
+                "content": f"对白{index + 1}",
+                "role": "dialogue",
+                "speaker": f"S{index + 1}",
+                "language": "Chinese",
+                "voice_gender": "male",
+                "delivery": "Chinese male voice",
+                "lip_sync": True,
+                "explicit_user_requested": True,
+            }
+            for index in range(3)
+        ]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=[{
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "analysis_summary": "Exactly two principal men on a red background.",
+            }],
+            special_skill_key=COMIC_TALK_SHOW_SPECIAL_SKILL,
+        )
+        self.assertEqual(
+            [row["speaker"] for row in plan["text_layers"]],
+            ["S1", "S2", "S1"],
+        )
+        self.assertTrue(all(row["voice_gender"] == "male" for row in plan["text_layers"]))
+        self.assertTrue(all(row["language"] == "Mandarin Chinese" for row in plan["text_layers"]))
+
     def test_loaded_picture_can_condition_a_general_source_img2img_request(self):
         payload = sample_design()
         payload["existing_media_uses"] = [{
@@ -215,6 +320,42 @@ class DesignEngineTests(unittest.TestCase):
         self.assertGreater(plan["shots"][0]["end_seconds"], original_first_end)
         self.assertGreater(plan["shots"][1]["start_seconds"], original_second_start)
         self.assertFalse(layer["speech_budget"]["risk"])
+
+    def test_generated_short_dialogue_releases_unused_shot_tail_to_vocal_silence(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 12.0
+        payload["shots"] = [{
+            **payload["shots"][0],
+            "start_seconds": 0.0,
+            "end_seconds": 12.0,
+        }]
+        payload["text_layers"] = [{
+            "start_seconds": 2.0,
+            "end_seconds": 9.0,
+            "track": "A4",
+            "content": "我请？我口袋比脸还干净啦！",
+            "role": "dialogue",
+            "speaker": "S1",
+            "language": "Chinese",
+            "delivery": "Natural quick comic delivery",
+            "lip_sync": True,
+            "explicit_user_requested": True,
+        }]
+        plan = normalize_design_plan(
+            payload, {"image": 9, "video": 3, "audio": 3}
+        )
+        layer = plan["text_layers"][0]
+        required = speech_timing_budget(
+            layer["content"], layer["language"], layer["delivery"], 7.0,
+        )["required_seconds"]
+        self.assertEqual(layer["start_seconds"], 2.0)
+        self.assertEqual(layer["end_seconds"], 2.0 + required)
+        self.assertTrue(layer["speech_window_auto_compacted"])
+        self.assertEqual(plan["shots"][0]["end_seconds"], 12.0)
+        self.assertTrue(any(
+            "released Shot tail is now vocal silence" in row
+            for row in plan["design_warnings"]
+        ))
 
     def test_authored_timecode_stays_locked_and_reports_speech_risk(self):
         payload = sample_design()
@@ -1134,8 +1275,10 @@ class DesignEngineTests(unittest.TestCase):
         self.assertNotEqual(voxcpm_speaker_seed("S1"), voxcpm_speaker_seed("S2"))
         female = voxcpm_voice_control({"speaker": "S1", "delivery": "克制而坚定"})
         male = voxcpm_voice_control({"speaker": "S2"})
+        explicit_male = voxcpm_voice_control({"speaker": "S1", "voice_gender": "male"})
         self.assertIn("female voice", female)
         self.assertIn("male voice", male)
+        self.assertIn("male voice", explicit_male)
         self.assertIn("natural on-location film dialogue", female)
         self.assertIn("not narration", female)
         self.assertIn("克制而坚定", female)
@@ -1146,6 +1289,8 @@ class DesignEngineTests(unittest.TestCase):
         self.assertEqual(qwen3_tts_speaker("S2"), "Uncle_Fu")
         self.assertEqual(qwen3_tts_speaker("S3"), "Serena")
         self.assertEqual(qwen3_tts_speaker("S4"), "Dylan")
+        self.assertEqual(qwen3_tts_speaker("S1", "male"), "Uncle_Fu")
+        self.assertEqual(qwen3_tts_speaker("S2", "female"), "Vivian")
         self.assertEqual(qwen3_tts_language("Mandarin Chinese"), "Chinese")
         self.assertEqual(qwen3_tts_language("French"), "French")
         self.assertEqual(qwen3_tts_language("unknown"), "Auto")
@@ -1327,7 +1472,8 @@ On-screen text: "EXACT TITLE"'''
 
     def test_design_prompt_defines_gender_speakers_and_background_audio(self):
         prompt = build_design_system_prompt({})
-        self.assertIn("Assign S1 to a female speaker and S2 to a male speaker", prompt)
+        self.assertIn("Preserve the authored Speaker ID without remapping it by gender", prompt)
+        self.assertIn("set voice_gender to male, female or auto", prompt)
         self.assertIn("diegetic location ambience", prompt)
         soundscape = automatic_background_soundscape({
             "creative_brief": "A man talks inside a quiet office.",
@@ -1343,6 +1489,8 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("NATIVE SPEECH-ENVIRONMENT FUSION", soundscape)
         self.assertIn("never replaces, gates, mutes, resets or fades", soundscape)
         self.assertIn("Apply dialogue ducking only to non-diegetic music", soundscape)
+        self.assertIn("CINEMATIC DIALOGUE ACOUSTIC INTEGRATION", soundscape)
+        self.assertIn("FINAL AUDIO PRIORITY", soundscape)
         self.assertNotIn("Reduce ambience", soundscape)
         music = automatic_background_music({
             "creative_brief": "A tense police chase through city streets.",
@@ -1435,6 +1583,9 @@ On-screen text: "EXACT TITLE"'''
         exterior_name, exterior = spatial_acoustics_profile(
             "A man speaks on an open outdoor street beside a field."
         )
+        rain_name, rain = spatial_acoustics_profile(
+            "Two people speak in heavy rain beside a shallow puddle."
+        )
         covered_name, covered = spatial_acoustics_profile(
             "Two people stand beneath a rainy coffee stall awning."
         )
@@ -1443,8 +1594,12 @@ On-screen text: "EXACT TITLE"'''
         self.assertEqual(hall_name, "large interior")
         self.assertIn("0.9-1.8s", hall)
         self.assertEqual(exterior_name, "open exterior")
-        self.assertIn("almost no reverb", exterior)
-        self.assertIn("reduce low-mid body", exterior)
+        self.assertIn("environment-to-voice ratio", exterior)
+        self.assertEqual(rain_name, "open rainy exterior")
+        self.assertIn("no invented indoor reverb", rain.lower())
+        self.assertIn("clean dry voice", rain)
+        self.assertIn("no invented indoor reverb", exterior)
+        self.assertIn("low-mid proximity fullness", exterior)
         self.assertEqual(covered_name, "covered semi-outdoor space")
         self.assertIn("no long enclosed-room tail", covered)
 
@@ -1465,6 +1620,16 @@ On-screen text: "EXACT TITLE"'''
         self.assertIn("0.00-2.50s small furnished room", schedule)
         self.assertIn("2.50-5.00s open exterior", schedule)
 
+        recovered = spatial_acoustics_schedule({
+            "duration_seconds": 9.5,
+            "shots": [{
+                "environment_response": "Steady rain crosses an open puddle.",
+            }],
+        })
+        self.assertIn("0.00-9.50s", recovered)
+        self.assertIn("open rainy exterior", recovered)
+        self.assertNotIn("0.00-0.00s", recovered)
+
         inherited = spatial_acoustics_schedule({
             "shots": [
                 {
@@ -1481,6 +1646,20 @@ On-screen text: "EXACT TITLE"'''
         })
         self.assertIn("0.00-5.00s covered semi-outdoor space", inherited)
         self.assertNotIn("neutral visible location", inherited)
+
+    def test_rain_scene_keeps_standard_auto_music_level(self):
+        music = automatic_background_music({
+            "creative_brief": "A playful exchange in steady rain beside a puddle.",
+            "non_diegetic_music": (
+                "Light comic strings. Music mix contract: Keep the score clearly audible. "
+                "WEATHER/WATER ENVIRONMENT-PRIORITY MIX LOCK: keep the score beneath the location bed."
+            ),
+            "shots": [{"environment_response": "Rain and wind continue across water."}],
+        })
+        self.assertTrue(music.startswith("Light comic strings."))
+        self.assertIn("Keep the score clearly audible", music)
+        self.assertIn("let it rise smoothly in dialogue gaps", music)
+        self.assertNotIn("WEATHER/WATER ENVIRONMENT-PRIORITY MIX LOCK", music)
 
     def test_old_no_reverb_auto_phrase_is_replaced_by_visible_space_contract(self):
         soundscape = automatic_background_soundscape({
@@ -1545,6 +1724,39 @@ On-screen text: "EXACT TITLE"'''
         self.assertEqual(result["max_output_tokens"], 32768)
         self.assertEqual(result["finish_reason"], "length")
         self.assertEqual(result["output_characters"], 2)
+
+    def test_design_ai_lm_studio_can_receive_p1_as_visual_input(self):
+        image = Path(__file__).parent / ".director_cache" / "design_visual_p1.jpg"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"p1-pixels")
+        calls = []
+
+        def fake_request(url, *, api_key, timeout, payload=None):
+            calls.append((url, payload))
+            if url.endswith("/models"):
+                return {"data": [{"id": "qwen-vl-local"}]}
+            return {
+                "choices": [{
+                    "message": {"content": "{}"},
+                    "finish_reason": "stop",
+                }],
+            }
+
+        with patch("design_ai_service.request_json", side_effect=fake_request):
+            result = handle_design_ai_job({
+                "action": "generate", "provider": "lm_studio",
+                "base_url": "http://127.0.0.1:1234/v1", "model": "qwen-vl-local",
+                "system_prompt": "Return JSON.", "user_prompt": "Inspect P1.",
+                "schema": {"type": "object"}, "input_image_paths": [str(image)],
+            })
+        completion = next(
+            payload for url, payload in calls if url.endswith("/chat/completions")
+        )
+        content = completion["messages"][-1]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0], {"type": "text", "text": "Inspect P1."})
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(result["input_images_used"], 1)
 
     def test_design_ai_preserves_empty_length_stop_for_ui_recovery(self):
         def fake_request(url, *, api_key, timeout, payload=None):

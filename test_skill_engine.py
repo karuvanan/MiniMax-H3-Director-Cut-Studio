@@ -40,6 +40,35 @@ class SkillEngineTests(unittest.TestCase):
         self.assertIn("subject_definitions", self.profiles[DEFAULT_SKILL].h3_reference_guide)
         self.assertIn("Typography Rules", self.profiles[SPECIAL_SKILL].instruction)
 
+    def test_comic_talk_show_compiler_keeps_p1_as_dynamic_group_plate(self):
+        p1 = MediaAsset(
+            node_id="1", class_type="LoadImage", media_type="image",
+            filename="group.png", tag="<Picture 1>", reference_id="P1",
+            binding="ref_images.ref_image_0", start_seconds=0.0,
+            end_seconds=6.0,
+            clip_prompt="P1 authoritative whole-design group cast.",
+        )
+        spec = PromptSpec(
+            brief="The group trades short jokes.",
+            shots=["The third principal speaks while the others react silently."],
+            text_ranges=[{
+                "layer_id": "T3", "track_id": "A6",
+                "start_seconds": 1.0, "end_seconds": 3.0,
+                "content_role": "dialogue", "text": "轮到我了。",
+                "speaker": "S3", "language": "Mandarin Chinese",
+                "delivery": "Dry comic timing", "lip_sync": True,
+            }],
+        )
+        prompt = build_ref2va_prompt(
+            spec, [p1], 6.0, self.profiles[DEFAULT_SKILL],
+            self.profiles["comic-talk-show-h3"],
+        )
+        self.assertIn("<P1 Group Cast>", prompt)
+        self.assertIn("S1 through SN", prompt)
+        self.assertIn("original location and medium", prompt)
+        self.assertIn("speaker (S3)", prompt)
+        self.assertNotIn("recurring human character whose exact recognizable face identity", prompt)
+
     def test_saved_mtv_a1_lip_instruction_is_retargeted_to_active_a2(self):
         old = "@P1 performs directly to @A1 with readable mouth, jaw, breath, facial and gesture timing."
         p1 = MediaAsset(
@@ -1176,7 +1205,8 @@ class SkillEngineTests(unittest.TestCase):
             self.profiles[DEFAULT_SKILL],
         )
         self.assertIn("authored_dialogue_stem", prompt)
-        self.assertIn("not a finished full mix", prompt)
+        self.assertIn("not a final dry waveform", prompt)
+        self.assertIn("scene-matched direct-to-ambient ratio", prompt)
         self.assertIn("diegetic ambience", prompt)
         self.assertIn("synchronized Foley/SFX", prompt)
         self.assertIn("ducked non-diegetic music", prompt)

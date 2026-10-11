@@ -76,6 +76,16 @@ from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_text_layer_accepts_dynamic_ensemble_speaker_ids(self):
+        self.assertEqual(
+            TextLayer("T7", "第七位发言", 0.0, 1.0, "A10", speaker="s7").speaker,
+            "S7",
+        )
+        self.assertEqual(
+            TextLayer("TX", "无效编号", 0.0, 1.0, "A4", speaker="host").speaker,
+            "S1",
+        )
+
     def test_mtv_supplied_speech_uses_a2_then_a1_without_activity_analysis(self):
         loaded = str(Path(__file__).resolve())
         a1 = MediaAsset(
@@ -833,17 +843,24 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.prompt_panel.spec()
         )
         self.assertEqual(without_audio.text_ranges[0]["supplied_audio_tag"], "")
+        self.assertLess(without_audio.text_ranges[0]["end_seconds"], 5.0)
         self.assertNotIn(window.text_layers[0].text, without_audio.shots[0])
         self.assertIn("NATIVE AUDIO DIRECTION", without_audio.shots[0])
         self.assertIn("diegetic sound", without_audio.shots[0])
         self.assertIn("ENVIRONMENT CONTINUITY", without_audio.shots[0])
         self.assertEqual(len(without_audio.native_audio_ranges), 1)
+        self.assertIn(
+            "CINEMATIC DIALOGUE ACOUSTIC INTEGRATION",
+            without_audio.audio,
+        )
+        self.assertIn("FINAL AUDIO PRIORITY", without_audio.audio)
         with_audio = window._prompt_spec_with_director_cues(
             window.prompt_panel.spec(), supplied_dialogue_audio_tag="<Audio 2>"
         )
         self.assertEqual(
             with_audio.text_ranges[0]["supplied_audio_tag"], "<Audio 2>"
         )
+        self.assertEqual(with_audio.text_ranges[0]["end_seconds"], 5.0)
         self.assertNotIn(window.text_layers[0].text, with_audio.shots[0])
         window.project_dirty = False
         window.close()
@@ -871,6 +888,54 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertIn("HUMAN VOCAL CHANNEL: EMPTY", direction)
         self.assertNotIn("natural conversational volume", direction)
         self.assertEqual(tail.text_ranges, [])
+        window.project_dirty = False
+        window.close()
+
+    def test_native_dialogue_budget_creates_explicit_silence_gaps_and_cleans_silent_shot(self):
+        window = DirectorCutStudio()
+        skill_index = window.special_combo.findData("comic-talk-show-h3")
+        self.assertGreaterEqual(skill_index, 0)
+        window.special_combo.blockSignals(True)
+        window.special_combo.setCurrentIndex(skill_index)
+        window.special_combo.blockSignals(False)
+        window.director_cues = [
+            DirectorCue(
+                "S1", "shot", 0.0, 2.0, "Group setup", track_id="V1",
+                subject_action=(
+                    "S3 pats S4 on the shoulder. A shutter clicks just before S1 speaks."
+                ),
+                continuity_state="S1's mouth is closed after his line.",
+            ),
+            DirectorCue(
+                "S2", "shot", 2.0, 7.0, "S1 speaker reveal", track_id="V1",
+                subject_action="S1 speaks his line, closes his mouth, then shrugs.",
+            ),
+        ]
+        window.text_layers = [TextLayer(
+            "T1", "我请？我口袋比脸还干净啦！", 2.0, 7.0, "A4",
+            content_role="dialogue", speaker="S1", language="Chinese",
+            delivery="Natural quick comic delivery", lip_sync=True, shot_id="S2",
+        )]
+
+        spec = window._prompt_spec_with_director_cues(
+            window.prompt_panel.spec(), window_start=0.0, window_end=7.0,
+        )
+        self.assertLess(spec.text_ranges[0]["end_seconds"], 7.0)
+        self.assertNotIn("speaks", spec.shot_ranges[0]["description"])
+        self.assertNotIn("after his line", spec.shot_ranges[0]["description"])
+        self.assertIn(
+            "HUMAN VOCAL CHANNEL: EMPTY",
+            spec.native_audio_ranges[0]["native_audio_direction"],
+        )
+        self.assertIn("SPEAKER TURN-END LOCK", spec.shot_ranges[1]["description"])
+
+        prompt = window._prompt_for_window(
+            0.0, 7.0, [], is_final_window=True,
+        )
+        self.assertIn("EXPLICIT HUMAN-VOCAL SILENCE WINDOWS", prompt)
+        self.assertIn("0.00-2.00s", prompt)
+        self.assertIn("COMIC TALK SHOW TURN-END LOCK", prompt)
+        self.assertIn("No principal may ad-lib", prompt)
         window.project_dirty = False
         window.close()
 
@@ -2231,7 +2296,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
-    def test_native_dialogue_prompt_locks_s1_female_and_s2_male_faces(self):
+    def test_native_dialogue_prompt_uses_explicit_voice_gender_not_speaker_parity(self):
         window = DirectorCutStudio()
         pictures = [asset for asset in window.scan.assets if asset.media_type == "image"]
         male, female = pictures[:2]
@@ -2244,20 +2309,23 @@ class DirectorTimelineDragTests(unittest.TestCase):
             TextLayer(
                 "T1", "请告诉我答案。", 0.0, 2.0, "A4",
                 content_role="dialogue", speaker="S1", language="Mandarin Chinese",
-                shot_id="S1",
+                shot_id="S1", voice_gender="female",
             ),
             TextLayer(
                 "T2", "我现在回答。", 2.5, 5.0, "A4",
                 content_role="dialogue", speaker="S2", language="Mandarin Chinese",
-                shot_id="S1",
+                shot_id="S1", voice_gender="male",
             ),
         ]
         prompt = window._prompt_for_window(
             0.0, 5.0, [male, female], is_final_window=True
         )
         self.assertIn("SPEAKER-TO-FACE IDENTITY LOCK", prompt)
-        self.assertIn(f"S1 always means the female voice/character defined by {female.tag}", prompt)
-        self.assertIn(f"S2 always means the male voice/character defined by {male.tag}", prompt)
+        self.assertIn("Speaker numbering never implies gender", prompt)
+        self.assertIn(f"T1 uses S1 -> {female.tag}", prompt)
+        self.assertIn(f"T2 uses S2 -> {male.tag}", prompt)
+        self.assertIn("S1, voice_gender=female", prompt)
+        self.assertIn("S2, voice_gender=male", prompt)
         self.assertIn("only the assigned speaker moves lips", prompt)
         window.project_dirty = False
         window.close()
@@ -4084,6 +4152,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         dialog = ContentLayerDialog(layer, window.scan.duration_seconds, [shot])
         self.assertEqual(dialog.role_combo.currentData(), "dialogue")
         self.assertTrue(all(not widget.isHidden() for _label, widget in dialog.dialogue_rows))
+        female_index = dialog.voice_gender_combo.findData("female")
+        dialog.voice_gender_combo.setCurrentIndex(female_index)
+        self.assertEqual(dialog.state()["voice_gender"], "female")
         state = dialog.state()
         self.assertEqual(state["speaker"], "S2")
         self.assertEqual(state["language"], "Cantonese")
@@ -4168,6 +4239,59 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(by_id["T1"]["track_id"], first.track_id)
         self.assertEqual(by_id["T2"]["track_id"], second.track_id)
         self.assertEqual(by_id["T2"]["overlap_policy"], "overlap")
+        window.project_dirty = False
+        window.close()
+
+    def test_each_native_dialogue_event_receives_its_own_track_and_gap_spec(self):
+        window = DirectorCutStudio()
+        first = TextLayer(
+            "T1", "第一句对白", 0.0, 3.0, "A4",
+            content_role="dialogue", language="Chinese",
+            overlap_policy="auto",
+        )
+        second = TextLayer(
+            "T2", "第二句对白", 4.0, 7.0, "A4",
+            content_role="dialogue", language="Chinese",
+            overlap_policy="auto",
+        )
+        window.text_layers = [first, second]
+        window._refresh_text_layers(second)
+        self.app.processEvents()
+
+        self.assertNotEqual(first.track_id, second.track_id)
+        self.assertEqual(
+            next(track.name for track in window.tracks if track.track_id == first.track_id),
+            "D1 · Dialogue",
+        )
+        self.assertEqual(
+            next(track.name for track in window.tracks if track.track_id == second.track_id),
+            "D2 · Dialogue",
+        )
+        guard = window._native_speech_guard_spec(0.0, 8.0, [])
+        self.assertTrue(guard["enabled"])
+        self.assertEqual(guard["authorized_windows"], [[0.0, 1.5], [4.0, 5.5]])
+        self.assertEqual(guard["silence_windows"], [[1.5, 4.0], [5.5, 8.0]])
+        self.assertEqual(
+            [row["layer_id"] for row in guard["authorized_lines"]],
+            ["T1", "T2"],
+        )
+        self.assertEqual(guard["authorized_lines"][0]["text"], "第一句对白")
+        window.project_dirty = False
+        window.close()
+
+    def test_speech_guard_checks_fully_silent_tail_for_external_tts(self):
+        window = DirectorCutStudio()
+        window.text_layers = [TextLayer(
+            "T1", "只有前段有对白", 0.0, 2.0, "A4",
+            content_role="dialogue", language="Mandarin Chinese",
+            voice_gender="male",
+        )]
+        window.render_settings.dialogue_tts_engine = "qwen3_tts_local"
+        guard = window._native_speech_guard_spec(3.0, 7.0, [])
+        self.assertTrue(guard["enabled"])
+        self.assertEqual(guard["authorized_windows"], [])
+        self.assertEqual(guard["silence_windows"], [[0.0, 4.0]])
+        self.assertEqual(guard["speech_source"], "authored_tts_reference")
         window.project_dirty = False
         window.close()
 
@@ -6247,6 +6371,75 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(window._stored_tts_signature(audio), signature)
         self.assertTrue(window._activate_authored_speech_reference(audio))
         self.assertFalse(track.muted)
+        window.project_dirty = False
+        window.close()
+
+    def test_authored_tts_rain_shot_keeps_location_audio_without_false_foley(self):
+        window = DirectorCutStudio()
+        audio = next(asset for asset in window.scan.assets if asset.media_type == "audio")
+        audio.filename = "exact-authored-speech.wav"
+        audio.local_path = str(PROJECT_ROOT / "exact-authored-speech.wav")
+        audio.timeline_placed = True
+        audio.timeline_track_id = "A1"
+        audio.start_seconds = 0.0
+        audio.end_seconds = 9.5
+        audio.recognition = "AI DESIGN AUTHORED SPEECH TTS\nAUTHORED TTS TRANSCRIPT:"
+        window.director_cues = [DirectorCue(
+            "S1", "shot", 0.0, 9.5, "Final visual punchline",
+            framing="Medium two-shot",
+            subject_action=(
+                "Both principals stand in a puddle; apply the speaker lock and hold the final visual punchline."
+            ),
+            environment_response="Steady rain and wind ripple the water around their boots.",
+        )]
+        window.text_layers = [TextLayer(
+            "T1", "合照而已", 0.5, 3.0, "A4",
+            content_role="dialogue", speaker="S1", language="Mandarin Chinese",
+            delivery="playful", lip_sync=True, shot_id="S1",
+        )]
+
+        window._refresh_native_audio_directions([audio])
+        cue = window.director_cues[0]
+        self.assertIn("open rainy exterior", cue.native_audio_direction)
+        self.assertIn("water, rain and wet-surface contact", cue.native_audio_direction)
+        self.assertNotIn("attack air-displacement", cue.native_audio_direction)
+        self.assertNotIn("rock fracture", cue.native_audio_direction)
+        self.assertNotIn("doors, locks", cue.native_audio_direction)
+        self.assertIn("Authored speech reference(s): <Audio 1>", cue.audio_reference_intent)
+        self.assertIn("not the complete soundtrack", cue.audio_reference_intent)
+        self.assertNotIn("No Audio or Video reference", cue.audio_reference_intent)
+        window.project_dirty = False
+        window.close()
+
+    def test_duplicate_authored_tts_assets_are_consolidated_before_h3(self):
+        window = DirectorCutStudio()
+        audio_assets = [asset for asset in window.scan.assets if asset.media_type == "audio"]
+        stale, current = audio_assets[:2]
+        for asset, name in ((stale, "stale.wav"), (current, "current.wav")):
+            asset.filename = name
+            asset.local_path = str(PROJECT_ROOT / name)
+            asset.timeline_placed = True
+            asset.enabled = True
+            asset.activation_mode = "auto"
+            asset.monitor_visible = True
+            asset.recognition = "AI DESIGN AUTHORED SPEECH TTS\nAUTHORED TTS TRANSCRIPT:"
+        window._write_tts_signature(current, window._timeline_tts_signature())
+
+        selected = window._ensure_timeline_tts_asset()
+
+        self.assertIs(selected, current)
+        self.assertTrue(current.timeline_placed)
+        self.assertTrue(current.enabled)
+        self.assertFalse(stale.timeline_placed)
+        self.assertFalse(stale.enabled)
+        self.assertEqual(stale.activation_mode, "bypass")
+        active = [
+            asset for asset in window.scan.assets
+            if asset.media_type == "audio"
+            and "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
+            and asset.timeline_placed and asset.enabled
+        ]
+        self.assertEqual(active, [current])
         window.project_dirty = False
         window.close()
 

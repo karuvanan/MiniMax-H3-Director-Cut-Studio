@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
+import mimetypes
+from pathlib import Path
 import re
 import sys
 import urllib.error
@@ -177,6 +180,16 @@ def generate(job: dict) -> dict:
     model = str(job.get("model", "")).strip()
     system_prompt = str(job.get("system_prompt", ""))
     user_prompt = str(job.get("user_prompt", ""))
+    input_images: list[str] = []
+    for raw_path in job.get("input_image_paths") or []:
+        path = Path(str(raw_path)).expanduser()
+        if not path.is_file():
+            continue
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        input_images.append(f"data:{mime_type};base64,{encoded}")
+        if len(input_images) >= 3:
+            break
     schema = job.get("schema") or {}
     raw_schema_name = str(job.get("schema_name", "h3_director_design")).strip()
     schema_name = re.sub(r"[^A-Za-z0-9_-]", "_", raw_schema_name)[:64]
@@ -193,15 +206,17 @@ def generate(job: dict) -> dict:
     if not model:
         raise ValueError("Model is required")
     if provider == "openai":
-        payload = request_json(
-            endpoint(base_url, "responses"),
-            api_key=api_key,
-            timeout=timeout,
-            payload={
+        def openai_payload(images: list[str]) -> dict:
+            user_content = [{"type": "input_text", "text": user_prompt}]
+            user_content.extend(
+                {"type": "input_image", "image_url": image_url}
+                for image_url in images
+            )
+            return {
                 "model": model,
                 "input": [
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                    {"role": "user", "content": user_content},
                 ],
                 "text": {
                     "format": {
@@ -212,19 +227,37 @@ def generate(job: dict) -> dict:
                     }
                 },
                 "max_output_tokens": max_output_tokens,
-            },
-        )
+            }
+        try:
+            payload = request_json(
+                endpoint(base_url, "responses"), api_key=api_key, timeout=timeout,
+                payload=openai_payload(input_images),
+            )
+        except RuntimeError:
+            if not input_images:
+                raise
+            input_images = []
+            payload = request_json(
+                endpoint(base_url, "responses"), api_key=api_key, timeout=timeout,
+                payload=openai_payload([]),
+            )
     else:
         models = available_openai_models(base_url, api_key, min(timeout, 30.0))
         # Older OpenAI-compatible local servers may return no model catalogue
         # even though chat/completions works. Keep the authored model in that
         # compatibility case; when a catalogue exists, stale IDs are repaired.
         model = select_available_model(model, models) or model
+        user_content: str | list[dict] = user_prompt
+        if input_images:
+            user_content = [{"type": "text", "text": user_prompt}] + [
+                {"type": "image_url", "image_url": {"url": image_url}}
+                for image_url in input_images
+            ]
         chat_payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0.3,
             "max_tokens": max_output_tokens,
@@ -249,15 +282,36 @@ def generate(job: dict) -> dict:
                 payload=chat_payload,
             )
         except RuntimeError as exc:
-            if "response_format" not in str(exc) and "json_schema" not in str(exc):
-                raise
-            chat_payload["response_format"] = {"type": "json_object"}
-            payload = request_json(
-                endpoint(base_url, "chat/completions"),
-                api_key=api_key,
-                timeout=timeout,
-                payload=chat_payload,
+            schema_error = (
+                "response_format" in str(exc) or "json_schema" in str(exc)
             )
+            if schema_error:
+                # Keep the P1 visual input while falling back from strict
+                # schema mode; the model still has to count the actual cast.
+                chat_payload["response_format"] = {"type": "json_object"}
+                try:
+                    payload = request_json(
+                        endpoint(base_url, "chat/completions"), api_key=api_key,
+                        timeout=timeout, payload=chat_payload,
+                    )
+                except RuntimeError as schema_exc:
+                    exc = schema_exc
+                else:
+                    exc = None
+            if exc is not None and input_images:
+                input_images = []
+                chat_payload["messages"][-1]["content"] = user_prompt
+                try:
+                    payload = request_json(
+                        endpoint(base_url, "chat/completions"), api_key=api_key,
+                        timeout=timeout, payload=chat_payload,
+                    )
+                except RuntimeError as text_exc:
+                    exc = text_exc
+                else:
+                    exc = None
+            if exc is not None:
+                raise exc
     finish_reason = response_finish_reason(payload)
     try:
         text = response_text(payload)
@@ -278,6 +332,7 @@ def generate(job: dict) -> dict:
         "output_characters": len(text),
         "max_output_tokens": max_output_tokens,
         "usage": payload.get("usage") or {},
+        "input_images_used": len(input_images),
     }
 
 

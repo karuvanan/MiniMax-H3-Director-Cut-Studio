@@ -98,6 +98,45 @@ class PromptEngineTests(unittest.TestCase):
         self.assertEqual(result.count("你先聽我講。"), 1)
         self.assertEqual(result.count("我已經聽夠了！"), 1)
 
+    def test_explicit_voice_gender_is_compiled_into_h3_dialogue(self):
+        self.spec.dialogue = ""
+        self.spec.text_ranges = [{
+            "layer_id": "T1", "track_id": "D1",
+            "start_seconds": 0.5, "end_seconds": 2.5,
+            "content_role": "dialogue", "speaker": "S1",
+            "language": "Mandarin Chinese", "voice_gender": "male",
+            "delivery": "Dry comic timing", "overlap_policy": "auto",
+            "text": "这句必须是男声。",
+        }]
+        result = build_structured_prompt(self.spec)
+        self.assertIn("voice_gender=male", result)
+        self.assertIn("VOICE GENDER LOCK", result)
+        self.assertIn("consistent male voice", result)
+
+    def test_identical_overlap_is_compiled_as_one_synchronized_unison(self):
+        self.spec.dialogue = ""
+        self.spec.text_ranges = [
+            {
+                "layer_id": "T3", "track_id": "A6",
+                "start_seconds": 12.5, "end_seconds": 16.5,
+                "content_role": "dialogue", "speaker": "S1",
+                "language": "Mandarin Chinese", "delivery": "Comic blame",
+                "overlap_policy": "overlap", "text": "都怪那个拍照的！对，就是你！",
+            },
+            {
+                "layer_id": "T4", "track_id": "A7",
+                "start_seconds": 12.5, "end_seconds": 16.5,
+                "content_role": "dialogue", "speaker": "S2",
+                "language": "Mandarin Chinese", "delivery": "Comic blame",
+                "overlap_policy": "overlap", "text": "都怪那个拍照的！对，就是你！",
+            },
+        ]
+        result = build_structured_prompt(self.spec)
+        self.assertEqual(result.count("都怪那个拍照的！对，就是你！"), 1)
+        self.assertIn("AUTHORIZED SYNCHRONIZED UNISON", result)
+        self.assertIn("S1+S2", result)
+        self.assertIn("one shared utterance once", result)
+
     def test_validation_keeps_reference_tags(self):
         prompt = build_structured_prompt(self.spec)
         report = validate_prompt(prompt, reference_tags_from_spec(self.spec))

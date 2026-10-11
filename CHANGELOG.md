@@ -2,6 +2,176 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.5-alpha.15] - 2026-10-11
+
+### Verified Native Location-Sound Reference Pipeline
+
+- 使用真实ComfyUI `192.168.0.185:8189`对受影响Segment完成三组H3实测：仅加强Prompt仍在对白后产生约0.94秒静音；把TTS与H3雨声作为两条Audio Reference仍产生约0.93秒静音；将准确TTS与H3原生无对白环境床合并成一条完整现场参考后，最终H3输出不再出现静音区，平均响度约`-14 dB`。
+- 外部TTS且含画面内Dialogue的Segment现在自动执行低成本`Native Ambience Reference Pass`：沿用同一视觉参考及声景，移除全部Audio reference，强制空人声通道，由H3生成连续环境声和物理Foley；结果按Segment fingerprint缓存。
+- Studio随后在提交最终H3前，把精确TTS与缓存的H3原生环境床组成一条完整现场录音参考，取代原来的干TTS loader。最终影片仍由H3一次生成，不在成片后覆盖或重混音轨；重跑相同Segment会复用环境床缓存。
+- 修复实际Segment Prompt在`Production mix contract`截断时一并删除全局`CINEMATIC DIALOGUE ACOUSTIC INTEGRATION`合约的问题；含Dialogue／Lyrics的窗口会重新插入完整合约。
+- Render Policy提升至30，旧Policy 29的干TTS Segment不会继续复用。
+
+### Verification
+
+- Smart Render Worker 19项、Native Audio／Design Engine 146项及标准生产流程14项测试通过；Timeline完整声学合约专项测试通过。真实服务器验证Prompt IDs：`7136dca9-bb3a-4155-9842-84516e5c07e9`、`dc80dd55-6898-4f32-b283-be2092cb8f0d`、`672293f5-5539-4193-820f-b45ab8baab2e`；最终`1.0 MP + RTX 2× ULTRA`验收为`fb539ec2-1bca-470e-a5e7-4a90f5efe76d`，输出`2752×1536 / 24fps`、平均约`-14.9 dB`且无可检测静音区。
+
+## [0.3.5-alpha.14] - 2026-10-11
+
+### Cinematic Dialogue Acoustic Integration
+
+- 新增全局`CINEMATIC DIALOGUE ACOUSTIC INTEGRATION — MANDATORY`合约，并由`overall_soundscape`及每Shot Native Audio实际提交给MiniMax H3。对白、环境床与Foley必须共享同一空气、方向、遮挡、反射场和空间深度，禁止ADR／配音棚式中央干声叠加。
+- 室内声学按可见空间大小、材质、陈设与开口推导早期反射、吸收和衰减；室外不再用简单`0–3% wetness`表示“几乎全干”，而是保留空气吸收、可见地面／湿地／建筑短反射、风雨环境渗漏、距离响度与高频损失。
+- 声音透视随景别执行：近景保留呼吸与口腔细节但不隔离环境，中景使用自然交谈比例，远景降低响度和亮度并提高环境声相对比例；镜头移动时连续过渡。
+- 新增动作与发声耦合：转头产生离轴方向性与高频损失，跑动／格斗／喊叫改变呼吸、力度与空间投射；仍严格禁止新增未授权文字或音节。
+- 外部TTS reference现在明确是原文、Speaker、音色、时序、音素与Lip Sync控制，不是最终干声波形或不可改变的声学渲染；H3必须在保持这些事实的同时重建现场声学透视。
+- Render Policy提升至29，避免复用旧的干声对白Segment缓存。
+
+### Verification
+
+- Native Audio与Design Engine 146项测试通过；新增ADR禁止、室外环境占比、TTS非最终干声、转头方向性和完整全局合约测试。Timeline雨景TTS与重复TTS合并专项测试通过。
+
+## [0.3.5-alpha.13] - 2026-10-11
+
+### TTS Reference Deduplication and Music-Level Restoration
+
+- 修复Design物化与Timeline TTS刷新竞态可能占用两个Audio slot，并把同一份全片TTS以A1、A2同时提交给H3的问题。Studio现在从全部资产中按当前TTS签名、有效文件、Timeline状态及A1优先级选择唯一stem；其他重复stem自动设为`bypass`、禁用并移出Timeline，但不删除备份文件。
+- Authored Speech Reference合约新增数字静音语义：语句间无声只表示没有人声，不代表静音现场；H3必须在空档及对白下方持续生成相同空间的环境底噪和可见Foley。
+- 撤销alpha.12过强的`WEATHER/WATER ENVIRONMENT-PRIORITY MIX LOCK`。MUSIC AUTO恢复标准行为：音乐层清晰可闻，对白时约降低8 dB，对白空档自然回升；环境声和Foley继续保持可闻且不参与对白ducking。
+- 现场对白质感由`low environmental bleed`加强为`clearly audible natural environmental bleed`，避免TTS听成脱离场景的录音棚配音。
+- Render Policy提升至28，防止沿用含重复TTS reference或旧音乐压低指令的Segment缓存。
+
+### Verification
+
+- 新增重复Authored TTS自动合并、TTS数字静音环境延续及雨景标准AUTO音乐回归测试。
+
+## [0.3.5-alpha.12] - 2026-10-10
+
+### TTS / Native Environment Fusion Compiler Fix
+
+- 修复Studio重新编译Prompt时只传入Shot动作与环境文字、漏掉起止时间，导致`Spatial acoustics contract`退化成`0.00–0.00s`的问题；现在传入完整时间、景别、机位、连续性与项目总时长，缺失时间的旧数据也会安全回退到下一Shot或项目实际结尾。
+- Foley英文触发词改为词汇边界匹配，并移除`lock/open/close`等容易与导演术语冲突的单独触发。`stands / punchline / speaker lock / close-up / open-air`不再制造沙石、攻击、门锁或开门声。
+- 新增`open rainy exterior`声学类型；雨、暴风与积水镜头持续生成开放空间雨、风、水面和湿地接触声。
+- 外部TTS资产不再被Shot级`Audio Reference Intent`误报为“没有音频参考”。每个重叠Shot会声明其仅为精确台词、Speaker、时序、音素与口型stem；H3仍负责生成连续现场环境与同步Foley，并把对白放入可见空间，禁止干录音棚声和重复声音。
+- 雨／风／水主导画面在MUSIC AUTO下加入环境优先混音锁：非叙事音乐必须低于现场环境床，且不得在对白空档盖过天气或水声。
+- Render Policy提升至27，避免沿用Policy 26下已编译错误声学范围或错误Foley的Segment缓存。
+
+### Verification
+
+- 新增TTS reference intent、雨景声学、Foley子串污染、缺失Shot时间回退与天气环境优先音乐回归测试；Native Audio与Design Engine共144项测试通过。
+
+## [0.3.5-alpha.11] - 2026-10-10
+
+### Native H3 Best-Take Selection and Unison Deduplication
+
+- 修复Native H3 Speech Guard连续三次都发现额外对白时，总是保留最后一个随机重生结果的问题；现在依据违规类型、额外文字长度与人声比例为每次take评分，重试耗尽后自动保留风险最低的一次，仍然不Hard Block整个Job。
+- 两个明确`OVERLAP`、时间完全相同且文字完全相同的Dialogue Text Layer现在编译为一个同步齐声事件；H3只收到一次原文，并明确禁止串行复读、回声、改写或追加回应。
+- 同步齐声不再完全跳过逐句检查：相同台词只转写检查一次；真正不同内容的重叠对白继续避免单声部误判。
+- 授权对白窗口新增“实质改写／不相关对白”检查；Whisper从撞击声或环境底噪误认出的极短英文`you`／`so`不再触发无意义重生。
+
+### TTS Dialogue Loudness
+
+- Edge TTS、Qwen3-TTS与VoxCPM2的每条独立语音在进入Timeline前统一为约`-16 LUFS`、True Peak不高于`-1.5 dB`；只提升干净对白stem，不提高环境声、Foley或背景音乐。
+- TTS签名加入响度配置版本，旧项目重新Preview时会自动重建旧的低音量TTS素材。
+- Render Policy提升至26，旧Policy 25缓存不会绕过最佳take选择与同步齐声修正。
+
+### Verification
+
+- 新增同步齐声单次编译／单次转写、无关授权对白、短英文Whisper噪声、TTS响度链及Speech Guard最佳take选择回归测试。
+
+## [0.3.5-alpha.10] - 2026-10-10
+
+### Authored-line Repetition Guard
+
+- 修复Speech Guard只检查Text Layer以外静音区、无法发现H3在合法对白窗口内复读同一句或擅自加词的问题。
+- Smart Render现在把每条Dialogue／Voice-over的`layer_id、原文、Speaker、Language、Voice Gender及Segment本地时间`写入守卫合约；本机CPU Whisper会逐条转写授权窗口，并以容许简繁体及少量识别误差的字符比对检查实质复读和额外短句。
+- 检测到授权窗口内复读或加词时，沿用非阻断策略自动换Seed重生同一Segment，最多两次；重试耗尽只显示WARNING并继续，不Hard Block整项Job。
+- 明确设置为`OVERLAP`且时间重叠的多声部对白跳过单句忠实度比较，避免把另一条已授权声部误判成额外台词；共同覆盖区仍受既有授权与静音边界约束。
+- 对`two_people_in_a_red_background_with_swords_4`只读验收确认：T1原文只含一次“怎么变成我害了雄霸”，成片在1.00–6.50秒内把该短语重复两次；新守卫准确标记`repeated_authored_phrase`，其余T2–T4没有被误判为复读。
+- Render Policy提升至25，Policy 24的旧Segment缓存不会绕过逐句复读检查。
+
+### Verification
+
+- 新增授权窗口复读、Whisper简繁体／同音字容错、守卫合约逐句原文及现有Smart Render自动重试回归测试。
+
+## [0.3.5-alpha.9] - 2026-10-10
+
+### Dialogue Voice Gender
+
+- Dialogue／Voice-over编辑器新增结构化`Voice Gender: AUTO / MALE / FEMALE`；该选择会保存到Text Layer，并传入H3 Prompt、Edge TTS、Qwen3-TTS、VoxCPM2及Windows SAPI后备，不再只依赖自由文字Delivery或Speaker奇偶编号猜测。
+- Design JSON为每条语音新增`voice_gender`；只有P1人物证据或用户指示明确时才锁定男声／女声，否则保留AUTO。中文台词的模糊`Chinese`语言标签会统一为`Mandarin Chinese`，避免尾段错误切换成日语或其他语言。
+- `comic-talk-show-h3`新增人数边界修复：明确只有两人的P1不会再生成S3；打开旧项目时，超出实际人数的Speaker会依发言顺序回收到有效S1…SN，并同步Authored Text与所属Shot。
+
+### Silent-tail and External-TTS Speech Guard
+
+- Native Speech Guard现在检查项目内所有Dialogue／Voice-over的完整Segment，包括没有任何Text Layer的最终静音Segment；最后一句结束后的尾段若出现日文、旁白、复读或其他无来源人声，也会触发自动换Seed重生。
+- Edge TTS、Qwen3-TTS与VoxCPM2项目不再绕过静音区守卫；外部TTS仍是授权声源，但H3在授权窗以外新增的人声会被识别。MTV／Lyrics继续按既有音乐时序处理。
+- Render Policy提升至24，旧的Policy 23 Segment缓存不会绕过上述保护；自动重试仍不Hard Block、不停止整项Job。
+
+### Verification
+
+- 新增Voice Gender UI、H3 Prompt、TTS路由、两人旧项目修复、外部TTS静音尾段及语言锁回归测试；Project格式保持向后兼容。
+
+## [0.3.5-alpha.8] - 2026-10-10
+
+### Independent Speech Tracks and Release Gaps
+
+- 每一个Dialogue／Voice-over事件使用独立可见Timeline轨道；即使同一Speaker稍后再次发言也不复用旧轨道，避免一条轨道上的紧贴事件造成覆盖或错误归属。
+- H3 Native的`AUTO`重叠策略改为安全顺序排程：相邻普通对白之间自动保留1.0秒闭嘴释放区，并同步顺延后续Text Layer、Shot、素材、已创作要求与实际Project时长。
+- 只有明确设为`OVERLAP`的打断、齐声或同时回应保留重叠；Lyrics、MTV和外部TTS原时序不受影响。
+
+### Native H3 Speech Guard · AUTO RETRY
+
+- Smart Render完成每个原生H3 Segment后，以本机CPU Whisper仅检查Text Layer授权区以外的人声静默窗口，不对正确对白重新转写或修改。
+- 检测到可辨识的无来源对白时，以确定性新Seed自动重生同一Segment，最多两次；不会Hard Block、不会停止整个Job，也不会在重试间卸载H3。
+- 重试耗尽或Whisper不可用时显示WARNING并继续拼接，由用户验收决定是否Reject；检查结果写入Segment manifest。
+- 短于等于15秒的原生对白Project同样进入Smart Render守卫路径；Render Policy提升至23，使旧缓存不会绕过新检查。
+
+### Comic Talk Show and Verification
+
+- 更新`comic-talk-show-h3`中英文Skill与Design Requirement模板，明确独立轨道、AUTO顺序语义、1.0秒释放区及环境声／Foley持续规则。
+- 新增原生语音排程、独立轨道、单Segment Smart Render及自动重试回归测试；Project保存格式维持不变。
+
+## [0.3.5-alpha.7] - 2026-10-10
+
+### Global Speech Authorization Windows
+
+- 修复短 Dialogue／Voice-over Text Layer 被扩展到完整 Shot 后，H3 在原句结束与下一句开始之间生成即兴、复读、翻译、耳语或无来源对白的问题。
+- Design 会按语言、Delivery 与文字长度计算真实发声预算，收紧自动生成台词的授权结束时间；镜头长度、无声表情、环境底噪及 Foley 保持不变。
+- Full、Batch 与长片 Segment 编译时统一建立有效语音区间及其补集 `EXPLICIT HUMAN-VOCAL SILENCE WINDOWS`，旧 Project 无需格式迁移即可在重新生成时获得修复。
+- 静音 Shot 的实际 Prompt 副本会移除残留的发声状态描述；有声 Shot 加入逐句 Speaker Turn-End Lock，台词结束后嘴形回到闭合／自然状态。
+- Lyrics、MTV 主音频及已提供外部 Dialogue／TTS 音频的完整时序保持不变，避免误裁切歌曲或用户已经准备好的声音文件。
+
+### Comic Talk Show Guardrails
+
+- `comic-talk-show-h3` 明确禁止当前 Speaker 在授权原句外即兴、复读、翻译或发出含字笑声，也禁止其他人物提前回答、耳语或背景交谈。
+- 对话后的剩余 Shot 时间固定用于闭嘴反应、现场环境声与画面同步 Foley，不改变 P1 动态人数、身份、排列及原始视觉媒介锁定。
+
+### Verification and Documentation
+
+- 新增自动短句预算、旧 Project Prompt 编译、静音 Shot 清理、显式空档及 Talk Show Turn-End Lock 回归测试。
+- 更新主 README、`v0.3.5 readme.md` 与应用版本号；Project 保存格式没有改变。
+
+## [0.3.5-alpha.6] - 2026-10-09
+
+### Comic Talk Show H3
+
+- 新增 `comic-talk-show-h3` Special Skill 与可自动填入的 `DESIGN_REQUIREMENT.txt`：把 P1 群像改编为约 45 秒的轮流说段子短片，而不是依赖固定五人模板。
+- Design 直接向支持视觉的 Qwen／OpenAI 模型提供 P1 像素，按完整、有意构图的前景主角动态建立从左到右的 `S1…SN` Speaker Ledger；裁切边缘残影、背景人物、海报、反射、雕像与人体模型不会计入主角。
+- 视觉请求被模型拒绝时自动回退到文字设计，并加入明确的 Cast Count／Speaker Ledger 人工复核警告，避免整个 Design 流程失败。
+
+### P1 人物与媒介完整性
+
+- P1 现在作为 Talk Show 全片的唯一主角身份、脸部、服装、人数、排列及原始视觉媒介母版；照片、漫画、3D 与插画不会被自动改成另一种风格。
+- 普通 Talk Show 自动移除人物图片 `media_requests`，阻止 P2–P9 或 Z-Image 陌生角色覆盖原图人物；编译后的 H3 Segment Prompt 会持续携带动态 P1 群像锁定。
+- 每名检测到的主角获得独立、可编辑的 Dialogue Text Layer；Speaker 字段与编辑器支持任意 `S1…SN`，不再硬编码为 S1／S2。
+- 只有当前 Speaker 可以发声和对嘴，其他角色只能执行无声表情与视线反应，降低多人同时开口及错误角色代读。
+
+### Documentation and Verification
+
+- 更新主 README 与 `v0.3.5 readme.md`，加入动态人数规则、P1 视觉优先级、模型回退行为及完整操作步骤。
+- 新增 Special Skill 载入、动态 Speaker 恢复、Design Prompt 覆盖、P1 群像 Prompt 编译及任意 `S1…SN` 编辑器回归测试。
+
 ## [0.3.5-alpha.5] - 2026-10-09
 
 ### Native Speech–Environment Fusion

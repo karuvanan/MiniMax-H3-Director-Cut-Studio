@@ -19,6 +19,7 @@ SPEECH_ROLES = {"dialogue", "voice_over", "lyrics"}
 SAFE_CJK_CHARACTERS_PER_SECOND = 3.6
 SAFE_LATIN_WORDS_PER_SECOND = 2.4
 FINAL_SPEECH_TAIL_SECONDS = 1.5
+NATIVE_SPEECH_RELEASE_GAP_SECONDS = 1.0
 
 _GENERATED_IDENTITY_PREFIX = (
     "PRIMARY RECURRING CHARACTER IDENTITY ANCHOR. Show one clear, unobstructed, "
@@ -118,15 +119,34 @@ def _repair_native_speech_timing(
     ):
         text = str(layer.get("text", layer.get("content", "")))
         language = str(layer.get("language", ""))
-        if re.search(r"[\u3400-\u9fff]", text) and not re.search(
-            r"chinese|mandarin|cantonese|中文|普通话|广东话|廣東話",
-            language,
-            re.I,
+        if re.search(r"[\u3400-\u9fff]", text) and (
+            not re.search(
+                r"chinese|mandarin|cantonese|中文|普通话|广东话|廣東話",
+                language,
+                re.I,
+            )
+            or language.strip().casefold() in {"chinese", "中文"}
         ):
             layer["language"] = "Mandarin Chinese"
             report.append(
                 f"Corrected {layer.get('layer_id', 'Text Layer')} language from "
                 f"{language or 'unspecified'} to Mandarin Chinese."
+            )
+        original_voice_gender = str(layer.get("voice_gender", "auto")).strip().casefold()
+        voice_gender = original_voice_gender
+        if voice_gender not in {"male", "female"}:
+            delivery = str(layer.get("delivery", "")).casefold()
+            if re.search(r"\b(?:male|man|boy)\b|男声|男聲|男性", delivery):
+                voice_gender = "male"
+            elif re.search(r"\b(?:female|woman|girl)\b|女声|女聲|女性", delivery):
+                voice_gender = "female"
+            else:
+                voice_gender = "auto"
+        layer["voice_gender"] = voice_gender
+        if voice_gender != original_voice_gender:
+            report.append(
+                f"Set {layer.get('layer_id', 'Text Layer')} voice gender to {voice_gender} "
+                "from its authored delivery direction."
             )
         start = _number(layer.get("start_seconds"))
         end = _number(layer.get("end_seconds"), start)
@@ -156,6 +176,66 @@ def _repair_native_speech_timing(
             f"Extended native speech at {start:.2f}-{end:.2f}s by {delta:.2f}s "
             "and rippled the owning Shot and later Timeline events."
         )
+
+    if bool(payload.get("enforce_native_speech_release_gap", False)):
+        release_layers = [
+            row for row in layers
+            if str(row.get("content_role", row.get("role", ""))).lower()
+            in {"dialogue", "voice_over"}
+        ]
+        latest_release_end: float | None = None
+        for layer in sorted(
+            release_layers,
+            key=lambda row: (
+                _number(row.get("start_seconds")),
+                _number(row.get("end_seconds")),
+            ),
+        ):
+            start = _number(layer.get("start_seconds"))
+            end = _number(layer.get("end_seconds"), start)
+            policy = str(layer.get("overlap_policy", "auto")).strip().lower()
+            if policy in {"allow", "allow_overlap", "intentional", "intentional_overlap"}:
+                policy = "overlap"
+            elif policy in {"no_overlap", "no overlap", "sequence"}:
+                policy = "sequential"
+            if latest_release_end is not None and policy != "overlap":
+                safe_start = latest_release_end + NATIVE_SPEECH_RELEASE_GAP_SECONDS
+                if start < safe_start - 1e-6:
+                    delta = round(safe_start - start, 6)
+                    boundary = start
+                    previous_shot = max(
+                        (
+                            shot for shot in shots
+                            if _number(shot.get("end_seconds")) <= boundary + 1e-6
+                        ),
+                        key=lambda shot: _number(shot.get("end_seconds")),
+                        default=None,
+                    )
+                    for other in layers:
+                        if _number(other.get("start_seconds")) >= boundary - 1e-9:
+                            _shift_timed_row(other, boundary, delta)
+                    for cue in cues:
+                        if cue is previous_shot:
+                            cue["end_seconds"] = round(
+                                _number(cue.get("end_seconds")) + delta, 6
+                            )
+                        else:
+                            _shift_timed_row(cue, boundary, delta)
+                    for row in (*asset_rows, *clip_rows, *authored_rows):
+                        _shift_timed_row(row, boundary, delta)
+                    duration = round(duration + delta, 6)
+                    start += delta
+                    end += delta
+                    layer["speech_timing_auto_adjusted"] = True
+                    layer["native_speech_release_gap_seconds"] = (
+                        NATIVE_SPEECH_RELEASE_GAP_SECONDS
+                    )
+                    report.append(
+                        f"Moved native speech {layer.get('layer_id', 'Text Layer')} "
+                        f"by {delta:.2f}s to preserve a "
+                        f"{NATIVE_SPEECH_RELEASE_GAP_SECONDS:.2f}s non-vocal release gap."
+                    )
+            latest_release_end = max(latest_release_end or 0.0, end)
 
     if layers:
         latest_end = max(_number(row.get("end_seconds")) for row in layers)
@@ -249,6 +329,127 @@ def _shot_owner(shots: list[dict], start: float, end: float) -> dict | None:
         key=lambda shot: abs(_number(shot.get("end_seconds")) - start),
         default=None,
     )
+
+
+def _explicit_cast_count(text: str) -> int | None:
+    """Return only a cast count that the saved design states explicitly."""
+    source = " ".join(str(text or "").split())
+    if not source:
+        return None
+    patterns = (
+        r"\b(?:exactly|actual(?:ly)?|visible|complete|principal|main)?\s*"
+        r"(\d{1,2})\s*(?:people|persons|characters|principals|speakers|cast members)\b",
+        r"\b(one|two|three|four|five|six|seven|eight|nine)\s*[- ]?"
+        r"(?:person|people|character|speaker|member|cast)\b",
+        r"(?:恰好|正好|实际|實際|共有|共|画面中|畫面中|P1中|P1 中)?\s*"
+        r"([一二两兩三四五六七八九十\d]{1,2})\s*"
+        r"(?:个|個|名|位)?(?:人|人物|角色|主角|发言者|發言者)",
+    )
+    word_numbers = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        "一": 1, "二": 2, "两": 2, "兩": 2, "三": 3, "四": 4,
+        "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    }
+    for pattern in patterns:
+        match = re.search(pattern, source, re.I)
+        if not match:
+            continue
+        token = match.group(1).strip().casefold()
+        value = int(token) if token.isdigit() else word_numbers.get(token)
+        if value is not None and 1 <= value <= 20:
+            return value
+    return None
+
+
+def _repair_comic_talk_show_speakers(
+    payload: dict,
+    shots: list[dict],
+    report: list[str],
+) -> None:
+    """Keep saved Comic Talk Show speakers inside the explicitly detected P1 cast."""
+    if str(payload.get("special_skill", "")).strip().casefold() != "comic-talk-show-h3":
+        return
+    prompt = payload.get("prompt") or {}
+    evidence_parts: list[str] = []
+    if isinstance(prompt, dict):
+        for key in ("brief", "creative_brief", "constraints"):
+            value = prompt.get(key)
+            if isinstance(value, list):
+                evidence_parts.extend(str(row) for row in value)
+            elif value:
+                evidence_parts.append(str(value))
+    for key in ("design_requirement", "design_requirements", "creative_brief"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            evidence_parts.extend(str(row) for row in value)
+        elif value:
+            evidence_parts.append(str(value))
+    cast_count = _explicit_cast_count("\n".join(evidence_parts))
+    if cast_count is None:
+        return
+
+    speech_layers = [
+        row for row in (payload.get("text_layers") or [])
+        if isinstance(row, dict)
+        and str(row.get("content_role", row.get("role", ""))).strip().lower()
+        in {"dialogue", "voice_over"}
+        and str(row.get("text", row.get("content", ""))).strip()
+    ]
+    speech_layers.sort(
+        key=lambda row: (_number(row.get("start_seconds")), _number(row.get("end_seconds")))
+    )
+    authored = [
+        row for row in (payload.get("authored_text_requirements") or [])
+        if isinstance(row, dict)
+    ]
+    cue_changes: list[tuple[dict, str, str]] = []
+    repaired_count = 0
+    for index, layer in enumerate(speech_layers):
+        old_speaker = str(layer.get("speaker", "")).strip()
+        match = re.fullmatch(r"S(\d+)", old_speaker, re.I)
+        if not match or int(match.group(1)) <= cast_count:
+            continue
+        new_number = index % cast_count + 1
+        new_speaker = f"S{new_number}"
+        layer["speaker"] = new_speaker
+        start = _number(layer.get("start_seconds"))
+        end = _number(layer.get("end_seconds"), start)
+        owner = _shot_owner(shots, start, end)
+        if owner is not None:
+            cue_changes.append((owner, old_speaker, new_speaker))
+        for authored_row in authored:
+            authored_text = str(
+                authored_row.get("text", authored_row.get("content", ""))
+            ).strip()
+            if authored_text != str(layer.get("text", layer.get("content", ""))).strip():
+                continue
+            if abs(_number(authored_row.get("start_seconds")) - start) > 0.05:
+                continue
+            authored_row["speaker"] = new_speaker
+        repaired_count += 1
+        report.append(
+            f"Remapped {layer.get('layer_id', 'Text Layer')} speaker from {old_speaker} "
+            f"to {new_speaker}; saved P1 evidence explicitly contains {cast_count} people."
+        )
+
+    if not repaired_count:
+        return
+    for cue, old_speaker, new_speaker in cue_changes:
+        for key in (
+            "subject_action", "detail", "continuity_state", "environment_response",
+            "native_audio_direction", "additional_direction",
+        ):
+            value = cue.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            value = re.sub(
+                rf"\b{re.escape(old_speaker)}\s*=\s*the\s+\d+(?:st|nd|rd|th)\s+complete",
+                f"{new_speaker}=the {new_speaker[1:]} complete",
+                value,
+                flags=re.I,
+            )
+            cue[key] = re.sub(rf"\b{re.escape(old_speaker)}\b", new_speaker, value)
 
 
 def _person_guard(text: str) -> str:
@@ -600,6 +801,7 @@ def repair_project_payload(
                         )
 
         duration = _repair_native_speech_timing(payload, shots, report)
+        _repair_comic_talk_show_speakers(payload, shots, report)
         for layer in payload.get("text_layers") or []:
             if not isinstance(layer, dict):
                 continue

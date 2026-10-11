@@ -4,7 +4,21 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from tts_service import Qwen3TTSLocalSynthesizer, VoxCPM2LocalSynthesizer
+from tts_service import (
+    Qwen3TTSLocalSynthesizer,
+    TTS_DIALOGUE_LOUDNESS_PROFILE,
+    VoxCPM2LocalSynthesizer,
+    tts_voice_filter_chain,
+)
+
+
+class TTSDialogueLoudnessTests(unittest.TestCase):
+    def test_every_utterance_uses_shared_dialogue_loudness_profile(self):
+        chain = tts_voice_filter_chain(1.25)
+        self.assertIn("atempo=1.250000", chain)
+        self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=7", chain)
+        self.assertEqual(chain[-1], "aresample=24000")
+        self.assertIn("loudnorm", TTS_DIALOGUE_LOUDNESS_PROFILE)
 
 
 class _FakeCuda:

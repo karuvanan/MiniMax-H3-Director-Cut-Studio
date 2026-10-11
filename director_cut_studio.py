@@ -112,6 +112,7 @@ from soulx_runtime import (
     start_local_soulx_server_if_installed,
 )
 from native_audio_engine import (
+    CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT,
     NativeAudioProfile,
     SPEECH_ENVIRONMENT_FUSION_CONTRACT,
     audio_reference_intent_text,
@@ -153,6 +154,7 @@ from media_semantic_enrichment import (
 )
 from design_engine import (
     BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
+    COMIC_TALK_SHOW_SPECIAL_SKILL,
     DESIGN_JSON_SCHEMA,
     H3_STABLE_DIALOGUE_LANGUAGES,
     DesignDialogueLanguageContractError,
@@ -375,7 +377,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 22
+SMART_RENDER_POLICY_VERSION = 30
 
 _UNTRACKED_VISIBLE_TEXT_TOKEN_RE = re.compile(
     r"\b(?:text|words?|subtitle|caption|title|lower[- ]?third|hashtag|typography|legible)\b|"
@@ -1103,6 +1105,7 @@ class TextLayer:
     overlap_policy: str = "auto"
     timeline_visible_text_kind: str = ""
     render_owner: str = "h3"
+    voice_gender: str = "auto"
 
     def __post_init__(self) -> None:
         self.font_size = max(8, min(240, int(self.font_size)))
@@ -1112,12 +1115,19 @@ class TextLayer:
         self.position_y = max(0.0, min(1.0, float(self.position_y)))
         if self.content_role not in {"on_screen_text", "dialogue", "voice_over", "lyrics"}:
             self.content_role = "on_screen_text"
-        self.speaker = self.speaker if self.speaker in {"S1", "S2"} else "S1"
+        normalized_speaker = str(self.speaker or "S1").strip().upper()
+        self.speaker = (
+            normalized_speaker
+            if re.fullmatch(r"S[1-9]\d*", normalized_speaker)
+            else "S1"
+        )
         self.language = str(self.language).strip() or "English"
         if re.search(r"[\u3400-\u9fff]", self.text) and self.language.lower() in {
-            "english", "original language", "auto",
+            "english", "original language", "auto", "chinese", "中文",
         }:
             self.language = "Mandarin Chinese"
+        gender = str(self.voice_gender or "auto").strip().casefold()
+        self.voice_gender = gender if gender in {"auto", "male", "female"} else "auto"
         self.delivery = str(self.delivery).strip() or "Natural"
         self.lip_sync = bool(self.lip_sync)
         self.speech_timing_auto_adjusted = bool(self.speech_timing_auto_adjusted)
@@ -1128,6 +1138,41 @@ class TextLayer:
             if str(self.render_owner).strip().casefold() == "studio_graphics"
             else "h3"
         )
+
+
+def effective_native_speech_layer(
+    layer: TextLayer,
+    *,
+    preserve_full_window: bool = False,
+) -> TextLayer:
+    """Return a prompt-only Text Layer with no unused native-vocal tail.
+
+    Older projects and manually loaded Design JSON may contain a short line
+    stretched across an entire camera Shot.  Do not mutate the editable
+    Timeline clip while compiling those projects; instead make H3's native
+    speech whitelist end at the conservative delivery budget.  Supplied TTS,
+    MTV performance audio and Lyrics retain their authored/audio-owned range.
+    """
+
+    compiled = deepcopy(layer)
+    if (
+        preserve_full_window
+        or compiled.content_role not in {"dialogue", "voice_over"}
+        or not compiled.text.strip()
+    ):
+        return compiled
+    budget = speech_timing_budget(
+        compiled.text,
+        compiled.language,
+        compiled.delivery,
+        compiled.end_seconds - compiled.start_seconds,
+    )
+    required = max(0.5, float(budget.get("required_seconds", 0.5) or 0.5))
+    compiled.end_seconds = min(
+        compiled.end_seconds,
+        round(compiled.start_seconds + required, 6),
+    )
+    return compiled
 
 
 def text_layer_from_mapping(value: dict) -> TextLayer:
@@ -4323,8 +4368,13 @@ class ContentLayerDialog(QDialog):
         self._refresh_color_button()
 
         self.speaker_combo = QComboBox()
-        self.speaker_combo.addItems(("S1", "S2"))
+        self.speaker_combo.setEditable(True)
+        self.speaker_combo.addItems(tuple(f"S{index}" for index in range(1, 17)))
         self.speaker_combo.setCurrentText(layer.speaker)
+        self.speaker_combo.setToolTip(
+            "Dialogue character ID. Use S1, S2, S3 and onward; ensemble Skills may map "
+            "the IDs to people in a group reference image."
+        )
         self.language_combo = QComboBox()
         self.language_combo.setEditable(True)
         timeline_languages = (
@@ -4336,6 +4386,17 @@ class ContentLayerDialog(QDialog):
         self.language_combo.setToolTip(
             "Language for this individual Dialogue, Voice-over or Lyrics layer. "
             "It is saved with the Timeline and passed to H3 native speech or the selected TTS engine."
+        )
+        self.voice_gender_combo = QComboBox()
+        self.voice_gender_combo.addItem("AUTO · infer from the assigned character", "auto")
+        self.voice_gender_combo.addItem("MALE · lock a male voice", "male")
+        self.voice_gender_combo.addItem("FEMALE · lock a female voice", "female")
+        self.voice_gender_combo.setCurrentIndex(
+            max(0, self.voice_gender_combo.findData(layer.voice_gender))
+        )
+        self.voice_gender_combo.setToolTip(
+            "Explicit voice identity for this speech event. AUTO follows character evidence; "
+            "MALE/FEMALE is passed to H3 and supported TTS engines."
         )
         self.delivery_combo = QComboBox()
         self.delivery_combo.setEditable(True)
@@ -4377,6 +4438,7 @@ class ContentLayerDialog(QDialog):
         for title, widget in (
             ("Speaker", self.speaker_combo),
             ("Language", self.language_combo),
+            ("Voice Gender", self.voice_gender_combo),
             ("Delivery", self.delivery_combo),
             ("Overlap", self.overlap_combo),
             ("Lip Sync", self.lip_sync_check),
@@ -4442,6 +4504,9 @@ class ContentLayerDialog(QDialog):
             # editing only Language must never reset speaker, delivery or Shot.
             "speaker": self.speaker_combo.currentText() if speech else "S1",
             "language": self.language_combo.currentText().strip() if speech else "English",
+            "voice_gender": (
+                str(self.voice_gender_combo.currentData() or "auto") if speech else "auto"
+            ),
             "delivery": self.delivery_combo.currentText().strip() if speech else "Natural",
             "overlap_policy": (
                 str(self.overlap_combo.currentData() or "auto") if speech else "auto"
@@ -7659,6 +7724,7 @@ class DesignPageDialog(QDialog):
     def _start_lm_design(self, fallback_note: str = "") -> None:
         self.pipeline_stage = "lm_plan"
         planning_context = self.active_design_context or self._selected_design_context()
+        special_key = _bound_special_skill_key(planning_context)
         free_capacity = planning_context.get("available_new_media_capacity") or self.capacities
         available_ids = [
             str(item) for item in planning_context.get("selected_existing_media_ids") or []
@@ -7732,6 +7798,28 @@ class DesignPageDialog(QDialog):
               "Avoid true duplicates, but allow visually distinct temporal states of the same subject "
               "when they help H3 advance instead of replaying an earlier action."
         )
+        input_image_paths: list[str] = []
+        if special_key == COMIC_TALK_SHOW_SPECIAL_SKILL:
+            p1 = next(
+                (
+                    row for row in planning_context.get("existing_media") or []
+                    if str(row.get("media_id", "")).strip().upper() == "P1"
+                    and str(row.get("media_type", "")).strip().lower() == "image"
+                    and Path(str(row.get("local_path", ""))).is_file()
+                ),
+                None,
+            )
+            if p1 is not None:
+                input_image_paths = [str(p1["local_path"])]
+                prompt += (
+                    "\n\nCOMIC TALK SHOW P1 VISUAL INSPECTION: Inspect the attached P1 pixels directly. "
+                    "Count only complete intentional principal people, ignore cropped edge fragments, "
+                    "and return one stable left-to-right S1-through-SN cast ledger and one main speaking "
+                    "beat per detected principal. Preserve P1's actual medium. Do not infer a fixed cast "
+                    "count from this reusable template. For this Skill the selected P1 already satisfies "
+                    "the full visual-reference coverage floor: keep image media_requests empty and never "
+                    "generate a replacement actor, portrait, pose image or group Picture."
+                )
         if fallback_note:
             prompt += "\n\nPIPELINE NOTE: " + fallback_note
         self._submit("generate", {
@@ -7739,6 +7827,7 @@ class DesignPageDialog(QDialog):
             "user_prompt": prompt,
             "schema": DESIGN_JSON_SCHEMA,
             "max_output_tokens": 32768,
+            "input_image_paths": input_image_paths,
         })
         self._set_design_stage(
             "Stage 1/4 · LM Studio is planning shots and requested image count…",
@@ -7762,6 +7851,20 @@ class DesignPageDialog(QDialog):
                 ),
                 selected_media_ids=planning_context.get("selected_existing_media_ids"),
             )
+            if (
+                self.pipeline_stage == "lm_plan"
+                and
+                _bound_special_skill_key(planning_context)
+                == COMIC_TALK_SHOW_SPECIAL_SKILL
+                and int(payload.get("input_images_used", 0) or 0) == 0
+            ):
+                warnings = [str(row) for row in plan.get("design_warnings") or []]
+                warnings.append(
+                    "Comic Talk Show Design model did not accept direct P1 visual input. "
+                    "Review the S1-through-SN cast count before Apply; H3 still retains P1 as "
+                    "the only cast plate and no replacement actor image will be generated."
+                )
+                plan["design_warnings"] = list(dict.fromkeys(warnings))
             if self.pipeline_stage == "lm_refine" and self.planned_plan:
                 # Refinement may improve generated-image prompts and shot language,
                 # but the first Plan owns every explicit authored text cue.
@@ -11745,7 +11848,8 @@ class DirectorCutStudio(QMainWindow):
             self.text_layers.append(TextLayer(
                 f"T{index}", item["content"], item["start_seconds"], item["end_seconds"],
                 track.track_id, content_role=item["role"], speaker=item["speaker"],
-                language=item["language"], delivery=item["delivery"],
+                language=item["language"], voice_gender=item.get("voice_gender", "auto"),
+                delivery=item["delivery"],
                 lip_sync=item["lip_sync"], shot_id=shot_id,
                 overlap_policy=item.get("overlap_policy", "auto"),
                 timeline_visible_text_kind=item.get("timeline_visible_text_kind", ""),
@@ -11917,6 +12021,7 @@ class DirectorCutStudio(QMainWindow):
                 "role": layer.content_role,
                 "speaker": layer.speaker,
                 "language": layer.language,
+                "voice_gender": layer.voice_gender,
                 "delivery": layer.delivery,
                 "lip_sync": layer.lip_sync,
                 "track_id": layer.track_id,
@@ -11934,6 +12039,7 @@ class DirectorCutStudio(QMainWindow):
         payload = {
             "engine": self.render_settings.dialogue_tts_engine,
             "voice_policy": "on_location_production_v1",
+            "loudness_profile": "dialogue_loudnorm_i-16_tp-1.5_lra7_v1",
             "duration_seconds": self.scan.duration_seconds if self.scan else 0.0,
             "text_layers": layers if layers is not None else self._speech_layers_for_tts(),
         }
@@ -11945,38 +12051,87 @@ class DirectorCutStudio(QMainWindow):
     def _authored_tts_asset(self) -> MediaAsset | None:
         if not self.scan:
             return None
-        return next(
-            (
-                asset for asset in self.scan.timeline_assets()
-                if asset.media_type == "audio"
-                and "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition
-                and str(asset.local_path or "").strip()
-            ),
-            None,
-        )
+        candidates = [
+            asset for asset in self.scan.assets
+            if asset.media_type == "audio"
+            and "AI DESIGN AUTHORED SPEECH TTS" in str(asset.recognition or "")
+        ]
+        if not candidates:
+            return None
+        expected_signature = self._timeline_tts_signature()
+
+        def priority(asset: MediaAsset) -> tuple[int, int, int, int]:
+            path = Path(str(asset.local_path or ""))
+            return (
+                int(self._stored_tts_signature(asset) == expected_signature),
+                int(path.is_file() and path.stat().st_size > 44),
+                int(asset.timeline_placed and asset.enabled),
+                int(stable_reference_id(asset).upper() == "A1"),
+            )
+
+        return max(candidates, key=priority)
+
+    def _consolidate_authored_tts_assets(self, selected: MediaAsset) -> bool:
+        """Keep exactly one authored speech stem active without deleting backups.
+
+        Design materialization and a near-simultaneous Timeline TTS refresh can
+        otherwise reserve two Audio slots before either WAV path is populated.
+        H3 then receives two identical full-duration speech references and treats
+        their digital-silence gaps as a stronger soundtrack condition, suppressing
+        native ambience and Foley.  Retain the best current stem and bypass every
+        duplicate; files remain recoverable on disk.
+        """
+        if not self.scan:
+            return False
+        changed = False
+        for asset in self.scan.assets:
+            if (
+                asset is selected
+                or asset.media_type != "audio"
+                or "AI DESIGN AUTHORED SPEECH TTS" not in str(asset.recognition or "")
+            ):
+                continue
+            if asset.timeline_placed:
+                asset.timeline_placed = False
+                changed = True
+            if asset.enabled:
+                asset.enabled = False
+                changed = True
+            if asset.activation_mode != "bypass":
+                asset.activation_mode = "bypass"
+                changed = True
+            if asset.monitor_visible:
+                asset.monitor_visible = False
+                changed = True
+        return changed
 
     def _ensure_timeline_tts_asset(self) -> MediaAsset | None:
         asset = self._authored_tts_asset()
         authored_stem_prompt = (
-            "Use this exact authored Timeline speech as a clean foreground dialogue stem for "
-            "wording, speaker identity, timing and lip sync. Spatialize it as live on-location "
+            "Use this exact authored Timeline speech only as performance and lip-sync control for "
+            "wording, speaker identity, timing and phoneme rhythm; it is not a final dry waveform mix. "
+            "Preserve those authored facts but obligatorily re-render it as live on-location "
             "production sound, then generate audible diegetic ambience, contact-synchronized "
             "Foley/SFX and dialogue-ducked background music around it. Never treat this dry stem "
-            "as the complete soundtrack and never duplicate the voice. "
+            "as the complete soundtrack and never duplicate the voice. Digital silence between "
+            "utterances means no human voice, not a silent location: H3 must fill it with the "
+            "continuous native ambience and visible non-vocal Foley, and keep that bed beneath speech. "
             + SPEECH_ENVIRONMENT_FUSION_CONTRACT
         )
-        if asset is not None:
+        if asset is not None and str(asset.local_path or "").strip():
             asset.clip_prompt = authored_stem_prompt
+            self._consolidate_authored_tts_assets(asset)
             return asset
         if not self.scan:
             return asset
-        asset = next(
-            (
-                item for item in self.scan.assets
-                if item.media_type == "audio" and not str(item.local_path or "").strip()
-            ),
-            None,
-        )
+        if asset is None:
+            asset = next(
+                (
+                    item for item in self.scan.assets
+                    if item.media_type == "audio" and not str(item.local_path or "").strip()
+                ),
+                None,
+            )
         if asset is None:
             asset = create_virtual_media_asset(self.scan, "audio")
             self._append_media_card(asset)
@@ -12006,6 +12161,7 @@ class DirectorCutStudio(QMainWindow):
             "Usage: h3_reference\n"
             "Requirement: exact Timeline speech and lip sync"
         )
+        self._consolidate_authored_tts_assets(asset)
         self.timeline_tts_stale = True
         return asset
 
@@ -12326,7 +12482,7 @@ class DirectorCutStudio(QMainWindow):
                     key: item.get(key)
                     for key in (
                         "start_seconds", "end_seconds", "content", "role", "speaker",
-                        "language", "delivery", "lip_sync",
+                        "language", "voice_gender", "delivery", "lip_sync",
                     )
                 }
                 for item in (
@@ -12831,8 +12987,9 @@ class DirectorCutStudio(QMainWindow):
             "track": "A1",
             "subject_keywords": ["exact authored Mandarin speech", "lip sync"],
             "prompt": (
-                "AUTHORED SPEECH TTS CLEAN DIALOGUE STEM. Preserve this exact timed transcript, "
-                "speaker identity and phoneme rhythm for lip sync. This is not the complete "
+                "AUTHORED SPEECH TTS PERFORMANCE AND LIP-SYNC CONTROL. Preserve this exact timed transcript, "
+                "speaker identity, voice identity and phoneme rhythm, but do not preserve a dry studio acoustic. "
+                "This is not a final waveform mix and is not the complete "
                 "soundtrack: spatialize it as live on-location production dialogue and generate "
                 "audible diegetic ambience, exact contact Foley/SFX and dialogue-ducked background "
                 "music around it. Never duplicate the voice. "
@@ -17873,6 +18030,8 @@ class DirectorCutStudio(QMainWindow):
                     "role": layer.content_role,
                     "speaker": layer.speaker,
                     "language": layer.language,
+                    "voice_gender": layer.voice_gender,
+                    "overlap_policy": layer.overlap_policy,
                     "delivery": layer.delivery,
                     "lip_sync": layer.lip_sync,
                     "overlap_policy": layer.overlap_policy,
@@ -20189,7 +20348,8 @@ class DirectorCutStudio(QMainWindow):
             if layer.content_role == "dialogue":
                 sync = "lip sync" if layer.lip_sync else "no required lip sync"
                 direction = (
-                    f'{layer.speaker} [{layer.language}, {layer.delivery}, {sync}] '
+                    f'{layer.speaker} [{layer.language}, voice gender={layer.voice_gender}, '
+                    f'{layer.delivery}, {sync}] '
                     f'[track={layer.track_id}, overlap={layer.overlap_policy}]: "{layer.text}"'
                 )
             elif layer.content_role == "voice_over":
@@ -20377,10 +20537,17 @@ class DirectorCutStudio(QMainWindow):
             soundscape = automatic_background_soundscape({
                 "overall_soundscape": self.prompt_panel.soundscape.toPlainText(),
                 "creative_brief": self.prompt_panel.brief.toPlainText(),
+                "duration_seconds": self.scan.duration_seconds,
                 "shots": [
                     {
+                        "start_seconds": cue.start_seconds,
+                        "end_seconds": cue.end_seconds,
+                        "framing": cue.framing,
+                        "camera_angle": cue.camera_angle,
                         "subject_action": cue.subject_action,
                         "environment_response": cue.environment_response,
+                        "additional_direction": cue.detail,
+                        "continuity_state": cue.continuity_state,
                     }
                     for cue in self.director_cues if cue.cue_type == "shot"
                 ],
@@ -20538,6 +20705,7 @@ class DirectorCutStudio(QMainWindow):
                 {
                     "content_role": layer.content_role,
                     "speaker": layer.speaker,
+                    "voice_gender": layer.voice_gender,
                     "delivery": layer.delivery,
                     "text": layer.text,
                 }
@@ -20635,6 +20803,7 @@ class DirectorCutStudio(QMainWindow):
                 row["content_role"] == "voice_over" for row in dialogue_rows
             )
             acoustic_references: list[str] = []
+            authored_speech_references: list[str] = []
             for asset in assets:
                 if not ranges_intersect(
                     asset.start_seconds,
@@ -20647,6 +20816,8 @@ class DirectorCutStudio(QMainWindow):
                     (asset.filename, asset.clip_prompt, asset.recognition)
                 ).lower()
                 is_authored_speech = "ai design authored speech tts" in evidence
+                if is_authored_speech:
+                    authored_speech_references.append(asset.tag)
                 is_music_or_dialogue = bool(re.search(
                     r"\b(?:music|song|score|dialogue|speech|voiceover|voice-over|lyrics)\b|"
                     r"音乐|音樂|歌曲|配乐|配樂|对白|對白|旁白|歌词|歌詞",
@@ -20756,7 +20927,8 @@ class DirectorCutStudio(QMainWindow):
                     )
                 else:
                     cue.audio_reference_intent = audio_reference_intent_text(
-                        acoustic_references
+                        acoustic_references,
+                        authored_speech_references=authored_speech_references,
                     )
             previous_profile = profile
 
@@ -20783,6 +20955,13 @@ class DirectorCutStudio(QMainWindow):
         self._refresh_native_audio_directions(reference_assets)
         state = asdict(spec)
         mtv_audio = is_mtv_singing_skill(self.special_combo.currentData())
+        compiled_text_layers = [
+            effective_native_speech_layer(
+                layer,
+                preserve_full_window=bool(supplied_dialogue_audio_tag) or mtv_audio,
+            )
+            for layer in self.text_layers
+        ]
         if mtv_audio:
             has_a2 = any(
                 asset.media_type == "audio"
@@ -20861,6 +21040,33 @@ class DirectorCutStudio(QMainWindow):
         state["audio"] = str(state.get("audio", "")).split(
             "Production mix contract:", 1
         )[0].strip(" .")
+        # The generated Design soundscape stores its automatic rules after the
+        # Production-mix marker.  The window compiler intentionally strips that
+        # generated suffix before adding Shot-local audio schedules; however,
+        # doing so also removed the global cinematic dialogue-acoustics contract
+        # from the *actual* H3 prompt.  Reinsert it once for windows containing
+        # on-screen dialogue/lyrics, ahead of the timestamped per-Shot detail.
+        # Voice-over remains an off-screen narrative source and is governed by
+        # its own authored direction instead of being forced into a visible room.
+        dialogue_acoustics_required = any(
+            layer.content_role in {"dialogue", "lyrics"}
+            and layer.text.strip()
+            and (
+                window_start is None
+                or window_end is None
+                or (
+                    float(layer.start_seconds) < float(window_end) - 1e-9
+                    and float(layer.end_seconds) > float(window_start) + 1e-9
+                )
+            )
+            for layer in compiled_text_layers
+        )
+        if dialogue_acoustics_required:
+            state["audio"] = (
+                state["audio"].rstrip(". ")
+                + ".\n"
+                + CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT
+            ).strip()
         raw_music_direction = str(state.get("music", "")).strip()
         active_special_skill = str(
             self.special_combo.currentData() or ""
@@ -20971,6 +21177,27 @@ class DirectorCutStudio(QMainWindow):
                 reference_scene_reset = self._is_reference_scene_reset_shot(cue)
                 campus_bridge = self._is_beat_synced_campus_bridge_shot(cue)
                 campus_composite = self._is_beat_synced_p4_campus_composite_shot(cue)
+                cue_window_start = max(
+                    cue.start_seconds,
+                    window_start if window_start is not None else cue.start_seconds,
+                )
+                cue_window_end = min(
+                    cue.end_seconds,
+                    window_end if window_end is not None else cue.end_seconds,
+                )
+                cue_speech_layers = [
+                    layer
+                    for layer in compiled_text_layers
+                    if layer.text.strip()
+                    and layer.content_role in {"dialogue", "voice_over", "lyrics"}
+                    and ranges_intersect(
+                        layer.start_seconds,
+                        layer.end_seconds,
+                        cue_window_start,
+                        cue_window_end,
+                    )
+                ]
+                cue_has_authored_speech = mtv_audio or bool(cue_speech_layers)
                 framing = (
                     "Campus-side frontal medium view of @P1 crossing the exit threshold, with both "
                     "eyes and the complete surprised facial reaction readable before a full-frame wipe"
@@ -21074,6 +21301,10 @@ class DirectorCutStudio(QMainWindow):
                         + "Use clear physical slow "
                         "motion, then settle completely before the final 0.5-second hold."
                     )
+                if not cue_has_authored_speech:
+                    executable_action = strip_unauthorized_speech_direction(
+                        executable_action
+                    )
                 if street_fighter_prompt:
                     executable_action = compact_street_fighter_prompt_field(
                         executable_action, global_contracts=compact_global_contracts
@@ -21103,6 +21334,10 @@ class DirectorCutStudio(QMainWindow):
                         "view direction from the incoming 24-frame motion reference. Preserve @P4 only "
                         "as subject identity and arrangement evidence, not as a background plate."
                     )
+                if not cue_has_authored_speech:
+                    continuity_state = strip_unauthorized_speech_direction(
+                        continuity_state
+                    )
                 if street_fighter_prompt:
                     continuity_state = compact_street_fighter_prompt_field(
                         continuity_state, global_contracts=compact_global_contracts
@@ -21131,6 +21366,10 @@ class DirectorCutStudio(QMainWindow):
                         "ground, shadows follow one shared light direction, and atmospheric depth, colour "
                         "temperature and reflections match the inherited outdoor scene."
                     )
+                if not cue_has_authored_speech:
+                    environment_response = strip_unauthorized_speech_direction(
+                        environment_response
+                    )
                 if street_fighter_prompt:
                     environment_response = compact_street_fighter_prompt_field(
                         environment_response, global_contracts=compact_global_contracts
@@ -21143,11 +21382,16 @@ class DirectorCutStudio(QMainWindow):
                             cue.semantic_reference_directions,
                     )
                 )
-                if cue.h3_optional_flourish:
+                optional_flourish = cue.h3_optional_flourish
+                if not cue_has_authored_speech:
+                    optional_flourish = strip_unauthorized_speech_direction(
+                        optional_flourish
+                    )
+                if optional_flourish:
                     parts.append(
                         "OPTIONAL FLOURISH - omit before delaying, replaying or weakening the core action: "
                         + canonicalize_cue_reference_ids(
-                            cue.h3_optional_flourish, cue.semantic_reference_directions
+                            optional_flourish, cue.semantic_reference_directions
                         )
                     )
                 environment_physics_clause = environmental_combat_prompt_clause(
@@ -21169,28 +21413,10 @@ class DirectorCutStudio(QMainWindow):
                         compacted = compacted[: limit - 1].rstrip(" ,;:") + "…"
                     return compacted
 
-                cue_window_start = max(
-                    cue.start_seconds,
-                    window_start if window_start is not None else cue.start_seconds,
-                )
-                cue_window_end = min(
-                    cue.end_seconds,
-                    window_end if window_end is not None else cue.end_seconds,
-                )
-                cue_has_authored_speech = mtv_audio or any(
-                    layer.text.strip()
-                    and layer.content_role in {"dialogue", "voice_over", "lyrics"}
-                    and ranges_intersect(
-                        layer.start_seconds,
-                        layer.end_seconds,
-                        cue_window_start,
-                        cue_window_end,
-                    )
-                    for layer in self.text_layers
-                )
                 native_audio_direction = cue.native_audio_direction
                 environment_continuity = cue.environment_continuity
                 audio_reference_intent = cue.audio_reference_intent
+                speech_turn_end_contract = ""
                 if reference_scene_reset:
                     environment_continuity = (
                         "Establish only the location tone implied by the active Picture from frame one; "
@@ -21228,11 +21454,26 @@ class DirectorCutStudio(QMainWindow):
                     audio_reference_intent = strip_unauthorized_speech_direction(
                         audio_reference_intent
                     )
+                elif cue_speech_layers and not mtv_audio:
+                    authorized_ranges = "; ".join(
+                        f"{local_time(max(layer.start_seconds, cue_window_start)):.2f}-"
+                        f"{local_time(min(layer.end_seconds, cue_window_end)):.2f}s "
+                        f"{layer.layer_id}/{layer.speaker or 'speaker'}"
+                        for layer in cue_speech_layers
+                    )
+                    speech_turn_end_contract = (
+                        "SPEAKER TURN-END LOCK: speaking-state directions apply only inside these "
+                        "exact Text Ranges: " + authorized_ranges
+                        + ". Immediately after each range ends, the speaker closes the mouth and the "
+                          "human vocal channel is empty until another listed Text Range begins."
+                    )
                 parts.append(
                     "NATIVE AUDIO DIRECTION - "
                     + compact_native_audio(native_audio_direction, 360)
                     + ". Every sound belongs to a visible or established filmed-world source as diegetic sound"
                 )
+                if speech_turn_end_contract:
+                    parts.append(speech_turn_end_contract)
                 parts.append(
                     "ENVIRONMENT CONTINUITY - "
                     + compact_native_audio(environment_continuity, 240)
@@ -21267,6 +21508,8 @@ class DirectorCutStudio(QMainWindow):
                         "environment and camera axis. @P4 owns only its visible subjects and their exact "
                         "identity, wardrobe and arrangement. Relight and ground them inside that campus."
                     )
+                if not cue_has_authored_speech:
+                    cue_detail = strip_unauthorized_speech_direction(cue_detail)
                 if street_fighter_prompt:
                     cue_detail = compact_street_fighter_prompt_field(
                         cue_detail, global_contracts=compact_global_contracts
@@ -21294,7 +21537,7 @@ class DirectorCutStudio(QMainWindow):
                         )
                 layers = [
                     layer
-                    for layer in self.text_layers
+                    for layer in compiled_text_layers
                     if (
                         (layer.shot_id == cue.cue_id and (
                             window_start is None
@@ -21377,6 +21620,7 @@ class DirectorCutStudio(QMainWindow):
                 "text": layer.text,
                 "speaker": layer.speaker,
                 "language": layer.language,
+                "voice_gender": layer.voice_gender,
                 "delivery": layer.delivery,
                 "lip_sync": layer.lip_sync,
                 "overlap_policy": layer.overlap_policy,
@@ -21386,7 +21630,7 @@ class DirectorCutStudio(QMainWindow):
                 "supplied_audio_tag": supplied_dialogue_audio_tag,
             }
             for layer in sorted(
-                self.text_layers,
+                compiled_text_layers,
                 key=lambda item: (item.start_seconds, item.end_seconds, item.layer_id),
             )
             if layer.text.strip()
@@ -21589,15 +21833,24 @@ class DirectorCutStudio(QMainWindow):
         """Build an H3 prompt whose timeline timestamps are local to one hidden segment."""
         campus_bridge = False
         campus_composite = False
+        mtv_audio = is_mtv_singing_skill(self.special_combo.currentData())
+        supplied_speech_audio_tag = self._supplied_speech_audio_tag(
+            assets,
+            prefer_mtv_vocal=mtv_audio,
+        )
+        compiled_text_layers = [
+            effective_native_speech_layer(
+                layer,
+                preserve_full_window=bool(supplied_speech_audio_tag) or mtv_audio,
+            )
+            for layer in self.text_layers
+        ]
         spec = self._prompt_spec_with_director_cues(
             self.prompt_panel.spec(),
             window_start=start,
             window_end=end,
             is_final_window=is_final_window,
-            supplied_dialogue_audio_tag=self._supplied_speech_audio_tag(
-                assets,
-                prefer_mtv_vocal=is_mtv_singing_skill(self.special_combo.currentData()),
-            ),
+            supplied_dialogue_audio_tag=supplied_speech_audio_tag,
             reference_assets=assets,
         )
         if start is not None and end is not None:
@@ -21611,7 +21864,7 @@ class DirectorCutStudio(QMainWindow):
                 and ranges_intersect(cue.start_seconds, cue.end_seconds, start, end)
             ])
             local_layers = [
-                layer for layer in self.text_layers
+                layer for layer in compiled_text_layers
                 if ranges_intersect(layer.start_seconds, layer.end_seconds, start, end)
             ]
             local_speech_layers = [
@@ -21850,12 +22103,43 @@ class DirectorCutStudio(QMainWindow):
                 ),
                 None,
             )
-            speaker_references = {
-                "S1": female_identity.tag if female_identity is not None else "the female character",
-                "S2": male_identity.tag if male_identity is not None else "the male character",
-            }
+            active_dialogue_speakers = sorted(
+                {
+                    layer.speaker for layer in local_speech_layers
+                    if layer.content_role == "dialogue"
+                    and re.fullmatch(r"S[1-9]\d*", layer.speaker)
+                },
+                key=lambda speaker: int(speaker[1:]),
+            )
+            speaker_voice_genders: dict[str, str] = {}
+            for speaker in active_dialogue_speakers:
+                explicit_genders = {
+                    layer.voice_gender
+                    for layer in local_speech_layers
+                    if layer.content_role == "dialogue"
+                    and layer.speaker == speaker
+                    and layer.voice_gender in {"male", "female"}
+                }
+                speaker_voice_genders[speaker] = (
+                    next(iter(explicit_genders)) if len(explicit_genders) == 1 else "auto"
+                )
+            speaker_references: dict[str, str] = {}
+            for speaker in active_dialogue_speakers:
+                gender = speaker_voice_genders.get(speaker, "auto")
+                if gender == "female" and female_identity is not None:
+                    speaker_references[speaker] = female_identity.tag
+                elif gender == "male" and male_identity is not None:
+                    speaker_references[speaker] = male_identity.tag
+                else:
+                    speaker_references[speaker] = (
+                        f"the existing visible character already assigned to {speaker} "
+                        "by the Timeline/Design cast ledger"
+                    )
             street_fighter_cast_mode = (
                 self.special_combo.currentData() == ENVIRONMENT_COMBAT_SPECIAL_SKILL
+            )
+            comic_talk_show_cast_mode = (
+                self.special_combo.currentData() == COMIC_TALK_SHOW_SPECIAL_SKILL
             )
             if street_fighter_cast_mode:
                 stable_images = {
@@ -21864,6 +22148,26 @@ class DirectorCutStudio(QMainWindow):
                 speaker_references = {
                     "S1": stable_images.get("P1", "<Subject 1> from permanent P1"),
                     "S2": stable_images.get("P2", "<Subject 2> from permanent P2"),
+                }
+            elif comic_talk_show_cast_mode:
+                stable_images = {
+                    stable_reference_id(asset): asset.tag for asset in image_assets
+                }
+                group_tag = stable_images.get("P1", "permanent P1 group cast")
+                active_speakers = sorted(
+                    {
+                        layer.speaker for layer in local_speech_layers
+                        if layer.content_role == "dialogue"
+                        and re.fullmatch(r"S[1-9]\d*", layer.speaker)
+                    },
+                    key=lambda speaker: int(speaker[1:]),
+                )
+                speaker_references = {
+                    speaker: (
+                        f"the complete P1 principal numbered {speaker} from image-left to image-right "
+                        f"in {group_tag}"
+                    )
+                    for speaker in active_speakers
                 }
             local_dialogue_layers = [
                 layer for layer in local_speech_layers
@@ -21878,8 +22182,35 @@ class DirectorCutStudio(QMainWindow):
                     right.start_seconds, right.end_seconds,
                 )
             ]
+            dialogue_unison_pairs = [
+                (left, right)
+                for left, right in dialogue_overlap_pairs
+                if (
+                    left.overlap_policy == "overlap"
+                    and right.overlap_policy == "overlap"
+                    and left.text.strip() == right.text.strip()
+                    and abs(left.start_seconds - right.start_seconds) <= 1e-6
+                    and abs(left.end_seconds - right.end_seconds) <= 1e-6
+                )
+            ]
+            independent_dialogue_overlap_pairs = [
+                pair for pair in dialogue_overlap_pairs
+                if pair not in dialogue_unison_pairs
+            ]
             if local_dialogue_layers:
-                if street_fighter_cast_mode:
+                if comic_talk_show_cast_mode:
+                    brief_parts.append(
+                        "DYNAMIC P1 GROUP SPEAKER-TO-FACE LOCK: permanent P1 is one immutable "
+                        "ensemble plate in its original photographic, comic, illustrated, 3D or "
+                        "stylized medium. Count only complete intentional principal people and keep "
+                        "their fixed image-left-to-image-right mapping as S1 through SN. Never assume "
+                        "five people, never substitute a generated actor, and never reorder, merge, "
+                        "duplicate or crop away a principal. During each non-overlapping Dialogue "
+                        "Text Range, only its assigned P1 principal articulates lips and jaw; every "
+                        "other visible principal keeps a neutral non-speaking mouth and reacts silently. "
+                        "Voice-over never causes a visible face to lip-sync."
+                    )
+                elif street_fighter_cast_mode:
                     brief_parts.append(
                         "SPEAKER-TO-FACE IDENTITY LOCK: S1 is exclusively permanent P1, currently "
                         f"mapped to {speaker_references['S1']}; S2 is exclusively permanent P2, "
@@ -21890,10 +22221,11 @@ class DirectorCutStudio(QMainWindow):
                     )
                 else:
                     brief_parts.append(
-                        "SPEAKER-TO-FACE IDENTITY LOCK: S1 always means the female voice/character "
-                        f"defined by {speaker_references['S1']}; S2 always means the male "
-                        f"voice/character defined by {speaker_references['S2']}. These assignments "
-                        "never swap with screen position, shot order or camera angle. During each "
+                        "SPEAKER-TO-FACE IDENTITY LOCK: every S1...SN ID keeps the existing visible "
+                        "character assigned by the Timeline/Design cast ledger. Speaker numbering "
+                        "never implies gender and never swaps with screen position, Shot order or "
+                        "camera angle. Each Text Layer's explicit voice_gender is authoritative; "
+                        "AUTO preserves the assigned character without inventing a gender. During each "
                         "non-overlapping Dialogue Text Range, only the assigned speaker moves lips "
                         "and jaw; every listener reacts silently. During an authored overlap, each "
                         "assigned speaker performs only their own independent Text Layer. "
@@ -21912,17 +22244,29 @@ class DirectorCutStudio(QMainWindow):
                     )
                     + "."
                 )
-                if dialogue_overlap_pairs:
+                if independent_dialogue_overlap_pairs:
                     brief_parts.append(
                         "AUTHORED DIALOGUE OVERLAP: "
                         + "; ".join(
                             f"{max(start, left.start_seconds, right.start_seconds) - start:.2f}-"
                             f"{min(end, left.end_seconds, right.end_seconds) - start:.2f}s "
                             f"{left.layer_id}/{left.track_id} with {right.layer_id}/{right.track_id}"
-                            for left, right in dialogue_overlap_pairs
+                            for left, right in independent_dialogue_overlap_pairs
                         )
                         + ". Both voices are intentional and independent. Preserve both exact lines; "
                           "never merge their words or transfer one speaker's words to the other."
+                    )
+                if dialogue_unison_pairs:
+                    brief_parts.append(
+                        "SYNCHRONIZED SAME-LINE UNISON: "
+                        + "; ".join(
+                            f"{max(start, left.start_seconds) - start:.2f}-"
+                            f"{min(end, left.end_seconds) - start:.2f}s "
+                            f"{left.layer_id}/{left.track_id} with {right.layer_id}/{right.track_id}"
+                            for left, right in dialogue_unison_pairs
+                        )
+                        + ". The assigned speakers say one shared exact utterance once in sync. "
+                          "Do not serialize, repeat, echo, paraphrase or follow it with another line."
                     )
             if local_shots:
                 brief_parts.append(
@@ -21945,16 +22289,19 @@ class DirectorCutStudio(QMainWindow):
                 )
             if local_speech_layers:
                 speech_windows = []
+                speech_intervals: list[tuple[float, float]] = []
                 for layer in sorted(
                     local_speech_layers,
                     key=lambda item: (item.start_seconds, item.end_seconds, item.layer_id),
                 ):
                     local_start = max(start, layer.start_seconds) - start
                     local_end = min(end, layer.end_seconds) - start
+                    speech_intervals.append((local_start, local_end))
                     speech_windows.append(
                         f"{local_start:.2f}-{local_end:.2f}s {layer.layer_id} "
                         f"on {layer.track_id} ({layer.content_role}, "
-                        f"{layer.speaker or 'speaker'}, overlap={layer.overlap_policy})"
+                        f"{layer.speaker or 'speaker'}, voice_gender={layer.voice_gender}, "
+                        f"overlap={layer.overlap_policy})"
                     )
                 brief_parts.append(
                     "SPEECH WHITELIST WITH VOCAL-SILENCE GAPS: human speech is permitted only "
@@ -21965,6 +22312,41 @@ class DirectorCutStudio(QMainWindow):
                       "start, repeated word, translation, commentary, whisper, crowd voice or "
                       "telephone voice. Room tone, music and non-vocal Foley may continue."
                 )
+                merged_intervals: list[list[float]] = []
+                for interval_start, interval_end in sorted(speech_intervals):
+                    if not merged_intervals or interval_start > merged_intervals[-1][1] + 1e-6:
+                        merged_intervals.append([interval_start, interval_end])
+                    else:
+                        merged_intervals[-1][1] = max(
+                            merged_intervals[-1][1], interval_end
+                        )
+                silence_windows: list[tuple[float, float]] = []
+                cursor = 0.0
+                segment_duration = end - start
+                for interval_start, interval_end in merged_intervals:
+                    if interval_start > cursor + 1e-6:
+                        silence_windows.append((cursor, interval_start))
+                    cursor = max(cursor, interval_end)
+                if cursor < segment_duration - 1e-6:
+                    silence_windows.append((cursor, segment_duration))
+                if silence_windows:
+                    brief_parts.append(
+                        "EXPLICIT HUMAN-VOCAL SILENCE WINDOWS: "
+                        + "; ".join(
+                            f"{gap_start:.2f}-{gap_end:.2f}s"
+                            for gap_start, gap_end in silence_windows
+                        )
+                        + ". Throughout every listed gap, every visible person keeps a closed or "
+                          "neutral non-speaking mouth. Generate ambience, breathing without syllables "
+                          "and picture-synchronous non-vocal Foley only."
+                    )
+                if comic_talk_show_cast_mode:
+                    brief_parts.append(
+                        "COMIC TALK SHOW TURN-END LOCK: each active P1 speaker says only the exact "
+                        "Text Layer once, immediately closes the mouth at that Text Range end, then "
+                        "reacts silently. No principal may ad-lib, repeat a punchline, translate, "
+                        "answer early, laugh vocally or produce a filler syllable between turns."
+                    )
             brief_parts.append(
                 "AUDIO SEGMENT BOUNDARY CONTRACT: establish the location's continuous room tone "
                 "or outdoor ambience from the first frame and keep it stable through the final "
@@ -22682,12 +23064,78 @@ class DirectorCutStudio(QMainWindow):
             patch_media_upload_names(compiled, uploads)
             segment.fingerprint = fingerprint
             all_media.extend(uploads)
+            location_sound_reference: dict = {}
+            has_on_screen_dialogue = any(
+                layer.content_role == "dialogue"
+                and layer.text.strip()
+                and float(layer.start_seconds) < core_end - 1e-9
+                and float(layer.end_seconds) > core_start + 1e-9
+                for layer in self.text_layers
+            )
+            authored_tts = next(
+                (
+                    asset
+                    for asset in assets
+                    if asset.media_type == "audio"
+                    and asset.enabled
+                    and "AI DESIGN AUTHORED SPEECH TTS"
+                    in str(asset.recognition or "")
+                    and Path(str(asset.local_path or "")).is_file()
+                ),
+                None,
+            )
+            if has_on_screen_dialogue and authored_tts is not None:
+                loader_node_id = str(
+                    authored_tts.request_loader_node_id
+                    or authored_tts.source_node_id
+                    or authored_tts.node_id
+                )
+                tts_upload = next(
+                    (
+                        item
+                        for item in uploads
+                        if str(item.get("loader_node_id", "")) == loader_node_id
+                    ),
+                    None,
+                )
+                if tts_upload is not None:
+                    cache_token = hashlib.sha256(
+                        (
+                            f"complete-location-sound-v1|{fingerprint}|"
+                            f"{core_start:.6f}|{core_end:.6f}|"
+                            f"{Path(str(authored_tts.local_path)).stat().st_mtime_ns}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:24]
+                    location_cache = workspace / "cache" / "native_location_sound"
+                    location_sound_reference = {
+                        "enabled": True,
+                        "version": 1,
+                        "cache_token": cache_token,
+                        "loader_node_id": loader_node_id,
+                        "speech_path": str(Path(str(authored_tts.local_path)).resolve()),
+                        "duration_seconds": round(max(0.01, core_end - core_start), 6),
+                        "ambience_gain": 0.55,
+                        "ambience_cache_path": str(
+                            location_cache / f"{cache_token}.native_ambience.wav"
+                        ),
+                        "complete_cache_path": str(
+                            location_cache / f"{cache_token}.complete_location.wav"
+                        ),
+                        "upload_name": (
+                            "h3ref_audio_complete_location_"
+                            f"{cache_token}.wav"
+                        ),
+                    }
             row = segment.to_dict()
             row.update(
                 {
                     "workflow": compiled,
                     "continuity": continuity,
                     "download_dir": str(render_root / segment.segment_id),
+                    "native_speech_guard": self._native_speech_guard_spec(
+                        core_start, core_end, assets
+                    ),
+                    "location_sound_reference": location_sound_reference,
                 }
             )
             segment_rows.append(row)
@@ -22789,6 +23237,8 @@ class DirectorCutStudio(QMainWindow):
             "segment_count": len(segment_rows),
             "progress_shots": self._progress_shot_rows(start, end),
             "segment_attempts": 3,
+            "native_speech_guard_retries": 2,
+            "native_speech_guard_model": str(self.runtime.speech_model),
             "history_poll_interval": self.render_settings.history_poll_interval,
             "generation_timeout": self.render_settings.generation_timeout,
             "http_timeout": self.render_settings.http_request_timeout,
@@ -22810,6 +23260,90 @@ class DirectorCutStudio(QMainWindow):
         job_path.parent.mkdir(parents=True, exist_ok=True)
         job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         return job_path, len(segment_rows)
+
+    def _native_speech_guard_spec(
+        self,
+        start: float,
+        end: float,
+        active_assets: list[MediaAsset],
+    ) -> dict:
+        """Return segment-local speech and strict non-vocal ranges.
+
+        The guard checks only ranges where no Dialogue/Voice-over is authorized.
+        It therefore also protects silent tails around supplied TTS without
+        judging or rewriting the authored TTS itself. MTV/Lyrics remain excluded.
+        """
+
+        has_project_speech = any(
+            layer.content_role in {"dialogue", "voice_over"} and layer.text.strip()
+            for layer in self.text_layers
+        )
+        guard_mode = bool(
+            has_project_speech
+            and not is_mtv_singing_skill(self.special_combo.currentData())
+        )
+        if not guard_mode:
+            return {"enabled": False, "authorized_windows": [], "silence_windows": []}
+        active_layers = [
+            effective_native_speech_layer(layer)
+            for layer in self.text_layers
+            if layer.content_role in {"dialogue", "voice_over"}
+            and layer.text.strip()
+            and ranges_intersect(layer.start_seconds, layer.end_seconds, start, end)
+        ]
+        duration = max(0.0, float(end) - float(start))
+        authorized = sorted(
+            [
+                max(0.0, float(layer.start_seconds) - start),
+                min(duration, float(layer.end_seconds) - start),
+            ]
+            for layer in active_layers
+        )
+        merged: list[list[float]] = []
+        for local_start, local_end in authorized:
+            if local_end <= local_start + 1e-6:
+                continue
+            if not merged or local_start > merged[-1][1] + 1e-6:
+                merged.append([local_start, local_end])
+            else:
+                merged[-1][1] = max(merged[-1][1], local_end)
+        silence: list[list[float]] = []
+        cursor = 0.0
+        for local_start, local_end in merged:
+            if local_start > cursor + 1e-6:
+                silence.append([round(cursor, 6), round(local_start, 6)])
+            cursor = max(cursor, local_end)
+        if cursor < duration - 1e-6:
+            silence.append([round(cursor, 6), round(duration, 6)])
+        return {
+            "enabled": bool(silence or active_layers),
+            "speech_source": (
+                "h3_native"
+                if self.render_settings.dialogue_tts_engine == "h3_native"
+                else "authored_tts_reference"
+            ),
+            "authorized_windows": [
+                [round(row[0], 6), round(row[1], 6)] for row in merged
+            ],
+            "silence_windows": silence,
+            "layer_ids": [layer.layer_id for layer in active_layers],
+            "authorized_lines": [
+                {
+                    "layer_id": layer.layer_id,
+                    "speaker": layer.speaker,
+                    "language": layer.language,
+                    "voice_gender": layer.voice_gender,
+                    "start_seconds": round(
+                        max(0.0, float(layer.start_seconds) - start), 6
+                    ),
+                    "end_seconds": round(
+                        min(duration, float(layer.end_seconds) - start), 6
+                    ),
+                    "text": layer.text,
+                }
+                for layer in active_layers
+            ],
+        }
 
     def _immutable_final_hold_spec(self, start: float, end: float) -> dict:
         """Compatibility shim: automatic P1 tail replacement has been retired."""
@@ -23050,6 +23584,10 @@ class DirectorCutStudio(QMainWindow):
             return []
         payload = {
             "timeline_duration_seconds": float(self.scan.duration_seconds),
+            "enforce_native_speech_release_gap": bool(
+                self.render_settings.dialogue_tts_engine == "h3_native"
+                and not is_mtv_singing_skill(self.special_combo.currentData())
+            ),
             "work_area": [float(self.clip_start.value()), float(self.clip_end.value())],
             "director_cues": [asdict(cue) for cue in self.director_cues],
             "text_layers": [asdict(layer) for layer in self.text_layers],
@@ -23088,6 +23626,7 @@ class DirectorCutStudio(QMainWindow):
             layer.start_seconds = float(row.get("start_seconds", layer.start_seconds))
             layer.end_seconds = float(row.get("end_seconds", layer.end_seconds))
             layer.language = str(row.get("language", layer.language))
+            layer.voice_gender = str(row.get("voice_gender", layer.voice_gender))
             layer.shot_id = str(row.get("shot_id", layer.shot_id))
             layer.speech_timing_auto_adjusted = bool(
                 row.get("speech_timing_auto_adjusted", layer.speech_timing_auto_adjusted)
@@ -23363,7 +23902,18 @@ class DirectorCutStudio(QMainWindow):
             self._read_settings_ui()
             self.generate_prompt(interactive=False)
             duration = self.clip_end.value() - self.clip_start.value()
-            is_smart_render = duration > MAX_NATIVE_SECONDS + 1e-6
+            native_speech_guard_requested = bool(
+                not is_mtv_singing_skill(self.special_combo.currentData())
+                and any(
+                    layer.content_role in {"dialogue", "voice_over"}
+                    and layer.text.strip()
+                    for layer in self.text_layers
+                )
+            )
+            is_smart_render = bool(
+                duration > MAX_NATIVE_SECONDS + 1e-6
+                or native_speech_guard_requested
+            )
             if is_smart_render:
                 job_path, segment_count = self._build_smart_render_job(
                     request_kind=request_kind,
@@ -23464,7 +24014,11 @@ class DirectorCutStudio(QMainWindow):
             "accepted": "accepted 1.0MP render",
         }.get(request_kind, f"{megapixels:g}MP final render")
         if is_smart_render:
-            label += f" · Smart Long Render · {segment_count} hidden segments"
+            label += (
+                f" · Speech Guard · {segment_count} segment(s)"
+                if native_speech_guard_requested
+                else f" · Smart Long Render · {segment_count} hidden segments"
+            )
         self.statusBar().showMessage(f"Submitting {label} · seed {seed}")
         example_folder = self._ensure_example_work_dir()
         self.statusBar().showMessage(

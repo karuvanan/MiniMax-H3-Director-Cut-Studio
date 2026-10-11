@@ -2,6 +2,7 @@ import unittest
 
 from audio_engine import evaluate_native_audio_qc
 from native_audio_engine import (
+    CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT,
     NO_AUTHORED_SPEECH_CONTRACT,
     SPEECH_ENVIRONMENT_FUSION_CONTRACT,
     audio_reference_intent_text,
@@ -9,6 +10,7 @@ from native_audio_engine import (
     enforce_no_authored_speech,
     environment_continuity_text,
     infer_acoustic_space,
+    infer_foley,
     native_audio_direction_text,
 )
 
@@ -51,6 +53,7 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertIn(SPEECH_ENVIRONMENT_FUSION_CONTRACT, prompt)
         self.assertIn("ordinary acoustic masking rather than gain ducking", prompt)
         self.assertIn("never to ambience or Foley", prompt)
+        self.assertIn("ADR-like centre isolation", prompt)
 
     def test_wide_outdoor_dialogue_has_distance_attenuation_and_open_bed(self):
         profile = build_native_audio_profile(
@@ -64,6 +67,20 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertIn("open exterior", prompt)
         self.assertIn("distance attenuation", prompt)
         self.assertIn("continuous open-air ambience", prompt)
+        self.assertIn("direct-to-ambient ratio", prompt)
+
+    def test_turning_character_changes_vocal_direction_without_extra_words(self):
+        profile = build_native_audio_profile(
+            {
+                "framing": "Medium close-up",
+                "subject_action": "S1 turns his head away while finishing the line in the rain.",
+            },
+            [{"delivery": "conversational", "content_role": "dialogue"}],
+        )
+        prompt = native_audio_direction_text(profile)
+        self.assertIn("off-axis directionality", prompt)
+        self.assertIn("high-frequency loss", prompt)
+        self.assertIn("without adding any unauthorised word", prompt)
 
     def test_same_space_preserves_environment_and_close_cut_changes_perspective(self):
         wide = build_native_audio_profile(
@@ -141,6 +158,46 @@ class NativeAudioDirectionTests(unittest.TestCase):
         self.assertIn("Do not copy, replay or imitate any words", direction)
         self.assertIn("Do not use a reference character's voice", direction)
         self.assertIn("preceding generated segment", direction)
+
+    def test_authored_tts_is_declared_as_speech_stem_not_complete_soundtrack(self):
+        direction = audio_reference_intent_text(
+            [], authored_speech_references=["<Audio 1>"]
+        )
+        self.assertIn("Authored speech reference(s): <Audio 1>", direction)
+        self.assertIn("exact authored words", direction)
+        self.assertIn("not the complete soundtrack", direction)
+        self.assertIn("continuous visible ambience", direction)
+        self.assertIn("Digital silence between supplied utterances", direction)
+        self.assertIn("not a silent-soundtrack instruction", direction)
+        self.assertIn("not a final dry waveform mix", direction)
+        self.assertIn("scene-matched direct-to-ambient ratio", direction)
+        self.assertIn("never duplicate or replace the voice", direction)
+        self.assertNotIn("No Audio or Video reference", direction)
+
+    def test_foley_terms_do_not_match_stands_punchline_or_speaker_lock(self):
+        foley = infer_foley(
+            "Both principals stand in rain for the final visual punchline. "
+            "Apply the speaker lock while the puddle ripples."
+        )
+        self.assertIn("water, rain and wet-surface contact", foley)
+        self.assertNotIn("attack air-displacement", foley)
+        self.assertNotIn("sharp contact transient", foley)
+        self.assertNotIn("rock fracture", foley)
+        self.assertNotIn("doors, locks", foley)
+
+    def test_rain_scene_infers_open_rainy_exterior(self):
+        profile = build_native_audio_profile({
+            "framing": "Medium two-shot",
+            "subject_action": "Two people stand in a puddle during steady rain.",
+        })
+        self.assertEqual(profile.acoustic_space, "open rainy exterior")
+        self.assertIn("open-air rain", profile.ambience)
+
+    def test_cinematic_dialogue_contract_forbids_adr_and_preserves_action_coupling(self):
+        self.assertIn("never like ADR", CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT)
+        self.assertIn("direct-to-ambient ratio", CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT)
+        self.assertIn("turning away changes directionality", CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT)
+        self.assertIn("add no new line", CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT)
 
     def test_native_audio_qc_is_analysis_only(self):
         result = evaluate_native_audio_qc(
