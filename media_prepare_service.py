@@ -14,6 +14,7 @@ from media_engine import (
     create_audio_waveform,
     create_image_analysis_regions,
     create_video_analysis_frames,
+    detect_video_scene_changes,
     human_probe_summary,
     probe_media,
     remove_solid_background,
@@ -87,6 +88,7 @@ def main() -> int:
                 continue
             media_type = str(job["media_type"])
             timeline_seconds = max(0.05, float(job.get("timeline_seconds", 60.0)))
+            full_duration_analysis = bool(job.get("full_duration_analysis", False))
             cache_root = Path(job["cache_root"])
             cache_root.mkdir(parents=True, exist_ok=True)
             digest = hashlib.sha1(
@@ -113,14 +115,30 @@ def main() -> int:
                 analysis_sources = [[label, str(path)] for label, path in regions]
             elif media_type == "video":
                 source_duration = max(0.05, float(info.get("duration", 0.0)))
-                analysis_duration = min(source_duration, timeline_seconds)
-                frame_dir = Path(str(cache_base) + "_frames")
+                analysis_duration = (
+                    source_duration
+                    if full_duration_analysis
+                    else min(source_duration, timeline_seconds)
+                )
+                frame_dir = Path(
+                    str(cache_base)
+                    # v3 adds early/late samples per edit so Qwen can inspect
+                    # performance changes and richer set evidence instead of
+                    # inferring a whole Shot from one midpoint still.
+                    + ("_full_scene_frames_v3" if full_duration_analysis else "_frames")
+                )
                 _emit({"job": job["job"], "progress": 0.25, "stage": "extracting frames"})
                 frames = create_video_analysis_frames(
                     source,
                     frame_dir,
                     analysis_duration,
                     runtime,
+                    scene_aware=full_duration_analysis,
+                    max_frames=int(job.get("max_analysis_frames", 18) or 18),
+                )
+                scene_cut_times = (
+                    detect_video_scene_changes(source, analysis_duration, runtime=runtime)
+                    if full_duration_analysis else []
                 )
                 analysis_sources = [[label, str(path)] for label, path in frames]
                 preview_path = frames[len(frames) // 2][1]
@@ -147,6 +165,15 @@ def main() -> int:
                         "metadata": human_probe_summary(info),
                         "preview_path": str(preview_path),
                         "analysis_sources": analysis_sources,
+                        "analysis_duration_seconds": (
+                            analysis_duration if media_type == "video" else 0.0
+                        ),
+                        "full_duration_analysis": bool(
+                            media_type == "video" and full_duration_analysis
+                        ),
+                        "scene_cut_times": (
+                            scene_cut_times if media_type == "video" else []
+                        ),
                         "background_removal": background_removal,
                     },
                 }

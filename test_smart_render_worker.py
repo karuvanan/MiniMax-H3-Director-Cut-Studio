@@ -802,11 +802,15 @@ class SmartRenderWorkerTests(unittest.TestCase):
                 patch.object(sys, "argv", ["smart_render_worker.py", str(job_path)]),
                 patch("smart_render_worker.preflight_smart_render", return_value=preflight),
                 patch("smart_render_worker.queue_segment", return_value=second_result),
-                patch("smart_render_worker.release_comfy_memory", return_value="released"),
+                patch(
+                    "smart_render_worker.release_comfy_memory",
+                    return_value="released",
+                ) as release,
                 patch("smart_render_worker.assemble_master", return_value=master_output),
                 patch("smart_render_worker.emit", side_effect=events.append),
             ):
                 self.assertEqual(main(), 0)
+            self.assertEqual(release.call_count, 1)
             progress_events = [
                 event["render_progress"] for event in events if "render_progress" in event
             ]

@@ -8,6 +8,7 @@ from audio_engine import SAMPLE_RATE, estimate_tempo, stream_audio_chunks, voice
 from blip_service import is_cuda_fallback_error
 from media_engine import (
     create_image_analysis_regions,
+    create_labeled_contact_sheet,
     create_video_analysis_frames,
     media_type_for_path,
     probe_media,
@@ -17,6 +18,27 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class MediaEngineTests(unittest.TestCase):
+    def test_labeled_contact_sheet_preserves_all_supplied_panels(self):
+        root = PROJECT_ROOT / ".director_cache" / "contact_sheet_test"
+        root.mkdir(parents=True, exist_ok=True)
+        sources = []
+        for index, colour in enumerate(((200, 20, 20), (20, 200, 20), (20, 20, 200), (180, 180, 20)), 1):
+            path = root / f"source_{index}.png"
+            Image.new("RGB", (120, 80), colour).save(path)
+            sources.append((f"scene {index:02d}", path))
+        destination = root / "sheet.jpg"
+
+        result = create_labeled_contact_sheet(sources, destination, columns=2, cell_size=(160, 100))
+
+        self.assertEqual(result, destination)
+        self.assertTrue(destination.is_file())
+        with Image.open(destination) as sheet:
+            self.assertEqual(sheet.size, (320, 260))
+        destination.unlink(missing_ok=True)
+        for _label, path in sources:
+            path.unlink(missing_ok=True)
+        root.rmdir()
+
     def test_blip_cuda_architecture_failure_is_safe_for_cpu_retry(self):
         self.assertTrue(
             is_cuda_fallback_error(
@@ -65,6 +87,18 @@ class MediaEngineTests(unittest.TestCase):
         self.assertTrue(all(path.is_file() for _, path in frames))
         self.assertIn("10%", frames[0][0])
         self.assertIn("90%", frames[-1][0])
+
+    def test_scene_aware_scan_keeps_three_frames_for_single_scene_video(self):
+        source = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
+        if not source.exists():
+            self.skipTest("runtime smoke video is not present")
+        target = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "scene_frames"
+        frames = create_video_analysis_frames(
+            source, target, 1.5, scene_aware=True, max_frames=18
+        )
+        self.assertEqual(len(frames), 3)
+        self.assertTrue(all(path.is_file() for _, path in frames))
+        self.assertIn("source opening", frames[0][0])
 
     def test_image_analysis_regions_include_overlay_resistant_scene_crops(self):
         root = PROJECT_ROOT / ".director_cache" / "image_region_test"

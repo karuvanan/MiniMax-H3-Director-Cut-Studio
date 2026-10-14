@@ -11,6 +11,7 @@ from drone_route_engine import analyse_red_route
 from design_engine import (
     BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
     COMIC_TALK_SHOW_SPECIAL_SKILL,
+    SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
     DESIGN_JSON_SCHEMA,
     DRONE_FIREWORKS_STILL_CONTRACT,
     DRONE_FIREWORKS_STILL_NEGATIVE_PROMPT,
@@ -24,6 +25,9 @@ from design_engine import (
     DesignSpeechLayerContractError,
     automatic_background_music,
     automatic_background_soundscape,
+    authored_locked_cast_picture_ids,
+    authored_master_audio_duration,
+    authored_master_audio_id,
     authored_text_layers_with_plan_assignments,
     bind_design_source_plate_paths,
     build_design_system_prompt,
@@ -46,8 +50,11 @@ from design_engine import (
     normalize_design_plan,
     protect_explicit_timed_text_layers,
     reconcile_requested_speech_layer_contract,
+    render_special_design_requirement_template,
     sanitize_drone_still_image_request,
     sanitize_design_model_context,
+    source_video_remake_duration,
+    source_video_remake_required_media,
     speech_timing_budget,
     spatial_acoustics_profile,
     spatial_acoustics_schedule,
@@ -779,6 +786,106 @@ class DesignEngineTests(unittest.TestCase):
             row.get("identity_anchor_media_id") == "P1"
             for row in plan["media_requests"]
             if row["media_type"] == "image"
+        ))
+
+    def test_original_audio_fixed_cast_remake_uses_supplied_people_only(self):
+        requirement = """
+        固定主要人物：@P1 的人脸身份全程保持一致。
+        固定主要人物：@P2 的人脸身份全程保持一致。
+        固定主要人物：@P3 的人脸身份全程保持一致。
+        固定主要人物：@P4 的人脸身份全程保持一致。
+        @A1 是不可改动的原声、唯一声音和主时间线。
+        不要自创或替换任何对话人物。
+        """
+        payload = sample_design()
+        payload["duration_seconds"] = 79.0
+        payload["shots"] = [
+            {
+                **payload["shots"][0],
+                "start_seconds": 0.0,
+                "end_seconds": 39.5,
+                "subject_action": "@P1 speaks from @A1 while @P2 listens.",
+            },
+            {
+                **payload["shots"][1],
+                "start_seconds": 39.5,
+                "end_seconds": 79.0,
+                "subject_action": "@P2 speaks from @A1 while @P1, @P3 and @P4 react.",
+            },
+        ]
+        payload["text_layers"] = [{
+            "start_seconds": 0.0,
+            "end_seconds": 2.0,
+            "track": "A4",
+            "role": "dialogue",
+            "speaker": "S1",
+            "content": "Invented duplicate line",
+            "explicit_user_requested": True,
+        }]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = [
+            {
+                "requirement_id": "replacement_p1_closeup",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "start_seconds": 0.0,
+                "end_seconds": 30.0,
+                "track": "V1",
+                "subject_keywords": ["woman", "customer"],
+                "prompt": "A woman customer speaks at a cafe counter.",
+            },
+            {
+                "requirement_id": "empty_cafe_plate",
+                "media_type": "image",
+                "usage": "h3_reference",
+                "start_seconds": 0.0,
+                "end_seconds": 79.0,
+                "track": "V1",
+                "subject_keywords": ["cafe interior", "counter"],
+                "prompt": "An empty photoreal cafe interior with a service counter.",
+            },
+        ]
+        inventory = [
+            {
+                "media_id": f"P{index}", "media_type": "image", "loaded": True,
+                "caption": f"Supplied principal {index}",
+            }
+            for index in range(1, 5)
+        ] + [{
+            "media_id": "A1", "media_type": "audio", "loaded": True,
+            "source_duration_seconds": 53.290667,
+        }]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            authored_requirement=requirement,
+        )
+
+        self.assertEqual(authored_master_audio_id(requirement), "A1")
+        self.assertEqual(authored_master_audio_duration(requirement, inventory), 53.290667)
+        self.assertEqual(
+            authored_locked_cast_picture_ids(requirement),
+            ["P1", "P2", "P3", "P4"],
+        )
+        self.assertEqual(plan["duration_seconds"], 53.290667)
+        self.assertEqual(plan["text_layers"], [])
+        self.assertEqual(
+            [row["requirement_id"] for row in plan["media_requests"]],
+            ["empty_cafe_plate"],
+        )
+        self.assertIn(
+            "FIXED-CAST ENVIRONMENT PLATE ONLY",
+            plan["media_requests"][0]["prompt"],
+        )
+        uses = {row["media_id"]: row for row in plan["existing_media_uses"]}
+        self.assertEqual(set(uses), {"P1", "P2", "P3", "P4", "A1"})
+        self.assertTrue(all(uses[f"P{index}"]["identity_anchor"] for index in range(1, 5)))
+        self.assertIn("sole audible speech source", uses["A1"]["instruction"])
+        self.assertTrue(any(
+            "replacement_p1_closeup" in warning
+            for warning in plan["design_warnings"]
         ))
 
     def test_h3_dialogue_language_catalog_and_deterministic_auto_detection(self):
@@ -3878,6 +3985,471 @@ On-screen text: "EXACT TITLE"'''
             (11.5, 18.0),
         )
         self.assertIn("ENVIRONMENT POPULATION KEYFRAME", loaded_p5["instruction"])
+
+
+    def test_source_video_cast_remake_locks_v1_duration_cast_and_original_soundtrack(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 79.0
+        payload["shots"] = [
+            {
+                **payload["shots"][0],
+                "start_seconds": 0.0,
+                "end_seconds": 79.0,
+                "subject_action": (
+                    "S1=@P1 speaks during V1 voice-active range from 0.09 to 1.29 seconds. "
+                    "S1 then turns toward the door."
+                ),
+            }
+        ]
+        payload["text_layers"] = [{
+            "layer_id": "dialogue_1", "role": "dialogue", "speaker": "S1",
+            "language": "Mandarin Chinese", "delivery": "Natural",
+            "content": "invented line", "start_seconds": 1.0, "end_seconds": 3.0,
+            "track": "A1", "lip_sync": True, "explicit_user_requested": True,
+        }]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = [
+            {
+                "requirement_id": "replacement_actor",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 79.0, "track": "V6",
+                "subject_keywords": ["new actor"],
+                "prompt": "One replacement actor in a restaurant.",
+            },
+            {
+                "requirement_id": "restaurant_plate",
+                "media_type": "image", "usage": "h3_reference",
+                "reuse_policy": "whole_design", "start_seconds": 0.0,
+                "end_seconds": 79.0, "track": "V7",
+                "subject_keywords": ["restaurant"],
+                "prompt": "Empty restaurant environment.",
+            },
+        ]
+        inventory = [{
+            "media_id": "V1", "media_type": "video", "loaded": True,
+            "source_duration_seconds": 53.290667,
+            "analysis_summary": (
+                "BLIP VISUAL SUMMARY\nRestaurant conversation with reaction cuts.\n"
+                "AUDIO INTELLIGENCE\nBeat estimate: 156.2 BPM\n"
+                "VAD voice ratio: 63.7%\nWHISPER TRANSCRIPT\n[00:00] hidden words\n"
+                "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=53.291s · "
+                "scene_cuts=2.745,9.553,17.052,30.788,45.610"
+            ),
+        }] + [
+            {
+                "media_id": f"P{index}", "media_type": "image", "loaded": True,
+                "caption": f"cast member {index}",
+            }
+            for index in range(1, 5)
+        ]
+
+        self.assertEqual(source_video_remake_duration(inventory), 53.290667)
+        self.assertEqual(source_video_remake_required_media(inventory), [])
+        rendered_template = render_special_design_requirement_template(
+            (
+                "Duration {{SOURCE_VIDEO_REMAKE_DURATION}}\n"
+                "V1 {{SOURCE_VIDEO_REMAKE_EVIDENCE}}\n"
+                "Cast {{SOURCE_VIDEO_REMAKE_CAST}}"
+            ),
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            inventory,
+        )
+        self.assertIn("53.291秒", rendered_template)
+        self.assertIn("Restaurant conversation with reaction cuts.", rendered_template)
+        self.assertNotIn("156.2 BPM", rendered_template)
+        self.assertNotIn("hidden words", rendered_template)
+        self.assertNotIn("Frame source scene", render_special_design_requirement_template(
+            "{{SOURCE_VIDEO_REMAKE_EVIDENCE}}",
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            [{
+                **inventory[0],
+                "analysis_summary": (
+                    inventory[0]["analysis_summary"]
+                    + "\nBLIP · Frame source scene 11: a lab coat at a computer"
+                ),
+            }] + inventory[1:],
+        ))
+        soundtrack_last = render_special_design_requirement_template(
+            "{{SOURCE_VIDEO_REMAKE_EVIDENCE}}",
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            [{
+                **inventory[0],
+                "analysis_summary": (
+                    "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=53.291s · "
+                    "scene_cuts=2.745\nBLIP VISUAL SUMMARY · CPU\n"
+                    "BLIP · Frame source scene 01: restaurant counter\n"
+                    "AUDIO INTELLIGENCE\nBeat estimate: 72 BPM\n"
+                    "WHISPER TRANSCRIPT\n[00:00] invented transcript at file end"
+                ),
+            }] + inventory[1:],
+        )
+        self.assertIn("SOURCE VIDEO BREAKDOWN", soundtrack_last)
+        self.assertNotIn("invented transcript", soundtrack_last)
+        self.assertNotIn("restaurant counter", soundtrack_last)
+        for index in range(1, 5):
+            self.assertIn(f"@P{index}", rendered_template)
+        self.assertNotIn("{{SOURCE_VIDEO_REMAKE_", rendered_template)
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1 @P2 @P3 @P4.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+        )
+
+        self.assertAlmostEqual(plan["duration_seconds"], 53.290667, places=6)
+        self.assertAlmostEqual(plan["shots"][-1]["end_seconds"], 53.290667, places=6)
+        self.assertEqual(len(plan["shots"]), 6)
+        self.assertAlmostEqual(plan["shots"][0]["end_seconds"], 2.745, places=3)
+        self.assertAlmostEqual(plan["shots"][1]["start_seconds"], 2.745, places=3)
+        self.assertIn("SOURCE BLUEPRINT, NOT SOURCE PLATE", plan["shots"][1]["additional_direction"])
+        self.assertNotIn("voice-active", plan["shots"][0]["subject_action"])
+        self.assertEqual(plan["text_layers"], [])
+        self.assertEqual(plan["media_requests"], [])
+        self.assertEqual(
+            {row["media_id"] for row in plan["existing_media_uses"]},
+            {"V1", "P1"},
+        )
+        v1 = next(row for row in plan["existing_media_uses"] if row["media_id"] == "V1")
+        self.assertEqual(v1["usage"], "analysis_only")
+        self.assertEqual(v1["reuse_policy"], "analysis_only")
+        self.assertIn("ANALYSIS BLUEPRINT ONLY", v1["instruction"])
+        self.assertIn("must never occupy an H3 video reference slot", v1["instruction"])
+        p1 = next(item for item in plan["existing_media_uses"] if item["media_id"] == "P1")
+        self.assertTrue(p1["identity_anchor"])
+        self.assertEqual(p1["reuse_policy"], "time_scoped")
+        self.assertIn("exclusively @P1", p1["instruction"])
+        self.assertIn("sole audible master", plan["overall_soundscape"])
+        self.assertIn("DIRECTOR-BLUEPRINT RECONSTRUCTION CONTRACT", plan["constraints"])
+        self.assertEqual(plan["shots"][0]["preset"], "source_blueprint_cast_reconstruction")
+        self.assertIn("S1=@P1", plan["shots"][0]["subject_action"])
+        self.assertNotIn("@P2", plan["shots"][0]["subject_action"])
+        self.assertIn("HIGH-FIDELITY V1 SCENE RECONSTRUCTION", plan["shots"][0]["environment_response"])
+        self.assertIn("then turns toward the door", plan["shots"][0]["subject_action"].casefold())
+        self.assertNotIn("@V1", plan["shots"][0]["subject_action"])
+        self.assertNotIn("scene_cuts=", v1["instruction"])
+
+        sanitized = sanitize_design_model_context({
+            "bound_h3_skills": {
+                "special": {"key": SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL},
+            },
+            "existing_media": inventory,
+            "current_prompt_fields": {"brief": "stale café rewrite"},
+            "existing_shots_and_cues": [{"subject_action": "stale five-second beat"}],
+        })
+        serialized = json.dumps(sanitized, ensure_ascii=False)
+        self.assertNotIn("current_prompt_fields", sanitized)
+        self.assertNotIn("existing_shots_and_cues", sanitized)
+        self.assertNotIn("156.2 BPM", serialized)
+        self.assertNotIn("hidden words", serialized)
+        self.assertIn("scene_cuts=2.745", serialized)
+
+    def test_source_video_cast_remake_time_scopes_each_role_to_its_beat(self):
+        payload = sample_design()
+        base = payload["shots"][0]
+        payload["duration_seconds"] = 25.0
+        payload["shots"] = [
+            {
+                **base,
+                "shot_id": f"beat_{index}",
+                "start_seconds": float((index - 1) * 5),
+                "end_seconds": float(index * 5),
+                "subject_action": f"S{index}=@P{index} enters and performs beat {index}.",
+            }
+            for index in range(1, 6)
+        ]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        inventory = [{
+            "media_id": "V1", "media_type": "video", "loaded": True,
+            "source_duration_seconds": 25.0,
+            "analysis_summary": (
+                "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=25.000s · "
+                "scene_cuts=5.000,10.000,15.000,20.000"
+            ),
+        }] + [
+            {
+                "media_id": f"P{index}", "media_type": "image", "loaded": True,
+                "caption": f"cast member {index}",
+            }
+            for index in range(1, 6)
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1 @P2 @P3 @P4 @P5.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+        )
+
+        cast_uses = [
+            row for row in plan["existing_media_uses"] if row["media_id"].startswith("P")
+        ]
+        self.assertEqual(len(cast_uses), 5)
+        by_id = {row["media_id"]: row for row in cast_uses}
+        for index in range(1, 6):
+            row = by_id[f"P{index}"]
+            self.assertEqual(row["reuse_policy"], "time_scoped")
+            self.assertEqual(row["start_seconds"], float((index - 1) * 5))
+            self.assertEqual(row["end_seconds"], float(index * 5))
+            self.assertIn(f"S{index}=@P{index}", plan["shots"][index - 1]["subject_action"])
+            for other in range(1, 6):
+                if other != index:
+                    self.assertNotIn(
+                        f"@P{other}", plan["shots"][index - 1]["subject_action"]
+                    )
+
+        with self.assertRaisesRegex(ValueError, r"unloaded cast reference.*@P5"):
+            normalize_design_plan(
+                payload,
+                {"image": 9, "video": 3, "audio": 3},
+                existing_media=[
+                    row for row in inventory if row.get("media_id") != "P5"
+                ],
+                repair_media_plan=True,
+                authored_requirement="Use @V1 with @P1 @P2 @P3 @P4; P5 is needed by Shot 5.",
+                special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            )
+
+    def test_source_video_cast_remake_ignores_global_cast_mentions_for_beat_scope(self):
+        payload = sample_design()
+        base = payload["shots"][0]
+        payload["duration_seconds"] = 10.0
+        payload["shots"] = [
+            {
+                **base,
+                "shot_id": "customer_beat",
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "subject_action": "S1=@P1 places the order while S2=@P2 listens.",
+                "h3_executable_action": (
+                    "The complete cast dictionary is P1, P2, P3 and P4, but only "
+                    "the people in subject_action appear in this beat."
+                ),
+            },
+            {
+                **base,
+                "shot_id": "reaction_beat",
+                "start_seconds": 5.0,
+                "end_seconds": 10.0,
+                "subject_action": "S3=@P3 reacts alone at the counter.",
+                "h3_executable_action": (
+                    "The complete cast dictionary is P1, P2, P3 and P4, but only "
+                    "the people in subject_action appear in this beat."
+                ),
+            },
+        ]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        inventory = [{
+            "media_id": "V1", "media_type": "video", "loaded": True,
+            "source_duration_seconds": 10.0,
+            "analysis_summary": (
+                "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=10.000s · "
+                "scene_cuts=5.000"
+            ),
+        }] + [
+            {
+                "media_id": f"P{index}", "media_type": "image", "loaded": True,
+                "caption": f"cast member {index}",
+            }
+            for index in range(1, 5)
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1 @P2 @P3 @P4.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+        )
+
+        cast_uses = [
+            row for row in plan["existing_media_uses"]
+            if row["media_id"].startswith("P")
+        ]
+        self.assertEqual(
+            {
+                (row["media_id"], row["start_seconds"], row["end_seconds"])
+                for row in cast_uses
+            },
+            {("P1", 0.0, 5.0), ("P2", 0.0, 5.0), ("P3", 5.0, 10.0)},
+        )
+        self.assertNotIn("@P4", plan["shots"][0]["subject_action"])
+        self.assertNotIn("@P4", plan["shots"][1]["subject_action"])
+
+    def test_source_video_role_binding_is_authoritative_for_cast_and_speaker(self):
+        payload = sample_design()
+        base = payload["shots"][0]
+        payload["duration_seconds"] = 10.0
+        payload["shots"] = [
+            {**base, "shot_id": "scene_1", "start_seconds": 0.0,
+             "end_seconds": 5.0, "subject_action": "Model guessed @P1."},
+            {**base, "shot_id": "scene_2", "start_seconds": 5.0,
+             "end_seconds": 10.0, "subject_action": "Model guessed @P2."},
+        ]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        ledger = {
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [2]},
+            ],
+            "location_ledger": [{
+                "location_id": "L1", "description": "same corridor",
+                "defining_elements": ["blue wall"],
+            }],
+            "scenes": [
+                {
+                    "scene_index": 1, "start_seconds": 0.0, "end_seconds": 5.0,
+                    "location_id": "L1", "active_source_roles": ["R1"],
+                    "visible_event": "The first source principal enters.",
+                    "action_causality": "The entrance motivates the cut.",
+                    "speaker_role": "R1", "listener_roles": [],
+                },
+                {
+                    "scene_index": 2, "start_seconds": 5.0, "end_seconds": 10.0,
+                    "location_id": "L1", "active_source_roles": ["R2"],
+                    "visible_event": "The second source principal answers.",
+                    "action_causality": "The answer follows the entrance.",
+                    "speaker_role": "R2", "listener_roles": [],
+                },
+            ],
+        }
+        inventory = [{
+            "media_id": "V1", "media_type": "video", "loaded": True,
+            "source_duration_seconds": 10.0,
+            "analysis_summary": (
+                "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=10.000s · "
+                "scene_cuts=5.000"
+            ),
+            "semantic_enrichment": (
+                "QWEN SOURCE VIDEO DIRECTOR ANALYSIS V4\n"
+                + json.dumps(ledger)
+            ),
+        }, {
+            "media_id": "P1", "media_type": "image", "loaded": True,
+        }, {
+            "media_id": "P2", "media_type": "image", "loaded": True,
+        }, {
+            "media_id": "P3", "media_type": "image", "loaded": True,
+        }, {
+            "media_id": "P4", "media_type": "image", "loaded": True,
+        }]
+        bindings = [
+            {"source_role_id": "R1", "target_media_id": "P2"},
+            {"source_role_id": "R2", "target_media_id": "P1"},
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1 and @P2.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            source_role_bindings=bindings,
+        )
+
+        self.assertEqual(
+            [(row["source_role_id"], row["target_media_id"])
+             for row in plan["source_role_bindings"]],
+            [("R1", "P2"), ("R2", "P1")],
+        )
+        self.assertIn("S1=@P2", plan["shots"][0]["subject_action"])
+        self.assertNotIn("@P1", plan["shots"][0]["subject_action"])
+        self.assertIn("R1=S1=@P2", plan["shots"][0]["additional_direction"])
+        self.assertIn("S2=@P1", plan["shots"][1]["subject_action"])
+        self.assertNotIn("@P2", plan["shots"][1]["subject_action"])
+        self.assertIn("R2=S2=@P1", plan["shots"][1]["additional_direction"])
+
+        duplicate_plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1 and @P2.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            source_role_bindings=[
+                {"source_role_id": "R1", "target_media_id": "P1"},
+                {"source_role_id": "R2", "target_media_id": "P1"},
+            ],
+        )
+        self.assertEqual(
+            [row["target_media_id"] for row in duplicate_plan["source_role_bindings"]],
+            ["P1", "P1"],
+        )
+
+    def test_source_video_same_role_can_change_picture_per_scene(self):
+        payload = sample_design()
+        base = payload["shots"][0]
+        payload["duration_seconds"] = 10.0
+        payload["shots"] = [
+            {**base, "shot_id": "scene_1", "start_seconds": 0.0,
+             "end_seconds": 5.0, "subject_action": "R1 begins."},
+            {**base, "shot_id": "scene_2", "start_seconds": 5.0,
+             "end_seconds": 10.0, "subject_action": "R1 continues."},
+        ]
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        ledger = {
+            "principal_roles": [{"role_id": "R1", "scene_indexes": [1, 2]}],
+            "location_ledger": [],
+            "scenes": [
+                {"scene_index": 1, "start_seconds": 0.0, "end_seconds": 5.0,
+                 "active_source_roles": ["R1"], "speaker_role": "R1",
+                 "listener_roles": [], "visible_event": "R1 begins.",
+                 "action_causality": "Opening action."},
+                {"scene_index": 2, "start_seconds": 5.0, "end_seconds": 10.0,
+                 "active_source_roles": ["R1"], "speaker_role": "R1",
+                 "listener_roles": [], "visible_event": "R1 continues.",
+                 "action_causality": "Continuation."},
+            ],
+        }
+        inventory = [{
+            "media_id": "V1", "media_type": "video", "loaded": True,
+            "source_duration_seconds": 10.0,
+            "analysis_summary": (
+                "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=10.000s · "
+                "scene_cuts=5.000"
+            ),
+            "semantic_enrichment": (
+                "QWEN SOURCE VIDEO DIRECTOR ANALYSIS V5\n" + json.dumps(ledger)
+            ),
+        }, {
+            "media_id": "P1", "media_type": "image", "loaded": True,
+        }, {
+            "media_id": "P2", "media_type": "image", "loaded": True,
+        }, {
+            "media_id": "P3", "media_type": "image", "loaded": True,
+        }, {
+            "media_id": "P4", "media_type": "image", "loaded": True,
+        }]
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1 and @P2.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            source_role_bindings=[
+                {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+                {"source_role_id": "R1", "target_media_id": "P2", "scene_indexes": [2]},
+            ],
+        )
+        self.assertEqual(
+            [row["target_media_id"] for row in plan["source_role_bindings"]],
+            ["P1", "P2"],
+        )
+        self.assertIn("S1=@P1", plan["shots"][0]["subject_action"])
+        self.assertNotIn("@P2", plan["shots"][0]["subject_action"])
+        self.assertIn("S1=@P2", plan["shots"][1]["subject_action"])
+        self.assertNotIn("@P1", plan["shots"][1]["subject_action"])
 
 
 if __name__ == "__main__":

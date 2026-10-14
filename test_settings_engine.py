@@ -24,6 +24,7 @@ class SettingsEngineTests(unittest.TestCase):
             music_mode="timeline",
             blip_device="cuda",
             workspace_free_disk_reserve_gb=75.0,
+            unload_all_models_before_generation=False,
         )
         save_settings(path, settings)
         restored = load_settings(path)
@@ -36,6 +37,7 @@ class SettingsEngineTests(unittest.TestCase):
         self.assertEqual(restored.blip_device, "cuda")
         self.assertEqual(restored.workspace_free_disk_reserve_gb, 75.0)
         self.assertEqual(restored.connection_recovery_timeout, 2400)
+        self.assertFalse(restored.unload_all_models_before_generation)
         self.assertIn(
             "H3_DIALOGUE_TTS_ENGINE=voxcpm2_local",
             path.read_text(encoding="utf-8"),
@@ -48,6 +50,10 @@ class SettingsEngineTests(unittest.TestCase):
         )
         self.assertIn(
             "H3_CONNECTION_RECOVERY_TIMEOUT=2400",
+            path.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "H3_UNLOAD_ALL_MODELS_BEFORE_GENERATION=false",
             path.read_text(encoding="utf-8"),
         )
         self.assertIn("UNRELATED=keep", path.read_text(encoding="utf-8"))
@@ -100,6 +106,14 @@ class SettingsEngineTests(unittest.TestCase):
         self.assertEqual(
             RenderSettings.from_mapping({"blip_device": "mystery"}).blip_device,
             "auto",
+        )
+
+    def test_pre_generation_model_unload_defaults_on_and_can_be_disabled(self):
+        self.assertTrue(RenderSettings.defaults().unload_all_models_before_generation)
+        self.assertFalse(
+            RenderSettings.from_mapping({
+                "unload_all_models_before_generation": "off"
+            }).unload_all_models_before_generation
         )
 
 

@@ -220,6 +220,27 @@ class SpecialSkillStoreTests(unittest.TestCase):
         self.assertIn("不得生成额外背景音乐", template)
         self.assertIn("禁止播放按钮", template)
 
+    def test_source_video_cast_remake_skill_uses_v1_and_fixed_p1_to_p4(self):
+        root = Path(__file__).parent / "skill special" / "source-video-cast-remake-h3"
+        document = load_special_skill_document(root)
+        validate_special_skill_document(document)
+        english = (root / "SKILL.md").read_text(encoding="utf-8")
+        chinese = (root / "SKILL.cn.md").read_text(encoding="utf-8")
+        template = (root / "DESIGN_REQUIREMENT.txt").read_text(encoding="utf-8")
+        self.assertEqual(document.key, "source-video-cast-remake-h3")
+        self.assertIn("@V1", english)
+        self.assertIn("P1-P4", english)
+        self.assertIn("media_requests", english)
+        self.assertIn("Blueprint, Not Pixel Plate", english)
+        self.assertIn("analysis_only", english)
+        self.assertIn("最终合成恢复", chinese)
+        self.assertIn("V1是蓝图，不是像素底片", chinese)
+        self.assertIn("{{SOURCE_VIDEO_REMAKE_DURATION}}", template)
+        self.assertIn("{{SOURCE_VIDEO_REMAKE_EVIDENCE}}", template)
+        self.assertIn("{{SOURCE_VIDEO_REMAKE_CAST}}", template)
+        for media_id in ("@V1", "@P1", "@P2", "@P3", "@P4"):
+            self.assertIn(media_id, template)
+
 
 if __name__ == "__main__":
     unittest.main()

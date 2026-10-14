@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -1044,6 +1044,79 @@ class StandardPipelineRegressions(unittest.TestCase):
         window.queue_design_cleanup(job)
         window._notify_design_apply_failed("simulated commit failure")
         self.assertEqual(window.pending_design_cleanup_job, {})
+
+    def test_qwen_source_analysis_uses_busy_overlay_and_recovers_on_failure(self):
+        window = DirectorCutStudio()
+        self.addCleanup(self._close, window)
+        with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
+            dialog = DesignPageDialog(
+                window.runtime, window._design_context(), window.scan.counts, window
+            )
+        self.addCleanup(dialog.close)
+
+        dialog._set_pipeline_busy(True)
+        dialog._set_design_stage(
+            "Qwen3.8 ANALYSIS · Reading the complete @V1 storyboard",
+            start=True,
+        )
+
+        self.assertFalse(dialog.design_busy_overlay.isHidden())
+        self.assertTrue(dialog.design_busy_overlay.timer.isActive())
+        self.assertFalse(dialog.generate_button.isEnabled())
+        self.assertIn("Qwen3.8 ANALYSIS", dialog.design_busy_overlay.message)
+
+        dialog.mark_source_video_analysis_failed("simulated service failure")
+
+        self.assertTrue(dialog.design_busy_overlay.isHidden())
+        self.assertFalse(dialog.design_busy_overlay.timer.isActive())
+        self.assertTrue(dialog.generate_button.isEnabled())
+        self.assertIn("simulated service failure", dialog.status_label.text())
+
+        dialog._set_pipeline_busy(True)
+        dialog._set_design_stage("Qwen3.8 ANALYSIS · complete", start=True)
+        with (
+            patch.object(
+                dialog, "generate_design", side_effect=RuntimeError("resume failed")
+            ),
+            patch("director_cut_studio.traceback.print_exc"),
+        ):
+            dialog._resume_after_source_video_analysis()
+        self.assertTrue(dialog.design_busy_overlay.isHidden())
+        self.assertTrue(dialog.generate_button.isEnabled())
+        self.assertIn("resume failed", dialog.status_label.text())
+
+        source_context = {
+            "bound_h3_skills": {
+                "special": {"key": "source-video-cast-remake-h3"}
+            },
+            "existing_media": [{"media_id": "V1", "media_type": "video"}],
+            "selected_existing_media_ids": ["V1"],
+            "available_new_media_capacity": dialog.capacities,
+            "requested_duration_seconds": 5.0,
+        }
+        dialog.active_design_context = source_context
+        dialog.pending_requirement = "Create a five second source-video cast remake."
+        fake_v1 = Mock(node_id="v1-node")
+        with (
+            patch.object(window, "_reference_asset", return_value=fake_v1),
+            patch.object(dialog, "_submit") as submit,
+        ):
+            dialog._start_lm_design()
+        submit.assert_called_once()
+        self.assertEqual(dialog.pipeline_stage, "lm_plan")
+
+        required, optional = dialog._required_planned_media_ids(
+            "Use @V1 with the available cast pool @P1 @P2 @P3 @P4.",
+            {
+                "shots": [
+                    {"subject_action": "S1=@P1 meets S2=@P2."},
+                    {"subject_action": "S3=@P3 reacts alone."},
+                ]
+            },
+            source_context,
+        )
+        self.assertEqual(required, {"V1", "P1", "P2", "P3"})
+        self.assertEqual(optional, {"P4"})
 
     def test_toolbar_unload_all_targets_comfy_lm_and_ace_step_models(self):
         window = DirectorCutStudio()

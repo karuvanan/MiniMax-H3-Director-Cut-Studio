@@ -55,7 +55,7 @@ QUALITY_PROFILES = {
     ),
     "motion_preview": QualityProfile(
         "motion_preview",
-        "Motion Preview · 0.2MP",
+        "Motion Preview · 0.2MP / 448×448",
         0.2,
         False,
         True,

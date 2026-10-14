@@ -18,6 +18,9 @@ from design_cleanup_service import unload_lm_studio
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_STRUCTURED_OUTPUT_TOKENS = 32768
+# Structured plans stay bounded so a local LM cannot spend tens of minutes
+# filling an oversized prediction budget.  Source-video analysis reduces its
+# prose through schema/prompt constraints and retries compactly instead.
 MAX_STRUCTURED_OUTPUT_TOKENS = 32768
 
 
@@ -180,6 +183,7 @@ def generate(job: dict) -> dict:
     model = str(job.get("model", "")).strip()
     system_prompt = str(job.get("system_prompt", ""))
     user_prompt = str(job.get("user_prompt", ""))
+    require_image_input = bool(job.get("require_image_input", False))
     input_images: list[str] = []
     for raw_path in job.get("input_image_paths") or []:
         path = Path(str(raw_path)).expanduser()
@@ -190,6 +194,10 @@ def generate(job: dict) -> dict:
         input_images.append(f"data:{mime_type};base64,{encoded}")
         if len(input_images) >= 3:
             break
+    if require_image_input and not input_images:
+        raise ValueError(
+            "This analysis requires direct image input, but no readable image was attached"
+        )
     schema = job.get("schema") or {}
     raw_schema_name = str(job.get("schema_name", "h3_director_design")).strip()
     schema_name = re.sub(r"[^A-Za-z0-9_-]", "_", raw_schema_name)[:64]
@@ -234,7 +242,7 @@ def generate(job: dict) -> dict:
                 payload=openai_payload(input_images),
             )
         except RuntimeError:
-            if not input_images:
+            if not input_images or require_image_input:
                 raise
             input_images = []
             payload = request_json(
@@ -243,6 +251,12 @@ def generate(job: dict) -> dict:
             )
     else:
         models = available_openai_models(base_url, api_key, min(timeout, 30.0))
+        if bool(job.get("require_exact_model", False)) and models and not any(
+            item.casefold() == model.casefold() for item in models
+        ):
+            raise RuntimeError(
+                f"Required LM Studio model {model!r} is not loaded or available"
+            )
         # Older OpenAI-compatible local servers may return no model catalogue
         # even though chat/completions works. Keep the authored model in that
         # compatibility case; when a catalogue exists, stale IDs are repaired.
@@ -253,13 +267,18 @@ def generate(job: dict) -> dict:
                 {"type": "image_url", "image_url": {"url": image_url}}
                 for image_url in input_images
             ]
+        try:
+            temperature = float(job.get("temperature", 0.3))
+        except (TypeError, ValueError):
+            temperature = 0.3
+        temperature = min(2.0, max(0.0, temperature))
         chat_payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            "temperature": 0.3,
+            "temperature": temperature,
             "max_tokens": max_output_tokens,
             # LM Studio reasoning models can spend the entire completion budget on
             # hidden thinking and return an empty content field. Director Design
@@ -298,7 +317,7 @@ def generate(job: dict) -> dict:
                     exc = schema_exc
                 else:
                     exc = None
-            if exc is not None and input_images:
+            if exc is not None and input_images and not require_image_input:
                 input_images = []
                 chat_payload["messages"][-1]["content"] = user_prompt
                 try:

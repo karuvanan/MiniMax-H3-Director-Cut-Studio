@@ -29,6 +29,7 @@ DEFAULT_SKILL = "h3-prompt-writing"
 SPECIAL_SKILL = "minimalist-product-ad-generator"
 NONE_SPECIAL = "__none__"
 COMIC_TALK_SHOW_SPECIAL_SKILL = "comic-talk-show-h3"
+SOURCE_REMAKE_SYNC_AUDIO_MARKER = "SOURCE REMAKE AUTHORIZED SYNC AUDIO"
 
 
 _SUPPORT_FACE_MARKER = "supporting environment or action-state reference only"
@@ -580,6 +581,21 @@ def build_ref2va_prompt(
         for row in spec.text_ranges
         if isinstance(row, dict)
     )
+    source_remake_sync_audio = bool(
+        special_profile is not None
+        and special_profile.key == "source-video-cast-remake-h3"
+        and any(
+            asset.media_type == "audio"
+            and SOURCE_REMAKE_SYNC_AUDIO_MARKER
+            in str(asset.recognition or "").upper()
+            for asset in assets
+        )
+    )
+    # Source-remake speech is deliberately not copied into Text Layers.  Its
+    # authority is the exact V1 soundtrack slice supplied to the current H3
+    # Segment.  Treating the empty Text-Layer ledger as silence used to add the
+    # global EMPTY VOCAL CHANNEL rule and made correct lip sync impossible.
+    has_authored_speech = bool(has_authored_speech or source_remake_sync_audio)
     if not has_authored_speech:
         # Text Layers are the speech authorization ledger. Old projects may
         # retain a Shot-wide conversational direction even when this compiled
@@ -817,7 +833,16 @@ def build_ref2va_prompt(
         ranges = ", ".join(
             f"{item.start_seconds:.2f}s to {item.end_seconds:.2f}s" for item in instances
         )
-        if "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition:
+        if SOURCE_REMAKE_SYNC_AUDIO_MARKER in str(asset.recognition or "").upper():
+            retention_rows.append(
+                f"{asset.tag}: source_sync_performance_clock - this is the exact V1 soundtrack "
+                f"slice for {ranges}. Preserve its timing, pauses, overlaps, syllable rhythm and "
+                "phoneme timing at 1x. Make only the mapped on-screen P character corresponding "
+                "to the audible source speaker articulate the words; listeners and observers keep "
+                "natural non-speaking mouths. Use it to drive facial performance and lip sync, "
+                "not source-actor appearance. Do not translate, paraphrase, repeat or add speech."
+            )
+        elif "AI DESIGN AUTHORED SPEECH TTS" in asset.recognition:
             retention_rows.append(
                 f"{asset.tag}: authored_dialogue_stem - preserve every spoken word, speaker "
                 f"identity, timing and phoneme rhythm during its {ranges} timeline range. Treat "
@@ -915,6 +940,23 @@ def build_ref2va_prompt(
         detailed_rows.append(
             f"Apply the approved {special_profile.display_name} Director cues already encoded "
             "in this Timeline; treat Skill discovery metadata as non-rendering context."
+        )
+    if source_remake_sync_audio:
+        sync_asset = next(
+            asset for asset in audio_assets
+            if SOURCE_REMAKE_SYNC_AUDIO_MARKER
+            in str(asset.recognition or "").upper()
+        )
+        detailed_rows.append(
+            "SOURCE SOUNDTRACK LIP-SYNC LOCK - "
+            f"Use {sync_asset.tag} as the exact local-time performance clock for this Segment. "
+            "At every audible syllable, the mapped P character replacing the source speaker must "
+            "show matching jaw, lip closure, vowel shape, breath and pause timing. A reaction shot "
+            "does not transfer the voice to the listener: every non-speaking visible character "
+            "keeps a relaxed closed or naturally resting mouth. Preserve overlapping source voices "
+            "as distinct simultaneous performances. Never invent dialogue, narration, translated "
+            "words or extra vocal sounds. The audio controls performance only and contributes no "
+            "source face, body, wardrobe, set pixel or composition."
         )
     if special_profile is not None and special_profile.key in {
         "drone-fly-on-city", "drone-fly-on-city-fireworks"

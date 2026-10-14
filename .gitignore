@@ -12,3 +12,4 @@ models/*
 !models/README.md
 .director_cache/
 director_projects/
+_backups/

@@ -32,6 +32,7 @@ from native_audio_engine import (
     CINEMATIC_DIALOGUE_ACOUSTIC_INTEGRATION_CONTRACT,
     SPEECH_ENVIRONMENT_FUSION_CONTRACT,
 )
+from source_video_analysis import parse_source_video_analysis
 
 
 MAX_DESIGN_DURATION_SECONDS = 600.0
@@ -50,12 +51,16 @@ STREET_FIGHTER_SPECIAL_SKILL = "street-fighter-live-action-h3"
 HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL = "hong-kong-comic-fighter"
 BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL = "beat-synced-entrance-18s"
 COMIC_TALK_SHOW_SPECIAL_SKILL = "comic-talk-show-h3"
+SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL = "source-video-cast-remake-h3"
 COMBAT_ACTION_SPECIAL_SKILLS = frozenset({
     STREET_FIGHTER_SPECIAL_SKILL,
     HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL,
 })
 STREET_FIGHTER_CAST_TEMPLATE_TOKEN = "{{STREET_FIGHTER_CAST_BINDINGS}}"
 HONG_KONG_COMIC_SOURCE_TEMPLATE_TOKEN = "{{HONG_KONG_COMIC_SOURCE_EVIDENCE}}"
+SOURCE_VIDEO_REMAKE_DURATION_TEMPLATE_TOKEN = "{{SOURCE_VIDEO_REMAKE_DURATION}}"
+SOURCE_VIDEO_REMAKE_EVIDENCE_TEMPLATE_TOKEN = "{{SOURCE_VIDEO_REMAKE_EVIDENCE}}"
+SOURCE_VIDEO_REMAKE_CAST_TEMPLATE_TOKEN = "{{SOURCE_VIDEO_REMAKE_CAST}}"
 HONG_KONG_COMIC_TECHNIQUE_TEXT_CONTRACT = (
     "COMIC TECHNIQUE TITLE CONTRACT: every completed signature technique receives exactly one "
     "short Chinese move name on an editable Timeline on_screen_text layer. The title appears only "
@@ -227,6 +232,142 @@ def street_fighter_character_bindings(existing_media: list[dict] | None) -> list
     return bindings
 
 
+def source_video_remake_duration(existing_media: list[dict] | None) -> float | None:
+    """Return the exact playable @V1 duration for a source-video remake."""
+
+    for raw in existing_media or []:
+        if not isinstance(raw, dict):
+            continue
+        media_id = str(raw.get("media_id") or raw.get("reference_id") or "").strip().upper().lstrip("@")
+        media_type = str(raw.get("media_type") or raw.get("type") or "").strip().casefold()
+        if media_id != "V1" or media_type != "video" or not bool(raw.get("loaded", False)):
+            continue
+        source_in = max(0.0, float(raw.get("source_in_seconds", 0.0) or 0.0))
+        source_out = float(raw.get("source_out_seconds", 0.0) or 0.0)
+        source_duration = float(raw.get("source_duration_seconds", 0.0) or 0.0)
+        if source_out > source_in + 0.01:
+            available = source_out - source_in
+        elif source_duration > source_in + 0.01:
+            available = source_duration - source_in
+        else:
+            start = float(raw.get("start_seconds", 0.0) or 0.0)
+            end = float(raw.get("end_seconds", 0.0) or 0.0)
+            available = end - start
+        if available > 0.01:
+            return min(MAX_DESIGN_DURATION_SECONDS, round(max(0.5, available), 6))
+    return None
+
+
+def source_video_remake_required_media(existing_media: list[dict] | None) -> list[str]:
+    """Return missing fixed inputs for the reusable V1/P1-P4 remake format."""
+
+    inventory = _media_inventory(existing_media)
+    required = {
+        "V1": "video",
+        "P1": "image",
+        "P2": "image",
+        "P3": "image",
+        "P4": "image",
+    }
+    return [
+        media_id
+        for media_id, media_type in required.items()
+        if not (
+            bool(inventory.get(media_id, {}).get("loaded", False))
+            and str(
+                inventory.get(media_id, {}).get("media_type")
+                or inventory.get(media_id, {}).get("type")
+                or ""
+            ).casefold() == media_type
+        )
+    ]
+
+
+def _source_video_visual_evidence(value: object) -> str:
+    """Remove audio telemetry/transcripts from model-visible V1 evidence."""
+
+    text = str(value or "")
+    text = re.sub(
+        r"(?:^|\n)\s*AUDIO INTELLIGENCE\b.*?"
+        r"(?=(?:\n\s*(?:AI SEMANTIC|SOURCE VIDEO BREAKDOWN)\b)|\Z)",
+        "\n",
+        text,
+        flags=re.I | re.S,
+    )
+    text = re.sub(
+        r"(?:^|\n)\s*WHISPER TRANSCRIPT\b.*?"
+        r"(?=(?:\n\s*(?:AI SEMANTIC|SOURCE VIDEO BREAKDOWN)\b)|\Z)",
+        "\n",
+        text,
+        flags=re.I | re.S,
+    )
+    kept: list[str] = []
+    for line in text.splitlines():
+        # Per-frame BLIP guesses are deliberately excluded from the planning
+        # prose.  The labelled full-duration contact sheet is stronger visual
+        # evidence, while a single weak caption (for example mistaking a
+        # service uniform for a lab coat) can fabricate an entire location.
+        if re.search(r"BLIP\s*[·.-]?\s*Frame\s+source\s+scene", line, flags=re.I):
+            continue
+        if re.search(
+            r"\b(?:BPM|VAD|WHISPER)\b|voice[- ]active|voiced[_ ]ratio|"
+            r"confidence(?: score)?|decoded_seconds",
+            line,
+            flags=re.I,
+        ):
+            continue
+        kept.append(line.strip())
+    return " ".join("\n".join(kept).split()).strip()
+
+
+def _source_video_remake_media_evidence(existing_media: list[dict] | None) -> tuple[str, str]:
+    """Build reusable V1 and loaded-P evidence labels for the template UI."""
+
+    inventory = _media_inventory(existing_media)
+    v1 = inventory.get("V1") or {}
+    evidence_parts = [
+        _source_video_visual_evidence(v1.get("semantic_enrichment")),
+        _source_video_visual_evidence(
+            v1.get("analysis_summary") or v1.get("raw_analysis_summary")
+        ),
+        _source_video_visual_evidence(v1.get("caption")),
+    ]
+    video_evidence = " ".join(dict.fromkeys(
+        value for value in evidence_parts if value
+    )).strip()
+    if not video_evidence:
+        video_evidence = "V1尚未完成分析；以V1实际像素、动作、剪辑与同步声轨为准"
+    # The dedicated Qwen ledger can exceed the old generic 6K summary cap.
+    # Preserve its middle scenes instead of silently retaining only the
+    # opening and tail of a longer source video.
+    video_evidence = " ".join(video_evidence.split())[:32000]
+
+    cast_rows: list[str] = []
+    cast_ids = sorted(
+        (
+            media_id for media_id, row in inventory.items()
+            if media_id.startswith("P")
+            and media_id[1:].isdigit()
+            and bool(row.get("loaded", False))
+            and str(row.get("media_type") or row.get("type") or "").casefold()
+            == "image"
+        ),
+        key=lambda media_id: int(media_id[1:]),
+    )
+    for media_id in cast_ids:
+        row = inventory.get(media_id) or {}
+        evidence = _blip_overview_from_media_row(row)
+        source = "BLIP · Overview"
+        if not evidence:
+            evidence = _semantic_character_summary_from_media_row(row)
+            source = "AI Enrich"
+        if not evidence:
+            evidence = "已加载人物图片；以实际图片像素为唯一身份事实"
+            source = "Loaded Picture"
+        cast_rows.append(f"@{media_id}（{source}：{' '.join(evidence.split())[:1000]}）")
+    return video_evidence, "；".join(cast_rows)
+
+
 def render_special_design_requirement_template(
     template: object,
     special_skill_key: object,
@@ -235,8 +376,20 @@ def render_special_design_requirement_template(
     """Resolve media-aware placeholders without modifying the reusable Skill file."""
 
     text = str(template or "")
+    normalized_special = str(special_skill_key or "").strip().casefold()
+    if normalized_special == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL:
+        duration = source_video_remake_duration(existing_media)
+        duration_label = (
+            f"{duration:.3f}".rstrip("0").rstrip(".") + "秒"
+            if duration is not None
+            else "尚未读取；请先把原片加载为@V1并等待媒体分析"
+        )
+        video_evidence, cast_evidence = _source_video_remake_media_evidence(existing_media)
+        text = text.replace(SOURCE_VIDEO_REMAKE_DURATION_TEMPLATE_TOKEN, duration_label)
+        text = text.replace(SOURCE_VIDEO_REMAKE_EVIDENCE_TEMPLATE_TOKEN, video_evidence)
+        text = text.replace(SOURCE_VIDEO_REMAKE_CAST_TEMPLATE_TOKEN, cast_evidence)
     if (
-        str(special_skill_key or "").strip().casefold()
+        normalized_special
         == MTV_SINGING_SPECIAL_SKILL
         and MTV_A1_DURATION_TEMPLATE_TOKEN in text
     ):
@@ -1957,7 +2110,7 @@ def _authored_identity_picture_ids(requirement: str) -> list[str]:
     """Find @P references that the user explicitly binds to face identity."""
     text = str(requirement or "")
     found: list[str] = []
-    for match in re.finditer(r"@P([1-9]\d*)\b", text, re.I):
+    for match in re.finditer(r"@P([1-9]\d*)(?!\d)", text, re.I):
         start = max(0, match.start() - 140)
         end = min(len(text), match.end() + 140)
         if _IDENTITY_WORD_RE.search(text[start:end]):
@@ -1965,6 +2118,76 @@ def _authored_identity_picture_ids(requirement: str) -> list[str]:
             if media_id not in found:
                 found.append(media_id)
     return found
+
+
+_MASTER_AUDIO_WORD_RE = re.compile(
+    r"(?:原声|原音|原始音频|原始音頻|唯一(?:的)?(?:可听|声音|音频|音頻)|"
+    r"主时间线|主時間線|时长来源|時長來源|时长基准|時長基準|"
+    r"master\s+(?:audio|sound|timeline)|(?:audio|sound)\s+master|duration\s+(?:source|master)|"
+    r"immutable\s+(?:audio|sound)|sole\s+(?:audible\s+)?(?:audio|sound)\s+source)",
+    re.I,
+)
+
+_LOCKED_CAST_WORD_RE = re.compile(
+    r"(?:固定|锁定|鎖定|不得替换|不得替換|不要替换|不要替換|"
+    r"不得重新设计|不得重新設計|不要自创|不要自創|完全参考|完全參考|"
+    r"嵌入视频|嵌入影片|嵌入影像|主要人物|主演|角色身份|"
+    r"locked\s+(?:principal\s+)?cast|supplied\s+cast\s+lock|principal\s+(?:cast|identity)|"
+    r"do\s+not\s+(?:replace|redesign|recreate).{0,30}(?:actor|character|person))",
+    re.I,
+)
+
+
+def authored_master_audio_id(requirement: object) -> str:
+    """Return an explicitly designated @A master soundtrack, if any.
+
+    A casual ``music reference @A1`` must not become a duration authority.  The
+    ID is promoted only when nearby authored wording says that it is the
+    original/sole/master audio or Timeline source.
+    """
+
+    text = str(requirement or "")
+    for match in re.finditer(r"@A([1-9]\d*)(?!\d)", text, re.I):
+        start = max(0, match.start() - 180)
+        end = min(len(text), match.end() + 180)
+        if _MASTER_AUDIO_WORD_RE.search(text[start:end]):
+            return f"A{int(match.group(1))}"
+    return ""
+
+
+def authored_master_audio_duration(
+    requirement: object,
+    existing_media: list[dict] | None,
+) -> float | None:
+    """Resolve the exact playable duration of an authored master Audio."""
+
+    media_id = authored_master_audio_id(requirement)
+    if not media_id:
+        return None
+    row = _media_inventory(existing_media).get(media_id)
+    if not row or not bool(row.get("loaded", False)):
+        return None
+    for key in ("source_duration_seconds", "duration_seconds", "duration"):
+        try:
+            value = float(row.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0.0:
+            return min(MAX_DESIGN_DURATION_SECONDS, value)
+    return None
+
+
+def authored_locked_cast_picture_ids(requirement: object) -> list[str]:
+    """Return supplied principal Pictures for an explicit fixed-cast remake.
+
+    Two or more identity-bound Pictures plus fixed/principal-cast wording is a
+    strong signal that Z-Image may design locations but may not synthesize
+    substitute actors or new speaking characters.
+    """
+
+    text = str(requirement or "")
+    picture_ids = _authored_identity_picture_ids(text)
+    return picture_ids if len(picture_ids) >= 2 and _LOCKED_CAST_WORD_RE.search(text) else []
 
 
 def _request_recreates_existing_anchor(request: dict, media_id: str) -> bool:
@@ -2066,6 +2289,898 @@ def _request_visible_person_count(request: dict) -> int:
     ):
         named_roles.add("person")
     return len(named_roles)
+
+
+def enforce_authored_master_audio_and_locked_cast(
+    plan: dict,
+    existing_media: list[dict] | None,
+    authored_requirement: object,
+) -> dict:
+    """Protect an original-sound recast from synthetic speakers and actors.
+
+    This is deliberately opt-in: the requirement must explicitly designate a
+    master @A source and/or bind at least two supplied Pictures as the fixed
+    principal cast.  Environment plates remain available, while any generated
+    still containing a person is rejected so it cannot compete with P1-Pn.
+    Background extras are described in Shot prose and rendered by H3, not
+    promoted into new recurring identity references.
+    """
+
+    requirement = str(authored_requirement or "")
+    inventory = _media_inventory(existing_media)
+    duration = float(plan.get("duration_seconds", 0.0) or 0.0)
+    cast_ids = authored_locked_cast_picture_ids(requirement)
+    master_audio_id = authored_master_audio_id(requirement)
+    uses = [
+        row for row in plan.get("existing_media_uses") or []
+        if isinstance(row, dict)
+    ]
+    used_requirement_ids = {
+        str(row.get("requirement_id", "")).strip() for row in uses
+    }
+
+    for media_id in cast_ids:
+        row = next((item for item in uses if item.get("media_id") == media_id), None)
+        if row is None:
+            source = inventory.get(media_id) or {}
+            requirement_id = f"locked_cast_{media_id.lower()}"
+            suffix = 2
+            while requirement_id in used_requirement_ids:
+                requirement_id = f"locked_cast_{media_id.lower()}_{suffix}"
+                suffix += 1
+            evidence = str(
+                source.get("clip_prompt")
+                or source.get("caption")
+                or source.get("analysis_summary")
+                or ""
+            ).strip()
+            row = {
+                "requirement_id": requirement_id,
+                "media_id": media_id,
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "whole_design",
+                "start_seconds": 0.0,
+                "end_seconds": duration,
+                "track": "V1",
+                "subject_keywords": ["locked principal cast identity"],
+                "instruction": evidence,
+            }
+            uses.append(row)
+            used_requirement_ids.add(requirement_id)
+        row.update({
+            "usage": "h3_reference",
+            "reuse_policy": "whole_design",
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "identity_anchor": True,
+        })
+        lock = (
+            f"LOCKED PRINCIPAL CAST: @{media_id} is the sole authoritative pixel identity for "
+            "this assigned story character. Preserve the exact face, age, hairstyle, skin tone, "
+            "body proportions, clothing and accessories. Never replace, redraw, blend, duplicate "
+            "or recast this person from a generated Picture."
+        )
+        if "LOCKED PRINCIPAL CAST:" not in str(row.get("instruction", "")):
+            row["instruction"] = (
+                str(row.get("instruction", "")).rstrip(" .")
+                + (". " if str(row.get("instruction", "")).strip() else "")
+                + lock
+            )
+
+    if cast_ids:
+        kept_requests: list[dict] = []
+        removed: list[str] = []
+        for request in plan.get("media_requests") or []:
+            if not isinstance(request, dict) or request.get("media_type") != "image":
+                kept_requests.append(request)
+                continue
+            if _request_visible_person_count(request) > 0:
+                removed.append(str(request.get("requirement_id") or "generated_person"))
+                continue
+            request.pop("identity_anchor", None)
+            request.pop("distinct_character_identity", None)
+            request.pop("identity_anchor_requirement_id", None)
+            request.pop("identity_anchor_media_id", None)
+            request["reuse_policy"] = (
+                "whole_design"
+                if float(request.get("start_seconds", 0.0) or 0.0) <= 0.0
+                and float(request.get("end_seconds", duration) or duration) >= duration
+                else "time_scoped"
+            )
+            clean_plate = (
+                " FIXED-CAST ENVIRONMENT PLATE ONLY. Show the physical location, architecture, "
+                "lighting, furniture and props without any visible person, face, silhouette, human "
+                "reflection, portrait or mannequin. The supplied principals and secondary background "
+                "extras are added only during H3 video generation."
+            )
+            if "FIXED-CAST ENVIRONMENT PLATE ONLY" not in str(request.get("prompt", "")):
+                request["prompt"] = str(request.get("prompt", "")).rstrip(" .") + "." + clean_plate
+            negative = str(request.get("negative_prompt", "")).strip()
+            no_people = (
+                "visible person, face, actor, character, crowd, human silhouette, human reflection, "
+                "portrait, mannequin, duplicate principal"
+            )
+            request["negative_prompt"] = (
+                f"{negative}, {no_people}" if negative else no_people
+            )
+            kept_requests.append(request)
+        plan["media_requests"] = kept_requests
+        cast_contract = (
+            "FIXED SUPPLIED CAST CONTRACT: the only principal and speaking characters are "
+            + ", ".join(f"@{media_id}" for media_id in cast_ids)
+            + ". Generated media may establish empty locations only. H3 may create anonymous "
+              "non-speaking background extras inside the final scene, but no extra may inherit a "
+              "principal face, become a new speaker or replace a supplied character."
+        )
+        if cast_contract not in str(plan.get("constraints", "")):
+            plan["constraints"] = (
+                str(plan.get("constraints", "")).rstrip(" .")
+                + (". " if str(plan.get("constraints", "")).strip() else "")
+                + cast_contract
+            )
+        warnings = [str(value) for value in plan.get("design_warnings") or []]
+        if removed:
+            warnings.append(
+                "Removed generated person reference request(s) "
+                + ", ".join(removed)
+                + "; supplied principal cast "
+                + ", ".join(cast_ids)
+                + " remains authoritative."
+            )
+        plan["design_warnings"] = list(dict.fromkeys(warnings))
+
+    if master_audio_id:
+        source = inventory.get(master_audio_id)
+        if source and bool(source.get("loaded", False)):
+            row = next(
+                (item for item in uses if item.get("media_id") == master_audio_id),
+                None,
+            )
+            if row is None:
+                requirement_id = f"master_audio_{master_audio_id.lower()}"
+                suffix = 2
+                while requirement_id in used_requirement_ids:
+                    requirement_id = f"master_audio_{master_audio_id.lower()}_{suffix}"
+                    suffix += 1
+                row = {
+                    "requirement_id": requirement_id,
+                    "media_id": master_audio_id,
+                    "media_type": "audio",
+                    "track": "A1",
+                    "subject_keywords": ["immutable original master audio"],
+                    "instruction": "",
+                }
+                uses.append(row)
+                used_requirement_ids.add(requirement_id)
+            row.update({
+                "usage": "h3_reference",
+                "reuse_policy": "whole_design",
+                "start_seconds": 0.0,
+                "end_seconds": duration,
+                "track": "A1",
+                "instruction": (
+                    f"@{master_audio_id} is the immutable original soundtrack, sole audible "
+                    "speech source and master timing source. Preserve its words, speakers, pauses, "
+                    "overlaps, music, ambience, rhythm and ordering exactly. Do not transcribe it "
+                    "into Text Layers and do not generate, translate, paraphrase or add speech."
+                ),
+            })
+        # Model-authored Text Layers would duplicate or replace words already
+        # present inside the original soundtrack and previously stretched this
+        # 53.29-second project to 79 seconds.
+        if plan.get("text_layers"):
+            warnings = [str(value) for value in plan.get("design_warnings") or []]
+            warnings.append(
+                f"Removed {len(plan['text_layers'])} generated Text Layer(s); "
+                f"@{master_audio_id} is the sole speech and timing authority."
+            )
+            plan["design_warnings"] = list(dict.fromkeys(warnings))
+        plan["text_layers"] = []
+        audio_contract = (
+            f"ORIGINAL AUDIO MASTER CONTRACT: @{master_audio_id} supplies every audible word, "
+            "voice, pause, overlap, room sound and timing cue. No Dialogue, Voice-over, Lyrics or "
+            "new speaking character may be authored. Only the person assigned to the currently "
+            "audible source voice moves their mouth; every listener and background extra remains "
+            "non-speaking."
+        )
+        for field in ("overall_soundscape", "constraints"):
+            if audio_contract not in str(plan.get(field, "")):
+                plan[field] = (
+                    str(plan.get(field, "")).rstrip(" .")
+                    + (". " if str(plan.get(field, "")).strip() else "")
+                    + audio_contract
+                )
+
+    plan["existing_media_uses"] = uses
+    return plan
+
+
+def enforce_source_video_cast_remake_plan(
+    plan: dict,
+    existing_media: list[dict] | None,
+    special_skill_key: object,
+    source_role_bindings: list[dict] | None = None,
+) -> dict:
+    """Use V1 as a planning blueprint while loaded P images rebuild principals.
+
+    V1 is deliberately analysis-only. Passing the source movie into an H3 video
+    slot makes its original actors compete with the supplied Pictures. Design
+    instead extracts event order, scene semantics, camera grammar, performance
+    functions and timing from V1, then H3 restages those beats from the loaded cast. The
+    untouched V1 soundtrack is restored after generated picture assembly.
+    """
+
+    if str(special_skill_key or "").strip().casefold() != SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL:
+        return plan
+    missing = source_video_remake_required_media(existing_media)
+    if missing:
+        raise ValueError(
+            "Source-Video Cast Remake requires loaded Media Pool sources: "
+            + ", ".join(f"@{media_id}" for media_id in missing)
+        )
+    duration = source_video_remake_duration(existing_media)
+    if duration is None:
+        raise ValueError(
+            "Source-Video Cast Remake cannot read @V1 duration. Wait for media preparation, then Design again."
+        )
+    inventory = _media_inventory(existing_media)
+    available_cast_ids = sorted(
+        (
+            media_id
+            for media_id, row in inventory.items()
+            if media_id.startswith("P")
+            and media_id[1:].isdigit()
+            and bool(row.get("loaded", False))
+            and str(row.get("media_type") or row.get("type") or "").casefold()
+            == "image"
+        ),
+        key=lambda media_id: int(media_id[1:]),
+    )
+    available_cast_id_set = set(available_cast_ids)
+    original_uses = [
+        deepcopy(row) for row in plan.get("existing_media_uses") or []
+        if isinstance(row, dict)
+    ]
+    uses: list[dict] = []
+
+    def evidence(media_id: str) -> str:
+        row = inventory.get(media_id) or {}
+        return str(
+            row.get("clip_prompt")
+            or row.get("caption")
+            or row.get("semantic_enrichment")
+            or row.get("analysis_summary")
+            or ""
+        ).strip()
+
+    def clean_model_text(value: object) -> str:
+        """Keep internal analysis telemetry out of H3-visible prose."""
+
+        text = str(value or "")
+        text = re.sub(
+            r"(?:@V1(?:'s)?\s+)?(?:first\s+)?voice[- ]active\s+range"
+            r"(?:\s+from)?\s*\d+(?:\.\d+)?\s*(?:to|[-–—])\s*"
+            r"\d+(?:\.\d+)?\s*(?:seconds?|s)?",
+            "the corresponding @V1 speaking turn",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r"(?:@V1(?:'s)?\s+)?voice[- ]active\s+range(?:\s+for\s+this\s+interval)?",
+            "the corresponding @V1 speaking turn",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r"(?:^|(?<=[.!?]))\s*[^.!?\n]*(?:\bBPM\b|\bVAD\b|WHISPER|"
+            r"voiced[_ ]ratio|confidence(?: score)?|decoded_seconds|"
+            r"analysis frame|source filename)[^.!?\n]*(?:[.!?]|$)",
+            " ",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(r"(?<![A-Za-z0-9_])@?V1\b", "the source blueprint", text, flags=re.I)
+        return " ".join(text.split()).strip()
+
+    def scene_cuts() -> list[float]:
+        row = inventory.get("V1") or {}
+        source = "\n".join(
+            str(row.get(field, "") or "")
+            for field in (
+                "raw_analysis_summary", "analysis_summary", "recognition", "clip_prompt"
+            )
+        )
+        match = re.search(r"scene_cuts=([^\n]+)", source, flags=re.I)
+        if not match or match.group(1).strip().casefold() == "none":
+            return []
+        values: list[float] = []
+        for raw in re.findall(r"\d+(?:\.\d+)?", match.group(1)):
+            value = float(raw)
+            # Preserve short but real opening/closing shots. The frame extractor
+            # accepts scenes from 0.12s, so Design must not silently collapse a
+            # final reaction/title-free beat merely because it is under 0.45s.
+            if value <= 0.12 or value >= duration - 0.12:
+                continue
+            if values and value - values[-1] < 0.45:
+                continue
+            values.append(value)
+        return values
+
+    def source_director_ledger() -> dict:
+        """Decode the schema-validated Qwen ledger embedded in V1 evidence."""
+
+        row = inventory.get("V1") or {}
+        source = "\n".join(
+            str(row.get(field, "") or "")
+            for field in (
+                "semantic_enrichment", "analysis_summary",
+                "raw_analysis_summary", "recognition",
+            )
+        )
+        return parse_source_video_analysis(source)
+
+    source_ledger = source_director_ledger()
+    source_ledger_scenes = [
+        row for row in source_ledger.get("scenes") or [] if isinstance(row, dict)
+    ]
+    source_locations = {
+        str(row.get("location_id", "")).strip(): row
+        for row in source_ledger.get("location_ledger") or []
+        if isinstance(row, dict) and str(row.get("location_id", "")).strip()
+    }
+    source_roles = [
+        row for row in source_ledger.get("principal_roles") or []
+        if isinstance(row, dict) and str(row.get("role_id", "")).strip()
+    ]
+    source_role_ids = [
+        str(row.get("role_id", "")).strip().upper() for row in source_roles
+    ]
+    raw_role_bindings = (
+        source_role_bindings
+        if source_role_bindings is not None
+        else plan.get("source_role_bindings") or []
+    )
+    role_rows = {
+        str(row.get("role_id", "")).strip().upper(): row for row in source_roles
+    }
+    required_role_scenes = [
+        (role_id, int(scene_index))
+        for role_id in source_role_ids
+        for scene_index in role_rows.get(role_id, {}).get("scene_indexes") or []
+        if isinstance(scene_index, (int, float)) and int(scene_index) > 0
+    ]
+    role_scene_to_media: dict[tuple[str, int], str] = {}
+    role_scene_uses_source_thumbnail: dict[tuple[str, int], bool] = {}
+    for raw in raw_role_bindings:
+        if not isinstance(raw, dict):
+            continue
+        role_id = str(raw.get("source_role_id", "")).strip().upper()
+        media_id = _normalized_media_id(raw.get("target_media_id", ""))
+        if not role_id or role_id not in source_role_ids:
+            continue
+        if media_id not in available_cast_id_set:
+            raise ValueError(
+                f"Source role {role_id} is bound to unavailable @{media_id or '(missing)'}."
+            )
+        scene_indexes = [
+            int(value) for value in raw.get("scene_indexes") or []
+            if isinstance(value, (int, float)) and int(value) > 0
+        ] or [
+            int(value)
+            for value in role_rows.get(role_id, {}).get("scene_indexes") or []
+            if isinstance(value, (int, float)) and int(value) > 0
+        ]
+        for scene_index in scene_indexes:
+            role_scene_to_media[(role_id, scene_index)] = media_id
+            role_scene_uses_source_thumbnail[(role_id, scene_index)] = bool(
+                raw.get("source_thumbnail", False)
+            )
+    if source_role_ids and raw_role_bindings:
+        missing_appearances = [
+            key for key in required_role_scenes if key not in role_scene_to_media
+        ]
+        if missing_appearances:
+            raise ValueError(
+                "Source remake appearance mapping is incomplete: "
+                + ", ".join(
+                    f"{role_id}/scene {scene_index}"
+                    for role_id, scene_index in missing_appearances
+                )
+            )
+    if source_role_ids and not role_scene_to_media:
+        if len(available_cast_ids) < len(source_role_ids):
+            raise ValueError(
+                "Source remake found more principal roles than loaded P identity Pictures. "
+                "Load another Picture or confirm a smaller principal-role ledger."
+            )
+        for role_id, media_id in zip(source_role_ids, available_cast_ids):
+            for scene_index in role_rows.get(role_id, {}).get("scene_indexes") or []:
+                role_scene_to_media[(role_id, int(scene_index))] = media_id
+                role_scene_uses_source_thumbnail[(role_id, int(scene_index))] = False
+    canonical_bindings = [
+        {
+            "source_role_id": role_id,
+            "target_media_id": role_scene_to_media[(role_id, scene_index)],
+            "scene_indexes": [scene_index],
+            "identity_lock": "strict",
+            "source_thumbnail": role_scene_uses_source_thumbnail.get(
+                (role_id, scene_index), False
+            ),
+        }
+        for role_id, scene_index in required_role_scenes
+        if (role_id, scene_index) in role_scene_to_media
+    ]
+    cast_ids = list(dict.fromkeys(
+        row["target_media_id"] for row in canonical_bindings
+    )) or available_cast_ids
+    cast_id_set = set(cast_ids)
+    cast_label = ", ".join("@" + media_id for media_id in cast_ids)
+    role_to_speaker = {
+        role_id: f"S{index}"
+        for index, role_id in enumerate(source_role_ids, 1)
+    }
+    cast_mapping = ", ".join(
+        (
+            f"{row['source_role_id']} scene {row['scene_indexes'][0]} keeps its user-selected "
+            f"V1 face as {role_to_speaker[row['source_role_id']]}=@{row['target_media_id']}"
+            if row.get("source_thumbnail", False)
+            else f"{row['source_role_id']} scene {row['scene_indexes'][0]} becomes "
+                 f"{role_to_speaker[row['source_role_id']]}=@{row['target_media_id']}"
+        )
+        for row in canonical_bindings
+    ) or ", ".join(
+        f"principal {media_id[1:]} becomes S{media_id[1:]}=@{media_id}"
+        for media_id in cast_ids
+    )
+    plan["source_role_bindings"] = canonical_bindings
+
+    def media_for_role_scene(role_id: str, scene_index: int) -> str:
+        return role_scene_to_media.get((str(role_id).strip().upper(), int(scene_index)), "")
+
+    def ledger_scene_for(start: float, end: float, ordinal: int) -> dict:
+        if 0 <= ordinal < len(source_ledger_scenes):
+            candidate = source_ledger_scenes[ordinal]
+            candidate_start = float(candidate.get("start_seconds", start) or start)
+            candidate_end = float(candidate.get("end_seconds", end) or end)
+            if abs(candidate_start - start) <= 0.08 and abs(candidate_end - end) <= 0.08:
+                return candidate
+        midpoint = (start + end) / 2.0
+        return next(
+            (
+                row for row in source_ledger_scenes
+                if float(row.get("start_seconds", 0.0) or 0.0) <= midpoint
+                < float(row.get("end_seconds", duration) or duration)
+            ),
+            {},
+        )
+
+    uses.append({
+        "requirement_id": "source_remake_v1_analysis_blueprint",
+        "media_id": "V1",
+        "media_type": "video",
+        "usage": "analysis_only",
+        "reuse_policy": "analysis_only",
+        "start_seconds": 0.0,
+        "end_seconds": duration,
+        "track": "V1",
+        "subject_keywords": [
+            "source event blueprint", "scene semantics", "camera grammar",
+            "performance function", "edit rhythm", "synchronized original soundtrack",
+        ],
+        "instruction": (
+            "SOURCE VIDEO ANALYSIS BLUEPRINT ONLY: analyse @V1's chronological events, principal-role "
+            "functions, entrances, exits, actions, reactions, scene elements, props, lighting logic, "
+            "camera grammar, cut rhythm and soundtrack timing. Recreate a new coherent production with "
+            "the same narrative and editorial functions, but do not copy source pixels, source actors, "
+            "exact geometry or exact composition. @V1 must never occupy an H3 video reference slot. "
+            "Its original soundtrack is restored after picture generation. Internal analysis telemetry "
+            "must never appear as visual text or spoken words."
+        ).strip(),
+    })
+    removed_requests = [
+        str(row.get("requirement_id") or "generated_media")
+        for row in plan.get("media_requests") or [] if isinstance(row, dict)
+    ]
+    removed_text_count = len([
+        row for row in plan.get("text_layers") or [] if isinstance(row, dict)
+    ])
+    plan["media_requests"] = []
+    plan["text_layers"] = []
+    plan["duration_seconds"] = duration
+
+    contract = (
+        "SOURCE-VIDEO DIRECTOR-BLUEPRINT RECONSTRUCTION CONTRACT: the source movie supplies analysis only: event "
+        "order, role functions, scene vocabulary, action causality, camera grammar, edit rhythm and "
+        "synchronized-soundtrack timing. Loaded cast mapping: " + cast_mapping + ", "
+        "locked by the user's principal-role binding table. Build every principal directly "
+        "from the assigned P reference. A source identity may survive only when that role's binding "
+        "explicitly has source_thumbnail=true; every other source face, hair, body and wardrobe must be replaced. "
+        "Reconstruct a recognisably close V1-derived set by preserving its architectural "
+        "topology, dominant objects, object adjacency, palette, practical-light direction, framing, "
+        "eyelines and blocking while never copying source pixels or source people. Preserve the purpose and cause-effect order of actions "
+        "and cuts while allowing a fresh, coherent cinematic staging. Match each audible source voice "
+        "to its mapped P-character's speaking turn; listeners keep non-speaking mouths."
+    )
+    plan["creative_brief"] = (
+        str(plan.get("creative_brief", "")).rstrip(" .")
+        + (". " if str(plan.get("creative_brief", "")).strip() else "")
+        + contract
+    )
+    plan["overall_soundscape"] = (
+        "Use the source movie's synchronized soundtrack as the sole audible master: preserve every original word, "
+        "speaker turn, pause, overlap, room tone, Foley, music cue and timing at 1x. Do not synthesize, "
+        "transcribe, translate, repeat, replace or add speech."
+    )
+    plan["non_diegetic_music"] = (
+        "Use only music already present in the source movie's original synchronized soundtrack at 1x; generate no replacement score."
+    )
+    plan["constraints"] = (
+        str(plan.get("constraints", "")).rstrip(" .")
+        + (". " if str(plan.get("constraints", "")).strip() else "")
+        + contract
+    )
+    source_shots = [
+        deepcopy(shot) for shot in plan.get("shots") or []
+        if isinstance(shot, dict)
+    ]
+    cuts = scene_cuts()
+    if cuts and source_shots:
+        boundaries = [0.0, *cuts, duration]
+        aligned_shots: list[dict] = []
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1):
+            midpoint = (start + end) / 2.0
+            source = next(
+                (
+                    row for row in source_shots
+                    if float(row.get("start_seconds", 0.0) or 0.0) <= midpoint
+                    < float(row.get("end_seconds", duration) or duration)
+                ),
+                min(
+                    source_shots,
+                    key=lambda row: abs(
+                        midpoint
+                        - (
+                            float(row.get("start_seconds", 0.0) or 0.0)
+                            + float(row.get("end_seconds", duration) or duration)
+                        ) / 2.0
+                    ),
+                ),
+            )
+            row = deepcopy(source)
+            row["shot_id"] = f"source_scene_{index:02d}"
+            row["start_seconds"] = round(start, 3)
+            row["end_seconds"] = round(end, 3)
+            direction = clean_model_text(row.get("additional_direction", ""))
+            row["additional_direction"] = (
+                f"SOURCE EDIT BLUEPRINT {start:.3f}-{end:.3f}s: restage only the corresponding "
+                "event, role handoff, camera function and cause-effect progression in this interval. "
+                "Use a newly generated but visually high-fidelity V1-derived environment: preserve "
+                "the analysed set topology, dominant objects, palette, lighting direction, framing, "
+                "screen direction and blocking without copying source pixels or source actors. "
+                "Begin after the preceding cut and finish at this cut; do "
+                "not replay an earlier beat or preview a later beat. "
+                + direction
+            ).strip()
+            aligned_shots.append(row)
+        plan["shots"] = aligned_shots
+    cast_intervals: dict[str, list[tuple[float, float]]] = {
+        media_id: [] for media_id in cast_ids
+    }
+
+    def active_cast_for_shot(shot: dict) -> list[str]:
+        # Prefer the event/action fields that describe who is physically in
+        # this beat. Global constraints often mention P1-P4 together and must
+        # not activate all four identities in every H3 request.
+        budget = shot.get("action_budget")
+        original_action = (
+            str(budget.get("original_subject_action", "") or "")
+            if isinstance(budget, dict)
+            else ""
+        )
+        original_response = (
+            str(budget.get("original_environment_response", "") or "")
+            if isinstance(budget, dict)
+            else ""
+        )
+        if original_action:
+            # Action budgeting preserves the model's pre-contract action here.
+            # It is the cleanest role ledger because deterministic restaging
+            # wrappers may legitimately mention the whole P1-P4 dictionary.
+            primary = " ".join((original_action, original_response))
+        else:
+            primary = " ".join(
+                str(shot.get(field, "") or "")
+                for field in (
+                    "authored_subject_action", "subject_action",
+                    "framing", "camera_angle", "camera_movement",
+                )
+            )
+        matches = re.findall(
+            r"(?<![A-Za-z0-9_])@?P(\d+)\b|(?<![A-Za-z0-9_])S(\d+)\b",
+            primary,
+            flags=re.I,
+        )
+        indexes = {left or right for left, right in matches if left or right}
+        if not indexes:
+            secondary = " ".join(
+                str(shot.get(field, "") or "")
+                for field in ("continuity_state", "environment_response")
+            )
+            matches = re.findall(
+                r"(?<![A-Za-z0-9_])@?P(\d+)\b|(?<![A-Za-z0-9_])S(\d+)\b",
+                secondary,
+                flags=re.I,
+            )
+            indexes = {left or right for left, right in matches if left or right}
+        referenced = [f"P{index}" for index in sorted(indexes, key=int)]
+        missing_cast = [media_id for media_id in referenced if media_id not in cast_id_set]
+        if missing_cast:
+            raise ValueError(
+                "Source remake Shot requires unloaded cast reference(s): "
+                + ", ".join("@" + media_id for media_id in missing_cast)
+                + ". Load the required Picture(s) or remove that role assignment."
+            )
+        return referenced
+
+    for shot_ordinal, shot in enumerate(plan.get("shots") or []):
+        if not isinstance(shot, dict):
+            continue
+        source_scene = ledger_scene_for(
+            float(shot.get("start_seconds", 0.0) or 0.0),
+            float(shot.get("end_seconds", 0.0) or 0.0),
+            shot_ordinal,
+        )
+        source_active_roles = [
+            str(value).strip().upper()
+            for value in source_scene.get("active_source_roles") or []
+            if str(value).strip()
+        ]
+        source_scene_index = int(
+            source_scene.get("scene_index", shot_ordinal + 1) or shot_ordinal + 1
+        )
+        mapped_cast = [
+            media_for_role_scene(role_id, source_scene_index)
+            for role_id in source_active_roles
+            if media_for_role_scene(role_id, source_scene_index)
+        ]
+        active_cast = list(dict.fromkeys(mapped_cast)) or active_cast_for_shot(shot)
+        active_role_instances = [
+            (
+                role_id,
+                role_to_speaker.get(role_id, ""),
+                media_for_role_scene(role_id, source_scene_index),
+            )
+            for role_id in source_active_roles
+            if media_for_role_scene(role_id, source_scene_index)
+        ]
+        active_original_source_roles = [
+            role_id for role_id in source_active_roles
+            if role_scene_uses_source_thumbnail.get(
+                (role_id, source_scene_index), False
+            )
+        ]
+        for field in (
+            "preset", "framing", "camera_angle", "camera_movement", "subject_action",
+            "environment_response", "continuity_state", "optional_flourish",
+            "additional_direction", "h3_executable_action", "h3_optional_flourish",
+            "authored_subject_action", "authored_environment_response",
+        ):
+            if field in shot:
+                shot[field] = clean_model_text(shot.get(field, ""))
+        start = float(shot.get("start_seconds", 0.0) or 0.0)
+        end = float(shot.get("end_seconds", start) or start)
+        source_scene = ledger_scene_for(start, end, shot_ordinal)
+        source_location = source_locations.get(
+            str(source_scene.get("location_id", "")).strip(), {}
+        )
+        for media_id in active_cast:
+            cast_intervals[media_id].append((start, end))
+        cast_clause = (
+            "; ".join(
+                f"{role_id} is a distinct visible person {speaker}=@{media_id}"
+                for role_id, speaker, media_id in active_role_instances
+            )
+            if active_role_instances else
+            ", ".join(f"S{media_id[1:]}=@{media_id}" for media_id in active_cast)
+            if active_cast
+            else "no mapped P principal"
+        )
+        repeated_identity_clause = (
+            " DUPLICATE IDENTITY CASTING IS INTENTIONAL: source roles remain separate physical "
+            "people with separate bodies and blocking even when they share the same P identity reference."
+            if len(mapped_cast) != len(set(mapped_cast)) else ""
+        )
+        cast_replacement_action = (
+            f"CAST-FIRST RESTAGING {start:.3f}-{end:.3f}s: perform this source-derived event with "
+            f"only the mapped role(s) active in this beat: {cast_clause}. Preserve each active P reference's "
+            "recognizable face, age, hair, body, complete wardrobe and accessories. Keep the event's "
+            "setup, action, reaction and handoff, but generate a fresh cinematic performance. "
+            + (
+                "For " + ", ".join(active_original_source_roles)
+                + ", preserve the exact user-selected original V1 face through its materialized P reference; "
+                  "do not copy the surrounding source frame."
+                if active_original_source_roles else
+                "Do not reproduce or retain any source actor."
+            )
+            + repeated_identity_clause
+        )
+        shot["preset"] = "source_blueprint_cast_reconstruction"
+        source_framing = clean_model_text(source_scene.get("framing", ""))
+        source_angle = clean_model_text(source_scene.get("camera_angle", ""))
+        source_movement = clean_model_text(source_scene.get("camera_movement", ""))
+        if source_framing:
+            shot["framing"] = source_framing
+        if source_angle:
+            shot["camera_angle"] = source_angle
+        if source_movement:
+            shot["camera_movement"] = source_movement
+        source_event = clean_model_text(source_scene.get("visible_event", ""))
+        source_causality = clean_model_text(source_scene.get("action_causality", ""))
+        existing_action = " ".join(
+            value for value in (source_event, source_causality) if value
+        ) or str(shot.get("subject_action", "")).strip()
+        shot["subject_action"] = cast_replacement_action + (
+            " " + existing_action if existing_action else ""
+        )
+        shot["h3_executable_action"] = cast_replacement_action + (
+            " " + existing_action if existing_action else ""
+        )
+        environment = str(shot.get("environment_response", "")).strip()
+        location_description = clean_model_text(
+            source_location.get("description", "")
+        )
+        location_elements = [
+            clean_model_text(value)
+            for value in (
+                list(source_location.get("defining_elements") or [])
+                + list(source_scene.get("environment_elements") or [])
+            )
+            if clean_model_text(value)
+        ]
+        location_elements = list(dict.fromkeys(location_elements))
+        source_fingerprint = " ".join(
+            part for part in (
+                (
+                    "SOURCE LOCATION FINGERPRINT: " + location_description + "."
+                    if location_description else ""
+                ),
+                (
+                    "MANDATORY VISIBLE SET ELEMENTS: "
+                    + ", ".join(location_elements)
+                    + "."
+                    if location_elements else ""
+                ),
+            ) if part
+        )
+        environment_contract = (
+            "HIGH-FIDELITY V1 SCENE RECONSTRUCTION: preserve the source scene's recognisable "
+            "location type, architectural topology, dominant background objects, object adjacency, "
+            "depth layers, practical-light direction, colour palette, material character, camera "
+            "height, lens impression, framing, screen direction and actor blocking. Rebuild these "
+            "facts as a clean new shot with the P cast; do not copy source pixels, UI or source people. "
+            "Do not replace the set with a generic room merely because it serves the same story function."
+        )
+        shot["environment_response"] = environment_contract + (
+            (" " + source_fingerprint if source_fingerprint else "")
+            + (" " + environment if environment else "")
+        )
+        continuity = str(shot.get("continuity_state", "")).strip()
+        shot["continuity_state"] = (
+            f"Continue the newly reconstructed world and P-character states through {start:.3f}-{end:.3f}s. "
+            "Do not jump back to source footage or change a mapped identity."
+            + (" " + continuity if continuity else "")
+        )
+        direction = str(shot.get("additional_direction", "")).strip()
+        shot["additional_direction"] = (
+            f"SOURCE BLUEPRINT, NOT SOURCE PLATE {start:.3f}-{end:.3f}s: follow the analysed event and "
+            f"camera purpose while composing a new shot. Match the V1 cut boundary, shot scale, lens feel, "
+            f"eyeline, screen position, blocking and set fingerprint closely. Use "
+            + (", ".join("@" + media_id for media_id in active_cast) or "no mapped P principal")
+            + " as the only principal visual facts in this source interval. "
+            "Do not show any unselected source actor, source-video pixels, subtitles, captions, social-media UI, icons, "
+            "logos or watermarks."
+            + (
+                " SOURCE CUT HANDOFF: "
+                + clean_model_text(source_scene.get("transition_out", ""))
+                + "."
+                if clean_model_text(source_scene.get("transition_out", "")) else ""
+            )
+            + (" " + direction if direction else "")
+        )
+        speaker_role = str(source_scene.get("speaker_role", "")).strip().upper()
+        mapped_speaker = media_for_role_scene(speaker_role, source_scene_index)
+        mapped_speaker_id = role_to_speaker.get(speaker_role, "")
+        mapped_listeners = [
+            (
+                role_id,
+                role_to_speaker.get(role_id, ""),
+                media_for_role_scene(role_id, source_scene_index),
+            )
+            for role_id in (
+                str(value).strip().upper()
+                for value in source_scene.get("listener_roles") or []
+            )
+            if media_for_role_scene(role_id, source_scene_index)
+        ]
+        if mapped_speaker:
+            listener_clause = (
+                "; " + ", ".join(
+                    f"{role_id}={speaker} using @{media_id}"
+                    for role_id, speaker, media_id in mapped_listeners
+                )
+                + " remain listeners with non-speaking mouths"
+                if mapped_listeners else ""
+            )
+            shot["additional_direction"] += (
+                f" SOURCE-AUDIO SPEAKER LOCK: {speaker_role}={mapped_speaker_id}=@{mapped_speaker} "
+                "is the only mapped principal allowed to articulate the audible V1 words in this interval"
+                + listener_clause + "."
+            )
+
+    for media_id in cast_ids:
+        index = int(media_id[1:])
+        ordered = sorted(cast_intervals[media_id])
+        merged: list[list[float]] = []
+        for interval_start, interval_end in ordered:
+            if interval_end <= interval_start + 1e-6:
+                continue
+            if merged and interval_start <= merged[-1][1] + 0.05:
+                merged[-1][1] = max(merged[-1][1], interval_end)
+            else:
+                merged.append([interval_start, interval_end])
+        for occurrence, (interval_start, interval_end) in enumerate(merged, 1):
+            uses.append({
+                "requirement_id": (
+                    f"source_remake_{media_id.lower()}_cast_identity_{occurrence:02d}"
+                ),
+                "media_id": media_id,
+                "media_type": "image",
+                "usage": "h3_reference",
+                "reuse_policy": "time_scoped",
+                "start_seconds": round(interval_start, 3),
+                "end_seconds": round(interval_end, 3),
+                "track": f"V{index + 1}",
+                "subject_keywords": [f"S{index}", "locked remake principal identity"],
+                "identity_anchor": True,
+                "instruction": (
+                    f"BEAT-SCOPED REMAKE CAST LOCK: S{index} is exclusively @{media_id} and is "
+                    f"active only from {interval_start:.3f}s to {interval_end:.3f}s. Preserve "
+                    f"@{media_id}'s exact recognizable face, apparent age, hair, skin tone, body "
+                    "proportions, complete wardrobe, footwear and accessories. Never blend, swap, "
+                    "duplicate, redraw or transfer this identity. Do not introduce this role outside "
+                    "its assigned event interval. " + clean_model_text(evidence(media_id))
+                ).strip(),
+            })
+    plan["existing_media_uses"] = uses
+
+    warnings = [str(row) for row in plan.get("design_warnings") or []]
+    if removed_requests:
+        warnings.append(
+            "Removed generated media request(s) " + ", ".join(removed_requests)
+            + "; this Skill reconstructs source-derived scenes directly in H3 and creates no competing actor stills."
+        )
+    if removed_text_count:
+        warnings.append(
+            f"Removed {removed_text_count} generated Text Layer(s); @V1 soundtrack is the sole speech authority."
+        )
+    discarded_uses = sorted({
+        str(row.get("media_id", "")) for row in original_uses
+        if str(row.get("media_id", "")).upper() not in {"V1", *cast_id_set}
+    })
+    if discarded_uses:
+        warnings.append(
+            "Removed unrelated model-selected media from the remake: " + ", ".join(discarded_uses)
+        )
+    warnings.append(
+        f"Locked remake duration to @V1 source length {duration:.3f}s; V1 is analysis-only and {cast_label} are beat-scoped to only the source-role intervals they replace."
+    )
+    if cuts:
+        warnings.append(
+            f"Aligned the remake to {len(cuts) + 1} detected @V1 source scenes instead of mechanical five-second Shots."
+        )
+    plan["design_warnings"] = list(dict.fromkeys(warnings))
+    return plan
 
 
 _SUBJECT_COUNT_GUARD_PATTERNS = (
@@ -2480,10 +3595,14 @@ def stabilize_generated_identity_references(
         # P1 is a multi-person plate. Never rewrite it as the generic single
         # recurring face anchor or append no-people guards to its cast.
         return plan
-    if normalized_special == BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL:
+    if normalized_special in {
+        BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
+        SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+    }:
         # P1 intentionally owns two disjoint beats while P2 and P3 own one
-        # entrance each. A whole-design promotion would leak one identity into
-        # the other entrances and into the P4 ending.
+        # entrance each; source-remake roles likewise own only their analysed
+        # source-role intervals. Whole-design promotion would leak identities
+        # into beats where those characters are absent.
         return plan
     requests = [
         row for row in plan.get("media_requests") or []
@@ -4132,6 +5251,23 @@ DESIGN_JSON_SCHEMA = {
         "overall_soundscape": {"type": "string"},
         "non_diegetic_music": {"type": "string"},
         "constraints": {"type": "string"},
+        "source_role_bindings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "source_role_id", "target_media_id", "scene_indexes", "identity_lock",
+                ],
+                "properties": {
+                    "source_role_id": {"type": "string"},
+                    "target_media_id": {"type": "string", "pattern": "^P[1-9][0-9]*$"},
+                    "scene_indexes": {"type": "array", "items": {"type": "integer"}},
+                    "identity_lock": {"type": "string", "enum": ["strict"]},
+                    "source_thumbnail": {"type": "boolean"},
+                },
+            },
+        },
         "environment_physics_schema_version": {"type": "integer"},
         "environment_transition_time_seconds": {"type": "number"},
         "combat_action_schema_version": {"type": "integer"},
@@ -4982,7 +6118,7 @@ def collect_design_preflight_blockers(
     explicit_ids = {
         _normalized_media_id(f"{match.group(1)}{match.group(2)}")
         for match in re.finditer(
-            r"(?<![A-Za-z0-9_])@([PVA])(\d+)\b",
+            r"(?<![A-Za-z0-9_])@([PVA])(\d+)(?!\d)",
             str(authored_requirement or ""),
             flags=re.I,
         )
@@ -6246,9 +7382,20 @@ def normalize_design_plan(
     authored_requirement: str = "",
     special_skill_key: str = "",
     selected_media_ids: list[str] | None = None,
+    source_role_bindings: list[dict] | None = None,
 ) -> dict:
     media_repair_warnings: list[str] = []
     prepared_payload = deepcopy(extract_design_json(payload))
+    master_audio_duration = authored_master_audio_duration(
+        authored_requirement,
+        existing_media,
+    )
+    source_video_duration = (
+        source_video_remake_duration(existing_media)
+        if str(special_skill_key or "").strip().casefold()
+        == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        else None
+    )
     mtv_duration = (
         mtv_master_audio_duration(existing_media)
         if str(special_skill_key or "").strip().casefold()
@@ -6256,19 +7403,35 @@ def normalize_design_plan(
         else None
     )
     authored_duration = (
-        mtv_duration
+        master_audio_duration
+        if master_audio_duration is not None
+        else source_video_duration
+        if source_video_duration is not None
+        else mtv_duration
         if mtv_duration is not None
         else infer_explicit_design_duration(authored_requirement)
     )
     if authored_duration is not None:
-        returned_duration = snap_half_second(
-            prepared_payload.get("duration_seconds", 5.0),
-            MAX_DESIGN_DURATION_SECONDS,
-        )
+        if master_audio_duration is not None or source_video_duration is not None:
+            try:
+                returned_duration = min(
+                    MAX_DESIGN_DURATION_SECONDS,
+                    max(0.5, float(prepared_payload.get("duration_seconds", 5.0))),
+                )
+            except (TypeError, ValueError):
+                returned_duration = 5.0
+        else:
+            returned_duration = snap_half_second(
+                prepared_payload.get("duration_seconds", 5.0),
+                MAX_DESIGN_DURATION_SECONDS,
+            )
         speech_base_duration = float(
             prepared_payload.get("_speech_timing_base_duration", 0.0) or 0.0
         )
         speech_adjusted_duration = bool(
+            master_audio_duration is None
+            and source_video_duration is None
+            and
             returned_duration >= authored_duration
             and abs(speech_base_duration - authored_duration) <= 0.01
         )
@@ -6276,7 +7439,22 @@ def normalize_design_plan(
             abs(returned_duration - authored_duration) > 0.01
             and not speech_adjusted_duration
         ):
-            if repair_media_plan:
+            if master_audio_duration is not None or source_video_duration is not None:
+                repair_note = _retime_design_payload(
+                    prepared_payload, authored_duration
+                )
+                if repair_note:
+                    media_repair_warnings.append(
+                        repair_note.replace(
+                            "explicit",
+                            (
+                                "immutable source-Video"
+                                if source_video_duration is not None
+                                else "immutable master-Audio"
+                            ),
+                        )
+                    )
+            elif repair_media_plan:
                 repair_note = _retime_design_payload(
                     prepared_payload, authored_duration
                 )
@@ -6302,7 +7480,11 @@ def normalize_design_plan(
     else:
         source = prepared_payload
     duration = (
-        min(MAX_DESIGN_DURATION_SECONDS, float(mtv_duration))
+        min(MAX_DESIGN_DURATION_SECONDS, float(master_audio_duration))
+        if master_audio_duration is not None
+        else min(MAX_DESIGN_DURATION_SECONDS, float(source_video_duration))
+        if source_video_duration is not None
+        else min(MAX_DESIGN_DURATION_SECONDS, float(mtv_duration))
         if mtv_duration is not None
         else snap_half_second(
             source.get("duration_seconds", 5.0),
@@ -6322,6 +7504,7 @@ def normalize_design_plan(
     plan["duration_seconds"] = duration
     for structured_key in (
         "experience_design", "reference_role_ledger", "physical_events", "fourdx_events",
+        "source_role_bindings",
     ):
         if structured_key in source:
             plan[structured_key] = deepcopy(source.get(structured_key))
@@ -6969,6 +8152,17 @@ def normalize_design_plan(
         media_requests.append(normalized_request)
         requested_requirement_ids.add(requirement_id)
     plan["media_requests"] = media_requests
+    enforce_authored_master_audio_and_locked_cast(
+        plan,
+        existing_media,
+        authored_requirement,
+    )
+    enforce_source_video_cast_remake_plan(
+        plan,
+        existing_media,
+        special_skill_key,
+        source_role_bindings=source_role_bindings,
+    )
     enforce_mtv_scene_keyframes(
         plan,
         existing_media,
@@ -7114,7 +8308,7 @@ def sanitize_design_model_context(context: dict) -> dict:
     bound_skills = prompt_context.get("bound_h3_skills") or {}
     special_profile = bound_skills.get("special") or {}
     special_key = str(special_profile.get("key", "")).strip().casefold()
-    if is_drone_special_skill(special_key):
+    if is_drone_special_skill(special_key) or special_key == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL:
         # A new Drone Design is driven by the current requirement plus P1.
         # Re-feeding prose from an older applied Drone plan can preserve an
         # already polluted landmark even after the offending filename is gone.
@@ -7128,10 +8322,18 @@ def sanitize_design_model_context(context: dict) -> dict:
         for key in (
             "filename", "original_filename", "source_filename", "basename",
             "local_path", "original_local_path", "source_plate_local_path",
+            "analysis_frame_paths",
         ):
             media.pop(key, None)
 
         media_id = str(media.get("media_id", "")).strip().upper().lstrip("@")
+        if special_key == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL and media_id == "V1":
+            for field in (
+                "recognition", "raw_analysis_summary", "analysis_summary",
+                "semantic_enrichment", "caption", "clip_prompt",
+            ):
+                if field in media:
+                    media[field] = _source_video_visual_evidence(media.get(field))
         analysis_only = is_analysis_only_media_use(media)
         if is_drone_special_skill(special_key) and media_id == "P2":
             analysis_only = True
@@ -7183,13 +8385,26 @@ def build_design_system_prompt(context: dict) -> str:
     requested_duration = context.get("requested_duration_seconds")
     duration_contract = ""
     if requested_duration is not None:
-        if str(context.get("duration_source_media_id", "")).strip().upper() == "A1":
+        duration_source_id = _normalized_media_id(
+            context.get("duration_source_media_id", "")
+        )
+        if duration_source_id.startswith("A"):
             duration_contract = (
-                "A1 MASTER-DURATION CONTRACT: the loaded @A1 source recording is the duration authority. "
+                f"{duration_source_id} MASTER-DURATION CONTRACT: the loaded @{duration_source_id} "
+                "source recording is the duration authority. "
                 f"Its playable duration is {float(requested_duration):.3f} seconds. Set duration_seconds "
                 f"to exactly {float(requested_duration):.3f}; make every Shot, reference range and final "
                 "hold cover 0.000 through that timestamp. Ignore any older numeric duration in the reusable "
                 "template or current workspace. Never trim, loop, time-stretch or pad the song to fit another duration. "
+            )
+        elif duration_source_id == "V1":
+            duration_contract = (
+                "V1 SOURCE-DURATION CONTRACT: the loaded @V1 video is the immutable duration, edit "
+                "and soundtrack authority. "
+                f"Its playable duration is {float(requested_duration):.3f} seconds. Set duration_seconds "
+                f"to exactly {float(requested_duration):.3f}; cover 0.000 through that timestamp with "
+                "continuous non-overlapping Shots and a final hold inside the last source interval. "
+                "Never trim, loop, time-stretch, pad or restart V1 to fit another duration. "
             )
         else:
             duration_contract = (
@@ -7276,7 +8491,51 @@ def build_design_system_prompt(context: dict) -> str:
                 "and appearance directly; BLIP/AI descriptions are metadata only. Do not generate "
                 "a substitute man/woman pair or person-bearing Z-Image action reference. "
             )
-    if selected_special_key == COMIC_TALK_SHOW_SPECIAL_SKILL:
+    if selected_special_key == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL:
+        source_cast_ids = sorted(
+            (
+                str(row.get("media_id", "")).strip().upper()
+                for row in context.get("existing_media") or []
+                if isinstance(row, dict)
+                and re.fullmatch(
+                    r"P\d+", str(row.get("media_id", "")).strip(), re.I
+                )
+                and bool(row.get("loaded", False))
+            ),
+            key=lambda media_id: int(media_id[1:]),
+        )
+        source_cast_mapping = ", ".join(
+            f"S{media_id[1:]}=@{media_id}" for media_id in source_cast_ids
+        )
+        source_cast_label = ", ".join("@" + media_id for media_id in source_cast_ids)
+        ending_contract = (
+            "SOURCE-VIDEO DIRECTOR-BLUEPRINT RECONSTRUCTION CONTRACT: analyse @V1's chronology, "
+            "principal-role functions, action causality, scene vocabulary, camera purpose, edit rhythm "
+            "and soundtrack timing. Source principals map once by narrative prominence and first "
+            "appearance to the loaded cast dictionary: " + source_cast_mapping + ". @V1 is analysis_only and must "
+            "never become an H3 video reference or immutable pixel plate. Rebuild the principals entirely "
+            "from " + source_cast_label + " and reconstruct coherent environments from V1's defining elements and atmosphere. "
+            "Exact pixels, geometry and composition need not match. Return no media_requests, never retain "
+            "a source actor, never invent an action beat and preserve the source-derived ending function. "
+            "When V1 evidence contains QWEN SOURCE VIDEO DIRECTOR ANALYSIS, its ordered scenes[] rows, "
+            "location IDs, active source roles, visible events and action handoffs are authoritative; cover "
+            "every row chronologically instead of replacing them with a newly invented generic story. "
+        )
+        speaker_gender_contract = (
+            "SOURCE-VIDEO AUDIO CONTRACT: @V1's embedded soundtrack is the sole source of dialogue, "
+            "voice-over, lyrics, music, ambience and timing. Keep text_layers empty. Never transcribe, "
+            "translate, rewrite, repeat or add audible words. Bind each audible source voice to its "
+            "assigned visible loaded-P character; only the active speaker articulates lips while listeners "
+            "and anonymous extras keep neutral non-speaking mouths. "
+        )
+        environmental_combat_contract = (
+            "SOURCE-VIDEO WORLD RECONSTRUCTION CONTRACT: preserve the analysed location type, defining "
+            "furnishings, props, weather, lighting, crowd function, spatial relationships, entrances, exits, "
+            "eyelines, contacts and reactions, but rebuild them as a new coherent H3 scene rather than an "
+            "unchanged pixel plate. Anonymous non-speaking extras may be recreated only where the analysed "
+            "event needs them; they may never inherit a P face or become another principal. "
+        )
+    elif selected_special_key == COMIC_TALK_SHOW_SPECIAL_SKILL:
         ending_contract = (
             "COMIC TALK SHOW DYNAMIC GROUP CONTRACT: @P1 is required and is the immutable whole-group "
             "cast and source-medium plate. Count only complete, intentional principal people visible in P1; "

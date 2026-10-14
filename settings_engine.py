@@ -21,6 +21,7 @@ ENV_KEYS = {
     "music_mode": "H3_MUSIC_MODE",
     "blip_device": "H3_BLIP_DEVICE",
     "workspace_free_disk_reserve_gb": "H3_WORKSPACE_FREE_DISK_RESERVE_GB",
+    "unload_all_models_before_generation": "H3_UNLOAD_ALL_MODELS_BEFORE_GENERATION",
 }
 
 
@@ -40,6 +41,7 @@ class RenderSettings:
     music_mode: str = "auto"
     blip_device: str = "auto"
     workspace_free_disk_reserve_gb: float = 50.0
+    unload_all_models_before_generation: bool = True
 
     @classmethod
     def defaults(cls) -> "RenderSettings":
@@ -85,6 +87,9 @@ class RenderSettings:
             blip_device=blip_device,
             workspace_free_disk_reserve_gb=max(
                 0.0, number("workspace_free_disk_reserve_gb", float)
+            ),
+            unload_all_models_before_generation=_as_bool(
+                merged["unload_all_models_before_generation"]
             ),
         )
 

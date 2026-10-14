@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
@@ -205,20 +207,191 @@ def create_video_analysis_frames(
     destination_dir: str | Path,
     duration: float,
     runtime: RuntimePaths | None = None,
+    *,
+    scene_aware: bool = False,
+    max_frames: int = 18,
 ) -> list[tuple[str, Path]]:
-    """Extract opening, middle and ending frames for temporal visual analysis."""
+    """Extract representative frames for temporal visual analysis.
+
+    Ordinary Media Pool video keeps the inexpensive opening/middle/ending
+    scan.  A source-video remake requests ``scene_aware`` so the design model
+    sees the complete edit instead of extrapolating a long video from its
+    first few seconds.
+    """
     runtime = runtime or load_runtime_paths()
     destination_dir = Path(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
     duration = max(0.05, duration)
-    samples = (("opening 10%", duration * 0.10), ("middle 50%", duration * 0.50), ("ending 90%", duration * 0.90))
+    if scene_aware:
+        cuts = detect_video_scene_changes(path, duration, runtime=runtime)
+        boundaries = [0.0, *cuts, duration]
+        scenes = [
+            (index, start, end)
+            for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1)
+            if end - start >= 0.12
+        ]
+        # Two temporal samples per edit let the vision model distinguish a
+        # speaking mouth from a static reaction and preserve more blocking/set
+        # detail.  Fall back to one midpoint only when a long edit would exceed
+        # the bounded 48-frame analysis budget.
+        samples: list[tuple[str, float]] = []
+        two_per_scene = bool(scenes and len(scenes) * 2 <= max(3, int(max_frames)))
+        for index, start, end in scenes:
+            span = end - start
+            if two_per_scene and span >= 0.36:
+                samples.extend((
+                    (
+                        f"source scene {index:02d} {start:.2f}-{end:.2f}s early",
+                        start + span * 0.34,
+                    ),
+                    (
+                        f"source scene {index:02d} {start:.2f}-{end:.2f}s late",
+                        start + span * 0.68,
+                    ),
+                ))
+            else:
+                samples.append((
+                    f"source scene {index:02d} {start:.2f}-{end:.2f}s midpoint",
+                    (start + end) / 2.0,
+                ))
+        if len(samples) < 3:
+            samples = [
+                ("source opening 10%", duration * 0.10),
+                ("source middle 50%", duration * 0.50),
+                ("source ending 90%", duration * 0.90),
+            ]
+        if len(samples) > max(3, int(max_frames)):
+            wanted = max(3, int(max_frames))
+            indexes = {
+                round(index * (len(samples) - 1) / (wanted - 1))
+                for index in range(wanted)
+            }
+            samples = [sample for index, sample in enumerate(samples) if index in indexes]
+    else:
+        samples = [
+            ("opening 10%", duration * 0.10),
+            ("middle 50%", duration * 0.50),
+            ("ending 90%", duration * 0.90),
+        ]
     frames: list[tuple[str, Path]] = []
     for index, (label, seconds) in enumerate(samples, 1):
         destination = destination_dir / f"frame_{index}.jpg"
         if not destination.exists():
             create_video_thumbnail(path, destination, seconds, runtime)
+            if scene_aware:
+                # Social-video captions and edge UI are not story evidence.
+                # Obscure the usual overlay zones before BLIP/Qwen sees them,
+                # while retaining faces, staging and the central environment.
+                with Image.open(destination) as opened:
+                    image = ImageOps.exif_transpose(opened).convert("RGB")
+                blurred = image.filter(ImageFilter.GaussianBlur(radius=12.0))
+                right = round(image.width * 0.88)
+                bottom = round(image.height * 0.76)
+                image.paste(
+                    blurred.crop((right, 0, image.width, image.height)),
+                    (right, 0),
+                )
+                image.paste(
+                    blurred.crop((0, bottom, image.width, image.height)),
+                    (0, bottom),
+                )
+                image.save(destination, format="JPEG", quality=90, optimize=True)
         frames.append((f"{label} @ {seconds:.2f}s", destination))
     return frames
+
+
+def create_labeled_contact_sheet(
+    sources: list[tuple[str, str | Path]],
+    destination: str | Path,
+    *,
+    columns: int = 4,
+    cell_size: tuple[int, int] = (320, 180),
+) -> Path:
+    """Pack chronological visual evidence into one model-readable image.
+
+    The Design client intentionally limits the number of attached images. A
+    contact sheet therefore exposes every detected source scene, or all cast
+    portraits, without silently dropping later evidence. These labels are
+    planning metadata only and never enter H3 rendering.
+    """
+
+    rows = [
+        (str(label).strip(), Path(path))
+        for label, path in sources
+        if Path(path).is_file()
+    ]
+    if not rows:
+        raise ValueError("A contact sheet requires at least one existing image")
+    columns = max(1, int(columns))
+    cell_width = max(96, int(cell_size[0]))
+    cell_height = max(72, int(cell_size[1]))
+    label_height = 30
+    row_count = (len(rows) + columns - 1) // columns
+    sheet = Image.new(
+        "RGB",
+        (columns * cell_width, row_count * (cell_height + label_height)),
+        (18, 20, 24),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, (label, path) in enumerate(rows):
+        x = (index % columns) * cell_width
+        y = (index // columns) * (cell_height + label_height)
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        image.thumbnail((cell_width, cell_height), Image.Resampling.LANCZOS)
+        paste_x = x + (cell_width - image.width) // 2
+        paste_y = y + (cell_height - image.height) // 2
+        sheet.paste(image, (paste_x, paste_y))
+        caption = label if len(label) <= 52 else label[:49] + "..."
+        draw.rectangle(
+            (x, y + cell_height, x + cell_width, y + cell_height + label_height),
+            fill=(8, 10, 13),
+        )
+        draw.text((x + 7, y + cell_height + 7), caption, fill=(238, 241, 246))
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(destination, format="JPEG", quality=91, optimize=True)
+    return destination
+
+
+def detect_video_scene_changes(
+    path: str | Path,
+    duration: float,
+    *,
+    runtime: RuntimePaths | None = None,
+    threshold: float = 0.28,
+) -> list[float]:
+    """Return reliable source edit points detected by FFmpeg scene scoring."""
+
+    runtime = runtime or load_runtime_paths()
+    duration = max(0.05, float(duration))
+    result = _run(
+        [
+            str(runtime.ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-i",
+            str(path),
+            "-t",
+            f"{duration:.3f}",
+            "-vf",
+            f"select=gt(scene\\,{max(0.05, min(0.95, float(threshold))):.3f}),showinfo",
+            "-an",
+            "-f",
+            "null",
+            os.devnull,
+        ]
+    )
+    values: list[float] = []
+    for raw in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr or ""):
+        seconds = float(raw)
+        if seconds <= 0.12 or seconds >= duration - 0.12:
+            continue
+        if values and seconds - values[-1] < 0.18:
+            continue
+        values.append(seconds)
+    return values
 
 
 def create_image_analysis_regions(

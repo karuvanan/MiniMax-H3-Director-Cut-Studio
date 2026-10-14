@@ -1,8 +1,10 @@
 """Run hidden H3 segments sequentially and assemble one continuous master.
 
-This worker intentionally keeps only one ComfyUI prompt in flight.  Between
-segments it asks ComfyUI to release models/VRAM, persists a resumable manifest,
-and can inject a preceding-segment continuity anchor into a free reference slot.
+This worker intentionally keeps only one ComfyUI prompt in flight while keeping
+the H3 model resident across normal Segment boundaries.  It persists a resumable
+manifest, can inject a preceding-segment continuity anchor into a free reference
+slot, releases memory mid-job only for a real CUDA OOM, and performs one final
+ComfyUI model/VRAM release after the assembled Master is complete.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from workflow_engine import validate_portable_media_manifest
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 30
+SMART_RENDER_POLICY_VERSION = 32
 AUDIO_JOIN_FADE_SECONDS = 0.04
 LOCATION_SOUND_REFERENCE_VERSION = 1
 COMPLETE_LOCATION_SOUND_CONTRACT = (
@@ -1298,15 +1300,25 @@ def queue_segment(
             # exceeded its recovery window; preserve prompt_id for later resume.
             if isinstance(exc, ComfyConnectionRecoveryTimeout):
                 raise
-            released = release_comfy_memory(server, http_timeout)
-            emit({
-                "progress": (
-                    f"{released} · retry class {failure_class}"
-                    if attempt < attempts
-                    else f"{released} · retry budget exhausted"
-                ),
-                "failure_class": failure_class,
-            })
+            if failure_class == "oom":
+                released = release_comfy_memory(server, http_timeout)
+                emit({
+                    "progress": (
+                        f"{released} · CUDA OOM retry"
+                        if attempt < attempts
+                        else f"{released} · CUDA OOM retry budget exhausted"
+                    ),
+                    "failure_class": failure_class,
+                })
+            else:
+                emit({
+                    "progress": (
+                        f"H3 kept resident · retry class {failure_class}"
+                        if attempt < attempts
+                        else f"H3 kept resident · retry budget exhausted ({failure_class})"
+                    ),
+                    "failure_class": failure_class,
+                })
             if attempt < attempts:
                 # OOM often needs a little longer for ComfyUI/PyTorch to return
                 # released allocations to the driver. Never lower megapixels
@@ -1626,7 +1638,10 @@ def main() -> int:
             "render_progress": build_render_progress(
                 job, segments, completed_indexes, stage="complete", current_index=index
             ),
-            "progress": f"Segment {index + 1}/{len(segments)} complete · " + release_comfy_memory(server, http_timeout),
+            "progress": (
+                f"Segment {index + 1}/{len(segments)} complete · "
+                "H3 kept resident for the next Segment"
+            ),
         })
 
     emit({
@@ -1636,6 +1651,7 @@ def main() -> int:
         "progress": f"Preparing to assemble {len(completed)} completed segments",
     })
     master = assemble_master(job, completed)
+    final_release = release_comfy_memory(server, http_timeout)
     final_manifest = {
         "format": "h3-smart-render-manifest",
         "version": 1,
@@ -1648,6 +1664,7 @@ def main() -> int:
         "megapixels": job.get("megapixels"),
         "target_duration_seconds": job.get("target_duration_seconds"),
         "master_output": str(master),
+        "final_model_release": final_release,
         "segments": completed,
     }
     _write_manifest(manifest_path, final_manifest)
@@ -1667,6 +1684,7 @@ def main() -> int:
         "render_progress": build_render_progress(
             job, segments, completed_indexes, stage="final"
         ),
+        "progress": f"Master complete · {final_release}",
     })
     return 0
 

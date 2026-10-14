@@ -15,11 +15,13 @@ from prompt_engine import PromptSpec
 from skill_engine import (
     DEFAULT_SKILL,
     SPECIAL_SKILL,
+    SOURCE_REMAKE_SYNC_AUDIO_MARKER,
     build_ref2va_prompt,
     load_skill_profiles,
     profile_system_prompt,
 )
 from workflow_engine import MediaAsset
+from native_audio_engine import NO_AUTHORED_SPEECH_CONTRACT
 
 
 class SkillEngineTests(unittest.TestCase):
@@ -39,6 +41,31 @@ class SkillEngineTests(unittest.TestCase):
         self.assertEqual(discovered, folder_names)
         self.assertIn("subject_definitions", self.profiles[DEFAULT_SKILL].h3_reference_guide)
         self.assertIn("Typography Rules", self.profiles[SPECIAL_SKILL].instruction)
+
+    def test_source_remake_audio_is_authorized_lip_sync_without_text_layers(self):
+        audio = MediaAsset(
+            node_id="virtual-source-audio", class_type="LoadAudio",
+            media_type="audio", filename="v1_window.wav", tag="<Audio 1>",
+            binding="ref_audios.ref_audio_0", reference_id="A999",
+            local_path="v1_window.wav", start_seconds=0.0, end_seconds=6.0,
+            recognition=SOURCE_REMAKE_SYNC_AUDIO_MARKER,
+        )
+        prompt = build_ref2va_prompt(
+            PromptSpec(
+                brief="Restage the source conversation with S1 and S2.",
+                shots=["S1 speaks while S2 listens."],
+                text_ranges=[],
+            ),
+            [audio],
+            6.0,
+            self.profiles[DEFAULT_SKILL],
+            self.profiles["source-video-cast-remake-h3"],
+        )
+
+        self.assertNotIn(NO_AUTHORED_SPEECH_CONTRACT, prompt)
+        self.assertIn("SOURCE SOUNDTRACK LIP-SYNC LOCK", prompt)
+        self.assertIn("source_sync_performance_clock", prompt)
+        self.assertIn("<Audio 1>", prompt)
 
     def test_comic_talk_show_compiler_keeps_p1_as_dynamic_group_plate(self):
         p1 = MediaAsset(

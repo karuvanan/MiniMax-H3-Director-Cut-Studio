@@ -2,6 +2,96 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.6-alpha2] - 2026-10-14
+
+### Featured Complete-Video Workflows
+
+- 新增可直接发布论坛的[`Shot Visual Editor + Ask Qwen Step by Step`](forum/Shot_Visual_Editor_Ask_Qwen_Step_by_Step.md)，集中介绍卡片式Shot导演控制、全部Character替换、Qwen字段权限、结构化Patch Review、Timeline全局助手、保存范围及`REGENERATE DIRTY`局部生成流程。
+- 主README与v0.3.6重点说明新增`MTV Singing H3`完整歌曲工作流：A1实际可播放长度自动控制全片，P1保持唯一主唱，P2/P3保持非发声陪衬，P4建立统一场景，P5–P9只作为P4派生环境状态；可选A2只作为嘴形时间源，最终声音仍使用A1原曲／Mix。
+- 新增可直接发布论坛的[`MTV Singing H3 Step by Step`](forum/MTV_Singing_H3_Step_by_Step.md)，覆盖素材槽位、Audio Separator、Design、0.2MP对嘴检查、Shot Visual Editor、Regenerate Dirty、正式输出、验收清单与常见问题。
+- 新增可直接发布论坛的[`Source Video Cast Remake H3 Step by Step`](forum/Source_Video_Cast_Remake_H3_Step_by_Step.md)，覆盖V1完整分析、逐时间脸孔绑定、Director Design、Preflight、原声对嘴、局部重生与最终Master Audio。
+- 为`Shot Visual Editor + Ask Qwen`、`MTV Singing H3`及`Source Video Cast Remake H3`三个主题分别生成16:9论坛宣传图，并以项目内相对路径接入README及独立教程，离线复制仓库后仍可正常显示。
+
+### Source-Video Qwen Reliability
+
+- 修复长V1分析返回约100K字符后出现`Expecting ',' delimiter`：Qwen输出改为零温度、短字段Schema和紧凑描述，优先完整返回全部场景与人物出场证据。
+- 结构化输出继续限制为32K tokens，避免把预测预算提升至64K后让本地Qwen长时间持续生成并触发worker watchdog。
+- Source-Video导演分析改用独立30分钟HTTP时限；watchdog读取当前语义Job的真实timeout，不再固定按普通Design的时限错误终止长片分析。
+- JSON截断、缺失场景、漏逗号或worker意外退出会自动进行一次紧凑重试。第二次失败保留`finish_reason`、输出字符数及明确的startup／job timeout原因，不再只显示模糊的`exited with code 1`。
+
+### Verification
+
+- `design_ai_service.py`、`source_video_analysis.py`、`director_cut_studio.py`及专项测试通过Python编译。
+- Source Video Analysis 10项测试全部通过，覆盖长JSON缺失逗号修复、32K上限、零温度、完整场景、旧账本升级、视觉输入与指定Qwen模型保护。
+- Director Project格式保持`26`，无需迁移已有Project。
+
+## [0.3.6-alpha.1] - 2026-10-13
+
+### Shot Visual Editor
+
+- Character卡片新增安全`Unlock All Characters`矩阵：同时列出当前Shot全部角色，每一行以带缩略图的Media Pool P Picture选择器独立替换，并支持当前Shot、连续镜头及同角色全部出现位置三个范围。
+- 多角色保存采用单次原子映射，安全支持`P1↔P2`互换及P1–P9批量重映射，不会因逐项替换产生身份合并或连锁污染。
+- 角色替换会写入持久化`character_identity_overrides`，同步精确`@P`引用、AI identity direction与对应V1 Role Binding；目标P未覆盖相关时间时自动建立隐藏H3参考Clip。
+- H3 Prompt新增Shot-local强制身份优先级，禁止旧脸残留、混脸、复制或由全局cast order覆盖；整次编辑、绑定同步和参考Clip共用一个Undo事务并只使受影响Segment dirty。
+
+- 双击Timeline Shot现在打开图像化`SHOT VISUAL EDITOR`，把景别、机位、运镜、速度、幅度、主体动作、环境反馈、发声状态、嘴形与声音方位拆成可直接点击的结构化控件；原始／编译文字默认折叠在`ADVANCED`。
+- Visual Editor改为完整卡片式工作区：顶部提供带真实素材预览的相邻Shot导航，中央提供Character／Camera／Speaking／Mouth／Voice／Action／Environment卡片，右侧提供Qwen字段权限与Restore Shot；窗口内Undo不会影响主Timeline Undo Stack。
+- 新增按需显示的`REGENERATE DIRTY`：Shot、Text Layer、素材映射或Qwen Patch令Segment失效后按钮自动出现并显示dirty数量；点击后自动选择完整Timeline并启动0.2MP Smart Render Preview，只重新生成dirty Segment、复用clean Segment，避免手工抄写Work Area时间且保证Accept后仍为完整Final Master。
+- 修复保存并重新打开已有`generated_preview.mp4`／`generated_output.mp4`的Project后，`REGENERATE DIRTY`因Preview seed、分辨率或缓存类型变化而从头生成的问题。Dirty repair现在保留已保存Seed，并跨Preview manifest、Production manifest与持久化Segment Takes恢复clean片段；只有dirty Shot所属Segment进入H3队列。
+- Settings新增持久化`Unload all models before Regenerate Dirty / Preview / Accept / Run & Queue` ON/OFF开关（默认ON）。所有H3提交统一在TTS／素材预处理完成后执行一次异步预生成清理：释放ComfyUI模型与VRAM缓存、LM Studio、ACE-Step及SoulX，再恢复原请求；OFF时中央提交入口完全跳过清理。Smart Render Job内部仍保持H3常驻，只在整个Job开始前清理一次。
+- 新增持久化`speech_visual_mode`、`mouth_behavior`及`voice_position`。H3编译器优先读取这些结构化事实，不再只依赖Prompt内是否碰巧出现`SPEAKER LOCK`关键词；可明确锁定画内说话者、静默听众、无人声、画外音或镜头后声音。
+- 保存范围支持`Shot Only`、`Linked Continuity`与`Whole Segment`。默认Linked模式会把明确的环境边界状态同步给前／后Shot，并使相邻依赖Segment失效；Whole Segment会使实际隐藏Render Segment整体dirty，而非只重算看得到的单一Shot。
+- 一次Shot编辑及必要的边界同步被封装成一次Undo transaction；不删除已接受成片，不改变不相关Media Pool素材。
+
+### Timeline Qwen Assistant
+
+- Timeline标题栏新增`ASK QWEN`与可停靠右侧助手，不必返回Design页面即可要求修改Shot、加入VFX、调整Camera、修正声音方位、处理Text Layer／Track或检查Work Area与整个Timeline。
+- Qwen只能返回严格Schema的结构化Patch：`target kind + target ID + field + value + reason + risk`。未知ID、未授权字段、重复Patch和嵌套任意JSON会在本地被拒绝；助手不能直接覆盖已经编译的完整H3 Prompt。
+- Patch在实际套用前以清单显示，可逐项勾选、Reject或`APPLY SELECTED`。对白原文、Speaker、Language、时间、轨道及Generation Work Area自动列为高影响修改并要求确认。
+- Shot、Text Layer、Track与Work Area变更会走同一个Undo Stack。系统依据Assistant Scope将Selected Shot、相邻连续性Shot、完整Render Segment、Work Area或全Timeline标记dirty，避免只改一处却错误复用旧Segment。
+
+### Project Format and Verification
+
+- Director Project格式由25升级至26，用于保存三个新增Shot视觉发声字段；旧Project向后兼容并使用`auto`安全默认值。
+- 新增Timeline Assistant纯逻辑与离屏PySide6 UI测试，覆盖严格Schema、未知／重复目标拒绝、高影响确认标记、邻接事实Prompt、字段保存兼容、Visual Editor控件及Patch review清单。
+- 修改前建立完整可编辑源码快照`_backups/pre-v0.3.6-alpha.1-20261013-150438.zip`，SHA-256：`C80752A2684C3D55E919FB83E514A300524AAA7C208DF2404A661BFACE3BCF8E`。
+
+## [0.3.5-alpha.17] - 2026-10-12
+
+### V1 Principal Role Thumbnail Binding
+
+- `Source Video Cast Remake H3`的Qwen3.8完整V1分析升级为V5账本：每位主要人物除稳定内部R编号、外观、职责与出场场景外，还为每个出场区间记录独立的early／late／midpoint面板、脸部可见度及近似正方形脸部裁切范围。
+- Design新增人物绑定表，只显示正方形V1脸部、逐行独立出场时间及带缩略图的P替换选项，不再向用户显示内部Source Role栏。
+- 允许多个源人物映射到同一P图。新增`Keep original V1 face`：选择后自动把对应V1脸部裁切物化为Project内的新P身份素材，供H3在相关Segment使用。
+- 遗漏或绑定到不可用图片仍会在Design前明确阻止。映射写入`source_role_bindings`并随Project保存／恢复。
+- Director Design与确定性Normalizer共同强制R→P账本；每个Shot依据`active_source_roles`选择人物，原声`speaker_role`及`listener_roles`沿用同一映射，防止角色互换、同脸复制及错误人物对嘴。
+- 源人物缩略图仅供UI识别，绝不送进H3。H3仍只接收用户绑定的P身份图及每段V1原声。
+- Render Policy提升至32，防止复用旧的顺序猜测人物Segment。
+
+### Verification
+
+- 修复已保存Project的分析版本兼容：V1角色绑定会读取V1–V5账本，不再因为项目仍保存`QWEN SOURCE VIDEO DIRECTOR ANALYSIS V4`而错误报告“没有principal-role ledger”。若旧／部分分析已有完整scene角色证据但遗漏顶层`principal_roles`，Studio会从`active_source_roles`、`speaker_role`与`listener_roles`确定性恢复角色及出场时间卡，不要求用户重复运行Qwen。
+- 修复长V1的第二条误挡路径：Qwen V5完整角色／场景JSON不再被Design Context的32K字符摘要上限从中间截断；Preflight依次读取最新选中Context、刷新后的Dialog Context及主工作区实时V1资产，异步分析完成后不会继续校验打开窗口时的旧副本。Design Engine统一复用同一兼容解析器。
+- Source Video角色分析升级至Qwen V5：每个角色的每个出场区间拥有独立面板、脸部框与可见度证据；角色绑定改为按时间排序的6列正方形卡片，同一卡片只显示一个时间点。同一角色的卡片初始沿用同一建议P图，之后不锁定、不联动，可逐时间点独立改成不同P图或原V1脸孔；“角色＋场景”映射会进入对应Shot、Speaker与Segment装载。
+- 修复69张以上卡片时最后一排仍被裁切：根因是水平`QSplitter`不会把左侧普通子Widget的超高布局传递给外层页面。左侧Design编辑器现改为独立`QScrollArea`，角色表完整展开全部卡片行且不再使用嵌套表格滚动；滚到底时最后一排及状态文字都位于真实布局内，不会画到父容器裁切区之外。
+- V1长片的Qwen结构化输出预算由16K提高至32K；对完整JSON中偶发的缺失逗号进行本地受限修复后仍执行全部Schema、场景数量与证据指纹校验，避免`Expecting ',' delimiter`令整次分析中断，同时绝不猜补被截断的内容。
+- 新增Qwen V5逐时间点方形脸部裁切字段解析、R1／R2反向绑定P2／P1、重复P映射、原V1脸孔物化为方形P素材、Shot局部人物及原声Speaker锁定回归测试；同步执行Source Analysis、Design Engine、Skill与Timeline重点测试。
+
+## [0.3.5-alpha.16] - 2026-10-11
+
+### Fixed-Cast Original-Audio Remake Contract
+
+- 新增通用“固定演员＋原声重演”识别：当Design Requirement把两个或以上已加载Picture明确设为固定身份，并把`@A`设为原声／唯一声音／主时间线时，Studio会自动进入严格重演模式。
+- 原声Audio的实际可播放长度现在是硬时长权威；即使Design模型把53.29秒原声错误扩展到79秒，Studio也会把完整Shot、Reference与Cue重新缩放回原声长度，不再接受由自创对白造成的延长。
+- 原声重演会强制清空模型自创的Dialogue／Voice-over／Lyrics Text Layers，防止重复对白、翻译、额外旁白或隐藏语音与原声竞争。
+- 所有明确锁定的`@P1–@Pn`都会成为whole-design身份锚点。任何包含人物的Z-Image请求会被自动移除；只允许无人环境／道具空镜。匿名周边群众改由H3按Shot描述生成，且必须保持非说话状态。
+- 新Design会排除上一轮失败Design遗留的AI generated Pictures，避免错误替身再次进入规划上下文。
+- 为项目`a_woman_with_long_black_hair_and_a_white_top_15`新增53.291秒、16:9、P1–P4固定演员、A1原声驱动的可直接粘贴Design Requirement。
+
+### Verification
+
+- Design Engine 131项测试通过；新增79秒错误计划自动回收到53.290667秒、移除自创Text Layer、删除人物替代图、保留无人餐厅空镜及P1–P4／A1完整绑定的回归测试。
+
 ## [0.3.5-alpha.15] - 2026-10-11
 
 ### Verified Native Location-Sound Reference Pipeline
