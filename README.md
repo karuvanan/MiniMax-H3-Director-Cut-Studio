@@ -35,43 +35,6 @@
 - [完整 Windows runtime（Google Drive）](https://drive.google.com/file/d/1mC_GpmCuYw7zaQPfkaqtQVXTSt6DlRsM/view?usp=drive_link)
 - [示范输出影片（YouTube）](https://www.youtube.com/@imbiplazaASUS/videos)
 
-### v0.3.6-alpha2 · 图像化Shot导演、Ask Qwen与完整影片工作流
-
-本版首先把`Shot Visual Editor + Ask Qwen`整理成完整的Timeline局部导演工作流：双击Shot即可用卡片控制全部人物、Camera、发声状态、Mouth、Voice Position、Action与Environment；Qwen只能在用户勾选的字段内提出结构化Patch，必须Review后才会Apply。保存后自动出现`REGENERATE DIRTY`，只用0.2MP重新预览受影响Segment，确认后再以1.0M装配完整Final Master。完整步骤请参阅[`Shot Visual Editor + Ask Qwen Step by Step`](forum/Shot_Visual_Editor_Ask_Qwen_Step_by_Step.md)。
-
-![Shot Visual Editor + Ask Qwen](forum/shot-visual-editor-ask-qwen-promo.png)
-
-本版同时整理两套可重复使用的完整影片工作流，并附上可直接发布到论坛的独立图文教程。
-
-`MTV Singing H3`以A1实际可播放长度自动建立完整Timeline：P1是唯一主唱，P2/P3是非发声陪衬，P4决定场景世界，P5–P9只生成P4派生的分时环境状态。A2存在时只作为P1嘴形时钟，A1仍是最终Master Audio；A2为空时才由A1驱动嘴形。Studio不会自动重唱、虚构歌词或在Segment边界重播歌曲开头。完整步骤请参阅[`MTV Singing H3 Step by Step`](forum/MTV_Singing_H3_Step_by_Step.md)。
-
-![MTV Singing H3](forum/mtv-singing-h3-promo.png)
-
-`Source Video Cast Remake H3`把V1当作导演蓝图而不是像素底片。Qwen读取完整Storyboard，建立人物职责、场景、动作因果、运镜、剪辑和原声账本；每次人物出场都会成为独立正方形脸孔时间卡，由用户逐张绑定P1–P9或`Keep original V1 face`。H3在新生成但保留V1场景语汇的世界中重演，最终恢复V1原声。alpha2把长片分析限制为紧凑32K JSON，为V1任务提供30分钟独立时限，并在JSON不完整或worker意外退出时自动重试一次。完整步骤请参阅[`Source Video Cast Remake H3 Step by Step`](forum/Source_Video_Cast_Remake_H3_Step_by_Step.md)。
-
-![Source Video Cast Remake H3](forum/source-video-cast-remake-h3-promo.png)
-
-### v0.3.6-alpha.1 · Shot Visual Editor 与 Timeline Qwen Assistant
-
-Timeline里的Shot现在不再只靠大段文字编辑。双击Shot会打开卡片式`SHOT VISUAL EDITOR`：顶部用缩略图切换相邻Shot，中央直接调整Character、Camera、Speaking、Mouth、Voice、Action与Environment，右侧可限定Qwen只修改获授权的字段；原始／编译文字默认收起，只有展开`ADVANCED`才会显示。
-
-Qwen Patch或手动编辑使既有输出失效后，Generation工具栏会自动出现橙色`REGENERATE DIRTY`。点击一次即可把Work Area安全切到完整Timeline、重新Preview所有dirty Segment并缓存复用未修改Segment；不必手工查找或输入Segment开始／结束时间。保存并重新打开Project后，Studio也会从Preview manifest、Production manifest及Workspace Segment Takes恢复缓存；即使Preview seed／分辨率不同，也只生成dirty Segment。Preview满意后照常点击`ACCEPT 1.0M`重组完整Final Master。
-
-Settings新增`Pre-generation VRAM cleanup · ON/OFF`，默认开启。开启时，`REGENERATE DIRTY`、`PREVIEW 0.2M`、`ACCEPT 1.0M`与`RUN+QUEUE`会在TTS和素材预处理完成后先释放ComfyUI模型／VRAM缓存，以及已加载的LM Studio、ACE-Step和SoulX模型，再自动继续原本的H3 Job；关闭后完全跳过这一步。该设置不会在同一个Smart Render Job的Segment之间卸载H3。
-
-每次保存可选择`Shot Only`、`Linked Continuity`或`Whole Segment`。默认`Linked Continuity`会检查前后Shot，传递明确的环境入／出状态，并把当前Shot、相邻Shot及相关Render Segment标记为dirty；它不会静默改写无关人物、对白或素材。所有改动合并为一次Undo。
-
-Timeline标题栏新增`ASK QWEN`。助手可处理Selected Shot、Linked Continuity、Whole Segment、Generation Work Area或Whole Timeline，并可直接执行“加入特效、改变运镜、修正闭嘴／画外音、修复环境连续性”等要求。Qwen不能直接覆写完整H3 Prompt，只能返回带目标ID、字段、旧／新值、原因与风险等级的结构化Patch。用户可逐项取消勾选、Reject或Apply Selected；对白文字、Speaker、时间、轨道及Work Area等高影响项目必须再次确认。
-
-Shot新增`speech_visual_mode`、`mouth_behavior`与`voice_position`三个持久化字段。它们在H3 Prompt编译时高于旧式关键词猜测，因此可明确指定`On-screen speaker`、`Silent listener`、`No human voice`、`Off screen`或`Behind camera`，避免画外音被错误转移给画面人物。Director Project格式升级至26；旧Project会以`Auto`安全默认值继续打开。
-
-详细操作与安全边界请参阅[`v0.3.6 readme.md`](v0.3.6%20readme.md)。
-
-Shot Visual Editor的Character卡片现在默认锁定；需要换人时点击`Unlock`，会一次列出当前Shot的全部Character，每个角色都可用缩略图选择现有P Picture，并决定只改当前Shot、连续镜头或全部出现位置。批量互换采用原子映射，保存会同步V1角色绑定、生成引用与dirty Segment，且可用一次Undo完整撤回。
-
-### v0.3.5-alpha.17 · V1主要角色缩略图绑定
-
-`Source Video Cast Remake H3`完成Qwen3.8全片分析后，会把每一次人物出场拆成独立的正方形脸孔卡片，严格按V1时间排序并以每行6张显示；每张卡片只显示自己的时间区间，不再把多个时间混在同一格。同一源角色的卡片第一次建立时沿用同一建议P图，但不会锁定或联动；用户可把任意时间卡片独立改成其他P图或`Keep original V1 face`，选择会以“角色＋场景”写入Project并只影响对应Shot。P图选项带缩略图，不同源人物或时间点也可复用同一P。Qwen V5会针对每个时间点分别选择清晰面板和脸部框。左侧Design编辑器拥有独立纵向滚动；绑定表完整展开全部卡片行，滚到最下方即可完整查看最后一排和状态栏，不会再被Splitter裁切。确认后的映射用于各Shot出场、Segment图片装载及V1原声发声者／听众口型。
 
 ## Studio 预览
 
