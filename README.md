@@ -1,6 +1,6 @@
 # MiniMax H3 Director Cut Studio
 
-> v0.3.7-alpha.1：Remake Engine现在由所选Special Skill自动决定。`Source Video Cast Remake H3`固定使用`LoRA Preserve V1`，调用MiniMax-H3 Character-Swap LoRA v1.5与H3 Relay保留V1表演、场景、时序和原声；没有Skill及其他Skill统一使用`Create H3 Remake`，不会误载Character-Swap模型。
+> v0.3.7-alpha.11：H3 Server Status Tray新增设定页面，可即时调整刷新秒数、监听的ComfyUI IP/API地址，以及Studio与Tray共同统计的H3 Cache目录。
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
@@ -24,7 +24,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.7-alpha.1`](VERSION)
+- 当前应用版本：[`v0.3.7-alpha.11`](VERSION)
 - v0.3.7 MiniMax-H3 Character-Swap LoRA与自动Remake Engine：[`v0.3.7 readme.md`](v0.3.7%20readme.md)
 - Character-Swap／Remake Engine论坛文章：[`forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md`](forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md)
 - v0.3.6 Shot Visual Editor 与 Timeline Qwen Assistant：[`v0.3.6 readme.md`](v0.3.6%20readme.md)
@@ -97,6 +97,7 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 |---|---|---|:---:|
 | ComfyUI | `0.32+` | Server现有ComfyUI安装 | 是 |
 | Custom node | 当前`akatz-ai/h3-relay`主分支 | `ComfyUI/custom_nodes/h3-relay/` | 是 |
+| Server status API + Tray | 本项目`comfyui_director_h3_cache_status` | `ComfyUI/custom_nodes/comfyui_director_h3_cache_status/` | 建议；用于Studio及Windows Tray显示Cache、VRAM、DRAM、GPU与CPU |
 | Character-Swap LoRA | `h3_character_swap_v1.5.safetensors` | `ComfyUI/models/loras/` | 是 |
 | Turbo LoRA | `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | `ComfyUI/models/loras/` | 是 |
 | H3 UNet | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `ComfyUI/models/diffusion_models/` | 是 |
@@ -111,7 +112,10 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 2. 按上表放置全部模型；文件名必须与API JSON完全一致。
 3. 确认项目根目录保留`akatz-labs-character-swap-turbo8-adaptive-window-api.json`，不需要把它复制到ComfyUI模型目录。
 4. 重新启动ComfyUI；确认没有`IMPORT FAILED`，并能找到`LabsH3PrepareVideo`与`H3RelayWindowedEdit`。
-5. 在Studio选择`Source Video Cast Remake H3`，顶部应自动显示只读`LoRA Preserve V1`；切换为None或其他Skill时应自动显示`Create H3 Remake`。
+5. 如需工具栏与Windows Tray实时资源显示，在ComfyUI主机执行`install_h3_cache_status_server.bat`；默认安装到`C:\ai program\Data\Packages\ComfyUI-GPU-1`并连接`http://127.0.0.1:8189`。其他位置可把ComfyUI根目录作为第一个参数、API地址作为第二个参数传入，例如`install_h3_cache_status_server.bat "D:\ComfyUI" "http://192.168.0.185:8189"`。安装程序会复制只读API、启动隐藏Tray并建立Windows登录自启动。重启ComfyUI后，Studio在`ESTIMATE`右侧及Tray都会显示Cache、VRAM、DRAM、GPU、CPU；无法读取的指标明确显示`N/A`。API不返回进程清单、文件名，也不提供删除操作。
+6. 在Studio选择`Source Video Cast Remake H3`，顶部应自动显示只读`LoRA Preserve V1`；切换为None或其他Skill时应自动显示`Create H3 Remake`。
+
+Shot Visual Editor中，`CURRENT ROLE · V1 SOURCE`显示当前Shot实际V1人物脸孔；点击任一Current Role卡，上方V1预览会自动加载该角色最清晰的24fps轨迹帧、实际时间与位置框，并同时勾选同排`SWAP`。角色专属画面仍显示同一帧内其他有可靠bbox的人物，因此可按住`Ctrl`点击其他人物框继续加入替换；没有可靠原始帧坐标的角色不会再显示误导性的整屏框，而会提示执行`DETECT V1 PEOPLE`。`REPLACE WITH`显示目标P Picture。若某位画内人物未被识别，点击`DETECT V1 PEOPLE`：Studio会按24fps逐帧解码该Shot、每32帧交给Qwen识别，并保存帧号、时间、人物位置框和轨迹锚点。选择对应P图并保存，再执行`REGENERATE DIRTY`即可补做该Shot，不必重新Design整片。
 
 > 模型、代码与源影片的下载、使用、二创和商用许可必须分别核对。Studio不会随源码分发这些权重。
 

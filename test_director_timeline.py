@@ -5,18 +5,19 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QTimer
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QPixmap, QUndoCommand, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QDialog, QGraphicsView, QListView,
-    QMessageBox, QPushButton, QToolButton, QWidget,
+    QLabel, QMessageBox, QPushButton, QToolButton, QWidget,
 )
 
 from PIL import Image
@@ -27,6 +28,7 @@ from character_swap_engine import (
 )
 
 from director_cut_studio import (
+    APP_STYLE,
     SMART_RENDER_POLICY_VERSION,
     _canonical_special_skill_key,
     ContentLayerDialog,
@@ -43,6 +45,7 @@ from director_cut_studio import (
     SmartCutDialog,
     StoryboardEditorDialog,
     ShotVisualEditorDialog,
+    V1PersonPickerWidget,
     TimelineClip,
     TimelineCueItem,
     TimelineTextClip,
@@ -84,10 +87,238 @@ from workflow_engine import (
 )
 from test_design_engine import sample_design
 from version_info import APP_VERSION, PROJECT_FORMAT_VERSION
-from source_video_analysis import render_source_video_analysis
+from source_video_analysis import parse_source_video_analysis, render_source_video_analysis
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_tooltip_style_is_opaque_and_high_contrast(self):
+        compact = " ".join(APP_STYLE.split())
+        self.assertIn("QToolTip {", compact)
+        self.assertIn("color: #f2f7fb", compact)
+        self.assertIn("background-color: #071017", compact)
+        self.assertIn("border: 1px solid #3f8496", compact)
+        self.assertIn("opacity: 255", compact)
+
+    def test_v1_person_picker_click_selects_exact_box_and_ctrl_adds(self):
+        pixmap = QPixmap(200, 100)
+        pixmap.fill(Qt.black)
+        picker = V1PersonPickerWidget(
+            pixmap,
+            {
+                "R1": {"bbox_normalized": [0.0, 0.0, 0.5, 1.0]},
+                "R2": {"bbox_normalized": [0.5, 0.0, 1.0, 1.0]},
+            },
+        )
+        picker.resize(520, 270)
+        picker.show()
+        self.app.processEvents()
+        clicks = []
+        picker.role_selected.connect(
+            lambda role, additive: clicks.append((role, additive))
+        )
+
+        QTest.mouseClick(picker, Qt.LeftButton, Qt.NoModifier, QPoint(390, 135))
+        QTest.mouseClick(
+            picker, Qt.LeftButton, Qt.ControlModifier, QPoint(130, 135)
+        )
+
+        self.assertEqual(clicks, [("R2", False), ("R1", True)])
+        picker.close()
+
+    def test_v1_person_picker_cycles_roles_with_the_same_position_box(self):
+        pixmap = QPixmap(200, 100)
+        pixmap.fill(Qt.black)
+        picker = V1PersonPickerWidget(
+            pixmap,
+            {
+                "R1": {"bbox_normalized": [0.0, 0.0, 1.0, 1.0]},
+                "R8": {"bbox_normalized": [0.0, 0.0, 1.0, 1.0]},
+                "R9": {"bbox_normalized": [0.0, 0.0, 1.0, 1.0]},
+            },
+        )
+        picker.resize(520, 270)
+        picker.show()
+        self.app.processEvents()
+        clicks = []
+        picker.role_selected.connect(
+            lambda role, additive: clicks.append((role, additive))
+        )
+
+        for _index in range(3):
+            QTest.mouseClick(
+                picker, Qt.LeftButton, Qt.NoModifier, QPoint(260, 135)
+            )
+
+        self.assertEqual(clicks, [
+            ("R1", False), ("R8", False), ("R9", False),
+        ])
+        self.assertEqual(
+            picker._rect_overlap_ratio(
+                QRectF(0.0, 0.0, 100.0, 100.0),
+                QRectF(0.0, 0.0, 100.0, 100.0),
+            ),
+            1.0,
+        )
+        picker.close()
+
+    def test_v1_person_picker_moves_and_resizes_role_box(self):
+        pixmap = QPixmap(200, 100)
+        pixmap.fill(Qt.black)
+        picker = V1PersonPickerWidget(
+            pixmap,
+            {"R1": {"bbox_normalized": [0.2, 0.2, 0.4, 0.7]}},
+        )
+        picker.resize(520, 270)
+        picker.set_selected_roles({"R1"})
+        picker.show()
+        self.app.processEvents()
+        edits = []
+        picker.role_bbox_edited.connect(
+            lambda role, bbox: edits.append((role, list(bbox)))
+        )
+        rect = picker._role_rect(picker._roles["R1"])
+        start = rect.center().toPoint()
+        end = QPoint(start.x() + 52, start.y())
+        QTest.mousePress(picker, Qt.LeftButton, Qt.NoModifier, start)
+        QTest.mouseMove(picker, end)
+        QTest.mouseRelease(picker, Qt.LeftButton, Qt.NoModifier, end)
+
+        self.assertEqual(edits[-1][0], "R1")
+        self.assertAlmostEqual(edits[-1][1][0], 0.3, delta=0.02)
+        self.assertAlmostEqual(edits[-1][1][2], 0.5, delta=0.02)
+
+        rect = picker._role_rect(picker._roles["R1"])
+        right_edge = QPoint(round(rect.right()), round(rect.center().y()))
+        wider_edge = QPoint(right_edge.x() + 52, right_edge.y())
+        QTest.mousePress(picker, Qt.LeftButton, Qt.NoModifier, right_edge)
+        QTest.mouseMove(picker, wider_edge)
+        QTest.mouseRelease(picker, Qt.LeftButton, Qt.NoModifier, wider_edge)
+        self.assertGreater(edits[-1][1][2] - edits[-1][1][0], 0.28)
+        picker.close()
+
+    def test_v1_person_picker_ctrl_click_adds_focused_role_box(self):
+        pixmap = QPixmap(200, 100)
+        pixmap.fill(Qt.black)
+        picker = V1PersonPickerWidget(pixmap, {})
+        picker.resize(520, 270)
+        picker.set_frame_content(pixmap, {}, focused_role="R8")
+        picker.show()
+        self.app.processEvents()
+        edits = []
+        picker.role_bbox_edited.connect(
+            lambda role, bbox: edits.append((role, list(bbox)))
+        )
+
+        QTest.mouseClick(
+            picker, Qt.LeftButton, Qt.ControlModifier, QPoint(260, 135)
+        )
+
+        self.assertEqual(edits[0][0], "R8")
+        self.assertAlmostEqual(edits[0][1][0], 0.39, delta=0.02)
+        self.assertAlmostEqual(edits[0][1][2], 0.61, delta=0.02)
+        self.assertEqual(picker._roles["R8"]["position_source"], "manual_shot_override")
+        picker.close()
+
+    def test_director_cue_preserves_manual_source_role_boxes(self):
+        cue = DirectorCue(
+            "S8", "shot", 1.0, 3.0, "manual person box",
+            source_role_bbox_overrides={"r2": [0.0, 0.1, 0.42, 0.95]},
+        )
+        restored = director_cue_from_mapping(asdict(cue))
+        self.assertEqual(
+            restored.source_role_bbox_overrides,
+            {"R2": [0.0, 0.1, 0.42, 0.95]},
+        )
+
+    def test_source_role_picker_keeps_every_current_role_without_a_valid_bbox(self):
+        window = DirectorCutStudio()
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {
+                    "role_id": "R1",
+                    "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": [0.1, 0.1, 0.3, 0.9],
+                },
+                {
+                    "role_id": "R8",
+                    "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": ["invalid"],
+                },
+                {
+                    "role_id": "R9",
+                    "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": [0.0, 0.0, 1.0, 1.0],
+                    "shot_scan_thumbnail_path": "cropped-role-portrait.png",
+                },
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1", "R8", "R9"],
+            }],
+        })
+        cache = PROJECT_ROOT / ".director_cache" / "all_current_role_boxes_test"
+        cache.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(cache, ignore_errors=True))
+        frame_path = cache / "v1_scene_01_midpoint.png"
+        Image.new("RGB", (200, 100), (25, 30, 35)).save(frame_path)
+        role_frame_path = cache / "r1_best_frame.png"
+        Image.new("RGB", (200, 100), (180, 35, 45)).save(role_frame_path)
+        ledger = parse_source_video_analysis(v1.semantic_enrichment)
+        ledger["principal_roles"][0]["shot_scan_tracks"] = [{
+            "cue_id": "S1",
+            "scene_index": 1,
+            "samples": [{
+                "frame_index": 24,
+                "time_seconds": 1.0,
+                "frame_path": str(role_frame_path),
+                "first_frame_index": 20,
+                "last_frame_index": 28,
+                "bbox_normalized": [0.1, 0.1, 0.3, 0.9],
+                "face_visibility": "front",
+            }],
+        }]
+        ledger["principal_roles"][2]["shot_scan_tracks"] = [{
+            "cue_id": "S1",
+            "scene_index": 1,
+            "samples": [{
+                "frame_index": 24,
+                "time_seconds": 1.0,
+                "frame_path": str(role_frame_path),
+                "first_frame_index": 20,
+                "last_frame_index": 28,
+                "bbox_normalized": [0.0, 0.0, 1.0, 1.0],
+                "face_visibility": "uncertain",
+            }],
+        }]
+        v1.semantic_enrichment = render_source_video_analysis(ledger)
+        window.analysis_paths[v1.node_id] = [
+            ("source scene 01 0.00-5.00s midpoint", frame_path)
+        ]
+
+        payload = window._source_role_picker_for_shot(
+            DirectorCue("S1", "shot", 0.0, 5.0, "three current roles")
+        )
+
+        self.assertEqual(set(payload["roles"]), {"R1"})
+        self.assertEqual(set(payload["role_views"]), {"R1", "R8", "R9"})
+        self.assertNotIn("R8", payload["role_views"]["R8"]["roles"])
+        self.assertNotIn("R9", payload["role_views"]["R9"]["roles"])
+        self.assertFalse(payload["role_views"]["R8"]["has_tracked_bbox"])
+        self.assertFalse(payload["role_views"]["R9"]["has_tracked_bbox"])
+        self.assertEqual(payload["role_views"]["R1"]["frame_index"], 24)
+        self.assertEqual(
+            Path(payload["role_views"]["R1"]["frame_path"]),
+            role_frame_path,
+        )
+        window.project_dirty = False
+        window.close()
+
     def test_remake_engine_toolbar_follows_active_skill_automatically(self):
         window = DirectorCutStudio()
         self.assertEqual(
@@ -141,8 +372,24 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "media_id": "V1",
             "duration_seconds": 5.0,
             "principal_roles": [
-                {"role_id": "R1", "scene_indexes": [1]},
-                {"role_id": "R2", "scene_indexes": [1]},
+                {
+                    "role_id": "R1", "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": [0.0, 0.0, 0.5, 1.0],
+                    "appearance_evidence": [{
+                        "scene_index": 1, "panel": "midpoint",
+                        "thumbnail_bbox_normalized": [0.0, 0.0, 0.5, 1.0],
+                        "face_visibility": "front",
+                    }],
+                },
+                {
+                    "role_id": "R2", "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": [0.5, 0.0, 1.0, 1.0],
+                    "appearance_evidence": [{
+                        "scene_index": 1, "panel": "midpoint",
+                        "thumbnail_bbox_normalized": [0.5, 0.0, 1.0, 1.0],
+                        "face_visibility": "front",
+                    }],
+                },
             ],
             "scenes": [{
                 "scene_index": 1,
@@ -203,8 +450,16 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "media_id": "V1",
             "duration_seconds": 5.0,
             "principal_roles": [
-                {"role_id": "R1", "scene_indexes": [1]},
-                {"role_id": "R2", "scene_indexes": [1]},
+                {
+                    "role_id": "R1",
+                    "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": [0.0, 0.0, 0.5, 1.0],
+                },
+                {
+                    "role_id": "R2",
+                    "scene_indexes": [1],
+                    "thumbnail_bbox_normalized": [0.5, 0.0, 1.0, 1.0],
+                },
             ],
             "scenes": [{
                 "scene_index": 1,
@@ -222,9 +477,16 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(identity_root, ignore_errors=True))
         identity_path = identity_root / "p1.png"
         Image.new("RGB", (96, 96), (35, 120, 190)).save(identity_path)
+        v1_frame = identity_root / "v1_scene_01_midpoint.png"
+        source_image = Image.new("RGB", (200, 100), (220, 30, 30))
+        source_image.paste((30, 210, 40), (100, 0, 200, 100))
+        source_image.save(v1_frame)
         p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
         p1.reference_id = "P1"
         assign_local_media(window.scan, p1, identity_path)
+        window.analysis_paths[v1.node_id] = [
+            ("source scene 01 0.00-5.00s midpoint", v1_frame)
+        ]
         cue = DirectorCue("S1", "shot", 0.0, 5.0, "two people")
         window.director_cues = [cue]
 
@@ -235,23 +497,505 @@ class DirectorTimelineDragTests(unittest.TestCase):
         inspected: list[int] = []
 
         def inspect_identity_dialog(identity_dialog):
+            role_scroll = identity_dialog.findChild(
+                QWidget, "shotIdentityRoleScroll"
+            )
+            buttons = identity_dialog.findChild(QWidget, "shotIdentityButtons")
+            self.assertIsNotNone(role_scroll)
+            self.assertTrue(role_scroll.widgetResizable())
+            self.assertIsNotNone(buttons)
+            self.assertFalse(role_scroll.isAncestorOf(buttons))
+            self.assertEqual(
+                identity_dialog.layout().indexOf(buttons),
+                identity_dialog.layout().count() - 1,
+            )
             current_rows = identity_dialog.findChildren(
                 QWidget, "shotIdentityCurrentRole"
             )
             avatars = identity_dialog.findChildren(
-                QWidget, "shotIdentityCurrentAvatar"
+                QLabel, "shotIdentityCurrentAvatar"
             )
             self.assertEqual(len(current_rows), 2)
             self.assertEqual(len(avatars), 2)
             self.assertTrue(all(not avatar.pixmap().isNull() for avatar in avatars))
+            colors = {
+                avatar.toolTip().split(" · ")[0].split()[-1]:
+                avatar.pixmap().toImage().pixelColor(
+                    avatar.pixmap().width() // 2,
+                    avatar.pixmap().height() // 2,
+                )
+                for avatar in avatars
+            }
+            self.assertGreater(colors["R1"].red(), colors["R1"].green())
+            self.assertGreater(colors["R2"].green(), colors["R2"].red())
+            picker = identity_dialog.findChild(
+                V1PersonPickerWidget, "v1PersonPicker"
+            )
+            self.assertIsNotNone(picker)
+            frame_label = identity_dialog.findChild(
+                QLabel, "v1PersonPickerFrameLabel"
+            )
+            self.assertIsNotNone(frame_label)
+            role_two = next(
+                row for row in current_rows
+                if getattr(row, "role_id", "") == "R2"
+            )
+            role_one_swap = identity_dialog.findChild(
+                QWidget, "shotRoleSwap_R1"
+            )
+            role_two_swap = identity_dialog.findChild(
+                QWidget, "shotRoleSwap_R2"
+            )
+            role_one_swap.setChecked(False)
+            role_two_swap.setChecked(False)
+            QTest.mouseClick(role_two, Qt.LeftButton)
+            self.assertEqual(set(picker._roles), {"R1", "R2"})
+            self.assertEqual(picker._focused_role, "R2")
+            self.assertIn("focused R2", frame_label.text())
+            self.assertFalse(role_one_swap.isChecked())
+            self.assertTrue(role_two_swap.isChecked())
+            QTest.mouseClick(
+                picker, Qt.LeftButton, Qt.ControlModifier, QPoint(130, 135)
+            )
+            self.assertTrue(role_one_swap.isChecked())
+            self.assertTrue(role_two_swap.isChecked())
+            picker.role_selected.emit("R2", False)
+            self.assertFalse(
+                identity_dialog.findChild(QWidget, "shotRoleSwap_R1").isChecked()
+            )
+            self.assertTrue(
+                identity_dialog.findChild(QWidget, "shotRoleSwap_R2").isChecked()
+            )
             inspected.append(len(current_rows))
-            return QDialog.Rejected
+            return QDialog.Accepted
 
         with patch.object(QDialog, "exec", new=inspect_identity_dialog):
             dialog._edit_identity()
         self.assertEqual(inspected, [2])
+        self.assertEqual(dialog.state()["source_role_swap_selection"], ["R2"])
         dialog.close()
         dialog.deleteLater()
+        window.project_dirty = False
+        window.close()
+
+    def test_shot_editor_detects_unbound_v1_people_and_stages_replacement(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [1]},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1", "R2"],
+            }],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+        ]
+        root = PROJECT_ROOT / ".director_cache" / "shot_detect_v1_people_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        p1_path = root / "p1.png"
+        v1_frame = root / "v1_scene.png"
+        Image.new("RGB", (96, 96), (35, 120, 190)).save(p1_path)
+        Image.new("RGB", (160, 90), (180, 90, 45)).save(v1_frame)
+        p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        p1.reference_id = "P1"
+        assign_local_media(window.scan, p1, p1_path)
+        window.analysis_paths[v1.node_id] = [
+            ("source scene 01 0.00-5.00s midpoint", v1_frame)
+        ]
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "two people")
+        window.director_cues = [cue]
+        editor = ShotVisualEditorDialog(cue, 5.0, window)
+        calls = []
+
+        def detect_then_accept(identity_dialog):
+            calls.append(identity_dialog)
+            if len(calls) == 1:
+                button = identity_dialog.findChild(QPushButton, "shotDetectV1People")
+                self.assertIsNotNone(button)
+                button.click()
+                return QDialog.Rejected
+            current_rows = identity_dialog.findChildren(
+                QWidget, "shotIdentityCurrentRole"
+            )
+            self.assertEqual(len(current_rows), 2)
+            return QDialog.Accepted
+
+        def immediate_qwen_scan(item, callback):
+            callback(window._detect_source_roles_for_shot(item), "")
+            return True
+
+        with patch.object(
+            window,
+            "_start_qwen_source_role_scan",
+            side_effect=immediate_qwen_scan,
+        ), patch.object(QDialog, "exec", new=detect_then_accept):
+            editor._edit_identity()
+        detected = next(
+            change for change in editor.identity_changes()
+            if change.get("source_role_id") == "R2"
+        )
+        self.assertTrue(detected["detected_unbound"])
+        self.assertEqual(detected["detected_scene_index"], 1)
+        self.assertEqual(detected["target_reference"], "P1")
+        editor.close()
+        editor.deleteLater()
+        window.project_dirty = False
+        window.close()
+
+    def test_unlock_all_characters_keeps_save_visible_with_many_roles(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        role_ids = [f"R{index}" for index in range(1, 37)]
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": role_id, "scene_indexes": [1]}
+                for role_id in role_ids
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": role_ids,
+            }],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": role_id, "target_media_id": "P1", "scene_indexes": [1]}
+            for role_id in role_ids
+        ]
+        root = PROJECT_ROOT / ".director_cache" / "many_character_dialog_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        p1_path = root / "p1.png"
+        Image.new("RGB", (96, 96), (40, 110, 185)).save(p1_path)
+        p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        p1.reference_id = "P1"
+        assign_local_media(window.scan, p1, p1_path)
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "large cast")
+        window.director_cues = [cue]
+        editor = ShotVisualEditorDialog(cue, 5.0, window)
+
+        def inspect_identity_dialog(identity_dialog):
+            identity_dialog.resize(780, 560)
+            identity_dialog.show()
+            self.app.processEvents()
+            role_scroll = identity_dialog.findChild(
+                QWidget, "shotIdentityRoleScroll"
+            )
+            buttons = identity_dialog.findChild(QWidget, "shotIdentityButtons")
+            self.assertGreater(role_scroll.verticalScrollBar().maximum(), 0)
+            self.assertTrue(buttons.isVisible())
+            button_bottom = buttons.mapTo(
+                identity_dialog, QPoint(0, buttons.height())
+            ).y()
+            self.assertLessEqual(button_bottom, identity_dialog.height())
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", new=inspect_identity_dialog):
+            editor._edit_identity()
+        editor.close()
+        editor.deleteLater()
+        window.project_dirty = False
+        window.close()
+
+    def test_detect_v1_people_queues_every_24fps_shot_frame(self):
+        window = DirectorCutStudio()
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        root = PROJECT_ROOT / ".director_cache" / "qwen_shot_scan_queue_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        source = root / "v1.mp4"
+        source.write_bytes(b"v1")
+        v1.reference_id = "V1"
+        assign_local_media(window.scan, v1, source)
+        cue = DirectorCue("S8", "shot", 17.052, 18.650, "two people")
+        window.director_cues = [cue]
+        writes = []
+        settings = SimpleNamespace(
+            lm_studio_base_url="http://127.0.0.1:1234/v1",
+            lm_studio_model="qwen3.8",
+            timeout=600,
+        )
+        with patch(
+            "director_cut_studio.load_design_settings", return_value=settings
+        ), patch.object(window.media_runner, "is_running", return_value=False), patch.object(
+            window.media_runner, "start", return_value=True
+        ), patch.object(window.media_runner, "write_json", side_effect=writes.append):
+            self.assertTrue(window._start_qwen_source_role_scan(cue, lambda *_: None))
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["operation"], "shot-frame-scan")
+        self.assertEqual(writes[0]["scan_fps"], 24.0)
+        self.assertAlmostEqual(
+            writes[0]["start_seconds"] * 24,
+            round(writes[0]["start_seconds"] * 24),
+            places=4,
+        )
+        self.assertAlmostEqual(
+            writes[0]["end_seconds"] * 24,
+            round(writes[0]["end_seconds"] * 24),
+            places=4,
+        )
+        scan_id = next(iter(window.source_role_scan_states))
+        window._finish_qwen_source_role_scan(scan_id, error="test cleanup")
+        window.project_dirty = False
+        window.close()
+
+    def test_qwen_shot_scan_reuses_new_role_across_frame_batches(self):
+        window = DirectorCutStudio()
+        root = PROJECT_ROOT / ".director_cache" / "qwen_shot_scan_merge_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        first = root / "frame_000000.jpg"
+        second = root / "frame_000032.jpg"
+        Image.new("RGB", (160, 90), (180, 80, 40)).save(first)
+        Image.new("RGB", (160, 90), (175, 78, 42)).save(second)
+        state = {
+            "cache_dir": root,
+            "known_roles": {
+                "R1": {"role_id": "R1", "visual_identity": "existing woman"}
+            },
+            "detected_roles": {},
+            "next_role_number": 2,
+            "frames_by_index": {
+                0: {"path": str(first), "time_seconds": 0.0},
+                32: {"path": str(second), "time_seconds": 32 / 24},
+            },
+        }
+        window._merge_qwen_source_role_batch(state, {
+            "people": [{
+                "matched_role_id": "",
+                "visual_identity": "older man with grey hair",
+                "wardrobe": "dark coat",
+                "first_frame_index": 0,
+                "last_frame_index": 0,
+                "best_frame_index": 0,
+                "bbox_normalized": [0.2, 0.1, 0.8, 0.95],
+                "face_visibility": "front",
+                "confidence": "high",
+            }],
+        })
+        self.assertIn("R2", state["known_roles"])
+        self.assertTrue(Path(
+            state["known_roles"]["R2"]["shot_scan_thumbnail_path"]
+        ).is_file())
+        window._merge_qwen_source_role_batch(state, {
+            "people": [{
+                # Qwen occasionally leaves this empty in every new time batch.
+                # Studio must still reuse R2 instead of allocating R3/R4/R5.
+                "matched_role_id": "",
+                "visual_identity": "same older man",
+                "wardrobe": "dark coat",
+                "first_frame_index": 32,
+                "last_frame_index": 32,
+                "best_frame_index": 32,
+                "bbox_normalized": [0.22, 0.1, 0.82, 0.95],
+                "face_visibility": "three-quarter",
+                "confidence": "high",
+            }],
+        })
+        self.assertEqual(set(state["detected_roles"]), {"R2"})
+        self.assertEqual(state["next_role_number"], 3)
+        self.assertEqual(state["detected_roles"]["R2"]["first_frame_index"], 0)
+        self.assertEqual(state["detected_roles"]["R2"]["last_frame_index"], 32)
+        self.assertEqual(
+            [
+                row["frame_index"]
+                for row in state["detected_roles"]["R2"]["track_samples"]
+            ],
+            [0, 32],
+        )
+        state["known_roles"]["R3"] = {
+            "role_id": "R3",
+            "visual_identity": "same older man",
+            "wardrobe": "dark coat",
+            "shot_scan_thumbnail_path": str(second),
+        }
+        state["next_role_number"] = 4
+        window._merge_qwen_source_role_batch(state, {
+            "people": [{
+                "matched_role_id": "R3",
+                "visual_identity": "same older man",
+                "wardrobe": "dark coat",
+                "first_frame_index": 32,
+                "last_frame_index": 32,
+                "best_frame_index": 32,
+                "bbox_normalized": [0.22, 0.1, 0.82, 0.95],
+                "face_visibility": "three-quarter",
+                "confidence": "high",
+            }],
+        })
+        self.assertEqual(set(state["detected_roles"]), {"R2"})
+        self.assertEqual(state["role_aliases"], {"R3": "R2"})
+        window.project_dirty = False
+        window.close()
+
+    def test_completed_shot_scan_removes_confirmed_legacy_duplicate_role(self):
+        window = DirectorCutStudio()
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        root = PROJECT_ROOT / ".director_cache" / "shot_scan_alias_cleanup_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        portrait = root / "same_person.png"
+        Image.new("RGB", (96, 96), (165, 75, 40)).save(portrait)
+        duplicate_role = {
+            "visual_identity": "older man with grey hair",
+            "wardrobe": "dark coat",
+            "narrative_function": "Shot-local Qwen detected V1 person",
+            "scene_indexes": [1],
+            "shot_scan_thumbnail_path": str(portrait),
+        }
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": "R2", **duplicate_role},
+                {"role_id": "R3", **duplicate_role},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R2", "R3"],
+            }],
+        })
+        window.source_video_role_bindings = [{
+            "source_role_id": "R3",
+            "target_media_id": "P1",
+            "scene_indexes": [1],
+        }]
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "same person duplicated")
+        window.director_cues = [cue]
+        scan_id = "source-role-scan:test"
+        detected = {
+            "role_id": "R2",
+            **duplicate_role,
+            "first_frame_index": 0,
+            "last_frame_index": 48,
+            "best_frame_index": 0,
+            "face_visibility": "front",
+            "confidence": "high",
+        }
+        window.source_role_scan_states[scan_id] = {
+            "cue_id": "S1",
+            "asset": v1,
+            "known_roles": {
+                "R2": dict(detected),
+                "R3": {"role_id": "R3", **duplicate_role},
+            },
+            "detected_roles": {"R2": detected},
+            "role_aliases": {},
+        }
+        with patch.object(window, "_finish_qwen_source_role_scan"):
+            window._complete_qwen_source_role_scan(scan_id)
+        ledger = parse_source_video_analysis(v1.semantic_enrichment)
+        self.assertEqual(
+            [row["role_id"] for row in ledger["principal_roles"]], ["R2"]
+        )
+        self.assertEqual(ledger["scenes"][0]["active_source_roles"], ["R2"])
+        self.assertEqual(
+            window.source_video_role_bindings[0]["source_role_id"], "R2"
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_detected_v1_person_is_saved_into_the_shot_swap_pass(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [1]},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1"],
+            }],
+        })
+        p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        p1.reference_id = "P1"
+        window.source_video_role_bindings = [{
+            "source_role_id": "R1",
+            "target_media_id": "P1",
+            "scene_indexes": [1],
+        }]
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "two people")
+        window.director_cues = [cue]
+
+        class AcceptedDetectedPersonEditor:
+            pending_qwen_request = None
+            pending_navigation_cue_id = ""
+
+            def __init__(self, item, _duration, _parent):
+                self.item = item
+
+            def exec(self):
+                return QDialog.Accepted
+
+            def deleteLater(self):
+                return None
+
+            def state(self):
+                return asdict(self.item)
+
+            def repair_scope(self):
+                return "shot_only"
+
+            def identity_changes(self):
+                return [{
+                    "source_reference": "P1",
+                    "target_reference": "P1",
+                    "scope": "shot_only",
+                    "target_direction": "",
+                    "source_role_id": "R2",
+                    "detected_unbound": True,
+                    "detected_scene_index": 1,
+                    "activate_source_role": True,
+                }]
+
+        with patch(
+            "director_cut_studio.ShotVisualEditorDialog",
+            AcceptedDetectedPersonEditor,
+        ):
+            window.edit_director_cue(cue)
+
+        self.assertEqual(cue.source_role_identity_overrides.get("R2"), "P1")
+        self.assertTrue(any(
+            row.get("source_role_id") == "R2"
+            and row.get("target_media_id") == "P1"
+            and row.get("scene_indexes") == [1]
+            for row in window.source_video_role_bindings
+        ))
+        updated = parse_source_video_analysis(v1.semantic_enrichment)
+        self.assertIn("R2", updated["scenes"][0]["active_source_roles"])
+        passes = window._source_remake_character_pass_specs(0.0, 5.0)
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0]["target_media_id"], "P1")
+        self.assertEqual(passes[0]["source_role_ids"], ["R1", "R2"])
         window.project_dirty = False
         window.close()
 
@@ -286,6 +1030,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         first = DirectorCue(
             "S1", "shot", 0.0, 5.0, "first",
             source_role_identity_overrides={"R1": "P2"},
+            source_role_bbox_overrides={"R1": [0.05, 0.15, 0.4, 0.9]},
         )
         second = DirectorCue("S2", "shot", 5.0, 10.0, "second")
         window.director_cues = [first, second]
@@ -295,8 +1040,61 @@ class DirectorTimelineDragTests(unittest.TestCase):
 
         self.assertEqual(first_passes[0]["target_media_id"], "P2")
         self.assertEqual(second_passes[0]["target_media_id"], "P1")
+        self.assertEqual(
+            first_passes[0]["source_roles"][0]["source_bbox_normalized"],
+            [0.05, 0.15, 0.4, 0.9],
+        )
+        self.assertNotEqual(
+            second_passes[0]["source_roles"][0]["source_bbox_normalized"],
+            [0.05, 0.15, 0.4, 0.9],
+        )
         reloaded = director_cue_from_mapping(asdict(first))
         self.assertEqual(reloaded.source_role_identity_overrides, {"R1": "P2"})
+        self.assertEqual(
+            reloaded.source_role_bbox_overrides,
+            {"R1": [0.05, 0.15, 0.4, 0.9]},
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_clicked_source_role_selection_is_local_and_filters_swap_passes(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [1]},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1", "R2"],
+            }],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+            {"source_role_id": "R2", "target_media_id": "P2", "scene_indexes": [1]},
+        ]
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 5.0, "two people",
+            source_role_swap_selection=["R2"],
+        )
+        window.director_cues = [cue]
+
+        passes = window._source_remake_character_pass_specs(0.0, 5.0)
+
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0]["source_role_ids"], ["R2"])
+        self.assertEqual(passes[0]["target_media_id"], "P2")
+        reloaded = director_cue_from_mapping(asdict(cue))
+        self.assertEqual(reloaded.source_role_swap_selection, ["R2"])
         window.project_dirty = False
         window.close()
 
@@ -7758,6 +8556,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.accept_preview_button,
             window.reject_preview_button,
             window.resource_estimate_button,
+            window.h3_cache_usage_label,
         ]
         positions = [widgets.index(widget) for widget in ordered]
         self.assertEqual(positions, sorted(positions))
@@ -7770,6 +8569,40 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(window.accept_preview_button.text(), "ACCEPT 1.0M")
         self.assertEqual(window.reject_preview_button.text(), "REJECT")
         self.assertEqual(window.resource_estimate_button.text(), "ESTIMATE")
+        self.assertEqual(
+            window.h3_cache_usage_label.text(),
+            "CACHE …/100GB | VRAM … | DRAM … | GPU … | CPU …",
+        )
+        window._apply_h3_relay_cache_status({
+            "ok": True,
+            "used_bytes": 75 * 1024**3,
+            "file_count": 12,
+            "cache_path": r"D:\ComfyUI\output\__h3_removal_cache",
+            "breakdown_bytes": {"windows": 74 * 1024**3},
+            "resources": {
+                "gpu_name": "NVIDIA Test GPU",
+                "vram_percent": 62.4,
+                "vram_used_bytes": 10 * 1024**3,
+                "vram_total_bytes": 16 * 1024**3,
+                "dram_percent": 51.2,
+                "dram_used_bytes": 32 * 1024**3,
+                "dram_total_bytes": 64 * 1024**3,
+                "gpu_percent": 84.0,
+                "cpu_percent": 27.0,
+            },
+        })
+        self.assertEqual(
+            window.h3_cache_usage_label.text(),
+            "CACHE 75.0/100GB | VRAM 62% | DRAM 51% | GPU 84% | CPU 27%",
+        )
+        self.assertIn("#ffc46b", window.h3_cache_usage_label.styleSheet())
+        self.assertIn("windows: 74.00 GB", window.h3_cache_usage_label.toolTip())
+        self.assertIn("NVIDIA Test GPU", window.h3_cache_usage_label.toolTip())
+        self.assertIn("10.00 / 16.00 GB", window.h3_cache_usage_label.toolTip())
+        self.assertIn(
+            r"D:\ComfyUI\output\__h3_removal_cache",
+            window.h3_cache_usage_label.toolTip(),
+        )
         window.clip_start.setValue(0.0)
         window.clip_end.setMaximum(120.0)
         window.clip_end.setValue(15.0)
@@ -7805,8 +8638,14 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.generation_overflow_toolbar.widgetForAction(action)
             for action in window.generation_overflow_toolbar.actions()
         ]
-        self.assertIn(window.preview_button, overflow_widgets)
-        self.assertIn(window.resource_estimate_button, overflow_widgets)
+        overflow_widgets_2 = [
+            window.generation_overflow_toolbar_2.widgetForAction(action)
+            for action in window.generation_overflow_toolbar_2.actions()
+        ]
+        wrapped_widgets = overflow_widgets + overflow_widgets_2
+        self.assertIn(window.preview_button, wrapped_widgets)
+        self.assertIn(window.resource_estimate_button, wrapped_widgets)
+        self.assertIn(window.h3_cache_usage_label, wrapped_widgets)
         primary_widgets = [
             window.generation_toolbar.widgetForAction(action)
             for action in window.generation_toolbar.actions()
@@ -7830,14 +8669,23 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.accept_preview_button,
             window.reject_preview_button,
             window.resource_estimate_button,
+            window.h3_cache_usage_label,
         ]
-        combined = [widget for widget in primary_widgets + overflow_widgets if widget in expected]
+        combined = [
+            widget for widget in primary_widgets + overflow_widgets + overflow_widgets_2
+            if widget in expected
+        ]
         self.assertEqual(combined, expected)
-        for toolbar in (window.generation_toolbar, window.generation_overflow_toolbar):
+        for toolbar in (
+            window.generation_toolbar,
+            window.generation_overflow_toolbar,
+            window.generation_overflow_toolbar_2,
+        ):
             native_more = toolbar.findChild(QToolButton, "qt_toolbar_ext_button")
             self.assertFalse(native_more and native_more.isVisible())
         self.app.sendEvent(window.generation_toolbar, QEvent(QEvent.Leave))
         self.app.sendEvent(window.generation_overflow_toolbar, QEvent(QEvent.Leave))
+        self.app.sendEvent(window.generation_overflow_toolbar_2, QEvent(QEvent.Leave))
         self.app.processEvents()
         self.assertTrue(window.generation_overflow_toolbar.isVisible())
         for widget in (
@@ -7847,6 +8695,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.storyboard_button,
             window.preview_button,
             window.resource_estimate_button,
+            window.h3_cache_usage_label,
         ):
             self.assertTrue(widget.property("generation_hover_help"))
             self.assertIn("<b>", widget.toolTip())

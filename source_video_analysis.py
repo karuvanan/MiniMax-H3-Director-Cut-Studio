@@ -20,6 +20,159 @@ SOURCE_VIDEO_QWEN_ANALYSIS_MARKER_RE = re.compile(
 )
 
 
+SOURCE_VIDEO_SHOT_PEOPLE_SCAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["media_id", "shot_id", "batch_index", "people"],
+    "properties": {
+        "media_id": {"type": "string"},
+        "shot_id": {"type": "string"},
+        "batch_index": {"type": "integer"},
+        "people": {
+            "type": "array",
+            "maxItems": 24,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "matched_role_id", "visual_identity", "wardrobe",
+                    "first_frame_index", "last_frame_index", "best_frame_index",
+                    "bbox_normalized", "face_visibility", "confidence",
+                ],
+                "properties": {
+                    "matched_role_id": {"type": "string"},
+                    "visual_identity": {"type": "string", "maxLength": 240},
+                    "wardrobe": {"type": "string", "maxLength": 180},
+                    "first_frame_index": {"type": "integer"},
+                    "last_frame_index": {"type": "integer"},
+                    "best_frame_index": {"type": "integer"},
+                    "bbox_normalized": {
+                        "type": "array", "items": {"type": "number"},
+                        "minItems": 4, "maxItems": 4,
+                    },
+                    "face_visibility": {"type": "string", "maxLength": 48},
+                    "confidence": {"type": "string", "maxLength": 40},
+                },
+            },
+        },
+    },
+}
+
+
+SOURCE_VIDEO_SHOT_PEOPLE_SCAN_SYSTEM_PROMPT = """You are performing a forensic, Shot-local people scan for Source Video Cast Remake H3.
+
+The attached chronological contact sheets contain every 24fps V1 relay frame in this batch; no frame may be skipped. Every panel label gives an absolute frame index and source time. If a cast-reference sheet is attached, its labelled portraits define the current stable R1, R2, R3 role ledger, including roles discovered by earlier batches.
+
+Read every frame left-to-right and top-to-bottom. Detect every physically visible person, including brief entrances, partial faces and background people whose head/body is actually visible. Consolidate repeated appearances of one person into one people row for this batch. Use face, hair, clothing, body, screen trajectory and adjacent-frame continuity together. Do not count posters, reflections, phone screens, statues or printed faces as people unless a real physical performer is visibly present.
+
+Identity is global across the whole Shot, not per frame, second or batch. A performer who remains visible or reappears must have one people row per batch and must reuse the same matched_role_id from the cast-reference sheet even when pose, expression, scale, lighting or camera angle changes. Never create a new identity merely because time advanced. Set matched_role_id to an existing R role whenever face, hair, clothing, body and motion continuity identify that performer. Only leave it empty for a genuinely new physical person not represented by any known R portrait. Studio will allocate one new R role and add its portrait to the next batch's cast-reference sheet. Never invent P mappings. For each person, report the first and last absolute frame indexes in this batch, choose the clearest best frame, and return a tight normalized [left, top, right, bottom] crop around face, hair and a little shoulder context in that single best-frame panel. When no readable face exists, crop the visible head/upper body and say so in face_visibility.
+
+A performer cut off by the left, right, top or bottom frame edge is still a valid principal person and must be detected. Fit bbox_normalized tightly to only the visible pixels. When the person is clipped by an edge, the corresponding coordinate may be exactly 0 or 1, while the opposite coordinate must stop at the actual visible silhouette. Never expand a partial person to the complete panel. Never return [0,0,1,1] as an uncertainty fallback; use the best tight visible head/upper-body crop instead.
+
+Return JSON only and match the supplied schema exactly."""
+
+
+def build_source_video_shot_people_scan_prompts(
+    *,
+    media_id: str,
+    shot_id: str,
+    batch_index: int,
+    frame_indexes: list[int],
+    known_roles: list[Mapping[str, Any]],
+) -> tuple[str, str]:
+    role_rows = [
+        {
+            "role_id": str(row.get("role_id", "")).strip().upper(),
+            "visual_identity": _plain(row.get("visual_identity"), 160),
+            "wardrobe": _plain(row.get("wardrobe"), 120),
+        }
+        for row in known_roles
+        if re.fullmatch(r"R[1-9][0-9]*", str(row.get("role_id", "")).strip().upper())
+    ]
+    payload = {
+        "task": "Scan every labelled V1 relay frame and enumerate all visible people.",
+        "media_id": str(media_id).strip().upper(),
+        "shot_id": str(shot_id).strip(),
+        "batch_index": int(batch_index),
+        "absolute_frame_indexes": [int(value) for value in frame_indexes],
+        "known_role_ledger": role_rows,
+    }
+    return (
+        SOURCE_VIDEO_SHOT_PEOPLE_SCAN_SYSTEM_PROMPT,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def normalize_source_video_shot_people_scan(
+    payload: Mapping[str, Any] | str,
+    *,
+    expected_media_id: str,
+    expected_shot_id: str,
+    expected_batch_index: int,
+    valid_frame_indexes: set[int],
+) -> dict[str, Any]:
+    source = _decode(payload)
+    media_id = str(source.get("media_id", "")).strip().upper()
+    shot_id = str(source.get("shot_id", "")).strip()
+    try:
+        batch_index = int(source.get("batch_index", -1))
+    except (TypeError, ValueError, OverflowError):
+        batch_index = -1
+    if media_id != str(expected_media_id).strip().upper():
+        raise ValueError("Qwen Shot scan returned the wrong media_id")
+    if shot_id != str(expected_shot_id).strip():
+        raise ValueError("Qwen Shot scan returned the wrong shot_id")
+    if batch_index != int(expected_batch_index):
+        raise ValueError("Qwen Shot scan returned the wrong batch_index")
+    valid = {int(value) for value in valid_frame_indexes}
+    people: list[dict[str, Any]] = []
+    for row in source.get("people") or []:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            first = int(row.get("first_frame_index", -1))
+            last = int(row.get("last_frame_index", -1))
+            best = int(row.get("best_frame_index", -1))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if first not in valid or last not in valid or best not in valid:
+            continue
+        first, last = min(first, last), max(first, last)
+        raw_bbox = row.get("bbox_normalized") or []
+        try:
+            bbox = [min(1.0, max(0.0, float(value))) for value in raw_bbox[:4]]
+        except (TypeError, ValueError):
+            bbox = []
+        if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            bbox = []
+        # Older Qwen responses used a full-panel rectangle to mean "person
+        # localization uncertain". It is not a usable actor position: Relay
+        # may insert the replacement into empty space rather than transform the
+        # visible person. Preserve the identity row but discard this sentinel.
+        if bbox == [0.0, 0.0, 1.0, 1.0]:
+            bbox = []
+        role = str(row.get("matched_role_id", "")).strip().upper()
+        if not re.fullmatch(r"R[1-9][0-9]*", role):
+            role = ""
+        people.append({
+            "matched_role_id": role,
+            "visual_identity": _plain(row.get("visual_identity"), 240),
+            "wardrobe": _plain(row.get("wardrobe"), 180),
+            "first_frame_index": first,
+            "last_frame_index": last,
+            "best_frame_index": best,
+            "bbox_normalized": [round(value, 5) for value in bbox],
+            "face_visibility": _plain(row.get("face_visibility"), 48),
+            "confidence": _plain(row.get("confidence"), 40),
+        })
+    return {
+        "media_id": media_id,
+        "shot_id": shot_id,
+        "batch_index": batch_index,
+        "people": people,
+    }
+
+
 SOURCE_VIDEO_DIRECTOR_ANALYSIS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -168,7 +321,7 @@ Return exactly one compact JSON object matching the supplied schema. Copy media_
 
 Track recurring source people with stable neutral role IDs R1, R2, R3 and so on. Use clothing, face, body, screen position and adjacent-shot continuity together. Do not identify real people. Do not map roles to P1-P4; that happens later.
 
-For every principal role, appearance_evidence must contain exactly one record for every scene_index in which that role appears. For each appearance choose the early, late or midpoint panel from that exact source interval where the role's face is largest and clearest. Return a tight approximately square normalized [left, top, right, bottom] crop around the face, hair and a small amount of shoulders. The coordinates are relative to the CONTENT OF THAT ONE LABELLED PANEL, not the complete contact sheet: [0,0] is the upper-left pixel inside the selected panel image and [1,1] is its lower-right pixel. Exclude the contact-sheet label, borders, neighbouring panels and background wherever possible. Never return a thin strip, a door, wall or full-body box when a readable face exists. face_visibility must briefly state front, three-quarter, profile, occluded or not-readable.
+For every principal role, appearance_evidence must contain exactly one record for every scene_index in which that role appears. For each appearance choose the early, late or midpoint panel from that exact source interval where the role's face is largest and clearest. A principal performer whose face or body is cropped by a frame edge still counts as visible. Return a tight approximately square normalized [left, top, right, bottom] crop around the visible face, hair and a small amount of shoulders. The coordinates are relative to the CONTENT OF THAT ONE LABELLED PANEL, not the complete contact sheet: [0,0] is the upper-left pixel inside the selected panel image and [1,1] is its lower-right pixel. When a face is clipped by an edge, let that crop coordinate touch 0 or 1 and bound the opposite side tightly around the visible performer. Exclude the contact-sheet label, borders, neighbouring panels and background wherever possible. Never return a thin strip, a door, wall, full-body box when a readable face exists, or [0,0,1,1] as an uncertainty fallback. face_visibility must briefly state front, three-quarter, profile, edge-cropped, occluded or not-readable.
 
 Also select the clearest appearance as representative_scene_index, representative_panel and thumbnail_bbox_normalized. Those representative coordinates obey the same single-panel coordinate system. Every crop is analysis UI evidence; only when the user explicitly chooses Keep original V1 face may Studio materialize the representative crop as a new P identity reference for H3.
 

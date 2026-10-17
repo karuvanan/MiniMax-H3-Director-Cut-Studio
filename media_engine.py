@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shutil
 from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
@@ -298,6 +299,98 @@ def create_video_analysis_frames(
                 image.save(destination, format="JPEG", quality=90, optimize=True)
         frames.append((f"{label} @ {seconds:.2f}s", destination))
     return frames
+
+
+def create_video_shot_frame_scan(
+    path: str | Path,
+    destination_dir: str | Path,
+    start_seconds: float,
+    end_seconds: float,
+    runtime: RuntimePaths | None = None,
+    *,
+    scan_fps: float = 24.0,
+    max_frames: int = 720,
+) -> list[dict[str, Any]]:
+    """Decode every H3/V1 relay frame inside one authored Shot.
+
+    Source Video Cast Remake renders against a 24fps V1 relay plate, so this
+    intentionally scans every frame on that same clock rather than sparsely
+    sampling the Shot.  A hard ceiling fails visibly instead of silently
+    dropping frames; unusually long Shots should be split before analysis.
+    """
+
+    runtime = runtime or load_runtime_paths()
+    source = Path(path)
+    start = max(0.0, float(start_seconds or 0.0))
+    end = max(start + 1.0 / max(1.0, scan_fps), float(end_seconds or 0.0))
+    fps = max(1.0, min(60.0, float(scan_fps or 24.0)))
+    expected = max(1, int(round((end - start) * fps)))
+    ceiling = max(1, int(max_frames))
+    if expected > ceiling:
+        raise ValueError(
+            f"Shot contains {expected} relay frames; the per-Shot Qwen scan limit "
+            f"is {ceiling}. Split the Shot before DETECT V1 PEOPLE."
+        )
+    destination = Path(destination_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    manifest = destination / "manifest.json"
+    signature = {
+        "source": str(source.resolve()),
+        "mtime_ns": source.stat().st_mtime_ns,
+        "start_seconds": round(start, 6),
+        "end_seconds": round(end, 6),
+        "scan_fps": round(fps, 6),
+    }
+    if manifest.is_file():
+        try:
+            cached = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            cached = {}
+        cached_rows = cached.get("frames") or []
+        if cached.get("signature") == signature and cached_rows and all(
+            Path(str(row.get("path", ""))).is_file()
+            for row in cached_rows if isinstance(row, dict)
+        ):
+            return [dict(row) for row in cached_rows if isinstance(row, dict)]
+    for stale in destination.glob("frame_*.jpg"):
+        stale.unlink(missing_ok=True)
+    result = _run(
+        [
+            str(runtime.ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source), "-ss", f"{start:.6f}", "-t", f"{end - start:.6f}",
+            "-map", "0:v:0", "-an",
+            "-vf", f"fps={fps:.6f},scale=768:-2:force_original_aspect_ratio=decrease",
+            "-q:v", "3", "-start_number", "0",
+            str(destination / "frame_%06d.jpg"),
+        ],
+        timeout=max(45, round((end - start) * 8)),
+    )
+    files = sorted(destination.glob("frame_*.jpg"))
+    if result.returncode or not files:
+        raise RuntimeError(result.stderr.strip() or "Unable to decode Shot frames")
+    if len(files) > ceiling:
+        for extra in files[ceiling:]:
+            extra.unlink(missing_ok=True)
+        raise ValueError(
+            f"Shot decoded to more than {ceiling} relay frames. Split the Shot "
+            "before DETECT V1 PEOPLE."
+        )
+    rows = [
+        {
+            "frame_index": index,
+            "time_seconds": round(start + index / fps, 6),
+            "label": f"frame {index:04d} · {start + index / fps:.3f}s",
+            "path": str(frame.resolve()),
+        }
+        for index, frame in enumerate(files)
+    ]
+    temporary = manifest.with_suffix(".writing.json")
+    temporary.write_text(
+        json.dumps({"signature": signature, "frames": rows}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    shutil.move(str(temporary), str(manifest))
+    return rows
 
 
 def create_labeled_contact_sheet(

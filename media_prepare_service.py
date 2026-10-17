@@ -14,6 +14,7 @@ from media_engine import (
     create_audio_waveform,
     create_image_analysis_regions,
     create_video_analysis_frames,
+    create_video_shot_frame_scan,
     detect_video_scene_changes,
     human_probe_summary,
     probe_media,
@@ -48,6 +49,25 @@ def main() -> int:
             job = json.loads(raw)
             source = Path(job["media"]).resolve()
             operation = job.get("operation", "prepare")
+            if operation == "shot-frame-scan":
+                destination = Path(job["destination"])
+                _emit({"job": job["job"], "progress": 0.08, "stage": "decoding every V1 Shot frame"})
+                frames = create_video_shot_frame_scan(
+                    source,
+                    destination,
+                    float(job.get("start_seconds", 0.0) or 0.0),
+                    float(job.get("end_seconds", 0.0) or 0.0),
+                    runtime,
+                    scan_fps=float(job.get("scan_fps", 24.0) or 24.0),
+                    max_frames=int(job.get("max_frames", 720) or 720),
+                )
+                _emit({
+                    "job": job["job"],
+                    "progress": 1.0,
+                    "stage": "ready",
+                    "result": {"frames": frames, "frame_count": len(frames)},
+                })
+                continue
             if operation == "audio-pan":
                 timeline_seconds = max(0.05, float(job.get("timeline_seconds", 60.0)))
                 pan = max(-1.0, min(1.0, float(job.get("pan", 0.0))))

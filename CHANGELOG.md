@@ -2,6 +2,163 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.7-alpha.11] - 2026-10-17
+
+### Configurable H3 Server Status Tray
+
+- Tray右键菜单新增`Settings...`设定页，可调整2–300秒刷新间隔、监听的ComfyUI URL／IP，以及H3 Relay Cache目录。
+- IP可直接填写`192.168.0.185:8189`，Tray会自动补上`http://`；储存后立即更新API endpoint及轮询Timer，不需要重启Tray。
+- Cache设定同时写入Tray的`tray-settings.json`及ComfyUI custom node的`status-settings.json`；Server API每次请求都会解析设定，Studio与Tray会共同统计新目录，而且换目录时自动丢弃旧路径的30秒统计缓存。
+- Server API现在回传实际`cache_path`与目录是否存在；Studio资源Tooltip显示真正监听路径，不再固定显示默认目录。
+- 安装器会初始建立两份设定并保存custom node设定位置。App版本升级至`0.3.7-alpha.11`；Project Format保持`28`，Render Policy保持`38`。
+
+### Verification
+
+- 自订Cache路径、错误JSON后备、Studio实际路径Tooltip、Tray／Installer PowerShell语法、Python编译及既有资源监控回归测试通过。
+
+## [0.3.7-alpha.10] - 2026-10-17
+
+### H3 Server Status Tray and Live Resource Meter
+
+- `install_h3_cache_status_server.bat`现在同时安装ComfyUI只读状态API与Windows Tray监控器；Tray以隐藏PowerShell／WinForms进程运行、建立登录自启动捷径，并用Mutex避免重复图标。
+- Tray每5秒显示Cache、VRAM、DRAM、GPU、CPU，可右键即时刷新、打开ComfyUI、打开`__h3_removal_cache`或退出；双击图标直接打开ComfyUI。高负载时图标会切换为Warning／Error。
+- Server API新增CPU与整机DRAM，以及最繁忙NVIDIA GPU的利用率、VRAM容量与百分比；只返回汇总资源，不返回进程、文件名或用户资料。缺少`psutil`或`nvidia-smi`时对应项目返回`N/A`而不伪造0%。
+- Studio的`ESTIMATE`右侧扩展为`CACHE …/100GB | VRAM … | DRAM … | GPU … | CPU …`，每5秒刷新并以Tooltip显示显卡名称、VRAM／DRAM实际容量及Cache细目。
+- Cache目录递归统计在Server缓存30秒，因此频繁资源刷新不会反复扫描数十GB的H3 Relay Cache。
+- 安装脚本第二参数可指定Tray访问的ComfyUI URL，例如`install_h3_cache_status_server.bat "D:\ComfyUI" "http://192.168.0.185:8189"`。
+- App版本升级至`0.3.7-alpha.10`；Project Format保持`28`，Render Policy保持`38`。
+
+### Verification
+
+- Cache计量、双GPU选择、VRAM／GPU CSV解析、CPU／DRAM采集、Studio资源标签、工具栏顺序、Python编译及PowerShell Tray／Installer语法检查通过。
+
+## [0.3.7-alpha.9] - 2026-10-17
+
+### Editable V1 Character Boxes
+
+- `Shot Visual Editor → Character → Unlock All Characters`的人物框现在可以直接拖拽移动，四边及四角可独立缩放；选中或聚焦框显示可见控制点及对应Resize鼠标指针。
+- 聚焦一张`CURRENT ROLE`卡后，可在V1画面空白处`Ctrl+点击`加入默认人物框，也可`Ctrl+拖拽`直接画出所需范围，解决半脸、贴边或Qwen漏框人物无法定位的问题。
+- `Ctrl+点击`已有框继续用于加入／移除多角色SWAP选择；重叠框循环选择及同排SWAP联动保持不变。
+- 新增Shot-local `source_role_bbox_overrides`：手动框随Project保存、Undo/Redo并在重开Project后恢复；Character Swap编译时优先使用手动框并移除冲突的旧Qwen轨迹锚点。
+- 手动框只影响当前Shot，不传播到邻近Shot。Render Policy升级至`38`，Director Project Format升级至`28`；Format 27及更早Project会自动以空手动框载入。
+
+### Verification
+
+- 人物框移动、边缘缩放、Current Role后Ctrl新增、坐标保存／重载、Shot隔离、Character Swap Prompt覆盖及既有点击／Ctrl多选回归测试通过。
+
+## [0.3.7-alpha.8] - 2026-10-17
+
+### Edge-Cropped Character Swap
+
+- 修复半脸、半身或贴着V1画面边缘的人物无法被真正替换的问题。实际案例中Character Swap Pass已经执行，但旧扫描把R2位置保存为整屏`[0,0,1,1]`，Relay因而在画面另一边新增P角色并保留原演员。
+- 逐帧Qwen人物扫描现在明确识别四边裁切人物，并要求bbox紧贴实际可见脸／上半身；禁止用整屏框代表“不确定位置”。
+- Studio、人物框UI及Character Swap编译统一拒绝整屏假框；身份记录仍会保留，不会因为没有可靠bbox而删除Current Role。
+- 单人Shot新增强制原位替换契约：锁定唯一现有前景人物，保留原始贴边裁切、位置、比例、动作、遮挡及口型；禁止补全被裁掉的身体、移动到空白区域、保留原演员或新增第二个人。
+- 多人Shot继续使用每名演员的有效24fps轨迹框；Current Role、同排SWAP联动及`Ctrl+点击`多选行为保持不变。
+- Render Policy升级至`37`，旧Project无需迁移；受影响Segment重新执行`Regenerate Dirty`即可使用新版Character Swap Prompt。
+
+### Verification
+
+- Character Swap单人贴边回归、整屏bbox拒绝、多人空间框、逐帧扫描标准化、Current Role无可靠bbox后备及Python编译检查通过。
+
+## [0.3.7-alpha.7] - 2026-10-17
+
+### Current Role SWAP Coupling and Accurate Person Boxes
+
+- 点击`CURRENT ROLE · V1 SOURCE`卡时，现在会自动勾选同一排的`SWAP`并启用对应`REPLACE WITH`，但不会取消其他已经选择的角色。
+- 修复人物框覆盖整个V1画面的根因：逐帧扫描保存的角色头像已经是裁剪图，其`[0,0,1,1]`只代表整张头像；旧逻辑却把它投影回完整V1帧。新版只接受原始V1帧轨迹bbox或非全尺寸Scene证据，绝不再把裁剪头像坐标当整屏人物框。
+- 点击Current Role切换到角色专属帧后，会同时装载该帧内所有实际可见且具有可靠bbox的人物；因此可以继续`Ctrl+点击`其他人物框加入新角色。无可靠位置的角色仍保留Current Role卡和画面导航，但明确显示`run DETECT V1 PEOPLE`，不再画假框。
+- Project Format保持`27`；旧Project无需迁移。
+
+### Verification
+
+- Current Role同排SWAP联动、同帧多人框保留、Ctrl多选、裁剪头像全屏bbox拒绝、角色专属换帧、无bbox后备提示及Studio编译专项测试通过。
+
+## [0.3.7-alpha.6] - 2026-10-17
+
+### Current Role Driven V1 Frame Navigation
+
+- `Shot Visual Editor → Character → Unlock All Characters`的每张`CURRENT ROLE · V1 SOURCE`卡现在可以点击；点击R角色会自动把上方V1画面切换到该角色在本Shot内最适合辨认的24fps轨迹帧。
+- 最佳帧优先采用真实存在的逐帧图像、正面／四分之三脸、较大的有效人物框，再以接近Shot中点作为排序依据；预览下方同步显示实际V1帧号、时间点和当前聚焦R角色。
+- 聚焦画面只显示该Current Role的独立位置框，并以黄色高亮；Current Role卡同步显示黄色边框。该动作只用于查看与定位，不会勾选／取消`SWAP`、不会更改`REPLACE WITH`，也不会把Shot标记为dirty。
+- 初次打开仍显示整个Shot的所有Current Role框；重复点击画面上的重叠框、`Ctrl+点击`多选及24fps位置轨迹规则保持不变。
+- Project Format保持`27`；旧Project不需要迁移。
+
+### Verification
+
+- 角色专属轨迹帧选择、Current Role点击换帧、独立框聚焦、SWAP状态隔离、全角色后备框及重叠人物循环选择测试通过；Studio模块Python编译通过。
+
+## [0.3.7-alpha.5] - 2026-10-17
+
+### Complete Current Role Position Boxes
+
+- 修复`Shot Visual Editor → Character → Unlock All Characters`只在V1画面显示部分R角色框的问题；所有已列在`CURRENT ROLE · V1 SOURCE`的角色现在都必须进入画面点选器。
+- 当锚点帧没有该角色的精确检测框时，Studio会使用该Shot内最近的24fps轨迹位置；连有效bbox都没有时则保留全画面后备框，不再静默删除该Current Role。
+- 多个R角色共用相同或高度重叠的位置时，框线与标签会错层显示；在同一位置连续点击可按R编号逐一切换，`Ctrl+点击`仍用于多选。
+- Project Format保持`27`；本次不改变已保存的人物绑定、Prompt或Character Swap生成路径。
+
+### Verification
+
+- V1人物框精确命中、Ctrl多选、全重叠R角色循环选择及Studio编译专项检查通过。
+
+## [0.3.7-alpha.4] - 2026-10-17
+
+### Current Role Tooltip Contrast
+
+- 修复`Unlock All Characters → CURRENT ROLE · V1 SOURCE`头像鼠标悬停说明出现深色文字叠在深色／半透明背景上、人物资料几乎无法阅读的问题。
+- Studio Tooltip统一使用不透明`#071017`深色背景、`#f2f7fb`浅色文字、青色边框、Segoe UI 12px字体及明确内边距；Current Role的场景、时间、人物外观和服装资料现在保持清晰可读。
+- Project Format保持`27`；本次只改变显示样式，不改变人物绑定、Character Swap Prompt或生成结果。
+
+### Verification
+
+- Tooltip样式契约与Studio模块Python编译通过。
+
+## [0.3.7-alpha.3] - 2026-10-17
+
+### Interactive V1 Person Picker
+
+- `Unlock All Characters`新增可点击的完整V1 Shot画面，并在Qwen检测到的人物位置显示R角色框。普通点击只选择该人物，`Ctrl+点击`可加入／移除多个人物；下方每个`CURRENT ROLE`亦有独立`SWAP`开关，未选人物保持原V1身份。
+- 每个Shot现在持久化可选的`source_role_swap_selection`。Character Swap编译器只为所选R角色建立Pass；空选择沿用旧Project的“全部可见已绑定角色”行为，不破坏既有工程。
+- 24fps人物扫描新增Shot-local轨迹样本：保存帧号、绝对时间、人物框及可见区间，并把当前生成窗口的最多六个位置锚点写入H3角色选择器，减少同镜多人、走位及交叉遮挡时换错人的风险。
+- `DETECT V1 PEOPLE`即使没有发现新角色，也会刷新既有角色的逐帧轨迹并重新打开人物选择器，不再因“所有人已有绑定”而丢弃本次扫描成果。
+
+### Release and Compatibility
+
+- 应用版本升级至`v0.3.7-alpha.3`；README及v0.3.7部署说明同步加入V1 Person Picker操作方式。
+- Director Project格式由`26`升级至`27`，用于保存Shot-local点击人物选择；旧Project自动以“替换全部可见已绑定角色”读取，无需手动迁移。
+
+### Verification
+
+- V1人物框命中、Ctrl多选、Shot-local Pass过滤、轨迹锚点Prompt、角色矩阵保存及Project Format 27兼容专项测试通过。
+- Director Studio、Character Swap Engine与测试模块通过Python编译。
+
+## [0.3.7-alpha.2] - 2026-10-17
+
+### Qwen 24fps Shot People Detection
+
+- `Unlock All Characters`的`DETECT V1 PEOPLE`升级为真正的24fps逐帧扫描：Studio完整解码当前Shot，不跳帧建立带绝对帧号／时间码的故事板，并以每32帧一个批次交给Qwen分析。
+- 前一批识别的新人物会取得稳定R编号及最佳参考头像并带入后续批次，能够补回短暂出场人物及同镜多人；结果只写入当前Shot的角色覆盖、场景绑定与Character-Swap Pass，只令对应Segment变为dirty。
+- 解码与Qwen分析保持异步，界面显示总帧数、当前批次和进度；成功或失败都会关闭进度遮罩。单Shot安全上限为720个24fps Relay帧，超限时明确要求先切分Shot，不会静默抽样或删帧。
+- 修复Qwen跨批次遗漏`matched_role_id`时把同一个人按每秒建立成R2、R3、R4的问题。Studio新增本地身份合并层，以脸部视觉指纹、人物描述、服装及相邻帧连续性复用稳定R编号，并合并Qwen指向的旧重复角色别名。
+- `Unlock All Characters`改为中间角色矩阵独立滚动、底部Identity Scope、说明及Save／Cancel固定显示；大量Character资料不再把Save按钮推到屏幕之外。
+
+### H3 Relay Cache Capacity Monitor
+
+- Generation工具栏的`ESTIMATE`右侧新增`CACHE 已用 / 100GB`容量指示器，读取ComfyUI Server的`output/__h3_removal_cache`实际占用；启动、ComfyUI URL变化、Estimate及生成结束时自动刷新，并每60秒后台更新。
+- 容量状态以阈值提示风险：低于70GB为绿色、70–90GB为琥珀色、90GB以上为红色；Server没有安装容量API或暂时无法连接时显示`N/A / 100GB`，不会把未知状态误报为0GB。
+- 新增只读ComfyUI companion `comfyui_director_h3_cache_status`及一键安装脚本`install_h3_cache_status_server.bat`／`.ps1`。API只返回总容量、文件数量及直属子目录汇总，不返回文件名、不删除缓存，并拒绝沿符号链接越界扫描。
+- Generation工具栏调整为三行稳定布局，确保窄窗口中`ESTIMATE`与`CACHE`始终相邻可见，不再被Qt原生overflow按钮截断。
+
+### Release and Compatibility
+
+- 应用版本升级至`v0.3.7-alpha.2`；README及v0.3.7部署说明同步记录逐帧人物检测、Cache Meter安装与显示规则。
+- Director Project格式保持`26`，已有Project无需迁移；本次容量API与UI显示不会改变生成结果、Character-Swap缓存内容或自动删除任何Server文件。
+
+### Verification
+
+- Cache Status companion、容量格式／颜色阈值、工具栏布局及Qwen逐帧扫描专项测试通过。
+- `version_info.py`、Director Studio与Cache Status companion通过Python编译；文档及版本引用完成一致性检查。
+
 ## [0.3.7-alpha.1] - 2026-10-17
 
 ### Automatic Remake Engine Routing
@@ -15,6 +172,7 @@ Every user-visible correction receives an application version and a dated entry 
 - 正式接入`akatz-labs-character-swap-turbo8-adaptive-window-api.json`、`h3_character_swap_v1.5.safetensors`、`LabsH3PrepareVideo`与`H3RelayWindowedEdit`，以24fps V1 Shot板保留源表演、姿势、表情、构图、场景、时间与声音，再按人物卡映射P演员。
 - 多角色Shot继续使用逐角色Pass，避免为同一窗口重复生成整套影片；Shot边界隔离、原声窗口、精确V1 Master Audio、听众闭嘴与角色对嘴合同保持生效。
 - Character-Swap API需要的H3 UNet、Qwen encoder、两组VAE、Turbo LoRA、FFmpeg及Custom Node已加入README与v0.3.7部署清单。
+- Shot Visual Editor的`CURRENT ROLE`现在显示该Shot／时间点实际V1人物脸孔，`REPLACE WITH`才显示目标P图，避免把已经绑定的P误认成源角色。
 
 ### Production Baseline and Documentation
 

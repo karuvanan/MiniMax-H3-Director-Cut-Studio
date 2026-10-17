@@ -6,6 +6,7 @@ import faulthandler
 import gc
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
 import hashlib
 import json
 import math
@@ -28,6 +29,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -63,6 +65,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -100,6 +103,7 @@ from blip_summary import (
 )
 from media_engine import (
     create_labeled_contact_sheet,
+    create_video_thumbnail,
     media_type_for_path,
     probe_media,
 )
@@ -167,9 +171,12 @@ from media_semantic_enrichment import (
 )
 from source_video_analysis import (
     SOURCE_VIDEO_DIRECTOR_ANALYSIS_SCHEMA,
+    SOURCE_VIDEO_SHOT_PEOPLE_SCAN_SCHEMA,
     SOURCE_VIDEO_QWEN_ANALYSIS_MARKER,
     build_source_video_analysis_prompts,
+    build_source_video_shot_people_scan_prompts,
     normalize_source_video_analysis,
+    normalize_source_video_shot_people_scan,
     parse_source_video_analysis,
     render_source_video_analysis,
     scene_intervals_from_breakdown,
@@ -444,7 +451,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 36
+SMART_RENDER_POLICY_VERSION = 38
 PROGRAM_MONITOR_FPS = 24.0
 H3_DURATION_FRAME_MODULUS = 17
 H3_DURATION_FRAME_REMAINDER = 5
@@ -696,6 +703,17 @@ QScrollArea { border: 0; }
 QSplitter::handle { background: #08090a; width: 3px; height: 3px; }
 QSlider::groove:horizontal { height: 4px; background: #393d43; }
 QSlider::handle:horizontal { width: 12px; margin: -5px 0; background: #52c4d8; border-radius: 6px; }
+QToolTip {
+    color: #f2f7fb;
+    background-color: #071017;
+    border: 1px solid #3f8496;
+    border-radius: 3px;
+    padding: 7px 9px;
+    font-family: "Segoe UI";
+    font-size: 12px;
+    font-weight: 500;
+    opacity: 255;
+}
 """
 
 
@@ -1462,6 +1480,13 @@ class DirectorCue:
     # distinct V1 people may intentionally share the same P Picture. This map
     # keeps Shot-local R1/R2 edits independent even when both currently use P4.
     source_role_identity_overrides: dict[str, str] = field(default_factory=dict)
+    # Optional explicit subset selected by clicking people in the V1 Person
+    # Picker. Empty preserves legacy behaviour: swap every visible mapped role.
+    source_role_swap_selection: list[str] = field(default_factory=list)
+    # Shot-local manual actor rectangles authored in the V1 Person Picker.
+    # Coordinates are normalized to the displayed V1 frame and take
+    # precedence over uncertain Qwen track boxes during Character Swap.
+    source_role_bbox_overrides: dict[str, list[float]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.cue_type not in DIRECTOR_LANE_TYPES and self.cue_type != "cut":
@@ -1508,6 +1533,34 @@ class DirectorCue:
                 and re.fullmatch(r"R[1-9]\d*", role)
                 and (target := normalize_picture_reference(raw_target))
             }
+        if not isinstance(self.source_role_swap_selection, list):
+            self.source_role_swap_selection = []
+        else:
+            self.source_role_swap_selection = list(dict.fromkeys(
+                role for raw_role in self.source_role_swap_selection
+                if (role := str(raw_role or "").strip().upper())
+                and re.fullmatch(r"R[1-9]\d*", role)
+            ))
+        if not isinstance(self.source_role_bbox_overrides, dict):
+            self.source_role_bbox_overrides = {}
+        else:
+            normalized_boxes: dict[str, list[float]] = {}
+            for raw_role, raw_bbox in self.source_role_bbox_overrides.items():
+                role = str(raw_role or "").strip().upper()
+                if not re.fullmatch(r"R[1-9]\d*", role):
+                    continue
+                try:
+                    left, top, right, bottom = [
+                        float(value) for value in raw_bbox[:4]
+                    ]
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                left, top = max(0.0, left), max(0.0, top)
+                right, bottom = min(1.0, right), min(1.0, bottom)
+                if right - left < 0.02 or bottom - top < 0.02:
+                    continue
+                normalized_boxes[role] = [left, top, right, bottom]
+            self.source_role_bbox_overrides = normalized_boxes
         if not isinstance(self.semantic_reference_directions, dict):
             self.semantic_reference_directions = {}
         else:
@@ -6164,6 +6217,422 @@ class ShotStripCard(QFrame):
         super().mousePressEvent(event)
 
 
+class V1PersonPickerWidget(QWidget):
+    """Clickable V1 frame overlay used to select exact source R roles."""
+
+    role_selected = Signal(str, bool)
+    role_bbox_edited = Signal(str, object)
+
+    def __init__(
+        self,
+        pixmap: QPixmap,
+        roles: dict[str, dict],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._pixmap = QPixmap(pixmap)
+        self._roles = {
+            str(role).strip().upper(): dict(payload)
+            for role, payload in roles.items()
+            if str(role).strip()
+        }
+        self._selected_roles: set[str] = set()
+        self._focused_role = ""
+        self._last_hit_roles: list[str] = []
+        self._last_hit_index = -1
+        self._edit_role = ""
+        self._edit_mode = ""
+        self._press_position = None
+        self._start_bbox: tuple[float, float, float, float] | None = None
+        self._create_origin = None
+        self._press_modifiers = Qt.NoModifier
+        self._drag_moved = False
+        self.setObjectName("v1PersonPicker")
+        self.setMinimumSize(520, 270)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setCursor(Qt.ArrowCursor)
+        self.setMouseTracking(True)
+        self.setToolTip(
+            "Click a boxed V1 person to replace only that R role. "
+            "Ctrl+click adds or removes another person. Repeated clicks cycle "
+            "through roles whose boxes overlap. Drag a box to move it; drag an "
+            "edge or corner to resize it. Focus a Current Role, then Ctrl+click "
+            "or Ctrl+drag empty image space to add its missing box."
+        )
+
+    def set_frame_content(
+        self,
+        pixmap: QPixmap,
+        roles: dict[str, dict],
+        *,
+        focused_role: str = "",
+    ) -> None:
+        """Switch the displayed V1 evidence frame without changing SWAP state."""
+
+        self._pixmap = QPixmap(pixmap)
+        self._roles = {
+            str(role).strip().upper(): dict(payload)
+            for role, payload in roles.items()
+            if str(role).strip()
+        }
+        self._focused_role = str(focused_role or "").strip().upper()
+        self._last_hit_roles = []
+        self._last_hit_index = -1
+        self.update()
+
+    def set_selected_roles(self, roles: set[str] | list[str]) -> None:
+        self._selected_roles = {
+            str(role).strip().upper() for role in roles if str(role).strip()
+        }
+        self.update()
+
+    def selected_roles(self) -> set[str]:
+        return set(self._selected_roles)
+
+    def _image_rect(self) -> QRectF:
+        if self._pixmap.isNull():
+            return QRectF()
+        scaled = self._pixmap.size()
+        scaled.scale(self.size(), Qt.KeepAspectRatio)
+        return QRectF(
+            (self.width() - scaled.width()) / 2.0,
+            (self.height() - scaled.height()) / 2.0,
+            scaled.width(),
+            scaled.height(),
+        )
+
+    @staticmethod
+    def _normalized_bbox(payload: dict) -> tuple[float, float, float, float] | None:
+        try:
+            left, top, right, bottom = [
+                float(value) for value in (payload.get("bbox_normalized") or [])[:4]
+            ]
+        except (TypeError, ValueError):
+            return None
+        left, top = max(0.0, left), max(0.0, top)
+        right, bottom = min(1.0, right), min(1.0, bottom)
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+
+    def _role_rect(self, payload: dict) -> QRectF:
+        image_rect = self._image_rect()
+        bbox = self._normalized_bbox(payload)
+        if image_rect.isEmpty() or bbox is None:
+            return QRectF()
+        left, top, right, bottom = bbox
+        return QRectF(
+            image_rect.left() + left * image_rect.width(),
+            image_rect.top() + top * image_rect.height(),
+            (right - left) * image_rect.width(),
+            (bottom - top) * image_rect.height(),
+        )
+
+    def _normalized_point(self, position) -> tuple[float, float] | None:
+        image_rect = self._image_rect()
+        if image_rect.isEmpty() or not image_rect.contains(position):
+            return None
+        return (
+            min(1.0, max(0.0, (position.x() - image_rect.left()) / image_rect.width())),
+            min(1.0, max(0.0, (position.y() - image_rect.top()) / image_rect.height())),
+        )
+
+    def _hit_roles(self, position) -> list[str]:
+        hits = [
+            (role_id, self._role_rect(payload))
+            for role_id, payload in self._roles.items()
+            if self._role_rect(payload).contains(position)
+        ]
+        hits.sort(key=lambda item: item[1].width() * item[1].height())
+        return [role_id for role_id, _rect in hits]
+
+    def _role_for_press(self, role_ids: list[str]) -> str:
+        if self._focused_role in role_ids:
+            return self._focused_role
+        selected_hits = [role for role in role_ids if role in self._selected_roles]
+        if len(selected_hits) == 1:
+            return selected_hits[0]
+        if role_ids == self._last_hit_roles:
+            self._last_hit_index = (self._last_hit_index + 1) % len(role_ids)
+        else:
+            self._last_hit_roles = role_ids
+            self._last_hit_index = 0
+        return role_ids[self._last_hit_index]
+
+    def _blank_creation_role(self) -> str:
+        if self._focused_role:
+            return self._focused_role
+        if len(self._selected_roles) == 1:
+            return next(iter(self._selected_roles))
+        return ""
+
+    def _edit_mode_at(self, role_id: str, position) -> str:
+        rect = self._role_rect(self._roles.get(role_id, {}))
+        if rect.isEmpty():
+            return ""
+        margin = 9.0
+        left = abs(position.x() - rect.left()) <= margin
+        right = abs(position.x() - rect.right()) <= margin
+        top = abs(position.y() - rect.top()) <= margin
+        bottom = abs(position.y() - rect.bottom()) <= margin
+        if left and top:
+            return "top_left"
+        if right and top:
+            return "top_right"
+        if left and bottom:
+            return "bottom_left"
+        if right and bottom:
+            return "bottom_right"
+        if left:
+            return "left"
+        if right:
+            return "right"
+        if top:
+            return "top"
+        if bottom:
+            return "bottom"
+        return "move"
+
+    @staticmethod
+    def _cursor_for_edit_mode(mode: str):
+        if mode in {"top_left", "bottom_right"}:
+            return Qt.SizeFDiagCursor
+        if mode in {"top_right", "bottom_left"}:
+            return Qt.SizeBDiagCursor
+        if mode in {"left", "right"}:
+            return Qt.SizeHorCursor
+        if mode in {"top", "bottom"}:
+            return Qt.SizeVerCursor
+        if mode == "move":
+            return Qt.SizeAllCursor
+        return Qt.ArrowCursor
+
+    def _set_role_bbox(self, role_id: str, bbox: list[float]) -> None:
+        payload = self._roles.setdefault(role_id, {})
+        payload["bbox_normalized"] = [
+            round(min(1.0, max(0.0, float(value))), 6) for value in bbox
+        ]
+        payload["position_source"] = "manual_shot_override"
+        self.update()
+
+    def _dragged_bbox(self, position) -> list[float] | None:
+        if self._press_position is None or self._start_bbox is None:
+            return None
+        image_rect = self._image_rect()
+        if image_rect.isEmpty():
+            return None
+        dx = (position.x() - self._press_position.x()) / image_rect.width()
+        dy = (position.y() - self._press_position.y()) / image_rect.height()
+        left, top, right, bottom = self._start_bbox
+        minimum_w, minimum_h = 0.025, 0.04
+        if self._edit_mode == "move":
+            width, height = right - left, bottom - top
+            left = min(max(0.0, left + dx), 1.0 - width)
+            top = min(max(0.0, top + dy), 1.0 - height)
+            return [left, top, left + width, top + height]
+        if "left" in self._edit_mode:
+            left = min(max(0.0, left + dx), right - minimum_w)
+        if "right" in self._edit_mode:
+            right = max(min(1.0, right + dx), left + minimum_w)
+        if "top" in self._edit_mode:
+            top = min(max(0.0, top + dy), bottom - minimum_h)
+        if "bottom" in self._edit_mode:
+            bottom = max(min(1.0, bottom + dy), top + minimum_h)
+        return [left, top, right, bottom]
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#050a0e"))
+        image_rect = self._image_rect()
+        if self._pixmap.isNull() or image_rect.isEmpty():
+            painter.setPen(QColor("#91a8ba"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Run DETECT V1 PEOPLE first")
+            return
+        painter.drawPixmap(image_rect.toRect(), self._pixmap)
+        drawn_rects: list[QRectF] = []
+        for role_id, payload in self._roles.items():
+            rect = self._role_rect(payload)
+            if rect.isEmpty():
+                continue
+            overlap_index = sum(
+                1 for previous in drawn_rects
+                if self._rect_overlap_ratio(rect, previous) >= 0.82
+            )
+            drawn_rects.append(QRectF(rect))
+            inset = min(10.0, float(overlap_index * 3))
+            visible_rect = rect.adjusted(inset, inset, -inset, -inset)
+            if visible_rect.width() < 8 or visible_rect.height() < 8:
+                visible_rect = rect
+            focused = role_id == self._focused_role
+            selected = role_id in self._selected_roles
+            colour = QColor(
+                "#ffe66d" if focused else "#18e7f2" if selected else "#f0b94b"
+            )
+            painter.setPen(QPen(colour, 4 if focused or selected else 2))
+            if focused or selected:
+                painter.fillRect(visible_rect, QColor(24, 231, 242, 34))
+            painter.drawRoundedRect(visible_rect, 4, 4)
+            if focused or selected:
+                painter.setBrush(QColor("#071017"))
+                painter.setPen(QPen(colour, 2))
+                for point in (
+                    visible_rect.topLeft(), visible_rect.topRight(),
+                    visible_rect.bottomLeft(), visible_rect.bottomRight(),
+                    visible_rect.center(),
+                ):
+                    painter.drawRect(QRectF(point.x() - 4, point.y() - 4, 8, 8))
+            label_top = max(image_rect.top(), rect.top() - 25) + overlap_index * 25
+            if label_top + 24 > image_rect.bottom():
+                label_top = max(image_rect.top(), image_rect.bottom() - 24)
+            label_rect = QRectF(rect.left(), label_top, 74, 24)
+            painter.fillRect(label_rect, QColor(3, 12, 18, 220))
+            painter.setPen(colour)
+            painter.drawText(label_rect, Qt.AlignCenter, role_id)
+
+    @staticmethod
+    def _rect_overlap_ratio(left: QRectF, right: QRectF) -> float:
+        intersection = left.intersected(right)
+        if intersection.isEmpty():
+            return 0.0
+        smaller = min(
+            max(0.0, left.width() * left.height()),
+            max(0.0, right.width() * right.height()),
+        )
+        return (
+            intersection.width() * intersection.height() / smaller
+            if smaller > 1e-9 else 0.0
+        )
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        role_ids = self._hit_roles(event.position())
+        self._press_position = event.position()
+        self._press_modifiers = event.modifiers()
+        self._drag_moved = False
+        if role_ids:
+            role_id = self._role_for_press(role_ids)
+            bbox = self._normalized_bbox(self._roles.get(role_id, {}))
+            if bbox is not None:
+                self._edit_role = role_id
+                self._start_bbox = bbox
+                self._edit_mode = self._edit_mode_at(role_id, event.position())
+                self.setCursor(self._cursor_for_edit_mode(self._edit_mode))
+            event.accept()
+            return
+        if (
+            event.modifiers() & Qt.ControlModifier
+            and self._normalized_point(event.position()) is not None
+        ):
+            role_id = self._blank_creation_role()
+            if role_id:
+                self._edit_role = role_id
+                self._edit_mode = "create"
+                self._create_origin = event.position()
+                self._start_bbox = None
+                self.setCursor(Qt.CrossCursor)
+            event.accept()
+            return
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._edit_role and self._press_position is not None:
+            delta = event.position() - self._press_position
+            if math.hypot(delta.x(), delta.y()) >= 3.0:
+                self._drag_moved = True
+            if self._edit_mode == "create":
+                start = self._normalized_point(self._create_origin)
+                current = self._normalized_point(event.position())
+                if start is not None and current is not None:
+                    left, right = sorted((start[0], current[0]))
+                    top, bottom = sorted((start[1], current[1]))
+                    if right - left >= 0.025 and bottom - top >= 0.04:
+                        self._set_role_bbox(
+                            self._edit_role, [left, top, right, bottom]
+                        )
+            elif self._drag_moved:
+                bbox = self._dragged_bbox(event.position())
+                if bbox is not None:
+                    self._set_role_bbox(self._edit_role, bbox)
+            event.accept()
+            return
+        hits = self._hit_roles(event.position())
+        if hits:
+            role_id = (
+                self._focused_role if self._focused_role in hits else hits[0]
+            )
+            self.setCursor(self._cursor_for_edit_mode(
+                self._edit_mode_at(role_id, event.position())
+            ))
+        elif event.modifiers() & Qt.ControlModifier:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton or not self._edit_role:
+            super().mouseReleaseEvent(event)
+            return
+        role_id = self._edit_role
+        additive = bool(self._press_modifiers & Qt.ControlModifier)
+        if self._edit_mode == "create":
+            bbox = self._normalized_bbox(self._roles.get(role_id, {}))
+            if not self._drag_moved or bbox is None:
+                point = self._normalized_point(event.position())
+                if point is not None:
+                    width, height = 0.22, 0.36
+                    left = min(max(0.0, point[0] - width / 2), 1.0 - width)
+                    top = min(max(0.0, point[1] - height / 2), 1.0 - height)
+                    self._set_role_bbox(
+                        role_id, [left, top, left + width, top + height]
+                    )
+            bbox = self._normalized_bbox(self._roles.get(role_id, {}))
+            if bbox is not None:
+                self._selected_roles.add(role_id)
+                self.role_bbox_edited.emit(role_id, list(bbox))
+        elif self._drag_moved:
+            bbox = self._normalized_bbox(self._roles.get(role_id, {}))
+            if bbox is not None:
+                self._selected_roles.add(role_id)
+                self.role_bbox_edited.emit(role_id, list(bbox))
+        else:
+            self.role_selected.emit(role_id, additive)
+        self._edit_role = ""
+        self._edit_mode = ""
+        self._press_position = None
+        self._start_bbox = None
+        self._create_origin = None
+        self._drag_moved = False
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+        event.accept()
+
+
+class V1CurrentRoleWidget(QFrame):
+    """Clickable CURRENT ROLE card that navigates V1 frame evidence only."""
+
+    role_clicked = Signal(str)
+
+    def __init__(self, role_id: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.role_id = str(role_id or "").strip().upper()
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(
+            f"Load the best V1 frame and position box for {self.role_id}. "
+            "The SWAP checkbox on the same row will also be enabled."
+        )
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.role_clicked.emit(self.role_id)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class ShotVisualEditorDialog(QDialog):
     """Card-based Shot editor; generated H3 prose stays hidden by default."""
 
@@ -6176,13 +6645,27 @@ class ShotVisualEditorDialog(QDialog):
         self._identity_change_payloads: list[dict[str, str]] = []
         self._identity_choices = self._picture_identity_choices(parent)
         self._source_role_bindings: dict[str, str] = {}
-        if (
+        self._detected_unbound_source_roles: dict[str, dict] = {}
+        self._source_role_visuals: dict[str, dict] = {}
+        self._source_role_picker_payload: dict = {}
+        self._source_role_swap_selection = list(cue.source_role_swap_selection)
+        self._source_role_bbox_overrides = deepcopy(
+            cue.source_role_bbox_overrides
+        )
+        self._source_remake_editor = bool(
             str(getattr(getattr(parent, "special_combo", None), "currentData", lambda: "")() or "")
             .strip().casefold() == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
-        ):
+        )
+        if self._source_remake_editor:
             resolver = getattr(parent, "_shot_role_picture_bindings", None)
             if callable(resolver):
                 self._source_role_bindings = dict(resolver(cue))
+            visual_resolver = getattr(parent, "_source_role_visuals_for_shot", None)
+            if callable(visual_resolver):
+                self._source_role_visuals = dict(visual_resolver(cue))
+            picker_resolver = getattr(parent, "_source_role_picker_for_shot", None)
+            if callable(picker_resolver):
+                self._source_role_picker_payload = dict(picker_resolver(cue))
         self.pending_qwen_request: tuple[str, str] | None = None
         self.pending_navigation_cue_id = ""
         self._history: list[dict] = []
@@ -6792,6 +7275,12 @@ class ShotVisualEditorDialog(QDialog):
                 f"@{change.get('target_reference', '')}"
                 for change in self._identity_change_payloads
             )
+        if self._source_remake_editor and self._source_role_swap_selection:
+            character_label = (
+                character_label
+                + "  ·  SWAP ONLY "
+                + ", ".join(self._source_role_swap_selection)
+            )
         self.shot_meta_label.setText(
             f"{self.cue.start_seconds:.3f}–{self.cue.end_seconds:.3f}s  ·  "
             f"{character_label} at {self.preset_edit.text().strip() or 'scene'}"
@@ -6880,6 +7369,10 @@ class ShotVisualEditorDialog(QDialog):
             "continuity_state": self.continuity_edit.toPlainText(),
             "native_audio_direction": self.native_audio_edit.toPlainText(),
             "identity_change_payloads": deepcopy(self._identity_change_payloads),
+            "source_role_swap_selection": list(self._source_role_swap_selection),
+            "source_role_bbox_overrides": deepcopy(
+                self._source_role_bbox_overrides
+            ),
         }
 
     def _load_raw_ui_state(self, value: dict) -> None:
@@ -6921,6 +7414,16 @@ class ShotVisualEditorDialog(QDialog):
             # Character Unlock implementation.
             legacy = value.get("identity_change_payload")
             self._identity_change_payloads = [deepcopy(legacy)] if isinstance(legacy, dict) else []
+        swap_selection = value.get("source_role_swap_selection")
+        if isinstance(swap_selection, list):
+            self._source_role_swap_selection = list(dict.fromkeys(
+                str(role).strip().upper()
+                for role in swap_selection
+                if re.fullmatch(r"R[1-9]\d*", str(role).strip(), flags=re.I)
+            ))
+        bbox_overrides = value.get("source_role_bbox_overrides")
+        if isinstance(bbox_overrides, dict):
+            self._source_role_bbox_overrides = deepcopy(bbox_overrides)
         self._refresh_card_values()
 
     def _undo_local(self) -> None:
@@ -6991,7 +7494,7 @@ class ShotVisualEditorDialog(QDialog):
                 for source in self._character_source_references(self.cue)
             ]
         )
-        if not identity_sources:
+        if not identity_sources and not self._source_remake_editor:
             QMessageBox.information(
                 self,
                 "Character identity",
@@ -7017,6 +7520,75 @@ class ShotVisualEditorDialog(QDialog):
         warning.setWordWrap(True)
         warning.setStyleSheet("color:#e5bd69; padding:6px;")
         layout.addWidget(warning)
+        if self._source_remake_editor:
+            detect_row = QHBoxLayout()
+            detect_button = QPushButton("DETECT V1 PEOPLE")
+            detect_button.setObjectName("shotDetectV1People")
+            detect_button.setToolTip(
+                "Decode every 24fps V1 relay frame in this Shot, let Qwen inspect the "
+                "complete frame sequence, then add every visible source role that is not "
+                "yet mapped to a P Picture."
+            )
+            detect_status = QLabel(
+                "Qwen frame-by-frame scan · finds brief and multi-person appearances."
+            )
+            detect_status.setObjectName("shotEditorSubtitle")
+            detect_row.addWidget(detect_button)
+            detect_row.addWidget(detect_status, 1)
+            layout.addLayout(detect_row)
+
+            def apply_detected_people(detected: dict, error: str = "") -> None:
+                if error:
+                    QMessageBox.warning(
+                        self,
+                        "Detect V1 people failed",
+                        error,
+                    )
+                    return
+                missing = {
+                    role: payload for role, payload in detected.items()
+                    if role not in self._source_role_bindings
+                }
+                self._detected_unbound_source_roles.update(deepcopy(missing))
+                self._source_role_bindings.update({
+                    role: normalize_picture_reference(payload.get("target_media_id"))
+                    for role, payload in missing.items()
+                    if normalize_picture_reference(payload.get("target_media_id"))
+                })
+                visual_resolver = getattr(
+                    self.parentWidget(), "_source_role_visuals_for_shot", None
+                )
+                if callable(visual_resolver):
+                    self._source_role_visuals = dict(visual_resolver(self.cue))
+                picker_resolver = getattr(
+                    self.parentWidget(), "_source_role_picker_for_shot", None
+                )
+                if callable(picker_resolver):
+                    self._source_role_picker_payload = dict(picker_resolver(self.cue))
+                if not missing:
+                    QMessageBox.information(
+                        self,
+                        "Detect V1 people",
+                        "The existing V1 roles were refreshed with frame-by-frame position "
+                        "tracks. Click a person in the V1 frame to choose the swap target.",
+                    )
+                self._edit_identity()
+
+            def detect_v1_people() -> None:
+                starter = getattr(
+                    self.parentWidget(), "_start_qwen_source_role_scan", None
+                )
+                if not callable(starter):
+                    QMessageBox.warning(
+                        self,
+                        "Detect V1 people",
+                        "The Qwen Shot scanner is not available.",
+                    )
+                    return
+                if starter(self.cue, apply_detected_people):
+                    dialog.reject()
+
+            detect_button.clicked.connect(detect_v1_people)
         staged_by_source = {
             (
                 str(item.get("source_role_id", "")).strip().upper()
@@ -7028,14 +7600,72 @@ class ShotVisualEditorDialog(QDialog):
                 or normalize_picture_reference(item.get("source_reference"))
             )
         }
-        matrix = QGridLayout()
-        source_heading = QLabel("CURRENT ROLE")
+        source_role_ids = [
+            str(source).strip().upper()
+            for source, _baseline, is_source_role in identity_sources
+            if is_source_role
+        ]
+        selected_roles = set(self._source_role_swap_selection or source_role_ids)
+        picker = None
+        frame_label = None
+        picker_payload = self._source_role_picker_payload
+        picker_pixmap = picker_payload.get("pixmap", QPixmap())
+        picker_roles = picker_payload.get("roles") or {}
+        picker_role_views = picker_payload.get("role_views") or {}
+        if (
+            self._source_remake_editor
+            and isinstance(picker_pixmap, QPixmap)
+            and not picker_pixmap.isNull()
+            and isinstance(picker_roles, dict)
+            and (picker_roles or picker_role_views)
+        ):
+            picker_box = QGroupBox("SELECT THE PERSON TO REPLACE IN THIS V1 SHOT")
+            picker_layout = QVBoxLayout(picker_box)
+            picker = V1PersonPickerWidget(picker_pixmap, picker_roles, picker_box)
+            picker.setMaximumHeight(390)
+            picker.set_selected_roles(selected_roles)
+            picker_layout.addWidget(picker)
+            picker_hint = QLabel(
+                "Click = replace only this boxed person · Ctrl+click = add/remove another "
+                "person · drag a box to move it · drag an edge/corner to resize · focus a "
+                "Current Role then Ctrl+click or Ctrl+drag empty space to add its box · "
+                "repeated clicks cycle overlapping R roles."
+            )
+            picker_hint.setWordWrap(True)
+            picker_hint.setStyleSheet("color:#69dce8; padding:3px;")
+            picker_layout.addWidget(picker_hint)
+            frame_label = QLabel(
+                f"V1 frame {int(picker_payload.get('frame_index', 0) or 0)} · "
+                f"{float(picker_payload.get('time_seconds', 0.0) or 0.0):.3f}s"
+            )
+            frame_label.setObjectName("v1PersonPickerFrameLabel")
+            frame_label.setStyleSheet("color:#8da5b6;")
+            picker_layout.addWidget(frame_label)
+            layout.addWidget(picker_box)
+        role_scroll = QScrollArea()
+        role_scroll.setObjectName("shotIdentityRoleScroll")
+        role_scroll.setWidgetResizable(True)
+        role_scroll.setFrameShape(QFrame.NoFrame)
+        role_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        role_scroll.setMinimumHeight(220)
+        role_scroll_content = QWidget()
+        role_scroll_content.setObjectName("shotIdentityRoleScrollContent")
+        matrix = QGridLayout(role_scroll_content)
+        matrix.setContentsMargins(0, 0, 4, 0)
+        matrix.setColumnStretch(0, 1)
+        matrix.setColumnStretch(1, 1)
+        matrix.setColumnStretch(2, 0)
+        source_heading = QLabel("CURRENT ROLE · V1 SOURCE")
         source_heading.setStyleSheet("color:#8da5b6; font-weight:700;")
         target_heading = QLabel("REPLACE WITH")
         target_heading.setStyleSheet("color:#8da5b6; font-weight:700;")
+        swap_heading = QLabel("SWAP")
+        swap_heading.setStyleSheet("color:#8da5b6; font-weight:700;")
         matrix.addWidget(source_heading, 0, 0)
         matrix.addWidget(target_heading, 0, 1)
-        identity_rows: list[tuple[str, str, bool, QComboBox]] = []
+        matrix.addWidget(swap_heading, 0, 2)
+        identity_rows: list[tuple[str, str, bool, QComboBox, QCheckBox]] = []
+        source_role_widgets: dict[str, tuple[QWidget, QComboBox, QCheckBox]] = {}
         for row_index, (source, baseline_target, is_source_role) in enumerate(identity_sources, 1):
             staged_target = normalize_picture_reference(
                 (staged_by_source.get(source) or {}).get("target_reference")
@@ -7047,11 +7677,16 @@ class ShotVisualEditorDialog(QDialog):
                 ),
                 None,
             )
-            current_widget = QFrame()
+            source_visual = self._source_role_visuals.get(source, {}) if is_source_role else {}
+            current_widget = (
+                V1CurrentRoleWidget(source) if is_source_role else QFrame()
+            )
             current_widget.setObjectName("shotIdentityCurrentRole")
             current_widget.setStyleSheet(
                 "QFrame#shotIdentityCurrentRole { background:#101820; "
-                "border:1px solid #294657; border-radius:4px; }"
+                "border:1px solid #294657; border-radius:4px; } "
+                "QFrame#shotIdentityCurrentRole[v1Focused=\"true\"] { "
+                "border:2px solid #ffe66d; background:#17212a; }"
             )
             current_layout = QHBoxLayout(current_widget)
             current_layout.setContentsMargins(7, 5, 9, 5)
@@ -7064,21 +7699,34 @@ class ShotVisualEditorDialog(QDialog):
                 "background:#091015; border:1px solid #3b5666; border-radius:3px;"
             )
             has_current_avatar = False
-            if current_choice is not None:
+            if is_source_role:
+                pixmap = source_visual.get("pixmap", QPixmap())
+                if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                    pixmap = pixmap.scaled(
+                        QSize(48, 48), Qt.KeepAspectRatioByExpanding,
+                        Qt.SmoothTransformation,
+                    )
+                    current_avatar.setPixmap(pixmap)
+                    has_current_avatar = True
+                current_avatar.setToolTip(str(source_visual.get("tooltip", "V1 source role")))
+            elif current_choice is not None:
                 pixmap = current_choice["icon"].pixmap(QSize(48, 48))
                 if not pixmap.isNull():
                     current_avatar.setPixmap(pixmap)
                     has_current_avatar = True
             if not has_current_avatar:
-                current_avatar.setText(f"@{baseline_target}")
+                current_avatar.setText(source if is_source_role else f"@{baseline_target}")
             current_text = QLabel(
-                f"{source}\ncurrently @{baseline_target}"
+                f"{source} · V1 source\nreplace with @{baseline_target}"
                 if is_source_role else
                 (f"@{source}" if baseline_target == source
                  else f"@{source}\ncurrently @{baseline_target}")
             )
             current_text.setWordWrap(True)
             current_text.setStyleSheet("font-weight:700; border:none;")
+            if is_source_role:
+                current_avatar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                current_text.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             current_layout.addWidget(current_avatar)
             current_layout.addWidget(current_text, 1)
             matrix.addWidget(current_widget, row_index, 0)
@@ -7093,8 +7741,164 @@ class ShotVisualEditorDialog(QDialog):
                 target_combo.addItem(f"@{staged_target}", staged_target)
             target_combo.setCurrentIndex(max(0, target_combo.findData(staged_target)))
             matrix.addWidget(target_combo, row_index, 1)
-            identity_rows.append((source, baseline_target, is_source_role, target_combo))
-        layout.addLayout(matrix)
+            swap_checkbox = QCheckBox()
+            swap_checkbox.setObjectName(f"shotRoleSwap_{source}")
+            swap_checkbox.setChecked(not is_source_role or source in selected_roles)
+            swap_checkbox.setEnabled(is_source_role)
+            swap_checkbox.setToolTip(
+                f"Replace {source} in this Shot" if is_source_role
+                else "Legacy Media Pool identity replacement"
+            )
+            matrix.addWidget(swap_checkbox, row_index, 2, Qt.AlignCenter)
+            if is_source_role:
+                target_combo.setEnabled(swap_checkbox.isChecked())
+                source_role_widgets[source] = (
+                    current_widget, target_combo, swap_checkbox
+                )
+            identity_rows.append((
+                source, baseline_target, is_source_role, target_combo, swap_checkbox
+            ))
+
+        def focus_source_role(role_id: str) -> None:
+            """Navigate V1 evidence and enable the clicked role's SWAP row."""
+
+            role_id = str(role_id or "").strip().upper()
+            if role_id not in source_role_widgets:
+                return
+            selected_roles.add(role_id)
+            _role_widget, role_combo, role_checkbox = source_role_widgets[role_id]
+            role_checkbox.blockSignals(True)
+            role_checkbox.setChecked(True)
+            role_checkbox.blockSignals(False)
+            role_combo.setEnabled(True)
+            view = picker_role_views.get(role_id, {})
+            if picker is None or not isinstance(view, dict):
+                return
+            view_pixmap = view.get("pixmap", QPixmap())
+            view_roles = deepcopy(view.get("roles") or {})
+            if not isinstance(view_pixmap, QPixmap) or view_pixmap.isNull():
+                return
+            if not isinstance(view_roles, dict):
+                view_roles = {}
+            for manual_role, manual_bbox in self._source_role_bbox_overrides.items():
+                if manual_role not in source_role_widgets:
+                    continue
+                manual_payload = dict(
+                    view_roles.get(manual_role)
+                    or picker_roles.get(manual_role)
+                    or {}
+                )
+                manual_payload["bbox_normalized"] = list(manual_bbox)
+                manual_payload["position_source"] = "manual_shot_override"
+                view_roles[manual_role] = manual_payload
+            picker.set_frame_content(
+                view_pixmap,
+                view_roles,
+                focused_role=role_id,
+            )
+            picker.set_selected_roles(selected_roles)
+            if frame_label is not None:
+                frame_label.setText(
+                    f"V1 frame {int(view.get('frame_index', 0) or 0)} · "
+                    f"{float(view.get('time_seconds', 0.0) or 0.0):.3f}s · "
+                    f"focused {role_id}" + (
+                        "" if (
+                            bool(view.get("has_tracked_bbox"))
+                            or role_id in self._source_role_bbox_overrides
+                        ) else " · no reliable box; Ctrl+click V1 to add one"
+                    )
+                )
+            for source_role, (widget, _combo, _checkbox) in source_role_widgets.items():
+                widget.setProperty("v1Focused", source_role == role_id)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+                widget.update()
+
+        def sync_role_controls(role_id: str, additive: bool) -> None:
+            role_id = str(role_id).strip().upper()
+            if role_id not in source_role_widgets:
+                return
+            if additive:
+                selected_roles.symmetric_difference_update({role_id})
+            else:
+                selected_roles.clear()
+                selected_roles.add(role_id)
+            for source_role, (_widget, combo, checkbox) in source_role_widgets.items():
+                checked = source_role in selected_roles
+                checkbox.blockSignals(True)
+                checkbox.setChecked(checked)
+                checkbox.blockSignals(False)
+                combo.setEnabled(checked)
+            if picker is not None:
+                picker.set_selected_roles(selected_roles)
+            role_widget, role_combo, _checkbox = source_role_widgets[role_id]
+            role_scroll.ensureWidgetVisible(role_widget, 12, 24)
+            role_combo.setFocus(Qt.MouseFocusReason)
+
+        def checkbox_changed(role_id: str, checked: bool) -> None:
+            if checked:
+                selected_roles.add(role_id)
+            else:
+                selected_roles.discard(role_id)
+            _widget, combo, _checkbox = source_role_widgets[role_id]
+            combo.setEnabled(checked)
+            if picker is not None:
+                picker.set_selected_roles(selected_roles)
+
+        def stage_role_bbox(role_id: str, raw_bbox: object) -> None:
+            role_id = str(role_id or "").strip().upper()
+            if role_id not in source_role_widgets:
+                return
+            try:
+                left, top, right, bottom = [float(value) for value in raw_bbox][:4]
+            except (TypeError, ValueError, OverflowError):
+                return
+            left, top = max(0.0, left), max(0.0, top)
+            right, bottom = min(1.0, right), min(1.0, bottom)
+            if right - left < 0.02 or bottom - top < 0.02:
+                return
+            bbox = [
+                round(left, 6), round(top, 6),
+                round(right, 6), round(bottom, 6),
+            ]
+            self._source_role_bbox_overrides[role_id] = bbox
+            selected_roles.add(role_id)
+            _widget, combo, checkbox = source_role_widgets[role_id]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
+            combo.setEnabled(True)
+            picker_payload.setdefault("roles", {}).setdefault(role_id, {})[
+                "bbox_normalized"
+            ] = list(bbox)
+            for view_role, view in picker_role_views.items():
+                if not isinstance(view, dict):
+                    continue
+                view_roles = view.setdefault("roles", {})
+                payload = dict(view_roles.get(role_id) or {})
+                payload["bbox_normalized"] = list(bbox)
+                payload["position_source"] = "manual_shot_override"
+                view_roles[role_id] = payload
+                if view_role == role_id:
+                    view["has_tracked_bbox"] = True
+            if picker is not None:
+                picker.set_selected_roles(selected_roles)
+            if frame_label is not None:
+                frame_label.setText(
+                    frame_label.text().split(" · manual box")[0] + " · manual box saved"
+                )
+
+        for source_role, (_widget, _combo, checkbox) in source_role_widgets.items():
+            checkbox.toggled.connect(
+                lambda checked, role=source_role: checkbox_changed(role, checked)
+            )
+            if isinstance(_widget, V1CurrentRoleWidget):
+                _widget.role_clicked.connect(focus_source_role)
+        if picker is not None:
+            picker.role_selected.connect(sync_role_controls)
+            picker.role_bbox_edited.connect(stage_role_bbox)
+        role_scroll.setWidget(role_scroll_content)
+        layout.addWidget(role_scroll, 1)
 
         scope_combo = QComboBox()
         scope_combo.addItem("This Shot only", "shot_only")
@@ -7115,16 +7919,37 @@ class ShotVisualEditorDialog(QDialog):
         note.setObjectName("shotEditorSubtitle")
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.setObjectName("shotIdentityButtons")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
+        available = dialog.screen().availableGeometry() if dialog.screen() else None
+        dialog.resize(
+            780,
+            min(760, max(520, available.height() - 96)) if available else 700,
+        )
 
         if dialog.exec() != QDialog.Accepted:
             return
+        selected_roles = {
+            source
+            for source, _baseline, is_source_role, _combo, checkbox in identity_rows
+            if is_source_role and checkbox.isChecked()
+        }
+        if source_role_ids and not selected_roles:
+            QMessageBox.warning(
+                self,
+                "Select a V1 person",
+                "Select at least one CURRENT ROLE to replace in this Shot.",
+            )
+            return
         changes: list[dict[str, str]] = []
-        for source, baseline_target, is_source_role, target_combo in identity_rows:
+        for source, baseline_target, is_source_role, target_combo, checkbox in identity_rows:
+            if is_source_role and not checkbox.isChecked():
+                continue
             target = normalize_picture_reference(target_combo.currentData())
-            if not target or target == baseline_target:
+            detected_unbound = self._detected_unbound_source_roles.get(source, {})
+            if not target or (target == baseline_target and not detected_unbound):
                 continue
             direction = next(
                 (
@@ -7142,9 +7967,23 @@ class ShotVisualEditorDialog(QDialog):
             }
             if is_source_role:
                 change["source_role_id"] = source
+                if detected_unbound:
+                    change["detected_unbound"] = True
+                    change["detected_scene_index"] = int(
+                        detected_unbound.get("scene_index", 0) or 0
+                    )
+                    change["activate_source_role"] = bool(
+                        detected_unbound.get("activate_source_role", False)
+                    )
             changes.append(change)
         self._push_history()
         self._identity_change_payloads = changes
+        # Empty means the legacy/all-roles behavior. Persist a non-empty list
+        # only when this Shot intentionally targets a subset of visible roles.
+        self._source_role_swap_selection = (
+            [] if set(source_role_ids) == selected_roles
+            else [role for role in source_role_ids if role in selected_roles]
+        )
         self._refresh_card_values()
 
     def _edit_camera(self) -> None:
@@ -7420,6 +8259,10 @@ class ShotVisualEditorDialog(QDialog):
             "h3_optional_flourish": budgeted["h3_optional_flourish"],
             "action_budget_status": budgeted["action_budget"]["status"],
             "action_budget_notes": budgeted["action_budget"]["notes"],
+            "source_role_swap_selection": list(self._source_role_swap_selection),
+            "source_role_bbox_overrides": deepcopy(
+                self._source_role_bbox_overrides
+            ),
         }
 
     def identity_changes(self) -> list[dict[str, str]]:
@@ -8929,6 +9772,9 @@ class DesignPageDialog(QDialog):
         return sorted(values, key=lambda media_id: int(media_id[1:]))
 
     def _representative_source_role_frame(self, role: dict) -> Path | None:
+        shot_scan_thumbnail = Path(str(role.get("shot_scan_thumbnail_path", "")))
+        if shot_scan_thumbnail.is_file():
+            return shot_scan_thumbnail
         owner = self.parentWidget()
         reference_asset = getattr(owner, "_reference_asset", None)
         v1_asset = reference_asset("V1") if callable(reference_asset) else None
@@ -8967,7 +9813,8 @@ class DesignPageDialog(QDialog):
         if pixmap.isNull():
             return pixmap
         bbox = (
-            role.get("appearance_thumbnail_bbox_normalized")
+            ([0.0, 0.0, 1.0, 1.0] if role.get("shot_scan_thumbnail_path") else None)
+            or role.get("appearance_thumbnail_bbox_normalized")
             or role.get("thumbnail_bbox_normalized")
             or [0.0, 0.0, 1.0, 1.0]
         )
@@ -11748,6 +12595,8 @@ class DirectorCutStudio(QMainWindow):
         self.audio_jobs: dict[str, MediaAsset] = {}
         self.source_remake_full_analysis_nodes: set[str] = set()
         self.source_remake_analysis_callbacks: list = []
+        self.source_role_scan_states: dict[str, dict] = {}
+        self.source_role_scan_progress: QProgressDialog | None = None
         self.source_video_role_bindings: list[dict] = []
         self.source_remake_render_mode = automatic_remake_engine_for_skill("")
         self.source_cast_live_action_adaptation = True
@@ -11909,6 +12758,11 @@ class DirectorCutStudio(QMainWindow):
         self.generation_previous_monitor: QWidget | None = None
         self.connection_runner: JsonLineProcess | None = None
         self.connection_result: dict = {}
+        self.h3_cache_status_pending = False
+        self.h3_cache_network = QNetworkAccessManager(self)
+        self.h3_cache_network.finished.connect(
+            self._h3_cache_status_reply_finished
+        )
         self.undo_stack = QUndoStack(self)
         self.project_path: Path | None = None
         self.project_dirty = False
@@ -11952,6 +12806,17 @@ class DirectorCutStudio(QMainWindow):
         self._build_toolbar()
         self._build_workspace()
         self._build_timeline_assistant_dock()
+        self.h3_cache_refresh_timer = QTimer(self)
+        self.h3_cache_refresh_timer.setInterval(5_000)
+        self.h3_cache_refresh_timer.timeout.connect(
+            self.refresh_h3_relay_cache_status
+        )
+        # Offscreen test windows must never contact the user's configured LAN
+        # server. Production windows refresh once after layout and then once a
+        # minute; generation completion also requests an immediate refresh.
+        if os.environ.get("QT_QPA_PLATFORM", "").casefold() != "offscreen":
+            self.h3_cache_refresh_timer.start()
+            QTimer.singleShot(1200, self.refresh_h3_relay_cache_status)
         self.statusBar().showMessage(
             f"Director Cut runtime ready · ACE-Step {self.ace_step_runtime_state.mode.upper()} MODE · "
             f"{self.ace_step_runtime_state.api_url}"
@@ -12231,6 +13096,9 @@ class DirectorCutStudio(QMainWindow):
         self.server_url.setFixedWidth(220)
         self.server_url.setPlaceholderText("ComfyUI server")
         self.server_url.setToolTip("ComfyUI server IP address and port")
+        self.server_url.editingFinished.connect(
+            lambda: self.refresh_h3_relay_cache_status(force=True)
+        )
         generation_bar.addWidget(self.server_url)
         self.test_connection_button = QPushButton("TEST")
         self.test_connection_button.setFixedWidth(55)
@@ -12348,6 +13216,20 @@ class DirectorCutStudio(QMainWindow):
         )
         self.resource_estimate_button.clicked.connect(self.show_resource_estimate)
         generation_bar.addWidget(self.resource_estimate_button)
+        self.h3_cache_usage_label = QLabel(
+            "CACHE …/100GB | VRAM … | DRAM … | GPU … | CPU …"
+        )
+        self.h3_cache_usage_label.setObjectName("h3RelayCacheUsageLabel")
+        self.h3_cache_usage_label.setAlignment(Qt.AlignCenter)
+        self.h3_cache_usage_label.setFixedWidth(440)
+        self.h3_cache_usage_label.setStyleSheet(
+            "QLabel { color:#7bd8e5; background:#172329; border:1px solid #31515b; "
+            "border-radius:3px; padding:4px 6px; font-weight:700; }"
+        )
+        self.h3_cache_usage_label.setToolTip(
+            "Reading ComfyUI cache and server CPU/GPU resources…"
+        )
+        generation_bar.addWidget(self.h3_cache_usage_label)
         self._configure_generation_hover_help()
         self._build_generation_overflow_toolbar()
         self._refresh_incremental_controls()
@@ -12450,6 +13332,11 @@ class DirectorCutStudio(QMainWindow):
                 "Estimate Time, GPU Work and Disk Use",
                 "Calculates new versus reusable duration and checks the protected Workspace disk reserve.",
             ),
+            (
+                self.h3_cache_usage_label,
+                "H3 Relay Cache and Server Resources",
+                "Shows Cache capacity plus server VRAM, DRAM, GPU and CPU use. Resource percentages refresh every 5 seconds; the server reuses a 30-second Cache scan.",
+            ),
         )
         for widget, title, description in help_rows:
             widget.setToolTip(f"<b>{title}</b><br>{description}")
@@ -12457,7 +13344,7 @@ class DirectorCutStudio(QMainWindow):
             widget.installEventFilter(self)
 
     def _build_generation_overflow_toolbar(self) -> None:
-        """Wrap the ordered Generation controls onto an automatic second row."""
+        """Wrap ordered Generation controls onto complete rows without Qt ellipsis."""
         self.generation_overflow_toolbar = QToolBar("Generation Controls · Row 2")
         self.generation_overflow_toolbar.setObjectName("generationOverflowToolbar")
         self.generation_overflow_toolbar.setMovable(False)
@@ -12469,6 +13356,17 @@ class DirectorCutStudio(QMainWindow):
         self.addToolBarBreak(Qt.TopToolBarArea)
         self.addToolBar(Qt.TopToolBarArea, self.generation_overflow_toolbar)
         self.generation_overflow_toolbar.hide()
+        self.generation_overflow_toolbar_2 = QToolBar("Generation Controls · Row 3")
+        self.generation_overflow_toolbar_2.setObjectName("generationOverflowToolbar2")
+        self.generation_overflow_toolbar_2.setMovable(False)
+        self.generation_overflow_toolbar_2.setFloatable(False)
+        self.generation_overflow_toolbar_2.setStyleSheet(
+            "QToolBar { background:#1b1e21; border-top:1px solid #343a40; "
+            "border-bottom:1px solid #050607; spacing:3px; padding:3px 5px; }"
+        )
+        self.addToolBarBreak(Qt.TopToolBarArea)
+        self.addToolBar(Qt.TopToolBarArea, self.generation_overflow_toolbar_2)
+        self.generation_overflow_toolbar_2.hide()
         self.generation_toolbar.installEventFilter(self)
         self._generation_toolbar_original_actions = list(
             self.generation_toolbar.actions()
@@ -12500,6 +13398,7 @@ class DirectorCutStudio(QMainWindow):
         for action in self._generation_toolbar_original_actions:
             self.generation_toolbar.removeAction(action)
             self.generation_overflow_toolbar.removeAction(action)
+            self.generation_overflow_toolbar_2.removeAction(action)
             self.generation_toolbar.addAction(action)
         self._generation_overflow_actions = []
 
@@ -12515,26 +13414,48 @@ class DirectorCutStudio(QMainWindow):
             self._restore_generation_actions_to_primary()
             self._refresh_incremental_controls()
             self.generation_overflow_toolbar.hide()
+            self.generation_overflow_toolbar_2.hide()
             available = max(0, self.generation_toolbar.width() - 24)
-            used = 0
-            overflow_started = False
-            overflow_actions = []
-            for action in self._generation_toolbar_original_actions:
+            rows: list[list] = [[], [], []]
+            row_widths = [0, 0, 0]
+            row_index = 0
+            actions = self._generation_toolbar_original_actions
+            for index, action in enumerate(actions):
                 width = self._generation_action_width(action, self.generation_toolbar)
-                if not overflow_started and (width <= 0 or used + width <= available):
-                    used += width
-                    continue
-                overflow_started = True
-                overflow_actions.append(action)
-            if not overflow_actions:
+                # ESTIMATE and CACHE are one logical pair. If they do not both
+                # fit, start them together on the next physical row.
+                required = width
+                if action is self._generation_widget_actions.get(
+                    self.resource_estimate_button
+                ) and index + 1 < len(actions):
+                    required += self._generation_action_width(
+                        actions[index + 1], self.generation_toolbar
+                    )
+                if (
+                    width > 0
+                    and row_widths[row_index] > 0
+                    and row_widths[row_index] + required > available
+                    and row_index < len(rows) - 1
+                ):
+                    row_index += 1
+                rows[row_index].append(action)
+                row_widths[row_index] += width
+            if not rows[1] and not rows[2]:
                 return
-            for action in overflow_actions:
+            for action in rows[1]:
                 self.generation_toolbar.removeAction(action)
                 self.generation_overflow_toolbar.addAction(action)
-            self._generation_overflow_actions = overflow_actions
+            for action in rows[2]:
+                self.generation_toolbar.removeAction(action)
+                self.generation_overflow_toolbar_2.addAction(action)
+            self._generation_overflow_actions = rows[1] + rows[2]
             self._refresh_incremental_controls()
-            self.generation_overflow_toolbar.show()
-            self.generation_overflow_toolbar.raise_()
+            if rows[1]:
+                self.generation_overflow_toolbar.show()
+                self.generation_overflow_toolbar.raise_()
+            if rows[2]:
+                self.generation_overflow_toolbar_2.show()
+                self.generation_overflow_toolbar_2.raise_()
         finally:
             self._generation_reflowing = False
 
@@ -12543,6 +13464,9 @@ class DirectorCutStudio(QMainWindow):
             return
         self.generation_overflow_toolbar.show()
         self.generation_overflow_toolbar.raise_()
+        if self.generation_overflow_toolbar_2.actions():
+            self.generation_overflow_toolbar_2.show()
+            self.generation_overflow_toolbar_2.raise_()
 
     def _aspect_ratio_changed(self, *_args) -> None:
         self.render_settings.aspect_ratio = str(self.aspect_ratio_combo.currentData())
@@ -16927,6 +17851,7 @@ class DirectorCutStudio(QMainWindow):
 
     def show_resource_estimate(self) -> None:
         self._read_settings_ui()
+        self.refresh_h3_relay_cache_status(force=True)
         estimate = self._resource_estimate()
         calibration = "calibrated from this Workspace" if estimate.calibrated else "first-run estimate"
         QMessageBox.information(
@@ -16943,6 +17868,148 @@ class DirectorCutStudio(QMainWindow):
             f"{estimate.reserve_disk_bytes / 1024**3:.1f} GB\n"
             f"Ready: {'YES' if estimate.fits_disk_budget else 'NO - insufficient reserve'}",
         )
+
+    def _set_h3_relay_cache_unavailable(self, detail: str = "") -> None:
+        if not hasattr(self, "h3_cache_usage_label"):
+            return
+        self.h3_cache_usage_label.setText(
+            "CACHE N/A/100GB | VRAM N/A | DRAM N/A | GPU N/A | CPU N/A"
+        )
+        self.h3_cache_usage_label.setStyleSheet(
+            "QLabel { color:#aeb7bd; background:#202428; border:1px solid #454c52; "
+            "border-radius:3px; padding:4px 6px; font-weight:700; }"
+        )
+        explanation = (
+            "The ComfyUI server did not return the Director Studio H3 Server Status API. "
+            "Install comfyui_director_h3_cache_status in ComfyUI/custom_nodes and restart "
+            "ComfyUI. Cache and resource values remain N/A rather than being reported as zero."
+        )
+        if detail:
+            explanation += f"\n\nServer response: {detail}"
+        self.h3_cache_usage_label.setToolTip(explanation)
+
+    def _apply_h3_relay_cache_status(self, payload: dict) -> None:
+        quota_bytes = 100 * 1024**3
+        try:
+            used_bytes = max(0, int(payload.get("used_bytes", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            self._set_h3_relay_cache_unavailable("Invalid used_bytes value")
+            return
+        used_gb = used_bytes / 1024**3
+        percent = used_bytes * 100.0 / quota_bytes
+        resources = payload.get("resources") or {}
+
+        def resource_percent(name: str) -> float | None:
+            try:
+                value = resources.get(name)
+                return None if value is None else min(100.0, max(0.0, float(value)))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        vram_percent = resource_percent("vram_percent")
+        dram_percent = resource_percent("dram_percent")
+        gpu_percent = resource_percent("gpu_percent")
+        cpu_percent = resource_percent("cpu_percent")
+        highest_resource = max(
+            (value for value in (
+                vram_percent, dram_percent, gpu_percent, cpu_percent
+            ) if value is not None),
+            default=0.0,
+        )
+        if percent >= 90.0 or highest_resource >= 95.0:
+            foreground, background, border = "#ff9189", "#3b2021", "#a64c48"
+        elif percent >= 70.0 or highest_resource >= 80.0:
+            foreground, background, border = "#ffc46b", "#382b18", "#8d682c"
+        else:
+            foreground, background, border = "#74e0c0", "#172923", "#326858"
+
+        def percent_text(value: float | None) -> str:
+            return "N/A" if value is None else f"{value:.0f}%"
+
+        self.h3_cache_usage_label.setText(
+            f"CACHE {used_gb:.1f}/100GB | VRAM {percent_text(vram_percent)} | "
+            f"DRAM {percent_text(dram_percent)} | GPU {percent_text(gpu_percent)} | "
+            f"CPU {percent_text(cpu_percent)}"
+        )
+        self.h3_cache_usage_label.setStyleSheet(
+            "QLabel { "
+            f"color:{foreground}; background:{background}; border:1px solid {border}; "
+            "border-radius:3px; padding:4px 6px; font-weight:700; }"
+        )
+        breakdown = payload.get("breakdown_bytes") or {}
+        breakdown_text = "\n".join(
+            f"{name}: {max(0, int(value or 0)) / 1024**3:.2f} GB"
+            for name, value in sorted(breakdown.items())
+            if isinstance(name, str) and isinstance(value, (int, float))
+        )
+        file_count = max(0, int(payload.get("file_count", 0) or 0))
+        cache_path = str(
+            payload.get("cache_path") or "ComfyUI/output/__h3_removal_cache"
+        )
+        tooltip = (
+            "Actual ComfyUI server status\n"
+            f"Used: {used_gb:.2f} GB ({percent:.1f}% of 100 GB)\n"
+            f"Files: {file_count:,}\n"
+            f"Path: {cache_path}"
+        )
+        try:
+            vram_used = int(resources.get("vram_used_bytes")) / 1024**3
+            vram_total = int(resources.get("vram_total_bytes")) / 1024**3
+            vram_detail = f"{vram_used:.2f} / {vram_total:.2f} GB"
+        except (TypeError, ValueError, OverflowError):
+            vram_detail = "N/A"
+        try:
+            dram_used = int(resources.get("dram_used_bytes")) / 1024**3
+            dram_total = int(resources.get("dram_total_bytes")) / 1024**3
+            dram_detail = f"{dram_used:.2f} / {dram_total:.2f} GB"
+        except (TypeError, ValueError, OverflowError):
+            dram_detail = "N/A"
+        tooltip += (
+            "\n\nServer resources"
+            f"\nGPU: {resources.get('gpu_name') or 'N/A'}"
+            f"\nVRAM: {percent_text(vram_percent)} ({vram_detail})"
+            f"\nDRAM: {percent_text(dram_percent)} ({dram_detail})"
+            f"\nGPU utilization: {percent_text(gpu_percent)}"
+            f"\nCPU utilization: {percent_text(cpu_percent)}"
+        )
+        if breakdown_text:
+            tooltip += "\n\n" + breakdown_text
+        self.h3_cache_usage_label.setToolTip(tooltip)
+
+    def refresh_h3_relay_cache_status(self, force: bool = False) -> None:
+        if self._closing or self.h3_cache_status_pending:
+            return
+        server = self.server_url.text().strip().rstrip("/")
+        parsed = urlparse(server)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            self._set_h3_relay_cache_unavailable("Invalid ComfyUI server URL")
+            return
+        self.h3_cache_status_pending = True
+        self.h3_cache_usage_label.setText(
+            "CACHE …/100GB | VRAM … | DRAM … | GPU … | CPU …"
+        )
+        request = QNetworkRequest(
+            QUrl(server + "/director_studio/h3-relay-cache-status")
+        )
+        request.setTransferTimeout(12_000 if force else 8_000)
+        request.setRawHeader(b"Accept", b"application/json")
+        self.h3_cache_network.get(request)
+
+    def _h3_cache_status_reply_finished(self, reply: QNetworkReply) -> None:
+        self.h3_cache_status_pending = False
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self._set_h3_relay_cache_unavailable(reply.errorString())
+                return
+            raw = bytes(reply.readAll()).decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or not payload.get("ok"):
+                raise ValueError("Cache Status API returned an invalid response")
+            self._apply_h3_relay_cache_status(payload)
+        except Exception as exc:
+            self._set_h3_relay_cache_unavailable(str(exc))
+        finally:
+            reply.deleteLater()
 
     def _activate_storyboard_mode(self) -> None:
         # Storyboard is a direct source-Timeline preview. Keep the generated
@@ -19893,6 +20960,11 @@ class DirectorCutStudio(QMainWindow):
         self.audio_jobs.clear()
         self.source_remake_full_analysis_nodes.clear()
         self.source_remake_analysis_callbacks.clear()
+        self.source_role_scan_states.clear()
+        if self.source_role_scan_progress is not None:
+            self.source_role_scan_progress.close()
+            self.source_role_scan_progress.deleteLater()
+            self.source_role_scan_progress = None
         self.audio_separator_mix_path = None
         self.audio_separator_manifest = {}
         previous_lm_request = next(
@@ -20470,6 +21542,26 @@ class DirectorCutStudio(QMainWindow):
         if job["path"] != asset.local_path:
             self.media_jobs.pop(payload.get("job", ""), None)
             return
+        if job.get("operation") == "source-role-frame-scan":
+            if "progress" in payload and "result" not in payload:
+                progress = self.source_role_scan_progress
+                if progress is not None:
+                    progress.setLabelText(
+                        "DETECT V1 PEOPLE · "
+                        + str(payload.get("stage", "decoding every V1 Shot frame"))
+                    )
+                return
+            self.media_jobs.pop(payload.get("job", ""), None)
+            scan_id = str(job.get("scan_id", ""))
+            if payload.get("error"):
+                self._finish_qwen_source_role_scan(
+                    scan_id, error=str(payload.get("error", ""))
+                )
+                return
+            self._begin_qwen_source_role_batches(
+                scan_id, (payload.get("result") or {}).get("frames") or []
+            )
+            return
         if job.get("operation") == "audio-pan":
             if "progress" in payload and "result" not in payload:
                 self.statusBar().showMessage(
@@ -20976,6 +22068,1225 @@ class DirectorCutStudio(QMainWindow):
                 candidates.append((overlap, scene))
         return max(candidates, key=lambda item: item[0])[1] if candidates else {}
 
+    @staticmethod
+    def _crop_v1_role_pixmap(pixmap: QPixmap, bbox: object) -> QPixmap:
+        """Crop one V1 role face while retaining enough hair/shoulder context."""
+
+        if pixmap.isNull():
+            return QPixmap()
+        try:
+            left, top, right, bottom = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            left, top, right, bottom = 0.0, 0.0, 1.0, 1.0
+        left = min(1.0, max(0.0, left))
+        top = min(1.0, max(0.0, top))
+        right = min(1.0, max(left + 0.01, right))
+        bottom = min(1.0, max(top + 0.01, bottom))
+        x1 = round(left * pixmap.width())
+        y1 = round(top * pixmap.height())
+        x2 = round(right * pixmap.width())
+        y2 = round(bottom * pixmap.height())
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        minimum_side = max(32, round(min(pixmap.width(), pixmap.height()) * 0.24))
+        side = min(
+            max(round(max(width, height) * 1.35), minimum_side),
+            pixmap.width(),
+            pixmap.height(),
+        )
+        center_x = x1 + width / 2.0
+        center_y = y1 + height / 2.0
+        square_x = max(0, min(pixmap.width() - side, round(center_x - side / 2.0)))
+        square_y = max(0, min(pixmap.height() - side, round(center_y - side / 2.0)))
+        return pixmap.copy(square_x, square_y, side, side)
+
+    def _source_role_visuals_for_shot(self, cue: DirectorCue) -> dict[str, dict]:
+        """Return V1 source-role portraits for the exact scene owning ``cue``.
+
+        These portraits are UI evidence only. They deliberately never use the
+        currently mapped P Picture, so CURRENT ROLE always means the person
+        visible in V1 and REPLACE WITH always means the chosen P identity.
+        """
+
+        v1 = self._reference_asset("V1")
+        ledger = parse_source_video_analysis(v1.semantic_enrichment) if v1 else {}
+        scene = self._source_scene_for_shot(cue)
+        try:
+            scene_index = int(scene.get("scene_index", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            scene_index = 0
+        roles = {
+            str(row.get("role_id", "")).strip().upper(): row
+            for row in ledger.get("principal_roles") or []
+            if isinstance(row, dict) and str(row.get("role_id", "")).strip()
+        }
+        active_roles = {
+            str(value or "").strip().upper()
+            for value in scene.get("active_source_roles") or []
+            if str(value or "").strip()
+        }
+        active_roles.update({
+            role_id for role_id, role in roles.items()
+            if scene_index in {
+                int(value) for value in role.get("scene_indexes") or []
+                if isinstance(value, (int, float))
+            }
+        })
+        active_roles.update(self._shot_role_picture_bindings(cue).keys())
+        if not active_roles:
+            return {}
+
+        frame_rows = self.analysis_paths.get(v1.node_id, []) if v1 else []
+        scene_pattern = re.compile(rf"source scene\s+0*{scene_index}\b", re.I)
+        scene_start = float(scene.get("start_seconds", cue.start_seconds) or cue.start_seconds)
+        scene_end = float(scene.get("end_seconds", cue.end_seconds) or cue.end_seconds)
+        source_path = Path(str(v1.local_path or "")) if v1 else Path()
+        visuals: dict[str, dict] = {}
+        for role_id in sorted(
+            active_roles,
+            key=lambda value: int(re.search(r"\d+", value).group())
+            if re.search(r"\d+", value) else 10**9,
+        ):
+            role = roles.get(role_id, {"role_id": role_id})
+            evidence = next(
+                (
+                    row for row in role.get("appearance_evidence") or []
+                    if isinstance(row, dict)
+                    and int(row.get("scene_index", 0) or 0) == scene_index
+                ),
+                {},
+            )
+            panel = str(
+                evidence.get("panel") or role.get("representative_panel") or "midpoint"
+            ).casefold()
+            shot_scan_thumbnail = Path(
+                str(role.get("shot_scan_thumbnail_path", ""))
+            )
+            candidates = [
+                Path(path) for label, path in frame_rows
+                if scene_pattern.search(str(label))
+                and panel in str(label).casefold()
+                and Path(path).is_file()
+            ]
+            if not candidates:
+                candidates = [
+                    Path(path) for label, path in frame_rows
+                    if scene_pattern.search(str(label)) and Path(path).is_file()
+                ]
+            frame = (
+                shot_scan_thumbnail
+                if shot_scan_thumbnail.is_file() else
+                next(iter(candidates), None)
+            )
+            if frame is None and source_path.is_file():
+                fraction = {"early": 0.34, "late": 0.68}.get(panel, 0.5)
+                seek = scene_start + max(0.0, scene_end - scene_start) * fraction
+                fingerprint = hashlib.sha1(
+                    (
+                        f"{source_path.resolve()}|{source_path.stat().st_mtime_ns}|"
+                        f"{scene_index}|{panel}|{seek:.6f}"
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                extracted = CACHE_ROOT / "shot_v1_roles" / f"scene_{scene_index}_{fingerprint}.jpg"
+                try:
+                    if not extracted.is_file():
+                        create_video_thumbnail(
+                            source_path, extracted, seek, runtime=self.runtime
+                        )
+                    frame = extracted if extracted.is_file() else None
+                except (OSError, RuntimeError):
+                    frame = None
+            pixmap = QPixmap(str(frame)) if frame is not None else QPixmap()
+            bbox = (
+                ([0.0, 0.0, 1.0, 1.0] if shot_scan_thumbnail.is_file() else None)
+                or evidence.get("thumbnail_bbox_normalized")
+                or role.get("thumbnail_bbox_normalized")
+                or [0.0, 0.0, 1.0, 1.0]
+            )
+            crop = self._crop_v1_role_pixmap(pixmap, bbox)
+            visuals[role_id] = {
+                "pixmap": crop,
+                "scene_index": scene_index,
+                "activate_source_role": role_id not in {
+                    str(value or "").strip().upper()
+                    for value in scene.get("active_source_roles") or []
+                },
+                "tooltip": "\n".join(filter(None, (
+                    f"V1 source role {role_id} · scene {scene_index}",
+                    f"{scene_start:.3f}–{scene_end:.3f}s",
+                    str(role.get("visual_identity", "")).strip(),
+                    str(role.get("wardrobe", "")).strip(),
+                ))),
+            }
+        return visuals
+
+    def _source_role_picker_for_shot(self, cue: DirectorCue) -> dict:
+        """Build one full-frame click map for the V1 roles visible in a Shot."""
+
+        def track_overlaps_shot(track: dict) -> bool:
+            """Keep malformed scan rows from hiding every role in the picker."""
+
+            for sample in track.get("samples") or []:
+                if not isinstance(sample, dict):
+                    continue
+                try:
+                    sample_time = float(sample.get("time_seconds", -1.0) or -1.0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if cue.start_seconds - 0.25 <= sample_time <= cue.end_seconds + 0.25:
+                    return True
+            return False
+
+        v1 = self._reference_asset("V1")
+        ledger = parse_source_video_analysis(v1.semantic_enrichment) if v1 else {}
+        scene = self._source_scene_for_shot(cue)
+        try:
+            scene_index = int(scene.get("scene_index", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            scene_index = 0
+        active_roles = {
+            str(value or "").strip().upper()
+            for value in scene.get("active_source_roles") or []
+            if str(value or "").strip()
+        }
+        active_roles.update(self._shot_role_picture_bindings(cue))
+        active_roles.update(
+            str(role or "").strip().upper()
+            for role in cue.source_role_bbox_overrides
+            if str(role or "").strip()
+        )
+        roles = {
+            str(row.get("role_id", "")).strip().upper(): row
+            for row in ledger.get("principal_roles") or []
+            if isinstance(row, dict) and str(row.get("role_id", "")).strip()
+        }
+        samples_by_role: dict[str, list[dict]] = {}
+        candidates: list[tuple[str, dict]] = []
+        for role_id in sorted(active_roles):
+            role = roles.get(role_id, {})
+            tracks = [
+                row for row in role.get("shot_scan_tracks") or []
+                if isinstance(row, dict)
+                and (
+                    str(row.get("cue_id", "")) == cue.cue_id
+                    or int(row.get("scene_index", 0) or 0) == scene_index
+                    or track_overlaps_shot(row)
+                )
+            ]
+            samples = [
+                dict(sample)
+                for track in tracks
+                for sample in track.get("samples") or []
+                if isinstance(sample, dict)
+            ]
+            if samples:
+                samples_by_role[role_id] = samples
+                candidates.extend((role_id, sample) for sample in samples)
+        anchor_role = ""
+        anchor_sample: dict = {}
+        if candidates:
+            def anchor_score(item: tuple[str, dict]) -> tuple[int, float]:
+                _role_id, sample = item
+                frame = int(sample.get("frame_index", 0) or 0)
+                coverage = sum(
+                    1 for samples in samples_by_role.values()
+                    if any(
+                        int(row.get("first_frame_index", row.get("frame_index", 0)) or 0)
+                        <= frame
+                        <= int(row.get("last_frame_index", row.get("frame_index", 0)) or 0)
+                        for row in samples
+                    )
+                )
+                time_seconds = float(sample.get("time_seconds", cue.start_seconds) or 0.0)
+                midpoint = (cue.start_seconds + cue.end_seconds) / 2.0
+                return coverage, -abs(time_seconds - midpoint)
+            anchor_role, anchor_sample = max(candidates, key=anchor_score)
+        frame_path = Path(str(anchor_sample.get("frame_path", "")))
+        anchor_frame = int(anchor_sample.get("frame_index", 0) or 0)
+        anchor_time = float(anchor_sample.get("time_seconds", cue.start_seconds) or 0.0)
+        if not frame_path.is_file():
+            scene_pattern = re.compile(rf"source scene\s+0*{scene_index}\b", re.I)
+            frame_path = next((
+                Path(path) for label, path in self.analysis_paths.get(v1.node_id, [])
+                if scene_pattern.search(str(label)) and Path(path).is_file()
+            ), Path()) if v1 is not None else Path()
+        pixmap = QPixmap(str(frame_path)) if frame_path.is_file() else QPixmap()
+        boxes: dict[str, dict] = {}
+        role_views: dict[str, dict] = {}
+
+        def normalized_position_bbox(value: object) -> list[float]:
+            try:
+                left, top, right, bottom = [float(item) for item in value][:4]
+            except (TypeError, ValueError, OverflowError):
+                return []
+            left, top = max(0.0, left), max(0.0, top)
+            right, bottom = min(1.0, right), min(1.0, bottom)
+            if right <= left or bottom <= top:
+                return []
+            # [0,0,1,1] in legacy/Qwen scan rows is an uncertainty sentinel,
+            # not a real person position in the complete V1 frame.
+            if left <= 0.001 and top <= 0.001 and right >= 0.999 and bottom >= 0.999:
+                return []
+            return [left, top, right, bottom]
+
+        def role_ledger_bbox(role: dict) -> list[float]:
+            evidence_rows = [
+                row for row in role.get("appearance_evidence") or []
+                if isinstance(row, dict)
+                and int(row.get("scene_index", 0) or 0) == scene_index
+            ]
+            for evidence in evidence_rows:
+                bbox = normalized_position_bbox(
+                    evidence.get("thumbnail_bbox_normalized") or []
+                )
+                if bbox and bbox != [0.0, 0.0, 1.0, 1.0]:
+                    return bbox
+            bbox = normalized_position_bbox(
+                role.get("thumbnail_bbox_normalized") or []
+            )
+            # Role portraits and several legacy ledgers encode [0,0,1,1]
+            # relative to an already-cropped thumbnail. Never project that
+            # value back over the complete V1 frame as a person position.
+            return [] if bbox == [0.0, 0.0, 1.0, 1.0] else bbox
+
+        def role_sample_score(sample: dict) -> tuple[int, int, float, float]:
+            sample_path = Path(str(sample.get("frame_path", "")))
+            visibility = str(sample.get("face_visibility", "")).strip().casefold()
+            visibility_score = (
+                3 if "front" in visibility
+                else 2 if "three" in visibility or "3/4" in visibility
+                else 1 if visibility else 0
+            )
+            try:
+                left, top, right, bottom = [
+                    float(value) for value in
+                    (sample.get("bbox_normalized") or [])[:4]
+                ]
+                area = max(0.0, right - left) * max(0.0, bottom - top)
+            except (TypeError, ValueError, OverflowError):
+                area = 0.0
+            try:
+                sample_time = float(
+                    sample.get("time_seconds", cue.start_seconds) or cue.start_seconds
+                )
+            except (TypeError, ValueError, OverflowError):
+                sample_time = cue.start_seconds
+            midpoint = (cue.start_seconds + cue.end_seconds) / 2.0
+            return (
+                1 if sample_path.is_file() else 0,
+                visibility_score,
+                area,
+                -abs(sample_time - midpoint),
+            )
+
+        for role_id in sorted(active_roles):
+            role = roles.get(role_id, {})
+            samples = samples_by_role.get(role_id, [])
+            frame_samples = [
+                row for row in samples
+                if int(row.get("first_frame_index", row.get("frame_index", 0)) or 0)
+                <= anchor_frame
+                <= int(row.get("last_frame_index", row.get("frame_index", 0)) or 0)
+            ]
+            sample = min(
+                frame_samples,
+                key=lambda row: abs(
+                    int(row.get("frame_index", anchor_frame) or anchor_frame) - anchor_frame
+                ),
+                default={},
+            )
+            normalized_bbox = normalized_position_bbox(
+                sample.get("bbox_normalized") or []
+            )
+            if not normalized_bbox and not samples:
+                normalized_bbox = role_ledger_bbox(role)
+            if normalized_bbox:
+                boxes[role_id] = {
+                    "bbox_normalized": normalized_bbox,
+                    "visual_identity": str(role.get("visual_identity", "")),
+                    "wardrobe": str(role.get("wardrobe", "")),
+                    "position_source": (
+                        "anchor_frame" if frame_samples else "role_ledger"
+                    ),
+                }
+            best_role_sample = max(
+                samples,
+                key=role_sample_score,
+                default={},
+            )
+            role_frame_path = Path(str(best_role_sample.get("frame_path", "")))
+            role_pixmap = (
+                QPixmap(str(role_frame_path))
+                if role_frame_path.is_file() else QPixmap(pixmap)
+            )
+            role_bbox = normalized_position_bbox(
+                best_role_sample.get("bbox_normalized") or []
+            ) or normalized_bbox
+            try:
+                role_frame_index = int(
+                    best_role_sample.get("frame_index", anchor_frame) or anchor_frame
+                )
+            except (TypeError, ValueError, OverflowError):
+                role_frame_index = anchor_frame
+            try:
+                role_time_seconds = float(
+                    best_role_sample.get("time_seconds", anchor_time) or anchor_time
+                )
+            except (TypeError, ValueError, OverflowError):
+                role_time_seconds = anchor_time
+            role_views[role_id] = {
+                "pixmap": role_pixmap,
+                "frame_path": (
+                    str(role_frame_path) if role_frame_path.is_file()
+                    else str(frame_path) if frame_path.is_file() else ""
+                ),
+                "frame_index": role_frame_index,
+                "time_seconds": role_time_seconds,
+                "roles": {},
+                "has_tracked_bbox": bool(role_bbox),
+            }
+        # Each role-specific view keeps every other person known to be visible
+        # in that exact frame. This makes Ctrl+click multi-selection possible
+        # after navigating from a CURRENT ROLE card.
+        for focus_role, view in role_views.items():
+            view_frame = int(view.get("frame_index", anchor_frame) or anchor_frame)
+            view_boxes: dict[str, dict] = {}
+            for candidate_role in sorted(active_roles):
+                candidate_samples = samples_by_role.get(candidate_role, [])
+                visible_samples = [
+                    row for row in candidate_samples
+                    if int(row.get("first_frame_index", row.get("frame_index", 0)) or 0)
+                    <= view_frame
+                    <= int(row.get("last_frame_index", row.get("frame_index", 0)) or 0)
+                ]
+                visible_sample = min(
+                    visible_samples,
+                    key=lambda row: abs(
+                        int(row.get("frame_index", view_frame) or view_frame) - view_frame
+                    ),
+                    default={},
+                )
+                candidate_bbox = normalized_position_bbox(
+                    visible_sample.get("bbox_normalized") or []
+                )
+                if not candidate_bbox and not candidate_samples:
+                    candidate_bbox = list(
+                        (boxes.get(candidate_role) or {}).get("bbox_normalized") or []
+                    )
+                if not candidate_bbox:
+                    continue
+                role = roles.get(candidate_role, {})
+                view_boxes[candidate_role] = {
+                    "bbox_normalized": candidate_bbox,
+                    "visual_identity": str(role.get("visual_identity", "")),
+                    "wardrobe": str(role.get("wardrobe", "")),
+                    "position_source": (
+                        "same_frame_track" if visible_sample else "role_ledger"
+                    ),
+                }
+            view["roles"] = view_boxes
+            view["has_tracked_bbox"] = focus_role in view_boxes
+        # Manual Shot Visual Editor boxes are authoritative for this Shot.
+        # Project them onto every role-specific evidence view so moving from
+        # one Current Role card to another never makes the authored rectangle
+        # disappear.
+        for raw_role_id, raw_bbox in cue.source_role_bbox_overrides.items():
+            role_id = str(raw_role_id or "").strip().upper()
+            normalized_bbox = normalized_position_bbox(raw_bbox)
+            if not normalized_bbox or role_id not in active_roles:
+                continue
+            role = roles.get(role_id, {})
+            payload = {
+                "bbox_normalized": normalized_bbox,
+                "visual_identity": str(role.get("visual_identity", "")),
+                "wardrobe": str(role.get("wardrobe", "")),
+                "position_source": "manual_shot_override",
+            }
+            boxes[role_id] = dict(payload)
+            for focus_role, view in role_views.items():
+                view.setdefault("roles", {})[role_id] = dict(payload)
+                if focus_role == role_id:
+                    view["has_tracked_bbox"] = True
+        return {
+            "pixmap": pixmap,
+            "frame_path": str(frame_path) if frame_path.is_file() else "",
+            "frame_index": anchor_frame,
+            "time_seconds": anchor_time,
+            "anchor_role": anchor_role,
+            "roles": boxes,
+            "role_views": role_views,
+        }
+
+    @staticmethod
+    def _shot_scan_text_similarity(left: object, right: object) -> float:
+        """Compare two short Qwen identity descriptions without trusting wording."""
+
+        left_text = " ".join(re.findall(r"[\w]+", str(left or "").casefold()))
+        right_text = " ".join(re.findall(r"[\w]+", str(right or "").casefold()))
+        if not left_text or not right_text:
+            return 0.0
+        if left_text == right_text:
+            return 1.0
+        left_tokens = set(left_text.split())
+        right_tokens = set(right_text.split())
+        token_score = len(left_tokens & right_tokens) / max(
+            1, len(left_tokens | right_tokens)
+        )
+        sequence_score = SequenceMatcher(None, left_text, right_text).ratio()
+        return max(token_score, sequence_score)
+
+    @classmethod
+    def _shot_scan_face_hashes(
+        cls, source: Path, bbox: object
+    ) -> tuple[int, int] | None:
+        """Return average/difference hashes for one Qwen-selected V1 face crop."""
+
+        if not source.is_file():
+            return None
+        pixmap = QPixmap(str(source))
+        if pixmap.isNull():
+            return None
+        crop = cls._crop_v1_role_pixmap(pixmap, bbox)
+        if crop.isNull():
+            return None
+        image = crop.toImage().convertToFormat(QImage.Format_Grayscale8)
+        average_image = image.scaled(
+            8, 8, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+        )
+        average_values = [
+            average_image.pixelColor(x, y).red()
+            for y in range(8) for x in range(8)
+        ]
+        threshold = sum(average_values) / max(1, len(average_values))
+        average_hash = 0
+        for index, value in enumerate(average_values):
+            if value >= threshold:
+                average_hash |= 1 << index
+        difference_image = image.scaled(
+            9, 8, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+        )
+        difference_hash = 0
+        bit = 0
+        for y in range(8):
+            for x in range(8):
+                if difference_image.pixelColor(x, y).red() >= difference_image.pixelColor(
+                    x + 1, y
+                ).red():
+                    difference_hash |= 1 << bit
+                bit += 1
+        return average_hash, difference_hash
+
+    @staticmethod
+    def _shot_scan_hash_similarity(
+        left: tuple[int, int] | None, right: tuple[int, int] | None
+    ) -> float:
+        if not left or not right:
+            return 0.0
+        average_score = 1.0 - ((left[0] ^ right[0]).bit_count() / 64.0)
+        difference_score = 1.0 - ((left[1] ^ right[1]).bit_count() / 64.0)
+        return max(average_score, difference_score)
+
+    def _match_qwen_source_scan_role(
+        self,
+        state: dict,
+        person: dict,
+        face_hashes: tuple[int, int] | None,
+        *,
+        role_ids: set[str] | None = None,
+    ) -> str:
+        """Resolve an untrusted Qwen row to one stable R role across frame batches."""
+
+        known_roles: dict[str, dict] = state.get("known_roles") or {}
+        detected_roles: dict[str, dict] = state.get("detected_roles") or {}
+        candidate_ids = role_ids if role_ids is not None else set(known_roles)
+        first = int(person.get("first_frame_index", -1))
+        last = int(person.get("last_frame_index", first))
+        best_match = ""
+        best_score = 0.0
+        for role_id in sorted(candidate_ids):
+            role = known_roles.get(role_id) or detected_roles.get(role_id)
+            if not isinstance(role, dict):
+                continue
+            known_hashes = role.get("_shot_scan_face_hashes")
+            if not known_hashes:
+                portrait = Path(str(role.get("shot_scan_thumbnail_path", "")))
+                known_hashes = self._shot_scan_face_hashes(
+                    portrait, [0.0, 0.0, 1.0, 1.0]
+                )
+                if known_hashes:
+                    role["_shot_scan_face_hashes"] = known_hashes
+            face_score = self._shot_scan_hash_similarity(face_hashes, known_hashes)
+            identity_score = self._shot_scan_text_similarity(
+                person.get("visual_identity"), role.get("visual_identity")
+            )
+            wardrobe_score = self._shot_scan_text_similarity(
+                person.get("wardrobe"), role.get("wardrobe")
+            )
+            existing = detected_roles.get(role_id) or {}
+            previous_last = int(existing.get("last_frame_index", -10_000))
+            next_first = int(existing.get("first_frame_index", 10_000))
+            frame_gap = min(abs(first - previous_last), abs(next_first - last))
+            overlaps = not (
+                last < int(existing.get("first_frame_index", first))
+                or first > int(existing.get("last_frame_index", last))
+            ) if existing else False
+            exact_identity = (
+                len(str(person.get("visual_identity", "")).strip()) >= 8
+                and str(person.get("visual_identity", "")).strip().casefold()
+                == str(role.get("visual_identity", "")).strip().casefold()
+            )
+            qualifies = (
+                face_score >= 0.92
+                or (face_score >= 0.84 and identity_score >= 0.42)
+                or (
+                    identity_score >= 0.82 and wardrobe_score >= 0.64
+                    and (not overlaps or face_score >= 0.78 or exact_identity)
+                )
+                or (
+                    frame_gap <= 48 and identity_score >= 0.62
+                    and wardrobe_score >= 0.50
+                )
+            )
+            score = (
+                face_score * 0.55
+                + identity_score * 0.30
+                + wardrobe_score * 0.15
+                + (0.08 if frame_gap <= 48 else 0.0)
+            )
+            if qualifies and score > best_score:
+                best_match, best_score = role_id, score
+        return best_match
+
+    def _detect_source_roles_for_shot(self, cue: DirectorCue) -> dict[str, dict]:
+        """Recover visible V1 roles that have no replacement binding in one Shot."""
+
+        visuals = self._source_role_visuals_for_shot(cue)
+        if not visuals or not self.scan:
+            return {}
+        mapped = self._shot_role_picture_bindings(cue)
+        pictures = sorted(
+            (
+                asset for asset in self.scan.assets
+                if asset.media_type == "image"
+                and normalize_picture_reference(stable_reference_id(asset))
+            ),
+            key=lambda asset: (
+                "[V1_SOURCE_FACE:" in str(asset.clip_prompt or ""),
+                int(re.search(r"\d+", stable_reference_id(asset)).group()),
+            ),
+        )
+        fallback = (
+            normalize_picture_reference(stable_reference_id(pictures[0]))
+            if pictures else ""
+        )
+        return {
+            role_id: {
+                "target_media_id": mapped.get(role_id) or fallback,
+                "scene_index": int(payload.get("scene_index", 0) or 0),
+                "activate_source_role": bool(payload.get("activate_source_role", False)),
+            }
+            for role_id, payload in visuals.items()
+            if mapped.get(role_id) or fallback
+        }
+
+    def _start_qwen_source_role_scan(self, cue: DirectorCue, callback) -> bool:
+        """Decode every 24fps relay frame, then scan it in sequential Qwen batches."""
+
+        if self.source_role_scan_states:
+            QMessageBox.information(
+                self,
+                "Detect V1 people",
+                "Another Qwen Shot people scan is already running.",
+            )
+            return False
+        v1 = self._reference_asset("V1")
+        source = Path(str(v1.local_path or "")) if v1 is not None else Path()
+        if v1 is None or not source.is_file():
+            QMessageBox.warning(
+                self, "Detect V1 people", "Load or reconnect the V1 source video first."
+            )
+            return False
+        settings = load_design_settings(DESIGN_SETTINGS_ENV)
+        if not str(settings.lm_studio_base_url or "").strip() or not str(
+            settings.lm_studio_model or ""
+        ).strip():
+            QMessageBox.warning(
+                self,
+                "Detect V1 people",
+                "Configure the LM Studio URL and Qwen model on the Design page first.",
+            )
+            return False
+        start = snap_video_frame_seconds(max(0.0, cue.start_seconds))
+        end = snap_video_frame_seconds(max(start + 1.0 / 24.0, cue.end_seconds))
+        signature = hashlib.sha1(
+            (
+                f"{source.resolve()}|{source.stat().st_mtime_ns}|{cue.cue_id}|"
+                f"{start:.6f}|{end:.6f}|qwen-frame-scan-v1"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        scan_id = f"source-role-scan:{cue.cue_id}:{time.time_ns()}"
+        cache_dir = CACHE_ROOT / "source_role_frame_scans" / signature
+        ledger = parse_source_video_analysis(v1.semantic_enrichment)
+        known_roles = {
+            str(row.get("role_id", "")).strip().upper(): dict(row)
+            for row in ledger.get("principal_roles") or []
+            if isinstance(row, dict)
+            and re.fullmatch(
+                r"R[1-9][0-9]*", str(row.get("role_id", "")).strip().upper()
+            )
+        }
+        self.source_role_scan_states[scan_id] = {
+            "scan_id": scan_id,
+            "asset": v1,
+            "path": v1.local_path,
+            "fingerprint": self._semantic_source_fingerprint(v1),
+            "cue_id": cue.cue_id,
+            "start_seconds": start,
+            "end_seconds": end,
+            "callback": callback,
+            "cache_dir": cache_dir,
+            "frames": [],
+            "frames_by_index": {},
+            "batches": [],
+            "batch_cursor": 0,
+            "known_roles": known_roles,
+            "detected_roles": {},
+            "role_aliases": {},
+            "next_role_number": max(
+                [int(role_id[1:]) for role_id in known_roles] or [0]
+            ) + 1,
+        }
+        progress = QProgressDialog(
+            "DETECT V1 PEOPLE · decoding every 24fps V1 relay frame…",
+            "",
+            0,
+            1,
+            self,
+        )
+        progress.setWindowTitle(f"Qwen V1 people scan · {cue.cue_id}")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setValue(0)
+        progress.show()
+        self.source_role_scan_progress = progress
+
+        job_id = f"source-role-frames:{cue.cue_id}:{time.time_ns()}"
+        self.media_jobs[job_id] = {
+            "asset": v1,
+            "path": v1.local_path,
+            "operation": "source-role-frame-scan",
+            "scan_id": scan_id,
+        }
+        try:
+            if not self.media_runner.is_running():
+                if not self.media_runner.start(
+                    str(self.runtime.python),
+                    [
+                        str(PROJECT_ROOT / "media_prepare_service.py"),
+                        "--ffmpeg",
+                        str(self.runtime.ffmpeg),
+                    ],
+                ):
+                    raise RuntimeError("Media preparation service is still stopping")
+            self.media_runner.write_json({
+                "job": job_id,
+                "operation": "shot-frame-scan",
+                "media": v1.local_path,
+                "start_seconds": start,
+                "end_seconds": end,
+                "scan_fps": 24.0,
+                "max_frames": 720,
+                "destination": str(cache_dir / "frames"),
+            })
+            self.statusBar().showMessage(
+                f"{cue.cue_id} · Qwen DETECT V1 PEOPLE decoding every relay frame"
+            )
+            return True
+        except Exception as exc:
+            self.media_jobs.pop(job_id, None)
+            self._finish_qwen_source_role_scan(scan_id, error=str(exc))
+            return False
+
+    def _begin_qwen_source_role_batches(
+        self, scan_id: str, frame_rows: list[dict]
+    ) -> None:
+        state = self.source_role_scan_states.get(scan_id)
+        if state is None:
+            return
+        frames = [
+            {
+                "frame_index": int(row.get("frame_index", -1)),
+                "time_seconds": float(row.get("time_seconds", 0.0) or 0.0),
+                "label": str(row.get("label", "")),
+                "path": str(row.get("path", "")),
+            }
+            for row in frame_rows
+            if isinstance(row, dict)
+            and int(row.get("frame_index", -1)) >= 0
+            and Path(str(row.get("path", ""))).is_file()
+        ]
+        if not frames:
+            self._finish_qwen_source_role_scan(
+                scan_id, error="FFmpeg returned no readable V1 Shot frames."
+            )
+            return
+        state["frames"] = frames
+        state["frames_by_index"] = {
+            int(row["frame_index"]): row for row in frames
+        }
+        state["batches"] = [
+            frames[offset : offset + 32] for offset in range(0, len(frames), 32)
+        ]
+        state["batch_cursor"] = 0
+        progress = self.source_role_scan_progress
+        if progress is not None:
+            progress.setRange(0, len(state["batches"]) + 1)
+            progress.setValue(1)
+            progress.setLabelText(
+                f"DETECT V1 PEOPLE · decoded {len(frames)} frames · starting Qwen batch 1/"
+                f"{len(state['batches'])}"
+            )
+        self._submit_next_qwen_source_role_batch(scan_id)
+
+    def _source_role_scan_cast_sheet(self, state: dict) -> Path | None:
+        cache_dir = Path(state["cache_dir"])
+        portraits_dir = cache_dir / "cast"
+        portraits_dir.mkdir(parents=True, exist_ok=True)
+        cue = next(
+            (item for item in self.director_cues if item.cue_id == state["cue_id"]),
+            None,
+        )
+        visuals = self._source_role_visuals_for_shot(cue) if cue is not None else {}
+        rows: list[tuple[str, Path]] = []
+        for role_id, role in sorted(
+            state["known_roles"].items(),
+            key=lambda item: int(item[0][1:]),
+        ):
+            portrait = Path(str(role.get("shot_scan_thumbnail_path", "")))
+            if not portrait.is_file():
+                portrait = portraits_dir / f"{role_id}.png"
+                pixmap = (visuals.get(role_id) or {}).get("pixmap", QPixmap())
+                if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                    pixmap.save(str(portrait), "PNG")
+            if portrait.is_file():
+                role["shot_scan_thumbnail_path"] = str(portrait.resolve())
+                hashes = self._shot_scan_face_hashes(
+                    portrait, [0.0, 0.0, 1.0, 1.0]
+                )
+                if hashes:
+                    role["_shot_scan_face_hashes"] = hashes
+                rows.append((f"{role_id} · known V1 role", portrait))
+        if not rows:
+            return None
+        destination = cache_dir / f"cast_before_batch_{state['batch_cursor'] + 1:03d}.jpg"
+        return create_labeled_contact_sheet(
+            rows[:24], destination, columns=6, cell_size=(192, 192)
+        )
+
+    def _submit_next_qwen_source_role_batch(self, scan_id: str) -> None:
+        state = self.source_role_scan_states.get(scan_id)
+        if state is None:
+            return
+        cursor = int(state.get("batch_cursor", 0))
+        batches = state.get("batches") or []
+        if cursor >= len(batches):
+            self._complete_qwen_source_role_scan(scan_id)
+            return
+        batch = batches[cursor]
+        cache_dir = Path(state["cache_dir"])
+        sheet_paths: list[Path] = []
+        for sheet_number, offset in enumerate(range(0, len(batch), 16), 1):
+            rows = batch[offset : offset + 16]
+            sheet_paths.append(create_labeled_contact_sheet(
+                [(row["label"], Path(row["path"])) for row in rows],
+                cache_dir / f"batch_{cursor + 1:03d}_sheet_{sheet_number}.jpg",
+                columns=4,
+                cell_size=(384, 216),
+            ))
+        cast_sheet = self._source_role_scan_cast_sheet(state)
+        input_paths = ([cast_sheet] if cast_sheet is not None else []) + sheet_paths
+        input_paths = input_paths[:3]
+        frame_indexes = [int(row["frame_index"]) for row in batch]
+        system_prompt, user_prompt = build_source_video_shot_people_scan_prompts(
+            media_id=media_shortcut(state["asset"]),
+            shot_id=state["cue_id"],
+            batch_index=cursor + 1,
+            frame_indexes=frame_indexes,
+            known_roles=list(state["known_roles"].values()),
+        )
+        settings = load_design_settings(DESIGN_SETTINGS_ENV)
+        timeout = max(600, int(settings.timeout))
+        job_id = f"source-role-qwen:{state['cue_id']}:{cursor + 1}:{time.time_ns()}"
+        state["semantic_job_id"] = job_id
+        self.semantic_jobs[job_id] = {
+            "kind": "source_remake_shot_people_scan",
+            "asset": state["asset"],
+            "path": state["path"],
+            "fingerprint": state["fingerprint"],
+            "provider": "lm_studio",
+            "base_url": str(settings.lm_studio_base_url or "").strip(),
+            "model": str(settings.lm_studio_model or "").strip(),
+            "timeout": timeout,
+            "unload_lm": cursor + 1 >= len(batches),
+            "scan_id": scan_id,
+            "batch_index": cursor + 1,
+            "frame_indexes": frame_indexes,
+        }
+        try:
+            if not self.semantic_runner.is_running():
+                if not self.semantic_runner.start(
+                    str(self.runtime.python), [str(PROJECT_ROOT / "design_ai_service.py")]
+                ):
+                    raise RuntimeError("Qwen semantic service is still stopping")
+            self.semantic_runner.write_json({
+                "job": job_id,
+                "action": "generate",
+                "provider": "lm_studio",
+                "base_url": str(settings.lm_studio_base_url or "").strip(),
+                "model": str(settings.lm_studio_model or "").strip(),
+                "api_key": "",
+                "timeout": timeout,
+                "schema_name": "source_video_shot_people_scan",
+                "max_output_tokens": 8192,
+                "temperature": 0.0,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "schema": SOURCE_VIDEO_SHOT_PEOPLE_SCAN_SCHEMA,
+                "input_image_paths": [str(path) for path in input_paths],
+                "require_image_input": True,
+                "require_exact_model": True,
+            })
+            self.semantic_last_lm_request = dict(self.semantic_jobs[job_id])
+            progress = self.source_role_scan_progress
+            if progress is not None:
+                progress.setValue(cursor + 1)
+                progress.setLabelText(
+                    f"DETECT V1 PEOPLE · Qwen scanning every frame · batch "
+                    f"{cursor + 1}/{len(batches)}"
+                )
+        except Exception as exc:
+            self.semantic_jobs.pop(job_id, None)
+            self._finish_qwen_source_role_scan(scan_id, error=str(exc))
+
+    def _merge_qwen_source_role_batch(self, state: dict, payload: dict) -> None:
+        known_roles: dict[str, dict] = state["known_roles"]
+        detected_roles: dict[str, dict] = state["detected_roles"]
+        frames_by_index: dict[int, dict] = state["frames_by_index"]
+        cache_dir = Path(state["cache_dir"]) / "detected"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        def reliable_person_bbox(value: object) -> list[float]:
+            try:
+                left, top, right, bottom = [float(item) for item in value][:4]
+            except (TypeError, ValueError, OverflowError):
+                return []
+            left, top = max(0.0, left), max(0.0, top)
+            right, bottom = min(1.0, right), min(1.0, bottom)
+            if right <= left or bottom <= top:
+                return []
+            if left <= 0.001 and top <= 0.001 and right >= 0.999 and bottom >= 0.999:
+                return []
+            return [left, top, right, bottom]
+
+        for person in payload.get("people") or []:
+            first = int(person["first_frame_index"])
+            last = int(person["last_frame_index"])
+            best = int(person["best_frame_index"])
+            frame = frames_by_index.get(best, {})
+            source = Path(str(frame.get("path", "")))
+            person_bbox = reliable_person_bbox(
+                person.get("bbox_normalized") or []
+            )
+            face_hashes = (
+                self._shot_scan_face_hashes(source, person_bbox)
+                if person_bbox else []
+            )
+            requested_role_id = str(
+                person.get("matched_role_id", "")
+            ).strip().upper()
+            if requested_role_id not in known_roles:
+                requested_role_id = ""
+            # Qwen sometimes describes the same performer once per second and
+            # either omits matched_role_id or alternates between duplicate old
+            # IDs.  Prefer the identity already observed by this scan.
+            role_id = self._match_qwen_source_scan_role(
+                state,
+                person,
+                face_hashes,
+                role_ids=set(detected_roles),
+            )
+            if role_id and requested_role_id and requested_role_id != role_id:
+                state.setdefault("role_aliases", {})[requested_role_id] = role_id
+            if not role_id:
+                role_id = requested_role_id
+            if not role_id:
+                role_id = self._match_qwen_source_scan_role(
+                    state, person, face_hashes
+                )
+            if not role_id:
+                role_id = f"R{int(state['next_role_number'])}"
+                state["next_role_number"] = int(state["next_role_number"]) + 1
+            row = detected_roles.setdefault(role_id, {
+                "role_id": role_id,
+                "visual_identity": str(person.get("visual_identity", "")),
+                "wardrobe": str(person.get("wardrobe", "")),
+                "first_frame_index": first,
+                "last_frame_index": last,
+                "best_frame_index": best,
+                "bbox_normalized": list(person_bbox),
+                "face_visibility": str(person.get("face_visibility", "")),
+                "confidence": str(person.get("confidence", "")),
+                "_shot_scan_face_hashes": face_hashes,
+                "track_samples": [],
+            })
+            row["first_frame_index"] = min(int(row["first_frame_index"]), first)
+            row["last_frame_index"] = max(int(row["last_frame_index"]), last)
+            if not str(row.get("visual_identity", "")).strip():
+                row["visual_identity"] = str(person.get("visual_identity", ""))
+            sample = {
+                "frame_index": best,
+                "time_seconds": float(frame.get("time_seconds", 0.0) or 0.0),
+                "frame_path": str(source.resolve()) if source.is_file() else "",
+                "first_frame_index": first,
+                "last_frame_index": last,
+                "bbox_normalized": list(person_bbox),
+                "face_visibility": str(person.get("face_visibility", "")),
+            }
+            existing_samples = row.setdefault("track_samples", [])
+            if not any(
+                int(value.get("frame_index", -1)) == best
+                for value in existing_samples if isinstance(value, dict)
+            ):
+                existing_samples.append(sample)
+            portrait = cache_dir / f"{role_id}.png"
+            if source.is_file() and person_bbox and not portrait.is_file():
+                pixmap = QPixmap(str(source))
+                crop = self._crop_v1_role_pixmap(
+                    pixmap, person_bbox
+                )
+                if not crop.isNull():
+                    crop.save(str(portrait), "PNG")
+            if portrait.is_file():
+                row["shot_scan_thumbnail_path"] = str(portrait.resolve())
+            known = known_roles.setdefault(role_id, {
+                "role_id": role_id,
+                "visual_identity": row["visual_identity"],
+                "wardrobe": row["wardrobe"],
+                "narrative_function": "Shot-local Qwen detected V1 person",
+                "confidence": row["confidence"],
+                "_shot_scan_face_hashes": face_hashes,
+            })
+            if face_hashes and not known.get("_shot_scan_face_hashes"):
+                known["_shot_scan_face_hashes"] = face_hashes
+            if portrait.is_file():
+                known["shot_scan_thumbnail_path"] = str(portrait.resolve())
+
+    def _complete_qwen_source_role_scan(self, scan_id: str) -> None:
+        state = self.source_role_scan_states.get(scan_id)
+        if state is None:
+            return
+        cue = next(
+            (item for item in self.director_cues if item.cue_id == state["cue_id"]),
+            None,
+        )
+        asset = state["asset"]
+        ledger = parse_source_video_analysis(asset.semantic_enrichment)
+        scene = self._source_scene_for_shot(cue) if cue is not None else {}
+        scene_index = int(scene.get("scene_index", 0) or 0)
+        roles_by_id = {
+            str(row.get("role_id", "")).strip().upper(): row
+            for row in ledger.get("principal_roles") or []
+            if isinstance(row, dict)
+        }
+        detected_roles = state.get("detected_roles") or {}
+        aliases = {
+            str(alias).strip().upper(): str(canonical).strip().upper()
+            for alias, canonical in (state.get("role_aliases") or {}).items()
+            if str(alias).strip().upper() != str(canonical).strip().upper()
+        }
+        # Repair role ledgers polluted by older scans. Only roles explicitly
+        # created by the Shot-local scanner are eligible; principal roles from
+        # the original V1 analysis are never pruned heuristically.
+        for role_id, role in (state.get("known_roles") or {}).items():
+            if role_id in detected_roles or str(
+                role.get("narrative_function", "")
+            ).strip() != "Shot-local Qwen detected V1 person":
+                continue
+            portrait = Path(str(role.get("shot_scan_thumbnail_path", "")))
+            hashes = role.get("_shot_scan_face_hashes") or self._shot_scan_face_hashes(
+                portrait, [0.0, 0.0, 1.0, 1.0]
+            )
+            canonical = self._match_qwen_source_scan_role(
+                state,
+                {
+                    "visual_identity": role.get("visual_identity", ""),
+                    "wardrobe": role.get("wardrobe", ""),
+                    "first_frame_index": -1,
+                    "last_frame_index": -1,
+                },
+                hashes,
+                role_ids=set(detected_roles),
+            )
+            if canonical and canonical != role_id:
+                aliases[role_id] = canonical
+        for alias in list(aliases):
+            canonical = aliases[alias]
+            visited = {alias}
+            while canonical in aliases and canonical not in visited:
+                visited.add(canonical)
+                canonical = aliases[canonical]
+            aliases[alias] = canonical
+        if aliases:
+            ledger["principal_roles"] = [
+                row for row in ledger.get("principal_roles") or []
+                if str(row.get("role_id", "")).strip().upper() not in aliases
+            ]
+            roles_by_id = {
+                str(row.get("role_id", "")).strip().upper(): row
+                for row in ledger.get("principal_roles") or []
+                if isinstance(row, dict)
+            }
+            for scene_row in ledger.get("scenes") or []:
+                active = [
+                    aliases.get(str(value).strip().upper(), str(value).strip().upper())
+                    for value in scene_row.get("active_source_roles") or []
+                    if str(value).strip()
+                ]
+                scene_row["active_source_roles"] = list(dict.fromkeys(active))
+                speaker = str(scene_row.get("speaker_role", "")).strip().upper()
+                if speaker in aliases:
+                    scene_row["speaker_role"] = aliases[speaker]
+                listeners = [
+                    aliases.get(str(value).strip().upper(), str(value).strip().upper())
+                    for value in scene_row.get("listener_roles") or []
+                    if str(value).strip()
+                ]
+                if listeners:
+                    scene_row["listener_roles"] = list(dict.fromkeys(listeners))
+            migrated_bindings: list[dict] = []
+            seen_binding_keys: set[tuple[str, tuple[int, ...]]] = set()
+            for binding in self.source_video_role_bindings:
+                migrated = dict(binding)
+                role_id = str(migrated.get("source_role_id", "")).strip().upper()
+                migrated["source_role_id"] = aliases.get(role_id, role_id)
+                indexes = tuple(sorted(
+                    int(value) for value in migrated.get("scene_indexes") or []
+                    if isinstance(value, (int, float))
+                ))
+                key = (migrated["source_role_id"], indexes)
+                if key in seen_binding_keys:
+                    continue
+                seen_binding_keys.add(key)
+                migrated_bindings.append(migrated)
+            self.source_video_role_bindings = migrated_bindings
+        for role_id, detected in detected_roles.items():
+            role = roles_by_id.get(role_id)
+            if role is None:
+                role = {
+                    "role_id": role_id,
+                    "visual_identity": detected.get("visual_identity", ""),
+                    "wardrobe": detected.get("wardrobe", ""),
+                    "narrative_function": "Shot-local Qwen detected V1 person",
+                    "scene_indexes": [scene_index] if scene_index > 0 else [],
+                    "confidence": detected.get("confidence", ""),
+                    "representative_scene_index": scene_index,
+                    "representative_panel": "midpoint",
+                    "thumbnail_bbox_normalized": [0.0, 0.0, 1.0, 1.0],
+                    "appearance_evidence": [{
+                        "scene_index": scene_index,
+                        "panel": "midpoint",
+                        "thumbnail_bbox_normalized": [0.0, 0.0, 1.0, 1.0],
+                        "face_visibility": detected.get("face_visibility", ""),
+                    }] if scene_index > 0 else [],
+                }
+                ledger.setdefault("principal_roles", []).append(role)
+                roles_by_id[role_id] = role
+            indexes = {
+                int(value) for value in role.get("scene_indexes") or []
+                if isinstance(value, (int, float))
+            }
+            if scene_index > 0:
+                indexes.add(scene_index)
+            role["scene_indexes"] = sorted(indexes)
+            if detected.get("shot_scan_thumbnail_path"):
+                role["shot_scan_thumbnail_path"] = detected[
+                    "shot_scan_thumbnail_path"
+                ]
+                role["thumbnail_bbox_normalized"] = [0.0, 0.0, 1.0, 1.0]
+            samples = [
+                dict(row) for row in detected.get("track_samples") or []
+                if isinstance(row, dict)
+            ]
+            tracks = [
+                dict(row) for row in role.get("shot_scan_tracks") or []
+                if isinstance(row, dict)
+                and str(row.get("cue_id", "")) != str(state.get("cue_id", ""))
+            ]
+            if samples:
+                tracks.append({
+                    "cue_id": str(state.get("cue_id", "")),
+                    "scene_index": scene_index,
+                    "samples": sorted(
+                        samples,
+                        key=lambda row: int(row.get("frame_index", 0) or 0),
+                    ),
+                })
+            role["shot_scan_tracks"] = tracks
+        if scene_index > 0:
+            for scene_row in ledger.get("scenes") or []:
+                if int(scene_row.get("scene_index", 0) or 0) != scene_index:
+                    continue
+                active = [
+                    str(value or "").strip().upper()
+                    for value in scene_row.get("active_source_roles") or []
+                    if str(value or "").strip()
+                ]
+                scene_row["active_source_roles"] = list(dict.fromkeys(
+                    [*active, *detected_roles.keys()]
+                ))
+                break
+        asset.semantic_enrichment = render_source_video_analysis(ledger)
+        self._sync_timeline_clip_sources(asset)
+        self._mark_dirty()
+        detected = self._detect_source_roles_for_shot(cue) if cue is not None else {}
+        self._finish_qwen_source_role_scan(scan_id, detected=detected)
+
+    def _finish_qwen_source_role_scan(
+        self,
+        scan_id: str,
+        *,
+        detected: dict | None = None,
+        error: str = "",
+    ) -> None:
+        state = self.source_role_scan_states.pop(scan_id, None)
+        progress = self.source_role_scan_progress
+        self.source_role_scan_progress = None
+        if progress is not None:
+            progress.setValue(progress.maximum())
+            progress.close()
+            progress.deleteLater()
+        if state is None:
+            return
+        callback = state.get("callback")
+        if callable(callback):
+            QTimer.singleShot(
+                0,
+                lambda result=dict(detected or {}), detail=str(error or ""):
+                callback(result, detail),
+            )
+        if error:
+            self.statusBar().showMessage(
+                "DETECT V1 PEOPLE failed · " + error,
+                10000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"DETECT V1 PEOPLE complete · {len(detected or {})} V1 role(s) found",
+                8000,
+            )
+
     def _source_role_picture_for_scene(self, role_id: str, scene_index: int) -> str:
         role = str(role_id or "").strip().upper()
         if not role:
@@ -21237,7 +23548,12 @@ class DirectorCutStudio(QMainWindow):
         affected_assets: list[MediaAsset] = []
         for job in self.media_jobs.values():
             detail = log[-300:] if log else f"exit {exit_code}"
-            if job.get("operation") == "audio-pan":
+            if job.get("operation") == "source-role-frame-scan":
+                self._finish_qwen_source_role_scan(
+                    str(job.get("scan_id", "")),
+                    error=f"V1 frame-scan service stopped: {detail}",
+                )
+            elif job.get("operation") == "audio-pan":
                 self.audio_pan_pending.discard(job["proxy_key"])
                 self.statusBar().showMessage(f"Pan proxy service stopped: {detail}")
             else:
@@ -21883,7 +24199,31 @@ class DirectorCutStudio(QMainWindow):
                 self.statusBar().showMessage(
                     f"Discarded stale semantic result for {asset.tag}"
                 )
+                if job.get("kind") == "source_remake_shot_people_scan":
+                    job["unload_lm"] = True
+                    self._finish_qwen_source_role_scan(
+                        str(job.get("scan_id", "")),
+                        error="V1 changed while Qwen was scanning this Shot.",
+                    )
                 self._maybe_auto_enrich(asset)
+                return
+            if job.get("kind") == "source_remake_shot_people_scan":
+                scan_id = str(job.get("scan_id", ""))
+                state = self.source_role_scan_states.get(scan_id)
+                if state is None:
+                    return
+                normalized = normalize_source_video_shot_people_scan(
+                    payload.get("text") or payload.get("response") or payload,
+                    expected_media_id=media_shortcut(asset),
+                    expected_shot_id=state["cue_id"],
+                    expected_batch_index=int(job.get("batch_index", 0) or 0),
+                    valid_frame_indexes={
+                        int(value) for value in job.get("frame_indexes") or []
+                    },
+                )
+                self._merge_qwen_source_role_batch(state, normalized)
+                state["batch_cursor"] = int(state.get("batch_cursor", 0)) + 1
+                self._submit_next_qwen_source_role_batch(scan_id)
                 return
             if job.get("kind") == "source_remake_qwen_analysis":
                 normalized = normalize_source_video_analysis(
@@ -21951,7 +24291,12 @@ class DirectorCutStudio(QMainWindow):
                     f"AI semantic enrichment ready for {asset.tag} · asset is not on Timeline"
                 )
         except Exception as exc:
-            if job.get("kind") == "source_remake_qwen_analysis":
+            if job.get("kind") == "source_remake_shot_people_scan":
+                job["unload_lm"] = True
+                self._finish_qwen_source_role_scan(
+                    str(job.get("scan_id", "")), error=str(exc)
+                )
+            elif job.get("kind") == "source_remake_qwen_analysis":
                 finish_reason = str(payload.get("finish_reason", "")).strip()
                 message = str(exc).strip()
                 retryable = (
@@ -22062,7 +24407,11 @@ class DirectorCutStudio(QMainWindow):
                 retry_assets.append((asset, retry_count + 1))
                 continue
             self.semantic_errors[asset.node_id] = failure
-            if job.get("kind") == "source_remake_qwen_analysis":
+            if job.get("kind") == "source_remake_shot_people_scan":
+                self._finish_qwen_source_role_scan(
+                    str(job.get("scan_id", "")), error=failure
+                )
+            elif job.get("kind") == "source_remake_qwen_analysis":
                 self._notify_source_video_remake_analysis_failed(asset, failure)
         self.semantic_jobs.clear()
         self.semantic_unload_job_id = ""
@@ -23604,6 +25953,8 @@ class DirectorCutStudio(QMainWindow):
             legacy_identity_target_rows: list[tuple[dict, list[DirectorCue]]] = []
             changes_by_target: dict[str, tuple[DirectorCue, list[dict]]] = {}
             updated_bindings = deepcopy(self.source_video_role_bindings)
+            detected_scene_roles: dict[int, set[str]] = {}
+            detected_binding_rows: list[dict] = []
             if identity_changes:
                 for identity_change in identity_changes:
                     identity_scope = str(identity_change.get("scope") or "shot_only")
@@ -23626,6 +25977,48 @@ class DirectorCutStudio(QMainWindow):
                         target_reference = normalize_picture_reference(
                             identity_change.get("target_reference")
                         )
+                        if bool(identity_change.get("detected_unbound", False)):
+                            try:
+                                detected_scene_index = int(
+                                    identity_change.get("detected_scene_index", 0) or 0
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                detected_scene_index = 0
+                            matching_binding = next(
+                                (
+                                    row for row in updated_bindings
+                                    if str(row.get("source_role_id", "")).strip().upper()
+                                    == source_role_id
+                                    and (
+                                        not row.get("scene_indexes")
+                                        or detected_scene_index in {
+                                            int(value) for value in row.get("scene_indexes") or []
+                                            if isinstance(value, (int, float))
+                                        }
+                                    )
+                                ),
+                                None,
+                            )
+                            if matching_binding is None and target_reference:
+                                detected_row = {
+                                    "source_role_id": source_role_id,
+                                    "target_media_id": target_reference,
+                                    "scene_indexes": (
+                                        [detected_scene_index]
+                                        if detected_scene_index > 0 else []
+                                    ),
+                                    "identity_lock": "strict",
+                                    "source_thumbnail": False,
+                                }
+                                updated_bindings.append(detected_row)
+                                detected_binding_rows.append(deepcopy(detected_row))
+                            if (
+                                detected_scene_index > 0
+                                and bool(identity_change.get("activate_source_role", False))
+                            ):
+                                detected_scene_roles.setdefault(
+                                    detected_scene_index, set()
+                                ).add(source_role_id)
                         for target in identity_targets:
                             existing = next(
                                 (row for row in changes if row[0] is target),
@@ -23672,15 +26065,64 @@ class DirectorCutStudio(QMainWindow):
                         )
                         if target_after != target_before:
                             changes.append((target, target_before, target_after))
-                updated_bindings = self._updated_source_role_bindings_for_identity_changes(
-                    legacy_identity_target_rows
-                )
+                if legacy_identity_target_rows:
+                    updated_bindings = self._updated_source_role_bindings_for_identity_changes(
+                        legacy_identity_target_rows
+                    )
+                    for detected_row in detected_binding_rows:
+                        role = str(detected_row["source_role_id"]).upper()
+                        indexes = set(detected_row.get("scene_indexes") or [])
+                        if not any(
+                            str(row.get("source_role_id", "")).strip().upper() == role
+                            and (
+                                not indexes
+                                or indexes.intersection(row.get("scene_indexes") or [])
+                            )
+                            for row in updated_bindings
+                        ):
+                            updated_bindings.append(deepcopy(detected_row))
                 if updated_bindings != self.source_video_role_bindings:
                     changes.append((
                         self,
                         {"source_video_role_bindings": deepcopy(self.source_video_role_bindings)},
                         {"source_video_role_bindings": updated_bindings},
                     ))
+                if detected_scene_roles:
+                    v1_asset = self._reference_asset("V1")
+                    ledger = (
+                        parse_source_video_analysis(v1_asset.semantic_enrichment)
+                        if v1_asset is not None else {}
+                    )
+                    before_enrichment = (
+                        str(v1_asset.semantic_enrichment or "")
+                        if v1_asset is not None else ""
+                    )
+                    for scene in ledger.get("scenes") or []:
+                        if not isinstance(scene, dict):
+                            continue
+                        try:
+                            scene_index = int(scene.get("scene_index", 0) or 0)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        additions = detected_scene_roles.get(scene_index, set())
+                        if not additions:
+                            continue
+                        active = [
+                            str(value or "").strip().upper()
+                            for value in scene.get("active_source_roles") or []
+                            if str(value or "").strip()
+                        ]
+                        scene["active_source_roles"] = list(dict.fromkeys(
+                            [*active, *sorted(additions)]
+                        ))
+                    if v1_asset is not None and ledger:
+                        after_enrichment = render_source_video_analysis(ledger)
+                        if after_enrichment != before_enrichment:
+                            changes.append((
+                                v1_asset,
+                                {"semantic_enrichment": before_enrichment},
+                                {"semantic_enrichment": after_enrichment},
+                            ))
             identity_clips: list[MediaAsset] = []
             clip_targets_by_reference: dict[str, dict[str, DirectorCue]] = {}
             for identity_change, identity_targets in identity_target_rows:
@@ -25896,6 +28338,12 @@ class DirectorCutStudio(QMainWindow):
         self._stop_all_timeline_media()
         self._release_all_media_sources()
         self._closing = True
+        if hasattr(self, "h3_cache_refresh_timer"):
+            self.h3_cache_refresh_timer.stop()
+        self.source_role_scan_states.clear()
+        if self.source_role_scan_progress is not None:
+            self.source_role_scan_progress.close()
+            self.source_role_scan_progress = None
         self.media_runner.stop()
         self.blip_runner.stop()
         self.audio_runner.stop()
@@ -30178,7 +32626,6 @@ class DirectorCutStudio(QMainWindow):
             cue for cue in self.director_cues
             if cue.cue_type == "shot"
             and ranges_intersect(cue.start_seconds, cue.end_seconds, start, end)
-            and cue.source_role_identity_overrides
         ]
         # Relay planning isolates authored Shot boundaries. If rounding leaves
         # more than one candidate, use the Shot owning the largest part of this
@@ -30195,11 +32642,19 @@ class DirectorCutStudio(QMainWindow):
                 for row in effective_bindings:
                     if str(row.get("source_role_id", "")).strip().upper() == role:
                         row["target_media_id"] = target
+        else:
+            owner = None
         return character_swap_passes_for_window(
             analysis,
             effective_bindings,
             start,
             end,
+            selected_role_ids=(
+                owner.source_role_swap_selection if owner is not None else None
+            ),
+            source_bbox_overrides=(
+                owner.source_role_bbox_overrides if owner is not None else None
+            ),
         )
 
     @staticmethod
@@ -31579,6 +34034,9 @@ class DirectorCutStudio(QMainWindow):
         self.active_generation_job_path = None
         self._refresh_regenerate_dirty_button()
         self._refresh_incremental_controls()
+        QTimer.singleShot(
+            0, lambda: self.refresh_h3_relay_cache_status(force=True)
+        )
 
     def _restore_monitor_after_generation(self) -> None:
         previous = self.generation_previous_monitor

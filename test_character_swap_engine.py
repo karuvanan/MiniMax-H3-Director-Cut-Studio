@@ -164,6 +164,140 @@ class CharacterSwapEngineTests(unittest.TestCase):
         self.assertIn("x=45-60%", prompt)
         self.assertIn("separate bodies", prompt)
 
+    def test_clicked_role_subset_builds_only_that_swap_pass_with_track_anchors(self):
+        analysis = {
+            "principal_roles": [
+                {"role_id": "R1", "visual_identity": "woman on the left"},
+                {
+                    "role_id": "R2",
+                    "visual_identity": "man on the right",
+                    "shot_scan_tracks": [{
+                        "cue_id": "S8",
+                        "scene_index": 1,
+                        "samples": [
+                            {
+                                "frame_index": 24,
+                                "time_seconds": 1.0,
+                                "bbox_normalized": [0.58, 0.12, 0.9, 0.94],
+                            },
+                            {
+                                "frame_index": 48,
+                                "time_seconds": 2.0,
+                                "bbox_normalized": [0.52, 0.1, 0.86, 0.93],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+                "active_source_roles": ["R1", "R2"],
+                "speaker_role": "R2",
+            }],
+        }
+        passes = character_swap_passes_for_window(
+            analysis,
+            [
+                {"source_role_id": "R1", "target_media_id": "P1"},
+                {"source_role_id": "R2", "target_media_id": "P2"},
+            ],
+            0.0,
+            3.0,
+            selected_role_ids=["R2"],
+        )
+
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0]["source_role_ids"], ["R2"])
+        self.assertEqual(passes[0]["target_media_id"], "P2")
+        self.assertEqual(len(passes[0]["source_roles"][0]["source_track_samples"]), 2)
+        prompt = build_character_swap_prompt(passes[0])
+        self.assertIn("tracked anchors 1.000s", prompt)
+        self.assertIn("2.000s box", prompt)
+        self.assertNotIn("woman on the left", prompt)
+
+    def test_edge_cropped_sole_performer_uses_in_place_replacement(self):
+        analysis = {
+            "principal_roles": [{
+                "role_id": "R2",
+                "visual_identity": "heavyset man in a white coat",
+                "appearance_evidence": [{
+                    "scene_index": 6,
+                    "thumbnail_bbox_normalized": [0.3, 0.1, 0.8, 0.95],
+                }],
+                "shot_scan_tracks": [{
+                    "cue_id": "S6",
+                    "scene_index": 6,
+                    "samples": [{
+                        "frame_index": 35,
+                        "time_seconds": 9.292,
+                        "bbox_normalized": [0.0, 0.0, 1.0, 1.0],
+                    }],
+                }],
+            }],
+            "scenes": [{
+                "scene_index": 6,
+                "start_seconds": 7.822,
+                "end_seconds": 9.553,
+                "active_source_roles": ["R2"],
+                "visible_event": "R2 is cropped by the left frame edge.",
+            }],
+        }
+
+        passes = character_swap_passes_for_window(
+            analysis,
+            [{"source_role_id": "R2", "target_media_id": "P1"}],
+            7.822,
+            9.553,
+        )
+
+        role = passes[0]["source_roles"][0]
+        self.assertEqual(role["source_bbox_normalized"], [])
+        self.assertEqual(role["source_track_samples"], [])
+        self.assertTrue(role["source_is_sole_visible_person"])
+        self.assertTrue(role["source_edge_truncated"])
+        prompt = build_character_swap_prompt(passes[0])
+        self.assertIn("IN-PLACE REPLACEMENT", prompt)
+        self.assertIn("only existing foreground person", prompt)
+        self.assertIn("exact frame-edge truncation", prompt)
+        self.assertIn("Never add Picture 1 as a second person", prompt)
+        self.assertNotIn("x=0-100%", prompt)
+
+    def test_manual_shot_bbox_overrides_qwen_track_anchor(self):
+        analysis = {
+            "principal_roles": [{
+                "role_id": "R1",
+                "visual_identity": "performer",
+                "shot_scan_tracks": [{
+                    "samples": [{
+                        "frame_index": 12,
+                        "time_seconds": 0.5,
+                        "bbox_normalized": [0.55, 0.1, 0.95, 0.9],
+                    }],
+                }],
+            }],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 2.0,
+                "active_source_roles": ["R1"],
+            }],
+        }
+        passes = character_swap_passes_for_window(
+            analysis,
+            [{"source_role_id": "R1", "target_media_id": "P1"}],
+            0.0,
+            2.0,
+            source_bbox_overrides={"R1": [0.05, 0.12, 0.45, 0.92]},
+        )
+        role = passes[0]["source_roles"][0]
+        self.assertEqual(role["source_bbox_normalized"], [0.05, 0.12, 0.45, 0.92])
+        self.assertEqual(role["source_track_samples"], [])
+        prompt = build_character_swap_prompt(passes[0])
+        self.assertIn("x=5-45%", prompt)
+        self.assertNotIn("tracked anchors", prompt)
+
     def test_illustrated_reference_can_be_adapted_as_live_action_identity(self):
         prompt = build_character_swap_prompt(
             {

@@ -7,7 +7,9 @@ from design_ai_service import generate
 from source_video_analysis import (
     SOURCE_VIDEO_QWEN_ANALYSIS_MARKER,
     build_source_video_analysis_prompts,
+    build_source_video_shot_people_scan_prompts,
     normalize_source_video_analysis,
+    normalize_source_video_shot_people_scan,
     parse_source_video_analysis,
     render_source_video_analysis,
     scene_intervals_from_breakdown,
@@ -72,6 +74,76 @@ def _analysis_payload(intervals):
 
 
 class SourceVideoAnalysisTests(unittest.TestCase):
+    def test_shot_people_scan_prompt_and_normalizer_preserve_frame_evidence(self):
+        system, user = build_source_video_shot_people_scan_prompts(
+            media_id="V1",
+            shot_id="S8",
+            batch_index=2,
+            frame_indexes=list(range(32, 64)),
+            known_roles=[{
+                "role_id": "R1",
+                "visual_identity": "woman with long dark hair",
+                "wardrobe": "blue dress",
+            }],
+        )
+        self.assertIn("every 24fps V1 relay frame", system)
+        self.assertIn("cut off by the left, right, top or bottom frame edge", system)
+        self.assertIn("Never return [0,0,1,1]", system)
+        self.assertIn('"shot_id":"S8"', user)
+        normalized = normalize_source_video_shot_people_scan(
+            {
+                "media_id": "V1",
+                "shot_id": "S8",
+                "batch_index": 2,
+                "people": [{
+                    "matched_role_id": "R1",
+                    "visual_identity": "same woman",
+                    "wardrobe": "blue dress",
+                    "first_frame_index": 35,
+                    "last_frame_index": 62,
+                    "best_frame_index": 48,
+                    "bbox_normalized": [-0.1, 0.1, 0.62, 1.2],
+                    "face_visibility": "front",
+                    "confidence": "high",
+                }],
+            },
+            expected_media_id="V1",
+            expected_shot_id="S8",
+            expected_batch_index=2,
+            valid_frame_indexes=set(range(32, 64)),
+        )
+        self.assertEqual(normalized["people"][0]["matched_role_id"], "R1")
+        self.assertEqual(
+            normalized["people"][0]["bbox_normalized"],
+            [0.0, 0.1, 0.62, 1.0],
+        )
+
+    def test_shot_people_scan_rejects_full_frame_uncertainty_bbox(self):
+        normalized = normalize_source_video_shot_people_scan(
+            {
+                "media_id": "V1",
+                "shot_id": "S6",
+                "batch_index": 0,
+                "people": [{
+                    "matched_role_id": "R2",
+                    "visual_identity": "edge-cropped man",
+                    "wardrobe": "white coat",
+                    "first_frame_index": 0,
+                    "last_frame_index": 23,
+                    "best_frame_index": 12,
+                    "bbox_normalized": [0, 0, 1, 1],
+                    "face_visibility": "edge-cropped",
+                    "confidence": "medium",
+                }],
+            },
+            expected_media_id="V1",
+            expected_shot_id="S6",
+            expected_batch_index=0,
+            valid_frame_indexes=set(range(24)),
+        )
+
+        self.assertEqual(normalized["people"][0]["bbox_normalized"], [])
+
     def test_scene_intervals_follow_full_duration_breakdown(self):
         intervals = scene_intervals_from_breakdown(
             "SOURCE VIDEO BREAKDOWN · full_duration=yes scene_cuts=2.5, 7.0, 9.25",

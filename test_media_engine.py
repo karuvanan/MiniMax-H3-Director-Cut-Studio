@@ -10,6 +10,7 @@ from media_engine import (
     create_image_analysis_regions,
     create_labeled_contact_sheet,
     create_video_analysis_frames,
+    create_video_shot_frame_scan,
     media_type_for_path,
     probe_media,
     remove_solid_background,
@@ -87,6 +88,19 @@ class MediaEngineTests(unittest.TestCase):
         self.assertTrue(all(path.is_file() for _, path in frames))
         self.assertIn("10%", frames[0][0])
         self.assertIn("90%", frames[-1][0])
+
+    def test_shot_scan_decodes_every_24fps_relay_frame(self):
+        source = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
+        if not source.exists():
+            self.skipTest("runtime smoke video is not present")
+        target = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "shot_scan_24fps"
+        frames = create_video_shot_frame_scan(
+            source, target, 0.0, 1.0, scan_fps=24.0, max_frames=30
+        )
+        self.assertEqual(len(frames), 24)
+        self.assertEqual(frames[0]["frame_index"], 0)
+        self.assertAlmostEqual(frames[-1]["time_seconds"], 23 / 24, places=6)
+        self.assertTrue(all(Path(row["path"]).is_file() for row in frames))
 
     def test_scene_aware_scan_keeps_three_frames_for_single_scene_video(self):
         source = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"

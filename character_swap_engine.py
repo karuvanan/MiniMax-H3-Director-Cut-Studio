@@ -98,13 +98,49 @@ def _role_rows(analysis: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     }
 
 
+def _normalized_person_bbox(value: object) -> list[float]:
+    """Return a usable source-frame bbox and reject synthetic full-frame crops."""
+
+    try:
+        left, top, right, bottom = [float(item) for item in value][:4]
+    except (TypeError, ValueError, OverflowError):
+        return []
+    left, top = max(0.0, left), max(0.0, top)
+    right, bottom = min(1.0, right), min(1.0, bottom)
+    if right <= left or bottom <= top:
+        return []
+    # Qwen and old Shot scans used [0,0,1,1] when localization failed. Passing
+    # that to Relay makes it interpret the complete scene as the actor and may
+    # insert Picture 1 beside the source performer instead of replacing them.
+    if left <= 0.001 and top <= 0.001 and right >= 0.999 and bottom >= 0.999:
+        return []
+    return [left, top, right, bottom]
+
+
 def character_swap_passes_for_window(
     analysis: Mapping[str, Any],
     bindings: Iterable[Mapping[str, Any]],
     start_seconds: float,
     end_seconds: float,
+    *,
+    selected_role_ids: Iterable[str] | None = None,
+    source_bbox_overrides: Mapping[str, object] | None = None,
 ) -> list[dict[str, Any]]:
     """Return one ordered character-swap pass per visible, mapped V1 role."""
+
+    selected_roles = {
+        str(role or "").strip().upper()
+        for role in (selected_role_ids or [])
+        if str(role or "").strip()
+    }
+    bbox_overrides = {
+        str(role or "").strip().upper(): _normalized_person_bbox(value)
+        for role, value in (source_bbox_overrides or {}).items()
+        if str(role or "").strip()
+    }
+    bbox_overrides = {
+        role: bbox for role, bbox in bbox_overrides.items() if bbox
+    }
 
     scenes: list[Mapping[str, Any]] = []
     for scene in analysis.get("scenes") or []:
@@ -136,6 +172,9 @@ def character_swap_passes_for_window(
                 visible_roles.append(normalized)
             if visible_event:
                 events_by_role.setdefault(normalized, []).append(visible_event)
+    if selected_roles:
+        visible_roles = [role for role in visible_roles if role in selected_roles]
+    sole_visible_role = len(visible_roles) == 1
 
     mapped: dict[str, str] = {}
     for binding in bindings:
@@ -161,6 +200,81 @@ def character_swap_passes_for_window(
         if not target:
             continue
         evidence = roles.get(role, {})
+        track_samples: list[dict[str, Any]] = []
+        rejected_full_frame_track = False
+        for track in evidence.get("shot_scan_tracks") or []:
+            if not isinstance(track, Mapping):
+                continue
+            for sample in track.get("samples") or []:
+                if not isinstance(sample, Mapping):
+                    continue
+                try:
+                    sample_time = float(sample.get("time_seconds", 0.0) or 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if sample_time < start_seconds - 0.25 or sample_time > end_seconds + 0.25:
+                    continue
+                raw_bbox = sample.get("bbox_normalized") or []
+                bbox_values = _normalized_person_bbox(raw_bbox)
+                if not bbox_values:
+                    try:
+                        raw_values = [float(value) for value in raw_bbox][:4]
+                    except (TypeError, ValueError, OverflowError):
+                        raw_values = []
+                    rejected_full_frame_track = rejected_full_frame_track or (
+                        raw_values == [0.0, 0.0, 1.0, 1.0]
+                    )
+                    continue
+                track_samples.append({
+                    "frame_index": int(sample.get("frame_index", 0) or 0),
+                    "time_seconds": sample_time,
+                    "bbox_normalized": bbox_values,
+                })
+        track_samples.sort(key=lambda row: row["time_seconds"])
+        if len(track_samples) > 6:
+            positions = {
+                round(index * (len(track_samples) - 1) / 5)
+                for index in range(6)
+            }
+            track_samples = [track_samples[index] for index in sorted(positions)]
+        scene_bbox: list[float] = []
+        for appearance in evidence.get("appearance_evidence") or []:
+            if not isinstance(appearance, Mapping):
+                continue
+            try:
+                appearance_scene = int(appearance.get("scene_index", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if appearance_scene not in scene_indexes:
+                continue
+            scene_bbox = _normalized_person_bbox(
+                appearance.get("thumbnail_bbox_normalized") or []
+            )
+            if scene_bbox:
+                break
+        if not scene_bbox:
+            scene_bbox = _normalized_person_bbox(
+                evidence.get("thumbnail_bbox_normalized") or []
+            )
+        source_bbox = (
+            list(track_samples[0]["bbox_normalized"])
+            if track_samples else ([] if sole_visible_role else scene_bbox)
+        )
+        if role in bbox_overrides:
+            # Shot Visual Editor owns the explicit manual rectangle. Remove
+            # older Qwen anchors from the prompt so they cannot compete with
+            # the box the user deliberately placed on this Shot.
+            source_bbox = list(bbox_overrides[role])
+            track_samples = []
+        edge_truncated = bool(rejected_full_frame_track)
+        for bbox in [source_bbox, *[
+            row.get("bbox_normalized") or [] for row in track_samples
+        ]]:
+            if len(bbox) == 4:
+                edge_truncated = edge_truncated or (
+                    float(bbox[0]) <= 0.015 or float(bbox[1]) <= 0.015
+                    or float(bbox[2]) >= 0.985 or float(bbox[3]) >= 0.985
+                )
         role_passes.append({
             "source_role_id": role,
             "target_media_id": target,
@@ -173,9 +287,10 @@ def character_swap_passes_for_window(
             "source_narrative_function": " ".join(
                 str(evidence.get("narrative_function", "") or "").split()
             ),
-            "source_bbox_normalized": list(
-                evidence.get("thumbnail_bbox_normalized") or []
-            )[:4],
+            "source_bbox_normalized": source_bbox,
+            "source_track_samples": track_samples,
+            "source_is_sole_visible_person": sole_visible_role,
+            "source_edge_truncated": edge_truncated,
             "source_events": list(dict.fromkeys(events_by_role.get(role, [])))[:4],
             "scene_indexes": sorted(scene_indexes),
             "speaker": role in speaker_roles,
@@ -208,6 +323,8 @@ def character_swap_passes_for_window(
             for key in (
                 "source_role_id", "source_visual_identity", "source_wardrobe",
                 "source_narrative_function", "source_bbox_normalized",
+                "source_track_samples", "source_is_sole_visible_person",
+                "source_edge_truncated",
             )
         })
         group["source_events"] = list(dict.fromkeys(
@@ -244,6 +361,11 @@ def build_character_swap_prompt(
             "source_wardrobe": pass_spec.get("source_wardrobe", ""),
             "source_narrative_function": pass_spec.get("source_narrative_function", ""),
             "source_bbox_normalized": pass_spec.get("source_bbox_normalized", []),
+            "source_track_samples": pass_spec.get("source_track_samples", []),
+            "source_is_sole_visible_person": pass_spec.get(
+                "source_is_sole_visible_person", False
+            ),
+            "source_edge_truncated": pass_spec.get("source_edge_truncated", False),
         }]
     events = [
         str(value).strip()
@@ -257,6 +379,8 @@ def build_character_swap_prompt(
         identity = " ".join(str(source_role.get("source_visual_identity", "") or "").split())
         wardrobe = " ".join(str(source_role.get("source_wardrobe", "") or "").split())
         function = " ".join(str(source_role.get("source_narrative_function", "") or "").split())
+        sole_visible = bool(source_role.get("source_is_sole_visible_person", False))
+        edge_truncated = bool(source_role.get("source_edge_truncated", False))
         bbox = source_role.get("source_bbox_normalized") or []
         location = ""
         if len(bbox) == 4:
@@ -268,9 +392,38 @@ def build_character_swap_prompt(
                 )
             except (TypeError, ValueError):
                 location = ""
-        description = ", ".join(
-            part for part in (function, identity, wardrobe, location) if part
+        track_anchors: list[str] = []
+        for sample in source_role.get("source_track_samples") or []:
+            if not isinstance(sample, Mapping):
+                continue
+            sample_bbox = sample.get("bbox_normalized") or []
+            if len(sample_bbox) != 4:
+                continue
+            try:
+                time_seconds = float(sample.get("time_seconds", 0.0) or 0.0)
+                x1, y1, x2, y2 = (float(value) for value in sample_bbox)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            track_anchors.append(
+                f"{time_seconds:.3f}s box x={round(x1 * 100)}-{round(x2 * 100)}%, "
+                f"y={round(y1 * 100)}-{round(y2 * 100)}%"
+            )
+        tracking = (
+            "tracked anchors " + " | ".join(track_anchors[:6])
+            if track_anchors else ""
         )
+        source_position = (
+            "the only existing physical foreground performer in Video 1"
+            if sole_visible else ""
+        )
+        crop_state = (
+            "intentionally cropped by the source frame edge"
+            if edge_truncated else ""
+        )
+        description = ", ".join(part for part in (
+            source_position, function, identity, wardrobe, crop_state,
+            location, tracking,
+        ) if part)
         selectors.append(f"{source_role_id}: {description}" if description else source_role_id)
     selector = "; ".join(selectors) or f"the source performer tracked as {role}"
     event_selector = " ".join(events[:2])
@@ -286,10 +439,18 @@ def build_character_swap_prompt(
             f"{selector}. Keep them as separate bodies in their original screen positions."
         )
     else:
+        sole_visible = bool(source_roles[0].get(
+            "source_is_sole_visible_person", False
+        ))
         target_clause = (
             "Replace only this selected source performer in <Video 1> with the "
             f"character shown in <Picture 1>: {selector}."
         )
+        if sole_visible:
+            target_clause += (
+                " The target is the only existing foreground person in the source "
+                "frame, including when only half of that person is visible."
+            )
     if event_selector:
         target_clause += " Target-performance evidence: " + event_selector
 
@@ -302,6 +463,9 @@ ILLUSTRATED-CAST TO LIVE-ACTION CONTRACT:
 """
 
     prompt = f"""{target_clause}
+
+IN-PLACE REPLACEMENT — MANDATORY:
+This is an identity transformation of the already-visible source performer, not an insertion, compositing or cast-addition request. Transform that performer's original pixels at the original screen coordinates. Never add Picture 1 as a second person elsewhere in the frame, never leave the original actor beside the replacement, and never move the replacement toward the centre or an empty side of the image. If the source performer is partially outside the frame, preserve the exact frame-edge truncation: replace only the visible face/body portion and keep the missing portion outside the image. Do not complete the cropped body, zoom out, reframe or create an extra full-body figure.
 
 subject_definitions:
 <Subject 1> is the replacement character. Its identity comes exclusively from the person visible in <Picture 1>: facial structure, apparent age, skin tone, hairstyle, body identity, clothing, colours and distinctive character design. <Picture 1> supplies identity only. Discard every reference-image pixel outside that character. Never import Picture 1's room, background, lighting, camera, crop, pose, expression or props.
