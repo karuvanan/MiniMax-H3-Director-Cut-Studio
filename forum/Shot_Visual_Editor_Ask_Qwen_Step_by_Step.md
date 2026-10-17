@@ -2,7 +2,7 @@
 
 ![Shot Visual Editor + Ask Qwen](./shot-visual-editor-ask-qwen-promo.png)
 
-适用版本：`MiniMax H3 Director Cut Studio v0.3.6-alpha2`
+适用版本：`MiniMax H3 Director Cut Studio v0.3.6-alpha.2`
 
 `Shot Visual Editor + Ask Qwen`把“修改一个镜头”从整段Prompt重写，改成可点击、可审查、可撤销的导演工作流。你可以直接在Timeline打开Shot，调整人物、镜头、发声状态、嘴形、声音方位、动作与环境；也可以用自然语言告诉Qwen想要的结果，只允许它提出指定范围的结构化Patch。保存后，Studio只把相关Segment标记为dirty，不会要求整部影片从头生成。
 

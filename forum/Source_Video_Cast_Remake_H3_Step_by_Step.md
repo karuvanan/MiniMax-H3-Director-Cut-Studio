@@ -2,9 +2,9 @@
 
 ![Source Video Cast Remake H3](./source-video-cast-remake-h3-promo.png)
 
-适用版本：`MiniMax H3 Director Cut Studio v0.3.6-alpha2`
+适用版本：`MiniMax H3 Director Cut Studio v0.3.7-alpha.1`
 
-`Source Video Cast Remake H3`不是逐帧换脸。Studio先把V1分析成场景、人物职责、动作因果、运镜、剪辑节奏与原声时间的导演蓝图，再让用户提供的P1–P9演员在重新生成的世界里重演。V1像素不会送进H3 Video Reference；最终声音则恢复为V1未经修改的原声。
+`Source Video Cast Remake H3`不是传统贴脸换脸。Studio先把V1分析成人物、Shot与原声账本，再自动选择`LoRA Preserve V1`：把逐Shot、24fps的V1片段送进H3 Relay，以Character-Swap LoRA v1.5替换绑定的P1–P9人物，同时保留源动作、镜头、背景与时间。最终声音恢复为V1未经修改的原声。
 
 > 只使用你拥有或获授权二创的源影片。
 
@@ -12,9 +12,9 @@
 
 | 槽位 | 内容 | 规则 |
 |---|---|---|
-| `V1` | 有权二创的源影片 | 只作为导演蓝图与原声时间权威，不作为H3画面参考。 |
-| `P1–P4` | 基础替换演员 | 在人物时间卡中逐次指定，不按编号自动猜角色。 |
-| `P5–P9` | 可选后续演员 | 只有V1确实存在额外主要角色时才启用。 |
+| `V1` | 有权二创的源影片 | Design阶段用于分析；生成阶段只以逐Shot Relay片段作为LoRA Preserve V1的运动／场景底板。 |
+| `P1` | 最低必需替换演员 | 只有一张P1也能开始；所有角色卡默认复用P1。 |
+| `P2–P9` | 可选演员池 | 加载后可在人物时间卡中按需指定，不要求凑满四张。 |
 | V1原声 | 对白、音乐、环境与节奏 | 每个Segment切出同一时间窗，最终恢复未经修改的Master Audio。 |
 
 ## 二、开始前检查
@@ -30,16 +30,17 @@
 ### Step 1｜把源片与演员放进Media Pool
 
 1. 把源影片加载为`V1`。
-2. 把第一组替换演员依次加载为`P1`、`P2`、`P3`、`P4`。
-3. 如果V1有更多主要人物，再加入P5及后续图片；不需要时不要硬塞人物。
+2. 至少加载一张替换演员图为`P1`；这已经足够完成Design与Apply。
+3. 如果想让不同角色使用不同外貌，再按需加入P2至P9；不需要凑满四张。
 4. 不要把V1重复加载成普通Video Reference。
 
 ### Step 2｜选择Special Skill
 
 1. 进入`Design`。
 2. 选择`Source Video Cast Remake H3`。
-3. 确认V1与P图片在Media Pool Intelligence中可见。
-4. 点击`CREATE DIRECTOR DESIGN JSON`。
+3. 确认顶部只读`Remake Engine · AUTO`显示`LoRA Preserve V1`。
+4. 确认V1与P图片在Media Pool Intelligence中可见。
+5. 点击`CREATE DIRECTOR DESIGN JSON`。
 
 ### Step 3｜等待Qwen完整分析V1
 
@@ -62,7 +63,7 @@ Studio会完成以下工作：
 3. 同一源人物的卡片最初会采用相同建议P图，但建立后不会锁定或联动。
 4. 在`REPLACE WITH`中选择P1–P9。
 5. 可以让多个时间卡复用同一P图。
-6. 如果某次出场要保留原演员，选择`Keep original V1 face`；Studio会把该脸孔裁切物化为新的P身份参考。
+6. 如果某次出场要保留原演员，选择`V1 DEFAULT · Keep source actor`；Studio会把该时间点的正方形脸孔裁切物化为新的P身份参考。这个选择只影响当前时间卡，不会锁定或同步同一角色的其他出场卡片。
 7. 滚到最下方，确认最后一排及ready状态完整显示。
 
 人物绑定以“源角色＋场景时间”为单位，因此后段可以故意换成另一张P图，而不会误改前段。
@@ -73,7 +74,7 @@ Studio会完成以下工作：
 
 - 所有V1主要角色都有明确P绑定；
 - `media_requests`没有自创人物图或场景替代图；
-- V1被标记为`analysis_only`；
+- V1在Design JSON中标记为`analysis_only`；实际生成时由Studio另行准备Shot-local Relay plate；
 - Shot顺序与V1事件顺序一致；
 - 每个Shot只写实际出现的P人物；
 - `text_layers`为空，没有转录、翻译或新对白；
@@ -91,7 +92,7 @@ Studio会完成以下工作：
 
 1. 点击`PREVIEW 0.2M`。
 2. 检查每次角色交接是否与V1相同。
-3. 检查场景类型、建筑结构、主要物件、光向和构图是否仍可辨认来自V1。
+3. 检查V1场景、建筑、主要物件、光向、构图与运镜是否被保留，没有被普通Creative Prompt重塑。
 4. 检查当前说话角色是否跟随对应V1原声音素。
 5. 检查听众和群众是否保持非发声嘴形。
 6. 检查切镜节奏与原声是否同步。
@@ -112,12 +113,12 @@ Preview确认后点击`ACCEPT 1.0M`。Studio用完整分辨率重新生成dirty�
 
 ## 四、验收清单
 
-- [ ] V1只作`analysis_only`，没有占用H3 Video Reference。
+- [ ] V1在Design中只作`analysis_only`；运行时仅使用Studio准备的Shot-local Relay plate。
 - [ ] 所有主要人物时间卡已经绑定。
 - [ ] P演员没有互换、混脸、复制或被V1原演员覆盖。
 - [ ] 每个Shot只加载真正出场的P人物。
 - [ ] 保留V1事件次序、动作因果、镜头目的与剪辑节奏。
-- [ ] 场景重新生成但仍保留V1的地点类型、拓扑、物件和光向。
+- [ ] V1场景、拓扑、物件、群众、光向与运镜保持，只有绑定演员身份被替换。
 - [ ] 只有当前发声人物对嘴；听众保持闭嘴反应。
 - [ ] 没有新增对白、旁白、歌词或替代音乐。
 - [ ] 最终声音为V1原声，总时长与V1一致。
@@ -126,13 +127,13 @@ Preview确认后点击`ACCEPT 1.0M`。Studio用完整分辨率重新生成dirty�
 
 ### `Qwen3.8 analysis stopped`
 
-先确认LM Studio API地址可以打开并已加载正确模型。v0.3.6-alpha2会区分JSON损坏、HTTP失败与worker timeout，自动进行一次紧凑重试；第二次失败时会保留明确原因。
+先确认LM Studio API地址可以打开并已加载正确模型。v0.3.6-alpha.2会区分JSON损坏、HTTP失败与worker timeout，自动进行一次紧凑重试；第二次失败时会保留明确原因。
 
 ### 出来的画面只是重复V1
 
-确认Skill确实是`Source Video Cast Remake H3`，且V1为`analysis_only`。它不应进入H3 Video Reference槽。
+确认Skill确实是`Source Video Cast Remake H3`，顶部Engine为`LoRA Preserve V1`。Design JSON中的V1应为`analysis_only`，运行时则由Studio自动准备24fps Relay Shot；不要手工把完整V1再塞入普通Video Reference槽。
 
-### 人物没有按照P1–P4替换
+### 人物没有按照人物卡绑定替换
 
 不要只在Media Pool放入图片；必须在每一张V1人物时间卡的`REPLACE WITH`中确认P绑定，再重新创建Director Design JSON。
 
@@ -142,4 +143,4 @@ Preview确认后点击`ACCEPT 1.0M`。Studio用完整分辨率重新生成dirty�
 
 ## 六、论坛简介（可直接复制）
 
-> Source Video Cast Remake H3把V1当作导演蓝图，而不是逐帧换脸底片。Studio先用Qwen分析全片人物出场、场景、动作因果、运镜、剪辑和原声，再把每次人物出场显示为独立脸孔时间卡，让用户逐张绑定P1–P9。H3随后在重新生成但仍保留V1场景语汇的世界中重演，最终恢复V1原声。人物或镜头需要调整时，可直接用Shot Visual Editor与Regenerate Dirty局部重做。
+> Source Video Cast Remake H3先用Qwen分析全片人物出场、发声与Shot边界，再把每次人物出场显示为独立脸孔时间卡，让用户逐张绑定P1–P9。选择该Skill后Studio自动进入LoRA Preserve V1，以逐Shot 24fps Relay底片保留V1动作、镜头、背景、时序和原声，只替换映射演员。人物或镜头需要调整时，可直接用Shot Visual Editor与Regenerate Dirty局部重做。

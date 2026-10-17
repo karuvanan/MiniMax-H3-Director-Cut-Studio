@@ -2,7 +2,7 @@
 
 ![MTV Singing H3](./mtv-singing-h3-promo.png)
 
-适用版本：`MiniMax H3 Director Cut Studio v0.3.6-alpha2`
+适用版本：`MiniMax H3 Director Cut Studio v0.3.6-alpha.2`
 
 `MTV Singing H3`不是让H3重新唱一次歌曲，而是让画面严格跟随已经准备好的音乐。P1负责演唱，P2/P3负责陪衬表演，P4固定场景世界；A1保留最终主音频，可选A2只提供更干净的人声嘴形时钟。影片时长自动采用A1的实际可播放长度，适合从十几秒测试扩展到完整MTV。
 

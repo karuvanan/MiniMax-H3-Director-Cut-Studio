@@ -1,4 +1,4 @@
-# v0.3.6-alpha2 Forum Promo Image Prompts
+# Forum Promo Image Prompts
 
 生成方式：Codex内置`imagegen`。
 
@@ -36,4 +36,18 @@ Style/medium: photoreal cinematic production key art combined with elegant dark 
 Composition/framing: wide 16:9, three-stage left-to-right visual story; source storyboard, cast binding cards, finished restaged film; readable headline area; high-end VFX breakdown aesthetic
 Text (verbatim): "SOURCE VIDEO CAST REMAKE H3"; "V1 DIRECTOR BLUEPRINT · P1–P9 NEW CAST"; "ANALYZE · BIND · RESTAGE · KEEP ORIGINAL AUDIO"
 Constraints: spell all supplied text exactly; no other text except tiny P1 P2 P3 P4 labels on cast cards; no logos; no watermark; no copyrighted actors; no face-swap implication; no cluttered literal software screenshot; polished forum-banner quality.
+```
+
+## MiniMax H3 Character Swap · Auto Remake Engine
+
+Generated for `v0.3.7-alpha.1` as `character-swap-auto-remake-engine-promo.png`.
+
+```text
+Use case: ads-marketing
+Asset type: premium 16:9 forum promotional hero image for an AI filmmaking desktop feature
+Primary request: Create a cinematic product key visual that clearly explains an automatic remake engine and multi-character replacement workflow. On the left, show a realistic source-film frame on a professional dark director monitor: two generic actors in an atmospheric urban restaurant, with subtle cyan tracking boxes and a small V1 film-strip motif. In the center, create a luminous intelligent routing hub with two clean branches; the highlighted branch flows through a stack of neural-film frames and character portrait cards, communicating LoRA-based identity replacement while preserving source motion, camera, environment and timing. On the right, show the same restaurant shot with two visibly different generic replacement actors naturally integrated into identical poses, lighting, perspective and environment, with convincing photoreal cinematic skin, fabric and shadows. Add a lower film timeline where every source frame stays aligned while only character identity colors change. The design must communicate source preservation, automatic engine selection, multi-character mapping and cinematic generation at a glance.
+Style/medium: high-end photoreal cinematic VFX breakdown key art, elegant dark navy and charcoal workstation aesthetic, cyan-teal data light, warm amber practical lighting, restrained violet AI accent, premium film-production advertising, crisp 4K detail
+Composition/framing: wide 16:9 landscape, strong left-to-right visual narrative, readable large headline in upper center, balanced negative space, source panel left, routing core center, finished output right, timeline along bottom
+Text (verbatim): "MINIMAX H3 CHARACTER SWAP"; "AUTO REMAKE ENGINE"; "CREATE H3 REMAKE"; "LoRA PRESERVE V1"
+Constraints: spell all supplied text exactly; no other prominent text except tiny "V1", "P1", and "P2" labels; no logos; no watermark; no brand marks; no celebrity likeness; no copyrighted characters; do not depict distorted faces or duplicated limbs; do not make it look like a cheap face-swap app; polished forum-banner quality.
 ```
