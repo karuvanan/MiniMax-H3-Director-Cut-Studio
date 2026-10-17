@@ -2,6 +2,37 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.7-alpha.14] - 2026-10-18
+
+### Completed-Prompt Output Download Recovery
+
+- 修复ComfyUI已经完成H3／Character Swap，但Studio在`ComfyUI connection lost while downloading output`阶段持续重试旧`/view`请求、画面长期停在`0/N completed`的问题。
+- 每次下载重试都会建立新HTTP请求；每5秒读取同一`prompt_id`的ComfyUI history并刷新实际filename／subfolder，不会重新Queue或重新生成H3。
+- MP4改为1MB分块写入`.part`，验证非零长度及`Content-Length`完整性后才原子替换正式文件，断线或截断文件不会被误当成成功Segment。
+- 输出下载恢复独立限制为120秒；超过时间会退出Generating并保留accepted Prompt checkpoint。再次点击`REGENERATE DIRTY`会继续监控并下载原Prompt，不会等待原有3600秒连接恢复上限。
+- 修复Dirty Segment被accepted Prompt checkpoint排除的问题；即使该Segment仍标示Dirty，只要fingerprint一致便优先恢复原Prompt。
+- Character Swap现在记录进行中的pass及已完成pass输出；下载中断后恢复同一Relay pass，不会重新执行角色替换或重复累积Server Cache。
+- App版本升级至`0.3.7-alpha.14`；Project Format保持`28`，Render Policy保持`38`，当前失败Job及既有Segment无需重生。
+
+### Verification
+
+- 34项连接恢复与Smart Render测试通过，另通过Studio Job Builder测试验证Dirty accepted Prompt可恢复；真实ComfyUI Prompt `540dbf57…`的1.27MB Character Swap输出已由新下载器成功读取，未触发新Prompt。
+
+## [0.3.7-alpha.13] - 2026-10-18
+
+### Reliable Large Master Assembly
+
+- 修复`REGENERATE DIRTY`的所有Shot／Segment已经100%完成后，画面长期停在`Assembling ... segments into the master video`的问题。实际失败Project的20个Segment均有效，但Windows FFmpeg一次开启20组Video／Audio输入的巨大`filter_complex`崩溃并留下0-byte `master.mp4`。
+- 超过6个Segment时改为安全分批组装：每批最多6段并统一画布、SAR、24fps及音频格式，最后用concat demuxer直接串接批次，不再让20–40条Stream进入同一个Filter Graph。
+- 批次Master不会再进行第二次影像编码；最终concat优先`-c copy`，只有极少数Codec／time-base不相容时才以少量批次执行规范化后备拼接。
+- Worker逐批回报`Master assembly batch N/M`及最终阶段，完成100%后仍可看见实际进度，不会误以为Studio无反应。
+- Windows Worker启用FFmpeg错误框抑制；即使FFmpeg异常退出，也会立即回传明确错误并结束Generating遮罩，不会卡在系统Application Error对话框后面。
+- 每一阶段拒绝0-byte输出并清理`.master.assembly-*`临时目录。App版本升级至`0.3.7-alpha.13`；Project Format保持`28`，Render Policy保持`38`，旧Segment可直接复用，不需重新生成。
+
+### Verification
+
+- 既有Overlap裁切、混合解析度／SAR、Native Tail及新20-Segment分批测试通过；并使用失败项目`a_cartoon_character_with_a_suit_and_tie`的真实20段输出完成53.333秒、704×704、24fps、AAC 48kHz双声道Master。
+
 ## [0.3.7-alpha.12] - 2026-10-18
 
 ### Independent Cache and Resource Refresh Intervals

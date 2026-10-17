@@ -854,6 +854,53 @@ class SmartRenderWorkerTests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_large_master_assembly_is_split_into_safe_batches(self):
+        root = PROJECT_ROOT / ".director_cache" / "large_staged_assembly_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        output = root / "master.mp4"
+        segments = []
+        for index in range(20):
+            source = root / f"segment_{index + 1:03d}.mp4"
+            source.write_bytes(b"segment")
+            segments.append({
+                "output_path": str(source),
+                "start_seconds": float(index),
+                "end_seconds": float(index + 1),
+                "overlap_before_seconds": 0.0,
+            })
+        calls = []
+
+        def fake_run(command, destination, **kwargs):
+            calls.append((list(command), Path(destination), dict(kwargs)))
+            Path(destination).write_bytes(b"assembled")
+
+        try:
+            with patch(
+                "smart_render_worker._assembly_canvas", return_value=(704, 704)
+            ), patch(
+                "smart_render_worker._has_audio", return_value=True
+            ), patch(
+                "smart_render_worker._run_assembly_command", side_effect=fake_run
+            ):
+                result = assemble_master(
+                    {
+                        "master_output": str(output),
+                        "ffmpeg": "ffmpeg",
+                        "ffprobe": "ffprobe",
+                        "target_duration_seconds": 20.0,
+                    },
+                    segments,
+                )
+            self.assertEqual(result, output.resolve())
+            self.assertEqual(len(calls), 5)
+            self.assertTrue(all(path.name.startswith("chunk_") for _, path, _ in calls[:4]))
+            self.assertIn("concat", calls[-1][0])
+            self.assertEqual(output.read_bytes(), b"assembled")
+            self.assertFalse(any(root.glob(".master.assembly-*")))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_assembly_ignores_legacy_plate_and_preserves_native_tail(self):
         from PIL import Image
 

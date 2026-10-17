@@ -19,6 +19,9 @@ from workflow_engine import validate_portable_media_manifest
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_RECONNECT_TIMEOUT_SECONDS = 3600
+DEFAULT_OUTPUT_DOWNLOAD_RECOVERY_SECONDS = 120
+OUTPUT_DOWNLOAD_HISTORY_REFRESH_SECONDS = 5.0
+OUTPUT_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class ComfyConnectionRecoveryTimeout(ConnectionError):
@@ -45,6 +48,16 @@ def _is_transient_connection_error(exc: BaseException) -> bool:
             http.client.HTTPException,
         ),
     )
+
+
+def _is_transient_output_download_error(exc: BaseException) -> bool:
+    """Return whether a completed output may become downloadable on retry."""
+
+    if isinstance(exc, urllib.error.HTTPError):
+        # ComfyUI can briefly publish history before /view sees the finished
+        # file, especially when the output folder is on a slower disk/share.
+        return int(exc.code) in {404, 408, 409, 425, 429, 500, 502, 503, 504}
+    return _is_transient_connection_error(exc)
 
 
 def _connection_event(
@@ -148,6 +161,72 @@ def _history_outputs(history_item: dict) -> list[dict]:
     return files
 
 
+def _matching_history_output(
+    current: dict,
+    refreshed: list[dict],
+    output_index: int,
+) -> dict | None:
+    """Find the same output again after refreshing a completed prompt history."""
+
+    filename = str(current.get("filename") or "")
+    subfolder = str(current.get("subfolder") or "")
+    output_type = str(current.get("type") or "output")
+    for candidate in refreshed:
+        if (
+            str(candidate.get("filename") or "") == filename
+            and str(candidate.get("subfolder") or "") == subfolder
+            and str(candidate.get("type") or "output") == output_type
+        ):
+            return candidate
+
+    node_id = str(current.get("node_id") or "")
+    kind = str(current.get("kind") or "")
+    suffix = Path(filename).suffix.lower()
+    node_matches = [
+        candidate
+        for candidate in refreshed
+        if str(candidate.get("node_id") or "") == node_id
+        and (not kind or str(candidate.get("kind") or "") == kind)
+    ]
+    suffix_matches = [
+        candidate
+        for candidate in node_matches
+        if Path(str(candidate.get("filename") or "")).suffix.lower() == suffix
+    ]
+    if suffix_matches:
+        return suffix_matches[0]
+    if node_matches:
+        return node_matches[0]
+    if len(refreshed) == 1:
+        return refreshed[0]
+    if 0 <= output_index < len(refreshed):
+        return refreshed[output_index]
+    return None
+
+
+def _refresh_completed_output(
+    server: str,
+    prompt_id: str,
+    current: dict,
+    output_index: int,
+    timeout: int,
+) -> dict | None:
+    """Refresh a /view descriptor without submitting another ComfyUI prompt."""
+
+    if not prompt_id:
+        return None
+    encoded_id = urllib.parse.quote(prompt_id, safe="")
+    request = urllib.request.Request(server + "/history/" + encoded_id, method="GET")
+    history = _request_json(request, timeout)
+    item = history.get(prompt_id) if isinstance(history, dict) else None
+    if not isinstance(item, dict):
+        return None
+    status = item.get("status") or {}
+    if status.get("status_str") == "error":
+        raise RuntimeError(f"ComfyUI reported an execution error for {prompt_id}")
+    return _matching_history_output(current, _history_outputs(item), output_index)
+
+
 def wait_for_history(
     server: str,
     prompt_id: str,
@@ -239,65 +318,133 @@ def download_outputs(
     reconnect_timeout: int = DEFAULT_RECONNECT_TIMEOUT_SECONDS,
     prompt_id: str = "",
     segment_id: str = "",
+    download_recovery_timeout: int = DEFAULT_OUTPUT_DOWNLOAD_RECOVERY_SECONDS,
+    history_refresh_interval: float = OUTPUT_DOWNLOAD_HISTORY_REFRESH_SECONDS,
 ) -> list[dict]:
     destination.mkdir(parents=True, exist_ok=True)
     downloaded: list[dict] = []
     for index, item in enumerate(outputs):
-        query = urllib.parse.urlencode(
-            {
-                "filename": item["filename"],
-                "subfolder": item.get("subfolder", ""),
-                "type": item.get("type", "output"),
-            }
-        )
-        request = urllib.request.Request(server + "/view?" + query, method="GET")
+        current_item = dict(item)
         suffix = Path(str(item["filename"])).suffix
         local_path = destination / f"{index:02d}_{item['node_id']}{suffix}"
         partial_path = local_path.with_suffix(local_path.suffix + ".part")
         disconnected_since: float | None = None
         last_notice = -10.0
+        last_history_refresh = time.monotonic()
+        effective_recovery_timeout = max(
+            1,
+            min(int(reconnect_timeout), int(download_recovery_timeout)),
+        )
         while True:
             try:
+                # Rebuild the request on every attempt. Reusing a Request after a
+                # reset LAN socket can leave urllib retrying stale connection state.
+                query = urllib.parse.urlencode(
+                    {
+                        "filename": current_item["filename"],
+                        "subfolder": current_item.get("subfolder", ""),
+                        "type": current_item.get("type", "output"),
+                    }
+                )
+                request = urllib.request.Request(server + "/view?" + query, method="GET")
                 with _direct_urlopen(request, timeout) as response:
-                    partial_path.write_bytes(response.read())
+                    expected_size = 0
+                    headers = getattr(response, "headers", None)
+                    if headers is not None:
+                        try:
+                            expected_size = int(headers.get("Content-Length") or 0)
+                        except (TypeError, ValueError):
+                            expected_size = 0
+                    written = 0
+                    with partial_path.open("wb") as stream:
+                        while chunk := response.read(OUTPUT_DOWNLOAD_CHUNK_BYTES):
+                            stream.write(chunk)
+                            written += len(chunk)
+                if written <= 0:
+                    raise ConnectionError("ComfyUI returned an empty output file")
+                if expected_size > 0 and written != expected_size:
+                    raise ConnectionError(
+                        "ComfyUI output download was incomplete "
+                        f"({written}/{expected_size} bytes)"
+                    )
                 partial_path.replace(local_path)
                 if disconnected_since is not None:
                     _connection_event(
                         "reconnected",
                         prompt_id,
                         "ComfyUI reconnected; output download resumed · "
-                        f"{item['filename']}",
+                        f"{current_item['filename']}",
                         disconnected_seconds=time.monotonic() - disconnected_since,
                         segment_id=segment_id,
                     )
                 break
             except Exception as exc:
                 partial_path.unlink(missing_ok=True)
-                if not _is_transient_connection_error(exc):
+                if not _is_transient_output_download_error(exc):
                     raise
                 now = time.monotonic()
                 if disconnected_since is None:
                     disconnected_since = now
                 disconnected_for = max(0.0, now - disconnected_since)
-                if disconnected_for > max(1, int(reconnect_timeout)):
+                if disconnected_for > effective_recovery_timeout:
                     raise ComfyConnectionRecoveryTimeout(
                         prompt_id,
-                        "ComfyUI output download did not recover within "
-                        f"{int(reconnect_timeout)}s for prompt_id {prompt_id}: {exc}",
+                        "The completed ComfyUI output could not be downloaded within "
+                        f"{effective_recovery_timeout}s. The accepted prompt was not re-queued; "
+                        f"run Generate Dirty again to resume prompt_id {prompt_id}. Last error: {exc}",
                     ) from exc
+                if (
+                    prompt_id
+                    and now - last_history_refresh >= max(0.1, float(history_refresh_interval))
+                ):
+                    last_history_refresh = now
+                    try:
+                        refreshed = _refresh_completed_output(
+                            server,
+                            prompt_id,
+                            current_item,
+                            index,
+                            timeout,
+                        )
+                        if refreshed is not None:
+                            changed = any(
+                                str(refreshed.get(key, ""))
+                                != str(current_item.get(key, ""))
+                                for key in ("filename", "subfolder", "type", "node_id")
+                            )
+                            current_item = dict(refreshed)
+                            if changed:
+                                _connection_event(
+                                    "disconnected",
+                                    prompt_id,
+                                    "ComfyUI history refreshed the completed output path; "
+                                    "continuing the same prompt without regeneration",
+                                    disconnected_seconds=disconnected_for,
+                                    segment_id=segment_id,
+                                )
+                    except Exception as refresh_exc:
+                        if not _is_transient_output_download_error(refresh_exc):
+                            raise
                 if disconnected_for - last_notice >= 5.0:
                     _connection_event(
                         "disconnected",
                         prompt_id,
-                        "ComfyUI connection lost while downloading output; retrying the same "
-                        f"server file · {disconnected_for:.0f}s",
+                        "ComfyUI output download interrupted; refreshing the completed Prompt "
+                        "and retrying without regeneration · "
+                        f"{disconnected_for:.0f}/{effective_recovery_timeout}s",
                         disconnected_seconds=disconnected_for,
                         segment_id=segment_id,
                     )
                     last_notice = disconnected_for
                 time.sleep(1.0)
-        downloaded.append({**item, "local_path": str(local_path.resolve())})
-        print(json.dumps({"progress": f"Downloaded {item['filename']}"}, ensure_ascii=False), flush=True)
+        downloaded.append({**current_item, "local_path": str(local_path.resolve())})
+        print(
+            json.dumps(
+                {"progress": f"Downloaded {current_item['filename']}"},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
     return downloaded
 
 
@@ -314,6 +461,15 @@ def main() -> int:
     reconnect_timeout = max(
         1,
         int(job.get("connection_recovery_timeout", DEFAULT_RECONNECT_TIMEOUT_SECONDS)),
+    )
+    output_download_recovery_timeout = max(
+        10,
+        int(
+            job.get(
+                "output_download_recovery_timeout",
+                DEFAULT_OUTPUT_DOWNLOAD_RECOVERY_SECONDS,
+            )
+        ),
     )
     validate_portable_media_manifest(
         job.get("workflow") or {},
@@ -393,6 +549,7 @@ def main() -> int:
             http_timeout,
             reconnect_timeout=reconnect_timeout,
             prompt_id=prompt_id,
+            download_recovery_timeout=output_download_recovery_timeout,
         )
     # Retired final_hold_* job metadata is deliberately ignored.
     print(

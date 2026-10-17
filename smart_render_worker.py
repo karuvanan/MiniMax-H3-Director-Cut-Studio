@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from array import array
 from copy import deepcopy
+import ctypes
 import hashlib
 import json
 import math
@@ -30,6 +31,7 @@ from datetime import datetime, timezone
 
 from comfy_submit_worker import (
     ComfyConnectionRecoveryTimeout,
+    DEFAULT_OUTPUT_DOWNLOAD_RECOVERY_SECONDS,
     DEFAULT_RECONNECT_TIMEOUT_SECONDS,
     _direct_urlopen,
     _request_json,
@@ -45,6 +47,7 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
 SMART_RENDER_POLICY_VERSION = 38
 AUDIO_JOIN_FADE_SECONDS = 0.04
+MAX_DIRECT_ASSEMBLY_SEGMENTS = 6
 LOCATION_SOUND_REFERENCE_VERSION = 1
 COMPLETE_LOCATION_SOUND_CONTRACT = (
     "COMPLETE LOCATION-SOUND REFERENCE CONTRACT — MANDATORY. The supplied authored "
@@ -794,6 +797,15 @@ def _queue_auxiliary_workflow(
     reconnect_timeout = max(
         1, int(job.get("connection_recovery_timeout", DEFAULT_RECONNECT_TIMEOUT_SECONDS))
     )
+    output_download_recovery_timeout = max(
+        10,
+        int(
+            job.get(
+                "output_download_recovery_timeout",
+                DEFAULT_OUTPUT_DOWNLOAD_RECOVERY_SECONDS,
+            )
+        ),
+    )
     payload = json.dumps(
         {"prompt": workflow, "client_id": "h3-native-ambience-" + uuid.uuid4().hex},
         ensure_ascii=False,
@@ -835,6 +847,7 @@ def _queue_auxiliary_workflow(
         reconnect_timeout=reconnect_timeout,
         prompt_id=prompt_id,
         segment_id=str(segment.get("segment_id", "")) + ":native-ambience",
+        download_recovery_timeout=output_download_recovery_timeout,
     )
     video = _primary_video(downloaded)
     if video is None:
@@ -1247,12 +1260,14 @@ def build_assembly_command(
     segments: list[dict],
     destination: Path,
     target_duration: float,
+    *,
+    canvas_override: tuple[int, int] | None = None,
 ) -> list[str]:
     """Build a trim/concat command that removes duplicated overlap frames."""
     paths = [Path(str(row["output_path"])) for row in segments]
     if not paths or not all(path.is_file() for path in paths):
         raise FileNotFoundError("One or more generated segment files are missing.")
-    canvas = _assembly_canvas(ffprobe, paths)
+    canvas = canvas_override or _assembly_canvas(ffprobe, paths)
     authoritative_audio_paths: list[Path | None] = []
     for row in segments:
         timing_spec = row.get("source_audio_timing_audit") or {}
@@ -1379,22 +1394,203 @@ def build_assembly_command(
     return command
 
 
+def _suppress_windows_ffmpeg_error_dialogs() -> None:
+    """Prevent a crashed FFmpeg child from blocking the worker behind a GUI dialog."""
+
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        current = int(kernel32.GetErrorMode())
+        # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        kernel32.SetErrorMode(current | 0x0001 | 0x0002 | 0x8000)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _run_assembly_command(
+    command: list[str],
+    destination: Path,
+    *,
+    timeout: int,
+    context: str,
+) -> None:
+    """Run one FFmpeg assembly phase and reject empty/crashed output."""
+
+    _suppress_windows_ffmpeg_error_dialogs()
+    destination.unlink(missing_ok=True)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or "").strip()[-1200:]
+        raise RuntimeError(
+            f"FFmpeg {context} failed (exit {completed.returncode}): " + detail
+        )
+    if not destination.is_file() or destination.stat().st_size <= 0:
+        raise RuntimeError(f"FFmpeg {context} returned no playable output file.")
+
+
+def _assembly_core_duration(row: dict) -> float:
+    trim_strategy = str(row.get("assembly_trim_strategy", "overlap"))
+    trim = (
+        0.0
+        if trim_strategy == "tail_padding_only"
+        else max(0.0, float(row.get("overlap_before_seconds", 0.0)))
+    )
+    core_start = row.get("core_start_seconds")
+    core_end = row.get("core_end_seconds")
+    if core_start is not None and core_end is not None:
+        return max(0.0, float(core_end) - float(core_start))
+    return max(
+        0.0,
+        float(row.get("end_seconds", 0.0))
+        - float(row.get("start_seconds", 0.0))
+        - trim,
+    )
+
+
+def _concat_assembly_chunks_command(
+    ffmpeg: Path,
+    list_path: Path,
+    destination: Path,
+    target_duration: float,
+) -> list[str]:
+    return [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-t", f"{target_duration:.6f}",
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c", "copy", "-movflags", "+faststart", str(destination),
+    ]
+
+
 def assemble_master(job: dict, segments: list[dict]) -> Path:
     destination = Path(job["master_output"])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    command = build_assembly_command(
-        Path(job["ffmpeg"]),
-        Path(job["ffprobe"]),
-        segments,
-        destination,
-        float(job["target_duration_seconds"]),
+    ffmpeg = Path(job["ffmpeg"])
+    ffprobe = Path(job["ffprobe"])
+    target_duration = float(job["target_duration_seconds"])
+    if len(segments) <= MAX_DIRECT_ASSEMBLY_SEGMENTS:
+        emit({"progress": f"Assembling {len(segments)} segments into the master video…"})
+        command = build_assembly_command(
+            ffmpeg, ffprobe, segments, destination, target_duration
+        )
+        _run_assembly_command(
+            command, destination, timeout=1800, context="master assembly"
+        )
+        return destination.resolve()
+
+    # Large one-shot filter graphs have crashed the Windows FFmpeg build after
+    # every H3 Segment was already complete, leaving a zero-byte master and a
+    # modal Application Error dialog. Normalize at most six inputs per batch,
+    # then concatenate the compatible batches without re-encoding them again.
+    paths = [Path(str(row["output_path"])) for row in segments]
+    canvas = _assembly_canvas(ffprobe, paths)
+    staging = destination.parent / (
+        f".{destination.stem}.assembly-{uuid.uuid4().hex[:10]}"
     )
-    emit({"progress": f"Assembling {len(segments)} segments into the master video…"})
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=1800)
-    if completed.returncode:
-        raise RuntimeError("FFmpeg master assembly failed: " + completed.stderr[-1200:])
-    # Preserve the assembled native ending, including for older saved jobs.
-    return destination.resolve()
+    staging.mkdir(parents=True, exist_ok=False)
+    chunk_rows: list[dict] = []
+    try:
+        groups = [
+            segments[offset : offset + MAX_DIRECT_ASSEMBLY_SEGMENTS]
+            for offset in range(0, len(segments), MAX_DIRECT_ASSEMBLY_SEGMENTS)
+        ]
+        cursor = 0.0
+        for group_index, group in enumerate(groups, start=1):
+            chunk_duration = sum(_assembly_core_duration(row) for row in group)
+            if chunk_duration <= 0.0:
+                raise ValueError(
+                    f"Assembly batch {group_index} has no positive duration."
+                )
+            chunk = staging / f"chunk_{group_index:03d}.mp4"
+            first = (group_index - 1) * MAX_DIRECT_ASSEMBLY_SEGMENTS + 1
+            last = first + len(group) - 1
+            emit({
+                "progress": (
+                    f"Master assembly batch {group_index}/{len(groups)} · "
+                    f"segments {first}–{last}"
+                ),
+                "assembly_progress": {
+                    "stage": "normalizing",
+                    "completed_batches": group_index - 1,
+                    "total_batches": len(groups) + 1,
+                },
+            })
+            command = build_assembly_command(
+                ffmpeg,
+                ffprobe,
+                group,
+                chunk,
+                chunk_duration,
+                canvas_override=canvas,
+            )
+            _run_assembly_command(
+                command,
+                chunk,
+                timeout=1800,
+                context=f"assembly batch {group_index}/{len(groups)}",
+            )
+            chunk_rows.append({
+                "output_path": str(chunk),
+                "start_seconds": cursor,
+                "end_seconds": cursor + chunk_duration,
+                "overlap_before_seconds": 0.0,
+            })
+            cursor += chunk_duration
+
+        list_path = staging / "chunks.txt"
+        list_path.write_text(
+            "".join(
+                f"file '{Path(str(row['output_path'])).name}'\n"
+                for row in chunk_rows
+            ),
+            encoding="utf-8",
+        )
+        emit({
+            "progress": f"Finalizing {len(groups)} assembly batches into the master video…",
+            "assembly_progress": {
+                "stage": "finalizing",
+                "completed_batches": len(groups),
+                "total_batches": len(groups) + 1,
+            },
+        })
+        concat_command = _concat_assembly_chunks_command(
+            ffmpeg, list_path, destination, target_duration
+        )
+        try:
+            _run_assembly_command(
+                concat_command,
+                destination,
+                timeout=900,
+                context="final batch concat",
+            )
+        except RuntimeError:
+            # Rare codec/time-base mismatch: only the small number of batches
+            # enters a final filter graph, so the Windows 20+ input crash is
+            # still avoided while retaining a deterministic recovery path.
+            fallback = build_assembly_command(
+                ffmpeg,
+                ffprobe,
+                chunk_rows,
+                destination,
+                target_duration,
+                canvas_override=canvas,
+            )
+            _run_assembly_command(
+                fallback,
+                destination,
+                timeout=1800,
+                context="final normalized batch concat",
+            )
+        return destination.resolve()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _workflow_for_attempt(workflow: dict, base_seed: int, attempt: int) -> dict:
@@ -1461,6 +1657,15 @@ def queue_segment(
     reconnect_timeout = max(
         1,
         int(job.get("connection_recovery_timeout", DEFAULT_RECONNECT_TIMEOUT_SECONDS)),
+    )
+    output_download_recovery_timeout = max(
+        10,
+        int(
+            job.get(
+                "output_download_recovery_timeout",
+                DEFAULT_OUTPUT_DOWNLOAD_RECOVERY_SECONDS,
+            )
+        ),
     )
     last_error: Exception | None = None
     resumed_prompt_id = str(segment.get("prompt_id", "")).strip()
@@ -1534,6 +1739,7 @@ def queue_segment(
                 reconnect_timeout=reconnect_timeout,
                 prompt_id=prompt_id,
                 segment_id=str(segment.get("segment_id", "")),
+                download_recovery_timeout=output_download_recovery_timeout,
             )
             video = _primary_video(downloaded)
             if video is None:
@@ -1754,12 +1960,42 @@ def queue_character_swap_passes(
 
     server = str(job["server"]).rstrip("/")
     http_timeout = max(1, int(job.get("http_timeout", 30)))
+    resume_prompt_id = str(segment.get("prompt_id") or "").strip()
+    resume_status = str(segment.get("status") or "").strip().lower()
+    resume_active = bool(
+        resume_prompt_id
+        and resume_status in {"queued", "monitoring", "reconnecting", "running"}
+    )
+    resume_pass_index = max(
+        0,
+        int(segment.get("active_character_swap_pass_index", 0) or 0),
+    )
+    completed_pass_outputs = [
+        str(path)
+        for path in (segment.get("character_swap_completed_pass_outputs") or [])
+        if str(path).strip()
+    ]
     previous_video: Path | None = None
+    if resume_active and resume_pass_index > 0:
+        if len(completed_pass_outputs) < resume_pass_index:
+            raise RuntimeError(
+                "Cannot safely resume this Character Swap pass because its preceding pass "
+                "checkpoint is missing. The accepted Prompt was not re-queued."
+            )
+        previous_video = Path(completed_pass_outputs[resume_pass_index - 1])
+        if not previous_video.is_file():
+            raise FileNotFoundError(
+                "Cannot safely resume this Character Swap pass because the preceding pass "
+                f"output is missing: {previous_video}"
+            )
     final_result: dict = {}
     for pass_index, pass_row in enumerate(passes):
         workflow = deepcopy(pass_row.get("workflow") or {})
         role = str(pass_row.get("source_role_id") or f"pass-{pass_index + 1}")
         target = str(pass_row.get("target_media_id") or "")
+        if resume_active and pass_index < resume_pass_index:
+            previous_video = Path(completed_pass_outputs[pass_index])
+            continue
         if pass_row.get("runtime_source"):
             if previous_video is None or not previous_video.is_file():
                 raise RuntimeError(
@@ -1817,12 +2053,37 @@ def queue_character_swap_passes(
             ),
             "native_speech_guard": {"enabled": False},
         }
+        if resume_active and pass_index == resume_pass_index:
+            pass_segment.update(
+                status="monitoring",
+                prompt_id=resume_prompt_id,
+                attempts_used=max(1, int(segment.get("attempts_used", 1) or 1)),
+            )
+
+        def checkpoint_character_swap_pass(
+            prompt_id: str,
+            attempt: int,
+            queued: dict,
+            *,
+            _pass_index: int = pass_index,
+            _role: str = role,
+        ) -> None:
+            # Store enough state in the outer Segment checkpoint to resume this
+            # exact accepted Relay pass after a /view download interruption.
+            segment["active_character_swap_pass_index"] = _pass_index
+            segment["active_character_swap_source_role_id"] = _role
+            segment["character_swap_completed_pass_outputs"] = list(
+                completed_pass_outputs
+            )
+            if on_queued is not None:
+                on_queued(prompt_id, attempt, queued)
+
         final_result = queue_segment(
             job,
             pass_segment,
             workflow,
             uploaded_media_for_workflow(workflow, uploaded),
-            on_queued=on_queued,
+            on_queued=checkpoint_character_swap_pass,
             speech_guard=None,
         )
         previous_video = Path(str(final_result.get("output_path") or ""))
@@ -1830,6 +2091,11 @@ def queue_character_swap_passes(
             raise RuntimeError(
                 f"Character Swap pass {pass_index + 1} returned no video."
             )
+        if len(completed_pass_outputs) <= pass_index:
+            completed_pass_outputs.append(str(previous_video.resolve()))
+        else:
+            completed_pass_outputs[pass_index] = str(previous_video.resolve())
+        resume_active = False
     return {
         **persisted,
         "status": "complete",

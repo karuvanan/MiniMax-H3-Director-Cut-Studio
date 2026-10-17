@@ -31984,6 +31984,14 @@ class DirectorCutStudio(QMainWindow):
 
         cache_key = "preview" if request_kind == "preview" else "production"
         cached_manifest = self.smart_render_manifests.get(cache_key, {})
+        # In-flight rows intentionally have no local output_path yet. Keep them
+        # separate from the durable-output merge below so Generate Dirty can
+        # resume their accepted ComfyUI prompt instead of submitting it again.
+        pending_rows = [
+            dict(row)
+            for row in (cached_manifest.get("segments") or [])
+            if isinstance(row, dict)
+        ]
         cached_rows = (
             list(cached_manifest.get("segments") or [])
             if int(cached_manifest.get("render_policy_version", 0))
@@ -32051,7 +32059,7 @@ class DirectorCutStudio(QMainWindow):
         manifest_server = str(cached_manifest.get("server", "")).strip().rstrip("/")
         pending_by_id = {
             str(row.get("segment_id", "")): row
-            for row in cached_rows
+            for row in pending_rows
             if str(row.get("prompt_id", "")).strip()
             and str(row.get("status", "")).strip().lower()
             in {"queued", "monitoring", "reconnecting", "running"}
@@ -32135,18 +32143,27 @@ class DirectorCutStudio(QMainWindow):
                     self.render_dirty_previewed_segment_ids.discard(segment_id)
             elif (
                 pending
-                and not dirty
                 and pending.get("fingerprint") == row.get("fingerprint")
             ):
                 # The remote ComfyUI prompt was already accepted. Preserve its
                 # identity and resume /history monitoring instead of queuing a
-                # duplicate Segment after Studio or the LAN reconnects.
+                # duplicate Segment after Studio or the LAN reconnects. This
+                # takes precedence even when the Segment is still marked dirty:
+                # that accepted prompt is the in-flight repair for this exact
+                # fingerprint, not an older clean take.
                 row.update(
                     status="monitoring",
                     prompt_id=str(pending["prompt_id"]),
                     queued_at=str(pending.get("queued_at", "")),
                     attempts_used=int(pending.get("attempts_used", 1) or 1),
                 )
+                for checkpoint_key in (
+                    "active_character_swap_pass_index",
+                    "active_character_swap_source_role_id",
+                    "character_swap_completed_pass_outputs",
+                ):
+                    if checkpoint_key in pending:
+                        row[checkpoint_key] = pending[checkpoint_key]
 
         self._refresh_render_status_bar()
 

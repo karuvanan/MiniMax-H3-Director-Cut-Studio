@@ -7160,6 +7160,52 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_dirty_repair_resumes_matching_accepted_prompt_without_requeue(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(15.0)
+        seed = 424242
+        first_path, _ = window._build_smart_render_job(
+            request_kind="preview",
+            megapixels=0.2,
+            seed=seed,
+            enable_rtx_vsr=False,
+            reuse_clean_segments=True,
+        )
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        pending = {
+            **{key: value for key, value in first["segments"][0].items() if key != "workflow"},
+            "status": "monitoring",
+            "prompt_id": "accepted-dirty-prompt",
+            "attempts_used": 1,
+            "active_character_swap_pass_index": 0,
+            "active_character_swap_source_role_id": "R1",
+            "character_swap_completed_pass_outputs": [],
+        }
+        window.smart_render_manifests["preview"] = {
+            "render_policy_version": SMART_RENDER_POLICY_VERSION,
+            "server": window.server_url.text().strip(),
+            "segments": [pending],
+        }
+        segment_id = str(pending["segment_id"])
+        window.render_dirty_segment_ids = {segment_id}
+
+        resumed_path, _ = window._build_smart_render_job(
+            request_kind="preview",
+            megapixels=0.2,
+            seed=seed,
+            enable_rtx_vsr=False,
+            reuse_clean_segments=True,
+        )
+        resumed = json.loads(resumed_path.read_text(encoding="utf-8"))
+        row = next(row for row in resumed["segments"] if row["segment_id"] == segment_id)
+        self.assertEqual(row["status"], "monitoring")
+        self.assertEqual(row["prompt_id"], "accepted-dirty-prompt")
+        self.assertEqual(row["active_character_swap_pass_index"], 0)
+        self.assertEqual(row["active_character_swap_source_role_id"], "R1")
+
+        window.project_dirty = False
+        window.close()
+
     def test_full_run_commits_clean_baseline_before_next_local_shot_edit(self):
         window = DirectorCutStudio()
         window._set_design_duration(45.0)

@@ -1,6 +1,6 @@
 # MiniMax H3 Director Cut Studio
 
-> v0.3.7-alpha.12：H3 Server Status把资源与Cache刷新完全分离；VRAM／DRAM／GPU／CPU默认每5秒更新，Cache Folder默认每120秒递归扫描，两者均可在Tray Settings独立调整。
+> v0.3.7-alpha.14：修复ComfyUI完成H3后在下载输出阶段长期卡住；Studio会刷新同一Prompt的history并重新建立`/view`下载、检查文件完整性，而且Character Swap续跑不会重复提交已经完成的生成。
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
@@ -24,7 +24,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.7-alpha.12`](VERSION)
+- 当前应用版本：[`v0.3.7-alpha.14`](VERSION)
 - v0.3.7 MiniMax-H3 Character-Swap LoRA与自动Remake Engine：[`v0.3.7 readme.md`](v0.3.7%20readme.md)
 - Character-Swap／Remake Engine论坛文章：[`forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md`](forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md)
 - v0.3.6 Shot Visual Editor 与 Timeline Qwen Assistant：[`v0.3.6 readme.md`](v0.3.6%20readme.md)

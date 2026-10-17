@@ -16,7 +16,7 @@ from comfy_submit_worker import (
     main as submit_main,
     wait_for_history,
 )
-from smart_render_worker import queue_segment
+from smart_render_worker import queue_character_swap_passes, queue_segment
 
 
 class ComfyConnectionRecoveryTests(unittest.TestCase):
@@ -85,6 +85,80 @@ class ComfyConnectionRecoveryTests(unittest.TestCase):
         self.assertFalse(destination.with_suffix(".mp4.part").exists())
         self.assertEqual(urlopen.call_count, 2)
 
+    def test_output_download_refreshes_history_descriptor_without_requeue(self):
+        response = MagicMock()
+        response.__enter__.return_value = BytesIO(b"refreshed-output")
+        response.__exit__.return_value = False
+        history = {
+            "prompt-3": {
+                "status": {"completed": True, "status_str": "success"},
+                "outputs": {
+                    "9": {
+                        "videos": [
+                            {
+                                "filename": "new.mp4",
+                                "subfolder": "fresh",
+                                "type": "output",
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+        with (
+            patch(
+                "comfy_submit_worker._direct_urlopen",
+                side_effect=[urllib.error.URLError("stale view socket"), response],
+            ) as urlopen,
+            patch("comfy_submit_worker._request_json", return_value=history) as refresh,
+            patch("comfy_submit_worker.time.monotonic", side_effect=[0.0, 6.0, 7.0]),
+            patch("comfy_submit_worker.time.sleep"),
+            patch("comfy_submit_worker._connection_event"),
+        ):
+            rows = download_outputs(
+                "http://remote:8188",
+                [
+                    {
+                        "node_id": "9",
+                        "kind": "videos",
+                        "filename": "old.mp4",
+                        "subfolder": "stale",
+                    }
+                ],
+                self.root,
+                1,
+                reconnect_timeout=3600,
+                download_recovery_timeout=120,
+                history_refresh_interval=5.0,
+                prompt_id="prompt-3",
+            )
+        self.assertEqual(Path(rows[0]["local_path"]).read_bytes(), b"refreshed-output")
+        self.assertEqual(rows[0]["filename"], "new.mp4")
+        self.assertIn("filename=new.mp4", urlopen.call_args_list[1].args[0].full_url)
+        self.assertEqual(refresh.call_count, 1)
+
+    def test_output_download_has_bounded_recovery_but_preserves_prompt(self):
+        with (
+            patch(
+                "comfy_submit_worker._direct_urlopen",
+                side_effect=urllib.error.URLError("LAN down"),
+            ),
+            patch("comfy_submit_worker.time.monotonic", side_effect=[0.0, 1.0, 122.0]),
+            patch("comfy_submit_worker.time.sleep"),
+        ):
+            with self.assertRaises(ComfyConnectionRecoveryTimeout) as raised:
+                download_outputs(
+                    "http://remote:8188",
+                    [{"node_id": "9", "kind": "videos", "filename": "out.mp4"}],
+                    self.root,
+                    1,
+                    reconnect_timeout=3600,
+                    download_recovery_timeout=120,
+                    prompt_id="prompt-bounded",
+                )
+        self.assertEqual(raised.exception.prompt_id, "prompt-bounded")
+        self.assertIn("was not re-queued", str(raised.exception))
+
     def test_smart_segment_does_not_requeue_accepted_prompt_after_recovery_timeout(self):
         job = {
             "server": "http://remote:8188",
@@ -145,6 +219,48 @@ class ComfyConnectionRecoveryTests(unittest.TestCase):
         queue.assert_not_called()
         self.assertEqual(result["prompt_id"], "persisted-prompt")
         self.assertEqual(result["status"], "complete")
+
+    def test_character_swap_resumes_download_prompt_instead_of_requeueing(self):
+        video = self.root / "relay-recovered.mp4"
+        video.write_bytes(b"video")
+        segment = {
+            "segment_id": "SEG-SWAP",
+            "index": 0,
+            "download_dir": str(self.root),
+            "status": "monitoring",
+            "prompt_id": "relay-prompt",
+            "attempts_used": 1,
+            "active_character_swap_pass_index": 0,
+            "character_swap_engine": "akatz-h3-relay",
+            "character_swap_passes": [
+                {
+                    "source_role_id": "R1",
+                    "target_media_id": "P1",
+                    "workflow": {},
+                }
+            ],
+        }
+
+        def resumed(_job, pass_segment, _workflow, _uploaded, **_kwargs):
+            self.assertEqual(pass_segment["status"], "monitoring")
+            self.assertEqual(pass_segment["prompt_id"], "relay-prompt")
+            return {
+                "status": "complete",
+                "output_path": str(video),
+                "prompt_id": "relay-prompt",
+                "outputs": [],
+                "uploaded": [],
+                "attempts_used": 1,
+            }
+
+        with patch("smart_render_worker.queue_segment", side_effect=resumed) as queue:
+            result = queue_character_swap_passes(
+                {"server": "http://remote:8188", "http_timeout": 1},
+                segment,
+                [],
+            )
+        self.assertEqual(queue.call_count, 1)
+        self.assertEqual(result["output_path"], str(video.resolve()))
 
     def test_native_job_checkpoints_prompt_id_and_reuses_it_on_worker_restart(self):
         job_path = self.root / "native.job.json"
