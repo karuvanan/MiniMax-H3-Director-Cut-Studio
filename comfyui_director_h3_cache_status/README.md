@@ -4,9 +4,10 @@ This is a read-only ComfyUI companion for the server meter shown immediately to
 the right of `ESTIMATE` in MiniMax H3 Director Cut Studio. The installer also
 adds a hidden Windows Tray monitor with login auto-start.
 
-Right-click the Tray icon and choose `Settings...` to configure the refresh
-interval (2-300 seconds), monitored ComfyUI URL/IP and monitored H3 Relay cache
-folder. Saving applies the new interval and endpoint immediately. The cache
+Right-click the Tray icon and choose `Settings...` to configure the resource
+refresh interval (2-300 seconds, default 5), Cache Folder scan interval
+(5-3600 seconds, default 120), monitored ComfyUI URL/IP and monitored H3 Relay
+cache folder. Saving applies the new intervals and endpoint immediately. The cache
 path is persisted to this custom node's `status-settings.json`, so Studio and
 Tray report the same folder without restarting ComfyUI.
 
@@ -26,7 +27,7 @@ The response contains Cache total bytes, file count, scan-error count, aggregate
 direct-child sizes, CPU, DRAM, GPU and VRAM percentages. It does not return
 process lists, filenames, download files, delete cache data or follow symbolic
 links. Resource samples refresh per request while the recursive Cache scan is
-reused for 30 seconds.
+reused for the configured interval (120 seconds by default).
 
 If the companion is absent or the server cannot be reached, Studio deliberately
 shows N/A for every unavailable value instead of incorrectly reporting zero.

@@ -10,6 +10,8 @@ import time
 from .cache_status import (
     CACHE_DIRECTORY_NAME,
     configured_cache_directory,
+    configured_cache_refresh_seconds,
+    configured_resource_refresh_seconds,
     measure_cache_directory,
 )
 from .system_status import collect_system_resources
@@ -20,11 +22,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_SAMPLE: dict = {}
 _CACHE_SAMPLED_AT = 0.0
-_CACHE_TTL_SECONDS = 30.0
 _CACHE_ROOT_KEY = ""
 
 
-def _combined_status(root: Path) -> dict:
+def _combined_status(
+    root: Path,
+    cache_refresh_seconds: int = 120,
+    resource_refresh_seconds: int = 5,
+) -> dict:
     global _CACHE_SAMPLE, _CACHE_SAMPLED_AT, _CACHE_ROOT_KEY
     now = time.monotonic()
     root_key = str(root.resolve(strict=False))
@@ -32,7 +37,7 @@ def _combined_status(root: Path) -> dict:
         if (
             not _CACHE_SAMPLE
             or root_key != _CACHE_ROOT_KEY
-            or now - _CACHE_SAMPLED_AT >= _CACHE_TTL_SECONDS
+            or now - _CACHE_SAMPLED_AT >= cache_refresh_seconds
         ):
             _CACHE_SAMPLE = measure_cache_directory(root)
             _CACHE_SAMPLED_AT = now
@@ -40,6 +45,8 @@ def _combined_status(root: Path) -> dict:
         cache = dict(_CACHE_SAMPLE)
     cache["cache_path"] = root_key
     cache["cache_path_exists"] = root.is_dir()
+    cache["cache_refresh_seconds"] = cache_refresh_seconds
+    cache["resource_refresh_seconds"] = resource_refresh_seconds
     cache["resources"] = collect_system_resources()
     cache["cache_sample_age_seconds"] = round(
         max(0.0, time.monotonic() - _CACHE_SAMPLED_AT), 3
@@ -56,11 +63,16 @@ def _register_route() -> None:
         default_root = (
             Path(folder_paths.get_output_directory()) / CACHE_DIRECTORY_NAME
         )
-        root = configured_cache_directory(
-            default_root,
-            Path(__file__).with_name("status-settings.json"),
+        settings_path = Path(__file__).with_name("status-settings.json")
+        root = configured_cache_directory(default_root, settings_path)
+        cache_refresh_seconds = configured_cache_refresh_seconds(settings_path)
+        resource_refresh_seconds = configured_resource_refresh_seconds(settings_path)
+        payload = await asyncio.to_thread(
+            _combined_status,
+            root,
+            cache_refresh_seconds,
+            resource_refresh_seconds,
         )
-        payload = await asyncio.to_thread(_combined_status, root)
         return web.json_response(payload)
 
     PromptServer.instance.routes.get(

@@ -9,6 +9,16 @@ from pathlib import Path
 
 CACHE_DIRECTORY_NAME = "__h3_removal_cache"
 CACHE_BUDGET_BYTES = 100 * 1024**3
+DEFAULT_CACHE_REFRESH_SECONDS = 120
+DEFAULT_RESOURCE_REFRESH_SECONDS = 5
+
+
+def _settings_payload(settings_path: str | Path) -> dict:
+    try:
+        payload = json.loads(Path(settings_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def configured_cache_directory(
@@ -18,17 +28,52 @@ def configured_cache_directory(
     """Resolve the locally-authored cache path without accepting it via HTTP."""
 
     fallback = Path(default_root)
-    try:
-        payload = json.loads(Path(settings_path).read_text(encoding="utf-8-sig"))
-        configured = str(payload.get("cache_path", "") or "").strip()
-    except (OSError, ValueError, TypeError, AttributeError):
-        return fallback
+    payload = _settings_payload(settings_path)
+    configured = str(payload.get("cache_path", "") or "").strip()
     if not configured:
         return fallback
     try:
         return Path(configured).expanduser().resolve(strict=False)
     except OSError:
         return fallback
+
+
+def configured_refresh_seconds(
+    settings_path: str | Path,
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Read and clamp a locally-authored monitoring interval."""
+
+    payload = _settings_payload(settings_path)
+    try:
+        value = int(payload.get(key, default))
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def configured_cache_refresh_seconds(settings_path: str | Path) -> int:
+    return configured_refresh_seconds(
+        settings_path,
+        "cache_refresh_seconds",
+        DEFAULT_CACHE_REFRESH_SECONDS,
+        minimum=5,
+        maximum=3600,
+    )
+
+
+def configured_resource_refresh_seconds(settings_path: str | Path) -> int:
+    return configured_refresh_seconds(
+        settings_path,
+        "resource_refresh_seconds",
+        DEFAULT_RESOURCE_REFRESH_SECONDS,
+        minimum=2,
+        maximum=300,
+    )
 
 
 def measure_cache_directory(root: str | Path) -> dict:
