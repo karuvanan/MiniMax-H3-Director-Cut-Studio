@@ -270,6 +270,40 @@ class SourceVideoAnalysisTests(unittest.TestCase):
         self.assertEqual(result["max_output_tokens"], 32768)
         self.assertEqual(result["finish_reason"], "stop")
 
+    def test_long_form_source_analysis_may_use_64k_output_budget(self):
+        calls = []
+
+        def fake_request(url, *, api_key, timeout, payload=None):
+            calls.append((url, payload))
+            if url.endswith("/models"):
+                return {"data": [{"id": "qwen-vision"}]}
+            return {
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "{}"},
+                }]
+            }
+
+        with patch("design_ai_service.request_json", side_effect=fake_request):
+            result = generate({
+                "provider": "lm_studio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "model": "qwen-vision",
+                "system_prompt": "Inspect a 90-second storyboard.",
+                "user_prompt": "Return the complete compact role ledger.",
+                "schema": {"type": "object"},
+                "max_output_tokens": 65536,
+                "allow_large_structured_output": True,
+                "temperature": 0.0,
+            })
+
+        chat_payload = next(
+            payload for url, payload in calls if url.endswith("/chat/completions")
+        )
+        self.assertEqual(chat_payload["max_tokens"], 65536)
+        self.assertEqual(result["max_output_tokens"], 65536)
+        self.assertEqual(result["finish_reason"], "stop")
+
 
 if __name__ == "__main__":
     unittest.main()

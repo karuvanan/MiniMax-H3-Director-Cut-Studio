@@ -35,6 +35,7 @@ from design_engine import (
     enforce_design_dialogue_language,
     enforce_design_music_mode,
     enforce_design_subtitle_policy,
+    enforce_source_video_cast_remake_plan,
     enforce_hong_kong_comic_technique_text_layers,
     enforce_hong_kong_comic_superhero_opening,
     enforce_hong_kong_comic_generated_source_plates,
@@ -65,6 +66,7 @@ from design_engine import (
     _append_subject_count_guard,
     _street_fighter_realtime_action_text,
 )
+from source_video_analysis import render_source_video_analysis
 from design_media_service import (
     generate as generate_design_media,
     image_workflow,
@@ -3986,6 +3988,118 @@ On-screen text: "EXACT TITLE"'''
         )
         self.assertIn("ENVIRONMENT POPULATION KEYFRAME", loaded_p5["instruction"])
 
+
+    def test_source_video_cast_remake_accepts_only_p1_and_reuses_it_for_all_roles(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 6.0
+        payload["text_layers"] = []
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        ledger = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 6.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [1]},
+                {"role_id": "R3", "scene_indexes": [1]},
+                {"role_id": "R4", "scene_indexes": [1]},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 6.0,
+                "active_source_roles": ["R1", "R2", "R3", "R4"],
+                "visible_event": "Four performers share one source shot.",
+            }],
+        })
+        inventory = [
+            {
+                "media_id": "V1", "media_type": "video", "loaded": True,
+                "source_duration_seconds": 6.0,
+                "semantic_enrichment": ledger,
+            },
+            {
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "caption": "the only replacement performer",
+            },
+        ]
+
+        self.assertEqual(source_video_remake_required_media(inventory), [])
+        self.assertEqual(
+            source_video_remake_required_media(inventory[:1]), ["P1"]
+        )
+        plan = enforce_source_video_cast_remake_plan(
+            payload,
+            inventory,
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+        )
+
+        self.assertEqual(len(plan["source_role_bindings"]), 4)
+        self.assertEqual(
+            {row["target_media_id"] for row in plan["source_role_bindings"]},
+            {"P1"},
+        )
+
+    def test_source_video_cast_remake_can_rebuild_background_while_locking_cast(self):
+        payload = sample_design()
+        payload["duration_seconds"] = 6.0
+        payload["shots"] = [{
+            **payload["shots"][0],
+            "start_seconds": 0.0,
+            "end_seconds": 6.0,
+            "environment_response": "A neon rain-soaked station requested by the user.",
+        }]
+        payload["text_layers"] = []
+        payload["existing_media_uses"] = []
+        payload["media_requests"] = []
+        ledger = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 6.0,
+            "location_ledger": [{
+                "location_id": "L1",
+                "description": "A bright school corridor",
+                "defining_elements": ["lockers", "classroom doors"],
+            }],
+            "principal_roles": [{"role_id": "R1", "scene_indexes": [1]}],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 6.0,
+                "location_id": "L1",
+                "active_source_roles": ["R1"],
+                "visible_event": "R1 walks toward camera.",
+            }],
+        })
+        inventory = [
+            {
+                "media_id": "V1", "media_type": "video", "loaded": True,
+                "source_duration_seconds": 6.0,
+                "semantic_enrichment": ledger,
+            },
+            {
+                "media_id": "P1", "media_type": "image", "loaded": True,
+                "caption": "replacement performer",
+            },
+        ]
+
+        plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Keep @P1 but rebuild the background as a neon station.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            source_rebuild_environment=True,
+        )
+
+        shot = plan["shots"][0]
+        self.assertIn("AUTHORED ENVIRONMENT REBUILD", shot["environment_response"])
+        self.assertIn("neon rain-soaked station", shot["environment_response"])
+        self.assertNotIn("HIGH-FIDELITY V1 SCENE", shot["environment_response"])
+        self.assertNotIn("MANDATORY VISIBLE SET ELEMENTS", shot["environment_response"])
+        self.assertIn("newly authored environment", shot["additional_direction"])
+        self.assertIn("REBUILT-WORLD CONTRACT", plan["constraints"])
+        self.assertIn("S1=@P1", shot["subject_action"])
 
     def test_source_video_cast_remake_locks_v1_duration_cast_and_original_soundtrack(self):
         payload = sample_design()

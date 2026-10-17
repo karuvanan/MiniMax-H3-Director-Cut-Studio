@@ -2,7 +2,43 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
-## [0.3.6-alpha2] - 2026-10-14
+## [0.3.7-alpha.1] - 2026-10-17
+
+### Automatic Remake Engine Routing
+
+- Remake Engine改由当前Special Skill单一决定，顶部显示只读`Remake Engine · AUTO`：没有Skill与其他所有Skill使用`Create H3 Remake`；只有`Source Video Cast Remake H3`使用`LoRA Preserve V1`。
+- Project载入、Design恢复、Apply及最终Compile都会重新按Skill计算Engine；旧Project保存的Creative／Directed手动值不再造成误路由，其他Skill也不会意外加载Character-Swap Relay。
+- `Source Video Cast Remake H3`的环境重塑开关在LoRA Preserve V1路径明确停用；需要重新生成环境时选择其他Skill，交回普通Create H3 Remake编译器。
+
+### MiniMax-H3 Character-Swap LoRA v1.5
+
+- 正式接入`akatz-labs-character-swap-turbo8-adaptive-window-api.json`、`h3_character_swap_v1.5.safetensors`、`LabsH3PrepareVideo`与`H3RelayWindowedEdit`，以24fps V1 Shot板保留源表演、姿势、表情、构图、场景、时间与声音，再按人物卡映射P演员。
+- 多角色Shot继续使用逐角色Pass，避免为同一窗口重复生成整套影片；Shot边界隔离、原声窗口、精确V1 Master Audio、听众闭嘴与角色对嘴合同保持生效。
+- Character-Swap API需要的H3 UNet、Qwen encoder、两组VAE、Turbo LoRA、FFmpeg及Custom Node已加入README与v0.3.7部署清单。
+
+### Production Baseline and Documentation
+
+- 首次`APPLY TO H3 WORKSPACE → RUN + QUEUE`完整生成成功后，会把全部Production Segment提交为clean基线；之后修改单一Shot，`REGENERATE DIRTY`只处理真正受影响的Segment，不再要求整片重新Preview／Accept。
+- 新增[`v0.3.7 readme.md`](v0.3.7%20readme.md)、可直接发布的Character-Swap／自动Remake Engine论坛文章与16:9宣传图。
+- Render Policy提升至36；Director Project格式保持26，无需迁移已有Project。
+
+### Verification
+
+- Character-Swap engine与Director Studio通过Python编译。
+- 自动路由、Source Skill Relay、多角色Pass、工作流装载及Live-Action Cast开关专项测试通过。
+
+## [0.3.6-alpha.2] - 2026-10-15
+
+### Dirty Segment Repair
+
+- 修复首次`RUN+QUEUE`完成整片1.0MP输出后，只修改一个Shot却在`REGENERATE DIRTY → ACCEPT 1.0M`阶段重新提交全部Shot的问题。首次正式输出现在作为持久化Production Segment基线；修复预览与正式Accept都只生成dirty Segment，clean Segment直接复用并重新组装完整Master。
+- 修复Shot Visual Editor及Timeline Ask Qwen默认`Linked Continuity`无条件把前一Shot与后一Shot同时标记dirty的问题。现在只在Incoming／Outgoing Environment State、连续性边界或角色映射确实传播到邻镜时才使邻镜所属Segment失效；普通动作、机位、嘴形或单镜人物调整只影响当前Shot覆盖的Segment。
+- `Whole Segment`仍保留明确的整段失效语义；首次Design尚未建立正式Production基线时，普通Preview／Accept流程保持原有完整生成行为。
+
+### Program Monitor
+
+- 修复同时显示V1 `TIMELINE SOURCE`与生成进度时，左侧原生视频表面覆盖`GENERATED OUTPUT`进度卡左半边的问题。生成遮罩现在只属于右侧Generated Output面板，并以该面板独立居中；V1素材保持可见但不再遮挡状态、百分比或进度条。
+- 单画面、Segment完成预览及最终输出的播放器结构保持不变；新增离屏UI回归检查，固定验证遮罩父容器与几何范围只属于右侧面板。
 
 ### Featured Complete-Video Workflows
 

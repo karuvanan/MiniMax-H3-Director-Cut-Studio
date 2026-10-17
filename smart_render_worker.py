@@ -10,13 +10,16 @@ ComfyUI model/VRAM release after the assembled Master is complete.
 from __future__ import annotations
 
 import argparse
+from array import array
 from copy import deepcopy
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -40,7 +43,7 @@ from workflow_engine import validate_portable_media_manifest
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 32
+SMART_RENDER_POLICY_VERSION = 36
 AUDIO_JOIN_FADE_SECONDS = 0.04
 LOCATION_SOUND_REFERENCE_VERSION = 1
 COMPLETE_LOCATION_SOUND_CONTRACT = (
@@ -332,6 +335,71 @@ def classify_generation_error(error: object) -> str:
     return "unknown"
 
 
+def _server_lora_choices(object_info: dict) -> list[str]:
+    """Read ComfyUI's concrete LoRA filenames from object_info."""
+
+    loader = object_info.get("LoraLoaderModelOnly") or {}
+    required = ((loader.get("input") or {}).get("required") or {})
+    spec = required.get("lora_name") or []
+    choices = spec[0] if isinstance(spec, list) and spec else []
+    if not isinstance(choices, list):
+        return []
+    return [str(value) for value in choices if str(value).strip()]
+
+
+def _character_swap_lora_for_server(
+    current_name: str,
+    available_names: list[str],
+) -> str:
+    """Prefer V1.5, otherwise resolve the template's V1 by basename."""
+
+    def normalized(value: str) -> str:
+        return (
+            value.replace("\\", "/").rsplit("/", 1)[-1]
+            .lower().replace("-", "_")
+        )
+
+    for name in available_names:
+        token = normalized(name)
+        if "character_swap" in token and ("v1.5" in token or "v1_5" in token):
+            return name
+    current_token = normalized(current_name)
+    for name in available_names:
+        if normalized(name) == current_token:
+            return name
+    return current_name
+
+
+def prefer_server_character_swap_lora(job: dict, object_info: dict) -> list[str]:
+    """Patch every Relay pass to the best Character Swap LoRA on the server."""
+
+    choices = _server_lora_choices(object_info)
+    selected: list[str] = []
+    for segment in job.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        for pass_row in segment.get("character_swap_passes") or []:
+            if not isinstance(pass_row, dict):
+                continue
+            workflow = pass_row.get("workflow") or {}
+            for node in workflow.values():
+                if (
+                    not isinstance(node, dict)
+                    or node.get("class_type") != "LoraLoaderModelOnly"
+                ):
+                    continue
+                inputs = node.setdefault("inputs", {})
+                current = str(inputs.get("lora_name") or "")
+                if "character_swap" not in current.lower().replace("-", "_"):
+                    continue
+                chosen = _character_swap_lora_for_server(current, choices)
+                inputs["lora_name"] = chosen
+                pass_row["character_swap_lora"] = chosen
+                if chosen not in selected:
+                    selected.append(chosen)
+    return selected
+
+
 def preflight_smart_render(job: dict) -> dict:
     """Fail before media upload if a long render cannot complete on this host."""
     segments = list(job.get("segments") or [])
@@ -385,6 +453,17 @@ def preflight_smart_render(job: dict) -> dict:
             manifest_rows,
             runtime_loader_node_ids=runtime_ids,
         )
+        for pass_row in segment.get("character_swap_passes") or []:
+            pass_runtime_ids = (
+                {str(pass_row.get("runtime_source_loader_node_id"))}
+                if pass_row.get("runtime_source")
+                else set()
+            )
+            validate_portable_media_manifest(
+                pass_row.get("workflow") or {},
+                manifest_rows,
+                runtime_loader_node_ids=pass_runtime_ids,
+            )
 
     output_parent = Path(job["master_output"]).parent
     output_parent.mkdir(parents=True, exist_ok=True)
@@ -395,10 +474,22 @@ def preflight_smart_render(job: dict) -> dict:
             f"{free_bytes / 1024**3:.2f}GB is available."
         )
 
+    workflows = [
+        workflow
+        for segment in segments
+        for workflow in [
+            segment.get("workflow") or {},
+            *[
+                row.get("workflow") or {}
+                for row in segment.get("character_swap_passes") or []
+                if isinstance(row, dict)
+            ],
+        ]
+    ]
     required_classes = {
         str(node.get("class_type", ""))
-        for segment in segments
-        for node in (segment.get("workflow") or {}).values()
+        for workflow in workflows
+        for node in workflow.values()
         if isinstance(node, dict) and node.get("class_type")
     }
     server = str(job["server"]).rstrip("/")
@@ -407,6 +498,7 @@ def preflight_smart_render(job: dict) -> dict:
         urllib.request.Request(server + "/object_info", method="GET"),
         http_timeout,
     )
+    selected_swap_loras = prefer_server_character_swap_lora(job, object_info)
     missing = sorted(required_classes - set(object_info))
     if missing:
         raise RuntimeError(
@@ -416,6 +508,7 @@ def preflight_smart_render(job: dict) -> dict:
         "segment_count": len(segments),
         "node_class_count": len(required_classes),
         "free_disk_gb": round(free_bytes / 1024**3, 2),
+        "character_swap_loras": selected_swap_loras,
     }
 
 
@@ -944,6 +1037,210 @@ def _has_audio(ffprobe: Path, source: Path) -> bool:
     return completed.returncode == 0 and bool(completed.stdout.strip())
 
 
+def _probe_video_geometry(ffprobe: Path, source: Path) -> tuple[int, int] | None:
+    """Return the first video stream's encoded size, or None when unavailable.
+
+    Assembly may combine H3/character-swap renders with untouched V1 relay
+    windows.  Those producers do not necessarily use the same canvas size or
+    sample-aspect-ratio, while FFmpeg's concat filter requires an identical
+    video contract for every input.  Geometry probing is deliberately
+    best-effort so command construction remains usable in dry-run tests.
+    """
+
+    try:
+        completed = subprocess.run(
+            [
+                str(ffprobe), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "json",
+                str(source),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode:
+            return None
+        streams = (json.loads(completed.stdout or "{}").get("streams") or [])
+        if not streams:
+            return None
+        width = int(streams[0].get("width") or 0)
+        height = int(streams[0].get("height") or 0)
+        if width <= 0 or height <= 0:
+            return None
+        return width, height
+    except (
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ):
+        return None
+
+
+def _assembly_canvas(ffprobe: Path, paths: list[Path]) -> tuple[int, int] | None:
+    """Choose a stable concat canvas from the dominant source geometry.
+
+    Count wins first so a single unusually large relay frame cannot upscale an
+    otherwise uniform job.  Equal counts prefer the larger canvas, retaining
+    the intended H3 quality in a mixed H3/V1 pair.  libx264/yuv420p requires
+    even dimensions, so odd source dimensions are rounded up by one pixel.
+    """
+
+    counts: dict[tuple[int, int], int] = {}
+    for path in paths:
+        geometry = _probe_video_geometry(ffprobe, path)
+        if geometry is not None:
+            counts[geometry] = counts.get(geometry, 0) + 1
+    if not counts:
+        return None
+    width, height = max(
+        counts,
+        key=lambda geometry: (
+            counts[geometry], geometry[0] * geometry[1], geometry[0], geometry[1]
+        ),
+    )
+    return width + (width % 2), height + (height % 2)
+
+
+def _decoded_audio_envelope(
+    ffmpeg: Path,
+    source: Path,
+    *,
+    duration_seconds: float,
+    sample_rate: int = 8000,
+    bucket_seconds: float = 0.01,
+) -> list[float]:
+    """Decode a compact mono amplitude envelope for timing-only comparison."""
+
+    completed = subprocess.run(
+        [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-i", str(source),
+            "-map", "0:a:0", "-t", f"{max(0.01, duration_seconds):.6f}",
+            "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1",
+        ],
+        capture_output=True,
+        timeout=max(60, int(max(1.0, duration_seconds) * 4)),
+    )
+    if completed.returncode or not completed.stdout:
+        raise RuntimeError(
+            "Could not decode source-audio timing envelope: "
+            + completed.stderr.decode("utf-8", errors="replace")[-600:]
+        )
+    samples = array("h")
+    samples.frombytes(completed.stdout[: len(completed.stdout) // 2 * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    bucket = max(1, round(sample_rate * bucket_seconds))
+    envelope: list[float] = []
+    for offset in range(0, len(samples), bucket):
+        values = samples[offset : offset + bucket]
+        if not values:
+            break
+        mean_abs = sum(abs(value) for value in values) / len(values)
+        envelope.append(math.log1p(mean_abs))
+    return envelope
+
+
+def _pearson(values_a: list[float], values_b: list[float]) -> float:
+    if len(values_a) < 8 or len(values_a) != len(values_b):
+        return 0.0
+    mean_a = sum(values_a) / len(values_a)
+    mean_b = sum(values_b) / len(values_b)
+    centered_a = [value - mean_a for value in values_a]
+    centered_b = [value - mean_b for value in values_b]
+    denominator = math.sqrt(
+        sum(value * value for value in centered_a)
+        * sum(value * value for value in centered_b)
+    )
+    if denominator <= 1e-12:
+        return 0.0
+    return sum(a * b for a, b in zip(centered_a, centered_b)) / denominator
+
+
+def best_envelope_offset(
+    expected: list[float],
+    actual: list[float],
+    *,
+    bucket_seconds: float = 0.01,
+    maximum_offset_seconds: float = 0.75,
+) -> tuple[float, float]:
+    """Return actual-vs-expected lag and correlation; never edits generated media."""
+
+    maximum_lag = max(0, round(maximum_offset_seconds / bucket_seconds))
+    best_lag = 0
+    best_score = -2.0
+    for lag in range(-maximum_lag, maximum_lag + 1):
+        if lag >= 0:
+            count = min(len(expected), len(actual) - lag)
+            left = expected[:count]
+            right = actual[lag : lag + count]
+        else:
+            count = min(len(expected) + lag, len(actual))
+            left = expected[-lag : -lag + count]
+            right = actual[:count]
+        if count < 8:
+            continue
+        score = _pearson(left, right)
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    return round(best_lag * bucket_seconds, 6), round(max(-1.0, best_score), 6)
+
+
+def audit_source_audio_timing(
+    ffmpeg: Path,
+    generated_video: Path,
+    spec: dict,
+) -> dict:
+    """Measure temporal offset against A999 without retrying or rewriting a take."""
+
+    if not spec.get("enabled"):
+        return {"status": "not_requested"}
+    expected_path = Path(str(spec.get("expected_path") or ""))
+    duration = max(0.01, float(spec.get("authored_duration_seconds", 0.0) or 0.0))
+    if not expected_path.is_file() or not generated_video.is_file():
+        return {"status": "unavailable", "reason": "missing expected or generated media"}
+    try:
+        expected = _decoded_audio_envelope(
+            ffmpeg, expected_path, duration_seconds=duration
+        )
+        actual = _decoded_audio_envelope(
+            ffmpeg, generated_video, duration_seconds=duration
+        )
+        offset, correlation = best_envelope_offset(
+            expected,
+            actual,
+            maximum_offset_seconds=float(
+                spec.get("maximum_offset_seconds", 0.75) or 0.75
+            ),
+        )
+        threshold = max(
+            0.0, float(spec.get("warning_offset_seconds", 0.045) or 0.045)
+        )
+        reliable = correlation >= 0.35
+        return {
+            "status": (
+                "warning" if reliable and abs(offset) > threshold
+                else "ok" if reliable else "low_confidence"
+            ),
+            "offset_seconds": offset,
+            "correlation": correlation,
+            "authored_duration_seconds": duration,
+            "padded_duration_seconds": float(
+                spec.get("padded_duration_seconds", duration) or duration
+            ),
+            "action": "detect_only_no_regeneration",
+        }
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        return {
+            "status": "unavailable",
+            "reason": str(exc),
+            "action": "detect_only_no_regeneration",
+        }
+
+
 def build_assembly_command(
     ffmpeg: Path,
     ffprobe: Path,
@@ -955,15 +1252,42 @@ def build_assembly_command(
     paths = [Path(str(row["output_path"])) for row in segments]
     if not paths or not all(path.is_file() for path in paths):
         raise FileNotFoundError("One or more generated segment files are missing.")
-    include_audio = all(_has_audio(ffprobe, path) for path in paths)
+    canvas = _assembly_canvas(ffprobe, paths)
+    authoritative_audio_paths: list[Path | None] = []
+    for row in segments:
+        timing_spec = row.get("source_audio_timing_audit") or {}
+        expected = Path(str(timing_spec.get("expected_path") or ""))
+        authoritative_audio_paths.append(
+            expected
+            if timing_spec.get("enabled") and expected.is_file()
+            else None
+        )
+    include_audio = all(
+        authoritative is not None or _has_audio(ffprobe, path)
+        for path, authoritative in zip(paths, authoritative_audio_paths)
+    )
     command = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y"]
     for path in paths:
         command.extend(["-i", str(path)])
+    authoritative_input_indexes: list[int | None] = []
+    for authoritative in authoritative_audio_paths:
+        if authoritative is None:
+            authoritative_input_indexes.append(None)
+            continue
+        authoritative_input_indexes.append(
+            len(paths) + sum(index is not None for index in authoritative_input_indexes)
+        )
+        command.extend(["-i", str(authoritative)])
 
     filters: list[str] = []
     concat_inputs: list[str] = []
     for index, row in enumerate(segments):
-        trim = max(0.0, float(row.get("overlap_before_seconds", 0.0)))
+        trim_strategy = str(row.get("assembly_trim_strategy", "overlap"))
+        trim = (
+            0.0
+            if trim_strategy == "tail_padding_only"
+            else max(0.0, float(row.get("overlap_before_seconds", 0.0)))
+        )
         core_start = row.get("core_start_seconds")
         core_end = row.get("core_end_seconds")
         if core_start is None or core_end is None:
@@ -978,17 +1302,50 @@ def build_assembly_command(
         if core_duration <= 0.0:
             raise ValueError(f"Segment {index + 1} has no positive core duration.")
         trim_end = trim + core_duration
-        filters.append(
-            f"[{index}:v]trim=start={trim:.6f}:end={trim_end:.6f},"
-            f"setpts=PTS-STARTPTS[v{index}]"
-        )
+        video_filters = [
+            f"[{index}:v]trim=start={trim:.6f}:end={trim_end:.6f}",
+            "setpts=PTS-STARTPTS",
+        ]
+        if canvas is not None:
+            width, height = canvas
+            # Preserve the source composition.  Differently shaped relay
+            # windows are fitted inside the dominant canvas and padded rather
+            # than stretched or cropped.  setsar/fps/format also repair the
+            # undefined SAR returned by some character-swap workflows.
+            video_filters.extend(
+                [
+                    f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease:"
+                    "force_divisible_by=2",
+                    f"pad=w={width}:h={height}:x=(ow-iw)/2:y=(oh-ih)/2:color=black",
+                    "setsar=1",
+                    "fps=24",
+                    "format=yuv420p",
+                    "settb=AVTB",
+                ]
+            )
+        filters.append(",".join(video_filters) + f"[v{index}]")
         concat_inputs.append(f"[v{index}]")
         if include_audio:
+            authoritative_index = authoritative_input_indexes[index]
+            audio_input_index = (
+                authoritative_index if authoritative_index is not None else index
+            )
+            # A999 is already an exact segment-local soundtrack with silence
+            # appended only after the authored core.  Never take H3's shifted
+            # or time-warped return audio when this authoritative input exists.
+            audio_trim = 0.0 if authoritative_index is not None else trim
             audio_filters = [
-                f"[{index}:a]atrim=start={trim:.6f}:end={trim_end:.6f}",
+                f"[{audio_input_index}:a]atrim=start={audio_trim:.6f}:"
+                f"end={audio_trim + core_duration:.6f}",
                 "asetpts=PTS-STARTPTS",
             ]
-            fade = min(AUDIO_JOIN_FADE_SECONDS, core_duration / 4.0)
+            # Exact consecutive A999 windows come from one V1 master and must
+            # meet sample-continuously.  Join fades would create audible dips
+            # and alter the source timing envelope.
+            fade = (
+                0.0 if authoritative_index is not None
+                else min(AUDIO_JOIN_FADE_SECONDS, core_duration / 4.0)
+            )
             if index > 0 and fade > 0.0:
                 audio_filters.append(f"afade=t=in:st=0:d={fade:.6f}")
             if index < len(segments) - 1 and fade > 0.0:
@@ -1353,6 +1710,139 @@ def uploaded_media_for_workflow(workflow: dict, uploaded: list[dict]) -> list[di
     ]
 
 
+def queue_character_swap_passes(
+    job: dict,
+    segment: dict,
+    uploaded: list[dict],
+    *,
+    on_queued=None,
+) -> dict:
+    """Run one Akatz Character Swap Relay pass per visible mapped role."""
+
+    passes = [
+        row for row in segment.get("character_swap_passes") or []
+        if isinstance(row, dict)
+    ]
+    persisted = {
+        key: value for key, value in segment.items()
+        if key not in {"workflow", "character_swap_passes"}
+    }
+    persisted["character_swap_passes"] = [
+        {
+            key: value for key, value in row.items()
+            if key != "workflow"
+        }
+        for row in passes
+    ]
+    if not passes:
+        passthrough = Path(str(segment.get("passthrough_path") or ""))
+        if not passthrough.is_file():
+            raise FileNotFoundError(
+                "Character Swap interval has no mapped role and no V1 passthrough Shot."
+            )
+        return {
+            **persisted,
+            "status": "complete",
+            "output_path": str(passthrough.resolve()),
+            "prompt_id": "",
+            "outputs": [],
+            "uploaded": [],
+            "error": "",
+            "attempts_used": 0,
+            "failure_class": "",
+        }
+
+    server = str(job["server"]).rstrip("/")
+    http_timeout = max(1, int(job.get("http_timeout", 30)))
+    previous_video: Path | None = None
+    final_result: dict = {}
+    for pass_index, pass_row in enumerate(passes):
+        workflow = deepcopy(pass_row.get("workflow") or {})
+        role = str(pass_row.get("source_role_id") or f"pass-{pass_index + 1}")
+        target = str(pass_row.get("target_media_id") or "")
+        if pass_row.get("runtime_source"):
+            if previous_video is None or not previous_video.is_file():
+                raise RuntimeError(
+                    f"Character Swap {role} requires the preceding pass output."
+                )
+            upload_name = (
+                f"h3relay_{segment.get('segment_id', 'segment')}_"
+                f"pass_{pass_index:02d}.mp4"
+            )
+            upload = upload_file(
+                server,
+                previous_video,
+                http_timeout,
+                upload_name,
+            )
+            uploaded_name = str((upload or {}).get("name") or upload_name)
+            loader_id = str(pass_row.get("runtime_source_loader_node_id") or "")
+            loader_input = str(
+                pass_row.get("runtime_source_loader_input") or "file"
+            )
+            loader = workflow.get(loader_id)
+            if not isinstance(loader, dict):
+                raise KeyError(
+                    f"Character Swap runtime source loader {loader_id} is missing."
+                )
+            loader.setdefault("inputs", {})[loader_input] = uploaded_name
+            uploaded.append({
+                "file": previous_video.name,
+                "upload_name": uploaded_name,
+                "result": upload,
+                "runtime_character_swap_source": True,
+            })
+        emit({
+            "progress": (
+                f"Segment {segment['index'] + 1} · Character Swap pass "
+                f"{pass_index + 1}/{len(passes)} · {role} → @{target}"
+            ),
+            "segment_index": segment["index"],
+            "character_swap_pass": {
+                "index": pass_index + 1,
+                "count": len(passes),
+                "source_role_id": role,
+                "target_media_id": target,
+            },
+        })
+        pass_segment = {
+            "segment_id": (
+                f"{segment.get('segment_id', 'segment')}__swap_{pass_index + 1:02d}_{role}"
+            ),
+            "index": segment.get("index", 0),
+            "seed": int(pass_row.get("seed", segment.get("seed", 0)) or 0),
+            "download_dir": str(
+                Path(str(segment["download_dir"]))
+                / f"character_swap_pass_{pass_index + 1:02d}_{role}"
+            ),
+            "native_speech_guard": {"enabled": False},
+        }
+        final_result = queue_segment(
+            job,
+            pass_segment,
+            workflow,
+            uploaded_media_for_workflow(workflow, uploaded),
+            on_queued=on_queued,
+            speech_guard=None,
+        )
+        previous_video = Path(str(final_result.get("output_path") or ""))
+        if not previous_video.is_file():
+            raise RuntimeError(
+                f"Character Swap pass {pass_index + 1} returned no video."
+            )
+    return {
+        **persisted,
+        "status": "complete",
+        "output_path": str(previous_video.resolve()),
+        "prompt_id": str(final_result.get("prompt_id") or ""),
+        "outputs": list(final_result.get("outputs") or []),
+        "uploaded": list(final_result.get("uploaded") or []),
+        "error": "",
+        "attempts_used": int(final_result.get("attempts_used", 1) or 1),
+        "failure_class": "",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("job")
@@ -1521,6 +2011,8 @@ def main() -> int:
                     "master_seed": job.get("seed"),
                     "megapixels": job.get("megapixels"),
                     "target_duration_seconds": job.get("target_duration_seconds"),
+                    "timeline_start_seconds": job.get("timeline_start_seconds", 0.0),
+                    "timeline_end_seconds": job.get("timeline_end_seconds"),
                     "active_prompt_id": prompt_id,
                     "segments": completed + [pending] + [
                         {key: value for key, value in row.items() if key != "workflow"}
@@ -1542,14 +2034,22 @@ def main() -> int:
                     ),
                 })
 
-            result = queue_segment(
-                job,
-                segment,
-                workflow,
-                uploaded_media_for_workflow(workflow, uploaded),
-                on_queued=checkpoint_queued,
-                speech_guard=speech_guard,
-            )
+            if str(segment.get("character_swap_engine") or "") == "akatz-h3-relay":
+                result = queue_character_swap_passes(
+                    job,
+                    segment,
+                    uploaded,
+                    on_queued=checkpoint_queued,
+                )
+            else:
+                result = queue_segment(
+                    job,
+                    segment,
+                    workflow,
+                    uploaded_media_for_workflow(workflow, uploaded),
+                    on_queued=checkpoint_queued,
+                    speech_guard=speech_guard,
+                )
         except Exception as exc:
             failure_class = classify_generation_error(exc)
             failed = {
@@ -1579,6 +2079,8 @@ def main() -> int:
                 "master_seed": job.get("seed"),
                 "megapixels": job.get("megapixels"),
                 "target_duration_seconds": job.get("target_duration_seconds"),
+                "timeline_start_seconds": job.get("timeline_start_seconds", 0.0),
+                "timeline_end_seconds": job.get("timeline_end_seconds"),
                 "active_prompt_id": accepted_prompt_id if recovery_pending else "",
                 "segments": completed + [failed] + [
                     {key: value for key, value in row.items() if key != "workflow"}
@@ -1608,6 +2110,31 @@ def main() -> int:
                 ),
             })
             raise
+        timing_spec = segment.get("source_audio_timing_audit") or {}
+        timing_audit = (
+            audit_source_audio_timing(
+                Path(job["ffmpeg"]),
+                Path(str(result.get("output_path") or "")),
+                timing_spec,
+            )
+            if timing_spec.get("enabled")
+            else {"status": "not_requested"}
+        )
+        if timing_audit.get("status") != "not_requested":
+            result["source_audio_timing_audit"] = timing_audit
+            offset = float(timing_audit.get("offset_seconds", 0.0) or 0.0)
+            correlation = float(timing_audit.get("correlation", 0.0) or 0.0)
+            emit({
+                "source_audio_timing_audit": {
+                    "segment_id": segment.get("segment_id", ""),
+                    **timing_audit,
+                },
+                "progress": (
+                    f"Segment {index + 1}: A999 timing audit "
+                    f"{timing_audit.get('status')} · offset {offset:+.3f}s · "
+                    f"confidence {correlation:.2f} · detection only"
+                ),
+            })
         completed.append(result)
         completed_indexes.add(index)
         previous_video = Path(result["output_path"])
@@ -1622,6 +2149,8 @@ def main() -> int:
             "master_seed": job.get("seed"),
             "megapixels": job.get("megapixels"),
             "target_duration_seconds": job.get("target_duration_seconds"),
+            "timeline_start_seconds": job.get("timeline_start_seconds", 0.0),
+            "timeline_end_seconds": job.get("timeline_end_seconds"),
             "segments": completed + [
                 {key: value for key, value in row.items() if key != "workflow"}
                 for row in segments[index + 1 :]
@@ -1663,6 +2192,8 @@ def main() -> int:
         "master_seed": job.get("seed"),
         "megapixels": job.get("megapixels"),
         "target_duration_seconds": job.get("target_duration_seconds"),
+        "timeline_start_seconds": job.get("timeline_start_seconds", 0.0),
+        "timeline_end_seconds": job.get("timeline_end_seconds"),
         "master_output": str(master),
         "final_model_release": final_release,
         "segments": completed,

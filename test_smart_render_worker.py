@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from smart_render_worker import (
     _mix_complete_location_reference,
+    best_envelope_offset,
     _patch_continuity,
     build_native_ambience_workflow,
     build_render_progress,
@@ -17,7 +18,9 @@ from smart_render_worker import (
     extract_tail_frames,
     main,
     patch_complete_location_reference,
+    prefer_server_character_swap_lora,
     preflight_smart_render,
+    queue_character_swap_passes,
     queue_segment,
     speech_guard_result_score,
 )
@@ -25,6 +28,168 @@ from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
+    def test_character_swap_prefers_server_v15_and_preserves_turbo_lora(self):
+        job = {
+            "segments": [{
+                "character_swap_passes": [{
+                    "workflow": {
+                        "4": {
+                            "class_type": "LoraLoaderModelOnly",
+                            "inputs": {
+                                "lora_name": "h3_character_swap_pro4500_1000.safetensors"
+                            },
+                        },
+                        "204": {
+                            "class_type": "LoraLoaderModelOnly",
+                            "inputs": {"lora_name": "minimax_h3_fl2v_turbo_8step.safetensors"},
+                        },
+                    }
+                }]
+            }]
+        }
+        object_info = {
+            "LoraLoaderModelOnly": {
+                "input": {"required": {"lora_name": [[
+                    "h3-character-swap-v1/h3_character_swap_pro4500_1000.safetensors",
+                    "h3-character-swap-v1.5/h3_character_swap_v1.5.safetensors",
+                    "minimax_h3_fl2v_turbo_8step.safetensors",
+                ]]}}
+            }
+        }
+
+        selected = prefer_server_character_swap_lora(job, object_info)
+
+        pass_row = job["segments"][0]["character_swap_passes"][0]
+        self.assertEqual(
+            pass_row["workflow"]["4"]["inputs"]["lora_name"],
+            "h3-character-swap-v1.5/h3_character_swap_v1.5.safetensors",
+        )
+        self.assertEqual(
+            pass_row["workflow"]["204"]["inputs"]["lora_name"],
+            "minimax_h3_fl2v_turbo_8step.safetensors",
+        )
+        self.assertEqual(selected, [
+            "h3-character-swap-v1.5/h3_character_swap_v1.5.safetensors"
+        ])
+
+    def test_character_swap_runs_visible_roles_as_sequential_source_passes(self):
+        root = PROJECT_ROOT / ".director_cache" / "character_swap_pass_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        first = root / "pass1.mp4"
+        second = root / "pass2.mp4"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        workflows = []
+
+        def fake_queue(_job, _segment, workflow, _uploaded, **_kwargs):
+            workflows.append(workflow)
+            output = first if len(workflows) == 1 else second
+            return {"output_path": str(output), "prompt_id": f"p{len(workflows)}"}
+
+        segment = {
+            "segment_id": "S1",
+            "index": 0,
+            "seed": 10,
+            "download_dir": str(root),
+            "character_swap_passes": [
+                {
+                    "source_role_id": "R1", "target_media_id": "P1", "seed": 11,
+                    "runtime_source": False,
+                    "workflow": {"30": {"class_type": "LoadVideo", "inputs": {"file": "v1.mp4"}}},
+                },
+                {
+                    "source_role_id": "R2", "target_media_id": "P2", "seed": 12,
+                    "runtime_source": True,
+                    "runtime_source_loader_node_id": "30",
+                    "runtime_source_loader_input": "file",
+                    "workflow": {"30": {"class_type": "LoadVideo", "inputs": {"file": "placeholder.mp4"}}},
+                },
+            ],
+        }
+        with (
+            patch("smart_render_worker.queue_segment", side_effect=fake_queue),
+            patch("smart_render_worker.upload_file", return_value={"name": "runtime-pass1.mp4"}),
+        ):
+            result = queue_character_swap_passes(
+                {"server": "http://127.0.0.1:8188", "http_timeout": 1},
+                segment,
+                [],
+            )
+        self.assertEqual(result["output_path"], str(second.resolve()))
+        self.assertEqual(len(workflows), 2)
+        self.assertEqual(workflows[1]["30"]["inputs"]["file"], "runtime-pass1.mp4")
+        shutil.rmtree(root, ignore_errors=True)
+
+    def test_timing_audit_detects_offset_without_requesting_regeneration(self):
+        expected = [0.0] * 20 + [1.0, 3.0, 2.0, 0.0] + [0.0] * 20
+        actual = [0.0] * 5 + expected
+        offset, correlation = best_envelope_offset(
+            expected, actual, bucket_seconds=0.01, maximum_offset_seconds=0.2
+        )
+        self.assertAlmostEqual(offset, 0.05, places=6)
+        self.assertGreater(correlation, 0.99)
+
+    def test_tail_padding_trim_starts_at_zero_and_ends_at_authored_core(self):
+        root = PROJECT_ROOT / ".director_cache" / "tail_padding_trim_test"
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "segment.mp4"
+        source.write_bytes(b"video")
+        destination = root / "master.mp4"
+        segment = {
+            "output_path": str(source),
+            "start_seconds": 0.0,
+            "end_seconds": 9.42,
+            "core_start_seconds": 0.0,
+            "core_end_seconds": 8.833333,
+            "overlap_before_seconds": 1.0,
+            "assembly_trim_strategy": "tail_padding_only",
+        }
+        with patch("smart_render_worker._has_audio", return_value=False):
+            command = build_assembly_command(
+                Path("ffmpeg"), Path("ffprobe"), [segment], destination, 8.833333
+            )
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertIn("trim=start=0.000000:end=8.833333", filters)
+        source.unlink(missing_ok=True)
+        root.rmdir()
+
+    def test_source_remake_assembly_uses_authoritative_a999_audio(self):
+        root = PROJECT_ROOT / ".director_cache" / "a999_authoritative_audio_test"
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "segment.mp4"
+        source.write_bytes(b"video")
+        a999 = root / "A999.wav"
+        a999.write_bytes(b"audio")
+        destination = root / "master.mp4"
+        segment = {
+            "output_path": str(source),
+            "start_seconds": 0.0,
+            "end_seconds": 9.42,
+            "core_start_seconds": 0.0,
+            "core_end_seconds": 8.833333,
+            "assembly_trim_strategy": "tail_padding_only",
+            "source_audio_timing_audit": {
+                "enabled": True,
+                "expected_path": str(a999),
+                "authored_duration_seconds": 8.833333,
+                "padded_duration_seconds": 9.42,
+            },
+        }
+        with patch("smart_render_worker._has_audio", return_value=False):
+            command = build_assembly_command(
+                Path("ffmpeg"), Path("ffprobe"), [segment], destination, 8.833333
+            )
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertEqual(command.count("-i"), 2)
+        self.assertIn(str(a999), command)
+        self.assertIn("[1:a]atrim=start=0.000000:end=8.833333", filters)
+        self.assertNotIn("[0:a]atrim", filters)
+        self.assertNotIn("afade=", filters)
+        source.unlink(missing_ok=True)
+        a999.unlink(missing_ok=True)
+        root.rmdir()
+
     @staticmethod
     def _location_sound_workflow():
         return {
@@ -625,6 +790,69 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertIn("afade=t=in:st=0:d=0.040000", filters)
         self.assertIn("concat=n=3:v=1:a=1", filters)
         self.assertIn("43.000000", command)
+
+    def test_assembly_normalizes_mixed_video_geometry_and_sar(self):
+        runtime = load_runtime_paths()
+        root = PROJECT_ROOT / ".director_cache" / "mixed_geometry_assembly_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        small = root / "small.mp4"
+        large = root / "large.mp4"
+        output = root / "master.mp4"
+        try:
+            for path, size, color in (
+                (small, "160x120", "blue"),
+                (large, "320x240", "red"),
+            ):
+                created = subprocess.run(
+                    [
+                        str(runtime.ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", f"color=c={color}:s={size}:r=24:d=1",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+
+            result = assemble_master(
+                {
+                    "master_output": str(output),
+                    "ffmpeg": str(runtime.ffmpeg),
+                    "ffprobe": str(runtime.ffprobe),
+                    "target_duration_seconds": 2.0,
+                },
+                [
+                    {
+                        "output_path": str(small),
+                        "start_seconds": 0.0,
+                        "end_seconds": 1.0,
+                    },
+                    {
+                        "output_path": str(large),
+                        "start_seconds": 1.0,
+                        "end_seconds": 2.0,
+                    },
+                ],
+            )
+            probe = subprocess.run(
+                [
+                    str(runtime.ffprobe), "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate",
+                    "-of", "json", str(result),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            stream = json.loads(probe.stdout)["streams"][0]
+            self.assertEqual((stream["width"], stream["height"]), (320, 240))
+            self.assertEqual(stream["sample_aspect_ratio"], "1:1")
+            self.assertEqual(stream["r_frame_rate"], "24/1")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_assembly_ignores_legacy_plate_and_preserves_native_tail(self):
         from PIL import Image

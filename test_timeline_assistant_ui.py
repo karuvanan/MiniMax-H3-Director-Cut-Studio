@@ -236,6 +236,39 @@ class TimelineAssistantUiTests(unittest.TestCase):
             window.project_dirty = False
             window.close()
 
+    def test_linked_qwen_performance_patch_dirties_only_its_segment(self):
+        window = DirectorCutStudio()
+        try:
+            window._set_design_duration(45.0)
+            window.director_cues = [
+                DirectorCue("S1", "shot", 1.0, 4.0, "Opening"),
+                DirectorCue("S2", "shot", 16.0, 19.0, "Middle"),
+                DirectorCue("S3", "shot", 31.0, 34.0, "Ending"),
+            ]
+            window._refresh_director_cues()
+            window.render_dirty_segment_ids.clear()
+            window.render_dirty_previewed_segment_ids.clear()
+            window.timeline_assistant_target_shot_id = "S2"
+            window.timeline_assistant_last_scope = "linked_continuity"
+            window._apply_timeline_assistant_operations([{
+                "target_kind": "shot",
+                "target_id": "S2",
+                "field": "camera_movement",
+                "value": "slow lateral track",
+                "reason": "Refine only this Shot's camera",
+                "requires_confirmation": False,
+            }])
+            dirty = [
+                segment for segment in window._planned_render_segments()
+                if segment.segment_id in window.render_dirty_segment_ids
+            ]
+            self.assertEqual(len(dirty), 1)
+            self.assertLess(dirty[0].start_seconds, 19.0)
+            self.assertGreater(dirty[0].end_seconds, 16.0)
+        finally:
+            window.project_dirty = False
+            window.close()
+
     def test_regenerate_dirty_action_appears_only_for_stale_segments(self):
         window = DirectorCutStudio()
         try:

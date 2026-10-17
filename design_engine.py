@@ -259,15 +259,17 @@ def source_video_remake_duration(existing_media: list[dict] | None) -> float | N
 
 
 def source_video_remake_required_media(existing_media: list[dict] | None) -> list[str]:
-    """Return missing fixed inputs for the reusable V1/P1-P4 remake format."""
+    """Return missing minimum inputs for a reusable V1 cast remake.
+
+    One replacement Picture is sufficient.  A detected V1 cast may reuse P1
+    across any number of source roles; additional Pictures only expand the
+    optional actor pool and must never become a fixed preflight requirement.
+    """
 
     inventory = _media_inventory(existing_media)
     required = {
         "V1": "video",
         "P1": "image",
-        "P2": "image",
-        "P3": "image",
-        "P4": "image",
     }
     return [
         media_id
@@ -2501,6 +2503,7 @@ def enforce_source_video_cast_remake_plan(
     existing_media: list[dict] | None,
     special_skill_key: object,
     source_role_bindings: list[dict] | None = None,
+    source_rebuild_environment: bool = False,
 ) -> dict:
     """Use V1 as a planning blueprint while loaded P images rebuild principals.
 
@@ -2676,28 +2679,20 @@ def enforce_source_video_cast_remake_plan(
             role_scene_uses_source_thumbnail[(role_id, scene_index)] = bool(
                 raw.get("source_thumbnail", False)
             )
-    if source_role_ids and raw_role_bindings:
-        missing_appearances = [
-            key for key in required_role_scenes if key not in role_scene_to_media
-        ]
-        if missing_appearances:
-            raise ValueError(
-                "Source remake appearance mapping is incomplete: "
-                + ", ".join(
-                    f"{role_id}/scene {scene_index}"
-                    for role_id, scene_index in missing_appearances
-                )
-            )
-    if source_role_ids and not role_scene_to_media:
-        if len(available_cast_ids) < len(source_role_ids):
-            raise ValueError(
-                "Source remake found more principal roles than loaded P identity Pictures. "
-                "Load another Picture or confirm a smaller principal-role ledger."
-            )
-        for role_id, media_id in zip(source_role_ids, available_cast_ids):
-            for scene_index in role_rows.get(role_id, {}).get("scene_indexes") or []:
-                role_scene_to_media[(role_id, int(scene_index))] = media_id
-                role_scene_uses_source_thumbnail[(role_id, int(scene_index))] = False
+    # Missing cards inherit a deterministic actor from the available pool.
+    # With only P1 loaded this intentionally maps every V1 role/appearance to
+    # P1.  With several Pictures, roles cycle through the pool while every
+    # user-selected card above remains authoritative.
+    for role_index, role_id in enumerate(source_role_ids):
+        if not available_cast_ids:
+            break
+        fallback_media_id = available_cast_ids[role_index % len(available_cast_ids)]
+        for scene_index in role_rows.get(role_id, {}).get("scene_indexes") or []:
+            key = (role_id, int(scene_index))
+            if key in role_scene_to_media:
+                continue
+            role_scene_to_media[key] = fallback_media_id
+            role_scene_uses_source_thumbnail[key] = False
     canonical_bindings = [
         {
             "source_role_id": role_id,
@@ -2789,6 +2784,18 @@ def enforce_source_video_cast_remake_plan(
     plan["text_layers"] = []
     plan["duration_seconds"] = duration
 
+    environment_contract = (
+        "REBUILT-WORLD CONTRACT: keep the mapped P-character identities, source performance timing, "
+        "action causality, camera function, cut boundaries and synchronized soundtrack, but create a "
+        "new coherent environment and background from the current Design Requirement. Do not preserve "
+        "V1 architecture, furnishings, palette or exact background layout unless the Requirement asks "
+        "for them. Integrate every retained P character into the new world's perspective, contact shadows, "
+        "ground plane, practical lighting and atmosphere."
+        if source_rebuild_environment else
+        "V1-WORLD RECONSTRUCTION CONTRACT: reconstruct a recognisably close V1-derived set by preserving "
+        "its architectural topology, dominant objects, object adjacency, palette, practical-light direction, "
+        "framing, eyelines and blocking while never copying source pixels or source people."
+    )
     contract = (
         "SOURCE-VIDEO DIRECTOR-BLUEPRINT RECONSTRUCTION CONTRACT: the source movie supplies analysis only: event "
         "order, role functions, scene vocabulary, action causality, camera grammar, edit rhythm and "
@@ -2796,9 +2803,7 @@ def enforce_source_video_cast_remake_plan(
         "locked by the user's principal-role binding table. Build every principal directly "
         "from the assigned P reference. A source identity may survive only when that role's binding "
         "explicitly has source_thumbnail=true; every other source face, hair, body and wardrobe must be replaced. "
-        "Reconstruct a recognisably close V1-derived set by preserving its architectural "
-        "topology, dominant objects, object adjacency, palette, practical-light direction, framing, "
-        "eyelines and blocking while never copying source pixels or source people. Preserve the purpose and cause-effect order of actions "
+        + environment_contract + " Preserve the purpose and cause-effect order of actions "
         "and cuts while allowing a fresh, coherent cinematic staging. Match each audible source voice "
         "to its mapped P-character's speaking turn; listeners keep non-speaking mouths."
     )
@@ -3053,7 +3058,12 @@ def enforce_source_video_cast_remake_plan(
                 ),
             ) if part
         )
-        environment_contract = (
+        shot_environment_contract = (
+            "AUTHORED ENVIRONMENT REBUILD: preserve the mapped P characters and this beat's physical "
+            "performance, but replace the V1 environment/background with the world requested by the "
+            "current Design Requirement. Keep believable perspective, floor contact, shadows, lighting, "
+            "atmosphere and shot-to-shot geography. V1 location pixels and set geometry are not visual facts."
+            if source_rebuild_environment else
             "HIGH-FIDELITY V1 SCENE RECONSTRUCTION: preserve the source scene's recognisable "
             "location type, architectural topology, dominant background objects, object adjacency, "
             "depth layers, practical-light direction, colour palette, material character, camera "
@@ -3061,8 +3071,8 @@ def enforce_source_video_cast_remake_plan(
             "facts as a clean new shot with the P cast; do not copy source pixels, UI or source people. "
             "Do not replace the set with a generic room merely because it serves the same story function."
         )
-        shot["environment_response"] = environment_contract + (
-            (" " + source_fingerprint if source_fingerprint else "")
+        shot["environment_response"] = shot_environment_contract + (
+            (" " + source_fingerprint if source_fingerprint and not source_rebuild_environment else "")
             + (" " + environment if environment else "")
         )
         continuity = str(shot.get("continuity_state", "")).strip()
@@ -3072,10 +3082,15 @@ def enforce_source_video_cast_remake_plan(
             + (" " + continuity if continuity else "")
         )
         direction = str(shot.get("additional_direction", "")).strip()
+        scene_matching_direction = (
+            "Preserve the V1 cut boundary, shot scale, lens feel, eyeline, screen position and action blocking, "
+            "but stage them inside the newly authored environment; do not restore the V1 set fingerprint."
+            if source_rebuild_environment else
+            "Match the V1 cut boundary, shot scale, lens feel, eyeline, screen position, blocking and set fingerprint closely."
+        )
         shot["additional_direction"] = (
             f"SOURCE BLUEPRINT, NOT SOURCE PLATE {start:.3f}-{end:.3f}s: follow the analysed event and "
-            f"camera purpose while composing a new shot. Match the V1 cut boundary, shot scale, lens feel, "
-            f"eyeline, screen position, blocking and set fingerprint closely. Use "
+            f"camera purpose while composing a new shot. {scene_matching_direction} Use "
             + (", ".join("@" + media_id for media_id in active_cast) or "no mapped P principal")
             + " as the only principal visual facts in this source interval. "
             "Do not show any unselected source actor, source-video pixels, subtitles, captions, social-media UI, icons, "
@@ -7383,6 +7398,7 @@ def normalize_design_plan(
     special_skill_key: str = "",
     selected_media_ids: list[str] | None = None,
     source_role_bindings: list[dict] | None = None,
+    source_rebuild_environment: bool = False,
 ) -> dict:
     media_repair_warnings: list[str] = []
     prepared_payload = deepcopy(extract_design_json(payload))
@@ -8162,6 +8178,7 @@ def normalize_design_plan(
         existing_media,
         special_skill_key,
         source_role_bindings=source_role_bindings,
+        source_rebuild_environment=source_rebuild_environment,
     )
     enforce_mtv_scene_keyframes(
         plan,
@@ -8492,6 +8509,12 @@ def build_design_system_prompt(context: dict) -> str:
                 "a substitute man/woman pair or person-bearing Z-Image action reference. "
             )
     if selected_special_key == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL:
+        source_rebuild_environment = bool(
+            context.get("source_rebuild_environment", False)
+        )
+        source_cast_live_action_adaptation = bool(
+            context.get("source_cast_live_action_adaptation", False)
+        )
         source_cast_ids = sorted(
             (
                 str(row.get("media_id", "")).strip().upper()
@@ -8508,14 +8531,31 @@ def build_design_system_prompt(context: dict) -> str:
             f"S{media_id[1:]}=@{media_id}" for media_id in source_cast_ids
         )
         source_cast_label = ", ".join("@" + media_id for media_id in source_cast_ids)
+        source_environment_direction = (
+            "Keep the loaded P cast and V1-derived performance/edit structure, but design a new "
+            "coherent environment and background from the user's current Requirement. V1 architecture, "
+            "furnishings, palette and exact background layout are not binding visual facts. "
+            if source_rebuild_environment else
+            "Reconstruct coherent environments from V1's defining elements and atmosphere; exact pixels, "
+            "geometry and composition need not match. "
+        )
+        source_cast_medium_direction = (
+            "For any mapped P reference whose evidence says cartoon, anime, comic or illustration, "
+            "preserve its recognisable facial-hair design, hairstyle, age impression, wardrobe concept, "
+            "colours and accessories while rendering it as a physically plausible live-action performer "
+            "with V1-matched anatomy, lighting, lens response and motion blur; never paste a 2D head or "
+            "retain ink outlines, cel shading or paper edges. Photographic P references remain unchanged. "
+            if source_cast_live_action_adaptation else
+            "Preserve each mapped P reference's original visual medium. "
+        )
         ending_contract = (
             "SOURCE-VIDEO DIRECTOR-BLUEPRINT RECONSTRUCTION CONTRACT: analyse @V1's chronology, "
             "principal-role functions, action causality, scene vocabulary, camera purpose, edit rhythm "
             "and soundtrack timing. Source principals map once by narrative prominence and first "
             "appearance to the loaded cast dictionary: " + source_cast_mapping + ". @V1 is analysis_only and must "
             "never become an H3 video reference or immutable pixel plate. Rebuild the principals entirely "
-            "from " + source_cast_label + " and reconstruct coherent environments from V1's defining elements and atmosphere. "
-            "Exact pixels, geometry and composition need not match. Return no media_requests, never retain "
+            "from " + source_cast_label + ". " + source_cast_medium_direction
+            + source_environment_direction + "Return no media_requests, never retain "
             "a source actor, never invent an action beat and preserve the source-derived ending function. "
             "When V1 evidence contains QWEN SOURCE VIDEO DIRECTOR ANALYSIS, its ordered scenes[] rows, "
             "location IDs, active source roles, visible events and action handoffs are authoritative; cover "
@@ -8529,11 +8569,22 @@ def build_design_system_prompt(context: dict) -> str:
             "and anonymous extras keep neutral non-speaking mouths. "
         )
         environmental_combat_contract = (
-            "SOURCE-VIDEO WORLD RECONSTRUCTION CONTRACT: preserve the analysed location type, defining "
-            "furnishings, props, weather, lighting, crowd function, spatial relationships, entrances, exits, "
-            "eyelines, contacts and reactions, but rebuild them as a new coherent H3 scene rather than an "
-            "unchanged pixel plate. Anonymous non-speaking extras may be recreated only where the analysed "
-            "event needs them; they may never inherit a P face or become another principal. "
+            (
+                "SOURCE-VIDEO AUTHORED-WORLD CONTRACT: retain mapped P identities, source action timing, "
+                "entrances, exits, eyelines, contacts and reactions, but replace the source location with "
+                "the Requirement's newly designed environment/background. Re-light and ground the retained "
+                "characters naturally inside that new world. "
+            )
+            if source_rebuild_environment else
+            (
+                "SOURCE-VIDEO WORLD RECONSTRUCTION CONTRACT: preserve the analysed location type, defining "
+                "furnishings, props, weather, lighting, crowd function, spatial relationships, entrances, exits, "
+                "eyelines, contacts and reactions, but rebuild them as a new coherent H3 scene rather than an "
+                "unchanged pixel plate. "
+            )
+        ) + (
+            "Anonymous non-speaking extras may be recreated only where the analysed event needs them; "
+            "they may never inherit a P face or become another principal. "
         )
     elif selected_special_key == COMIC_TALK_SHOW_SPECIAL_SKILL:
         ending_contract = (

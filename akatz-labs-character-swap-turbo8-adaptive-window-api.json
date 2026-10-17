@@ -1,0 +1,273 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "2": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 3,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "ModelSamplingMiniMaxH3"
+    }
+  },
+  "3": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "ModelAttentionBackend"
+    }
+  },
+  "4": {
+    "inputs": {
+      "lora_name": "h3_character_swap_v1.5.safetensors",
+      "strength_model": 1,
+      "model": [
+        "204",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Character Swap v1"
+    }
+  },
+  "6": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "7": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "8": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "9": {
+    "inputs": {
+      "image": "h3ref_image_P2_8492603680bf_P2_f2d1444234aa_WhatsApp_Image_2026-10-11_at_9.18.51_AM.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "2 · Upload character reference"
+    }
+  },
+  "11": {
+    "inputs": {
+      "value": "Replace the person in <Video 1> with the character shown in <Picture 1>. \n\nsubject_definitions:\n<Subject 1> is the replacement character whose appearance comes from <Picture 1> and whose performance comes from the person being replaced in <Video 1>. Preserve the reference character's facial features, hairstyle, skin tone, body proportions, clothing, colors, and distinctive visual style. The reference image supplies appearance only, not the character's pose, expression, background, or framing.\n<Subject 2> is the surrounding scene from <Video 1>, including its background, lighting, objects, and any people other than the person being replaced.\n<Video 1> is the source video being edited and supplies the shot composition, camera movement, timing, and sequence of actions.\n\nsummary:\n[video editing + reference generation] The target video is an edited version of <Video 1>. Replace the original person with <Subject 1>, transferring their complete visible performance to the reference character while preserving <Subject 2> and the source video's framing and timing.\n\nretention_analysis:\n<Subject 1> (throughout [Shot 1]): fully_preserved - maintain the character's referenced identity, clothing, proportions, and visual style consistently as the character performs the source person's movements.\n<Subject 2> (throughout [Shot 1]): fully_preserved - retain the surrounding scene and its changes over time.\n<Video 1>: partially_preserved - retain composition, camera motion, action timing, and duration; replace only the selected person's appearance.\n\ndetailed_description:\nPreserve the source scene's visual treatment while retaining the replacement character's distinctive design. Adapt illumination, shading, and perspective to the source scene.\n\n[Shot 1] Begin with the same composition and camera viewpoint as <Video 1>. <Subject 1> occupies the original person's position and follows their movement through the frame. Match the original performance moment by moment: body posture, gestures, head turns, gaze, blinking, facial expressions, and visible mouth movements.\n\nMaintain the reference character's identity through every expression and viewing angle. Hair and clothing move naturally with the transferred performance. Preserve interactions with source-scene objects and the ordering of foreground and background occlusions.\n\nKeep the source video's crop and shot scale. Show only the portions of the replacement character that belong within that framing; do not widen the shot to reproduce the full-body reference. Do not import the reference image's background, static pose, or handheld props. Preserve the source camera movement and action timing through the final frame.\n\noverall_soundscape:\nRetain the source clip's existing sound without adding new dialogue or sound effects.\n\nnon_diegetic_music:\nRetain existing source music, if present; add no new music."
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "Swap prompt · preserved"
+    }
+  },
+  "23": {
+    "inputs": {
+      "fps": [
+        "219",
+        6
+      ],
+      "bit_depth": "auto",
+      "color_space": "sRGB",
+      "images": [
+        "223",
+        0
+      ],
+      "audio": [
+        "219",
+        1
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "创建视频"
+    }
+  },
+  "24": {
+    "inputs": {
+      "filename_prefix": "labs-swap-relay/result",
+      "format": "mp4",
+      "format.codec": "h264",
+      "format.codec.encoding": "re-encode",
+      "format.codec.encoding.crf": 16,
+      "codec": "auto",
+      "video-preview": "",
+      "video": [
+        "23",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "保存视频"
+    }
+  },
+  "30": {
+    "inputs": {
+      "file": "WhatsApp Video 2026-10-14 at 11.43.57 PM.mp4",
+      "video-preview": ""
+    },
+    "class_type": "LoadVideo",
+    "_meta": {
+      "title": "1 · Upload source video"
+    }
+  },
+  "204": {
+    "inputs": {
+      "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+      "strength_model": 1,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Turbo 8 — strength 1.0"
+    }
+  },
+  "205": {
+    "inputs": {
+      "device": "gpu:0",
+      "clip": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "SelectCLIPDevice",
+    "_meta": {
+      "title": "选择 CLIP 设备"
+    }
+  },
+  "219": {
+    "inputs": {
+      "resolution": "480",
+      "duration_seconds": 0,
+      "video": [
+        "30",
+        0
+      ]
+    },
+    "class_type": "LabsH3PrepareVideo",
+    "_meta": {
+      "title": "Resolution budget & output duration"
+    }
+  },
+  "221": {
+    "inputs": {
+      "source": [
+        "219",
+        7
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Prepared dimensions & duration"
+    }
+  },
+  "223": {
+    "inputs": {
+      "fps": [
+        "219",
+        6
+      ],
+      "prompt": [
+        "11",
+        0
+      ],
+      "window_frames": "124",
+      "history_frames": "18",
+      "seed": 904234,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "er_sde",
+      "scheduler": "simple",
+      "denoise": 1,
+      "source_count": [
+        "219",
+        5
+      ],
+      "window_controls": "{\"windows\":{\"0\":{\"seed\":\"904234\",\"locked\":true,\"record_id\":\"5d44861b017d4905a604c19896189dbb\"},\"1\":{\"seed\":\"904235\",\"locked\":true,\"record_id\":\"27eefb5e04894995886788b56945eeac\"},\"2\":{\"seed\":\"904236\",\"locked\":true,\"record_id\":\"16b39ce3bdfd4b96ab76598d3bd2b529\"},\"3\":{\"seed\":\"904237\",\"locked\":true,\"record_id\":\"8bc24cf0ba2f4ef9a9940491ab98db50\"},\"4\":{\"seed\":\"904238\",\"locked\":true,\"record_id\":\"41b3a7b913554c498247b439bf688466\"},\"5\":{\"seed\":\"904239\",\"locked\":true,\"record_id\":\"8668ea96dce9447daee904753c20d46b\"},\"6\":{\"seed\":\"904240\",\"locked\":true,\"record_id\":\"d364a1e1d6c6406eb9e4b3a2c14c5d77\"}},\"config_key\":\"8a806f5b7e6ab3200de9941cd950df9c847c103097a9b882566df4fde19e9e94\"}",
+      "model": [
+        "4",
+        0
+      ],
+      "clip": [
+        "205",
+        0
+      ],
+      "video_vae": [
+        "7",
+        0
+      ],
+      "audio_vae": [
+        "8",
+        0
+      ],
+      "source": [
+        "219",
+        0
+      ],
+      "reference_image": [
+        "9",
+        0
+      ],
+      "source_audio": [
+        "219",
+        1
+      ]
+    },
+    "class_type": "H3RelayWindowedEdit",
+    "_meta": {
+      "title": "H3 Relay · Character Swap · windows & rerolls"
+    }
+  },
+  "224": {
+    "inputs": {
+      "source": [
+        "223",
+        1
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Window plan · exact source-frame mapping"
+    }
+  }
+}

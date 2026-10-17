@@ -2,6 +2,7 @@ import os
 import json
 import shutil
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 import time
 import unittest
@@ -15,10 +16,15 @@ from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QDialog, QGraphicsView, QListView,
-    QPushButton, QToolButton, QWidget,
+    QMessageBox, QPushButton, QToolButton, QWidget,
 )
 
 from PIL import Image
+
+from character_swap_engine import (
+    SOURCE_REMAKE_MODE_CHARACTER_SWAP,
+    SOURCE_REMAKE_MODE_CREATIVE_H3,
+)
 
 from director_cut_studio import (
     SMART_RENDER_POLICY_VERSION,
@@ -36,6 +42,7 @@ from director_cut_studio import (
     SpecialSkillCreatorDialog,
     SmartCutDialog,
     StoryboardEditorDialog,
+    ShotVisualEditorDialog,
     TimelineClip,
     TimelineCueItem,
     TimelineTextClip,
@@ -43,6 +50,9 @@ from director_cut_studio import (
     TrackHeaderWidget,
     media_shortcut,
     resolve_project_media_path,
+    h3_supported_duration_seconds,
+    role_picture_binding_collisions,
+    snap_video_frame_seconds,
     snap_timeline_range,
     snap_timeline_seconds,
     strip_untracked_visible_text_directions,
@@ -55,6 +65,7 @@ from project_integrity import (
 from runtime_paths import PROJECT_ROOT
 from design_engine import (
     HONG_KONG_COMIC_FIGHTER_SPECIAL_SKILL,
+    SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
     STREET_FIGHTER_MARKET_CONTRACT,
     STREET_FIGHTER_P1_P2_PIXEL_LOCK,
     normalize_design_plan,
@@ -77,6 +88,342 @@ from source_video_analysis import render_source_video_analysis
 
 
 class DirectorTimelineDragTests(unittest.TestCase):
+    def test_remake_engine_toolbar_follows_active_skill_automatically(self):
+        window = DirectorCutStudio()
+        self.assertEqual(
+            window.source_remake_render_mode,
+            SOURCE_REMAKE_MODE_CREATIVE_H3,
+        )
+        self.assertEqual(
+            window.source_remake_mode_combo.currentText(),
+            "Create H3 Remake",
+        )
+        self.assertFalse(window.source_remake_mode_combo.isEnabled())
+
+        source_index = window.special_combo.findData(
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        window.special_combo.setCurrentIndex(source_index)
+        self.app.processEvents()
+        self.assertEqual(
+            window.source_remake_render_mode,
+            SOURCE_REMAKE_MODE_CHARACTER_SWAP,
+        )
+        self.assertEqual(
+            window.source_remake_mode_combo.currentText(),
+            "LoRA Preserve V1",
+        )
+        self.assertTrue(window._source_remake_uses_character_swap_relay())
+
+        other_index = window.special_combo.findData("mtv-singing-h3")
+        self.assertGreaterEqual(other_index, 0)
+        window.special_combo.setCurrentIndex(other_index)
+        self.app.processEvents()
+        self.assertEqual(
+            window.source_remake_render_mode,
+            SOURCE_REMAKE_MODE_CREATIVE_H3,
+        )
+        self.assertEqual(
+            window.source_remake_mode_combo.currentText(),
+            "Create H3 Remake",
+        )
+        self.assertFalse(window._source_remake_uses_character_swap_relay())
+        window.project_dirty = False
+        window.close()
+
+    def test_role_specific_identity_edit_does_not_change_other_role_sharing_p(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [1]},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1", "R2"],
+            }],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+            {"source_role_id": "R2", "target_media_id": "P1", "scene_indexes": [1]},
+        ]
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "two people")
+        window.director_cues = [cue]
+        updated = window._updated_source_role_bindings_for_identity_changes([(
+            {
+                "source_role_id": "R1",
+                "source_reference": "P1",
+                "target_reference": "P2",
+                "scope": "shot_only",
+            },
+            [cue],
+        )])
+        self.assertEqual(
+            [(row["source_role_id"], row["target_media_id"]) for row in updated],
+            [("R1", "P2"), ("R2", "P1")],
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_project_save_allows_duplicate_p_bindings(self):
+        window = DirectorCutStudio()
+        root = PROJECT_ROOT / ".director_cache" / "duplicate_binding_save_test"
+        shutil.rmtree(root, ignore_errors=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        window.project_path = root / "duplicate.h3director.json"
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+            {"source_role_id": "R2", "target_media_id": "P1", "scene_indexes": [1]},
+        ]
+        window.director_cues = [DirectorCue("S1", "shot", 0.0, 5.0, "two people")]
+        with patch.object(window, "_write_shot_state_manifests"), patch.object(
+            QMessageBox, "warning"
+        ) as warning:
+            self.assertTrue(window.save_project())
+        warning.assert_not_called()
+        self.assertTrue(window.project_path.is_file())
+        window.project_dirty = False
+        window.close()
+
+    def test_source_remake_shot_editor_exposes_r_roles_with_duplicate_p_bindings(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [1]},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1", "R2"],
+            }],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+            {"source_role_id": "R2", "target_media_id": "P1", "scene_indexes": [1]},
+        ]
+        identity_root = PROJECT_ROOT / ".director_cache" / "shot_current_role_avatar_test"
+        identity_root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(identity_root, ignore_errors=True))
+        identity_path = identity_root / "p1.png"
+        Image.new("RGB", (96, 96), (35, 120, 190)).save(identity_path)
+        p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        p1.reference_id = "P1"
+        assign_local_media(window.scan, p1, identity_path)
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "two people")
+        window.director_cues = [cue]
+
+        dialog = ShotVisualEditorDialog(cue, 5.0, window)
+        self.assertEqual(dialog._source_role_bindings, {"R1": "P1", "R2": "P1"})
+        self.assertIn("R1=@P1", dialog.character_value.text())
+        self.assertIn("R2=@P1", dialog.character_value.text())
+        inspected: list[int] = []
+
+        def inspect_identity_dialog(identity_dialog):
+            current_rows = identity_dialog.findChildren(
+                QWidget, "shotIdentityCurrentRole"
+            )
+            avatars = identity_dialog.findChildren(
+                QWidget, "shotIdentityCurrentAvatar"
+            )
+            self.assertEqual(len(current_rows), 2)
+            self.assertEqual(len(avatars), 2)
+            self.assertTrue(all(not avatar.pixmap().isNull() for avatar in avatars))
+            inspected.append(len(current_rows))
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", new=inspect_identity_dialog):
+            dialog._edit_identity()
+        self.assertEqual(inspected, [2])
+        dialog.close()
+        dialog.deleteLater()
+        window.project_dirty = False
+        window.close()
+
+    def test_source_role_override_is_local_to_the_owning_shot(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 10.0,
+            "principal_roles": [
+                {
+                    "role_id": "R1",
+                    "scene_indexes": [1],
+                    "visual_identity": "center performer",
+                    "thumbnail_bbox_normalized": [0.35, 0.1, 0.65, 0.95],
+                },
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 10.0,
+                "active_source_roles": ["R1"],
+            }],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P1", "scene_indexes": [1]},
+        ]
+        first = DirectorCue(
+            "S1", "shot", 0.0, 5.0, "first",
+            source_role_identity_overrides={"R1": "P2"},
+        )
+        second = DirectorCue("S2", "shot", 5.0, 10.0, "second")
+        window.director_cues = [first, second]
+
+        first_passes = window._source_remake_character_pass_specs(0.0, 5.0)
+        second_passes = window._source_remake_character_pass_specs(5.0, 10.0)
+
+        self.assertEqual(first_passes[0]["target_media_id"], "P2")
+        self.assertEqual(second_passes[0]["target_media_id"], "P1")
+        reloaded = director_cue_from_mapping(asdict(first))
+        self.assertEqual(reloaded.source_role_identity_overrides, {"R1": "P2"})
+        window.project_dirty = False
+        window.close()
+
+    def test_character_swap_relay_drops_rounded_subframe_tail_past_v1_eof(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        source = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        source.reference_id = "V1"
+        source.source_duration_seconds = 39.466042
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 15.0, "opening"),
+            DirectorCue("S2", "shot", 15.0, 30.0, "middle"),
+            DirectorCue("S3", "shot", 30.0, 39.466042, "ending"),
+        ]
+        window.clip_start.setValue(0.0)
+        window.clip_end.setValue(39.47)
+
+        planned = window._planned_render_segments()
+        core_ranges = [
+            (
+                segment.core_start_seconds
+                if segment.core_start_seconds is not None else segment.start_seconds,
+                segment.core_end_seconds
+                if segment.core_end_seconds is not None else segment.end_seconds,
+            )
+            for segment in planned
+        ]
+
+        self.assertTrue(core_ranges)
+        self.assertLessEqual(core_ranges[-1][1], 39.466042)
+        self.assertLess(39.466042 - core_ranges[-1][1], 0.001)
+        self.assertFalse(
+            any(start >= 39.466042 - 1e-6 for start, _end in core_ranges)
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_source_remake_audio_worker_exit_continues_to_qwen_gate(self):
+        window = DirectorCutStudio()
+        asset = next(item for item in window.scan.assets if item.media_type == "video")
+        window.source_remake_full_analysis_nodes.add(asset.node_id)
+        window.audio_jobs["audio:test"] = asset
+
+        with patch.object(window, "_maybe_auto_enrich") as auto_enrich, patch.object(
+            window, "_maybe_finish_source_remake_analysis"
+        ) as finish_source_analysis, patch.object(
+            window, "_mark_analysis_failure"
+        ) as hard_failure:
+            window._audio_service_finished(1, "forced audio worker stop")
+
+        self.assertFalse(window.audio_jobs)
+        self.assertIn("Audio analysis warning", asset.recognition)
+        hard_failure.assert_not_called()
+        auto_enrich.assert_called_once_with(asset)
+        finish_source_analysis.assert_called_once_with(asset)
+        window.project_dirty = False
+        window.close()
+
+    def test_source_remake_routes_speaker_to_v1_and_disables_listener_shot(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 4.0,
+            "principal_roles": [
+                {"role_id": "R1", "scene_indexes": [1]},
+                {"role_id": "R2", "scene_indexes": [2]},
+            ],
+            "scenes": [
+                {
+                    "scene_index": 1, "start_seconds": 0.0, "end_seconds": 2.0,
+                    "active_source_roles": ["R1"], "speaker_role": "R1",
+                    "listener_roles": [],
+                },
+                {
+                    "scene_index": 2, "start_seconds": 2.0, "end_seconds": 4.0,
+                    "active_source_roles": ["R2"], "speaker_role": "",
+                    "listener_roles": ["R2"],
+                },
+            ],
+        })
+        window.source_video_role_bindings = [
+            {"source_role_id": "R1", "target_media_id": "P3", "scene_indexes": [1]},
+            {"source_role_id": "R2", "target_media_id": "P4", "scene_indexes": [2]},
+        ]
+        speaker = DirectorCue("S1", "shot", 0.0, 2.0, "speaker")
+        listener = DirectorCue("S2", "shot", 2.0, 4.0, "listener")
+        window.director_cues = [speaker, listener]
+        self.assertEqual(window._normalize_source_remake_lip_sync_routes(), 2)
+        self.assertEqual(
+            (speaker.lip_sync_mode, speaker.lip_sync_target, speaker.lip_sync_source),
+            ("enabled", "P3", "V1"),
+        )
+        self.assertEqual(listener.lip_sync_mode, "disabled")
+        self.assertEqual(listener.lip_sync_target, "")
+        window.project_dirty = False
+        window.close()
+
+    def test_program_monitor_snaps_to_24fps_without_changing_edit_grid(self):
+        self.assertAlmostEqual(snap_video_frame_seconds(1.03), 25 / 24, places=6)
+        self.assertEqual(snap_timeline_seconds(1.03), 1.0)
+
+    def test_h3_duration_quantization_matches_workflow_frame_contract(self):
+        self.assertAlmostEqual(
+            h3_supported_duration_seconds(8.833333),
+            226 / 24,
+            places=6,
+        )
+        self.assertGreaterEqual(h3_supported_duration_seconds(1.6), 1.6)
+
+    def test_two_source_roles_cannot_share_one_picture_in_one_shot(self):
+        self.assertEqual(
+            role_picture_binding_collisions({"R1": "P1", "R2": "@P1", "R3": "P4"}),
+            {"P1": ["R1", "R2"]},
+        )
+        self.assertEqual(
+            role_picture_binding_collisions({"R1": "P1", "R2": "P2"}),
+            {},
+        )
+
     def test_text_layer_accepts_dynamic_ensemble_speaker_ids(self):
         self.assertEqual(
             TextLayer("T7", "第七位发言", 0.0, 1.0, "A10", speaker="s7").speaker,
@@ -481,6 +828,12 @@ class DirectorTimelineDragTests(unittest.TestCase):
         r1_combo = dialog.source_role_binding_combos["R1"][0]
         r1_later_combo = dialog.source_role_binding_combos["R1"][1]
         r2_combo = dialog.source_role_binding_combos["R2"][0]
+        v1_default_index = r1_combo.findData("__SOURCE_V1_FACE__")
+        self.assertGreaterEqual(v1_default_index, 0)
+        self.assertEqual(
+            r1_combo.itemText(v1_default_index),
+            "V1 DEFAULT · Keep source actor",
+        )
         self.assertEqual(r1_combo.currentData(), r1_later_combo.currentData())
         r1_combo.setCurrentIndex(
             r1_combo.findData("P2")
@@ -562,6 +915,66 @@ class DirectorTimelineDragTests(unittest.TestCase):
             dialog.source_role_binding_status.geometry().top(),
             dialog.source_role_binding_table.geometry().bottom(),
         )
+        dialog.close()
+        dialog.deleteLater()
+        window.project_dirty = False
+        window.close()
+        window.deleteLater()
+
+    def test_source_video_role_table_reuses_single_p1_for_every_detected_role(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        ledger = {
+            "media_id": "V1", "evidence_fingerprint": "single-p1-role-ui",
+            "duration_seconds": 5.0, "location_ledger": [],
+            "principal_roles": [
+                {
+                    "role_id": f"R{number}", "visual_identity": f"performer {number}",
+                    "wardrobe": "source wardrobe", "narrative_function": "performer",
+                    "scene_indexes": [1], "representative_scene_index": 1,
+                    "representative_panel": "midpoint",
+                    "thumbnail_bbox_normalized": [0.1 * number, 0.1, 0.1 * number + 0.2, 0.8],
+                    "appearance_evidence": [{
+                        "scene_index": 1, "panel": "midpoint",
+                        "thumbnail_bbox_normalized": [0.1 * number, 0.1, 0.1 * number + 0.2, 0.8],
+                        "face_visibility": "front",
+                    }],
+                    "confidence": "high",
+                }
+                for number in range(1, 5)
+            ],
+            "scenes": [{
+                "scene_index": 1, "start_seconds": 0.0, "end_seconds": 5.0,
+                "active_source_roles": ["R1", "R2", "R3", "R4"],
+            }],
+            "global_camera_grammar": "one group shot", "edit_rhythm": "single beat",
+            "continuity_constraints": [], "uncertain_inferences": [],
+        }
+        context = window._design_context()
+        context["existing_media"] = [
+            {
+                "media_id": "V1", "media_type": "video", "loaded": True,
+                "source_duration_seconds": 5.0, "has_embedded_audio": True,
+                "semantic_enrichment": render_source_video_analysis(ledger),
+            },
+            {"media_id": "P1", "media_type": "image", "loaded": True},
+        ]
+        dialog = DesignPageDialog(
+            window.runtime, context, context["media_capacity"], window,
+            context_provider=lambda: context,
+        )
+
+        self.assertEqual(
+            {
+                combo.currentData()
+                for combos in dialog.source_role_binding_combos.values()
+                for combo in combos
+            },
+            {"P1"},
+        )
+        self.assertEqual(len(window.source_video_role_bindings), 4)
+        self.assertTrue(dialog._validate_source_role_bindings())
         dialog.close()
         dialog.deleteLater()
         window.project_dirty = False
@@ -5800,6 +6213,65 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_isolated_shot_repair_preserves_authored_boundaries_and_neighbors(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(30.0)
+        skill_index = window.special_combo.findData(
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        self.assertGreaterEqual(skill_index, 0)
+        window.special_combo.blockSignals(True)
+        window.special_combo.setCurrentIndex(skill_index)
+        window.special_combo.blockSignals(False)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 9.553, "Opening", track_id="V1"),
+            DirectorCue("S2", "shot", 9.553, 17.052, "Repair", track_id="V1"),
+            DirectorCue("S3", "shot", 17.052, 30.0, "Continue", track_id="V1"),
+        ]
+        window.render_isolated_shot_ids = {"S2"}
+        planned = window._planned_render_segments()
+        repaired = next(
+            row for row in planned
+            if abs(row.start_seconds - 9.553) <= 1e-6
+            and abs(row.end_seconds - 17.052) <= 1e-6
+        )
+        self.assertEqual(repaired.shot_ids, ["S2"])
+        self.assertEqual(repaired.continuity_mode, "motion_reference")
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in planned],
+            [(0.0, 9.553), (9.553, 17.052), (17.052, 30.0)],
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_character_swap_relay_keeps_every_source_shot_as_one_render_unit(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(12.0)
+        skill_index = window.special_combo.findData(
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        self.assertGreaterEqual(skill_index, 0)
+        window.special_combo.setCurrentIndex(skill_index)
+        relay_index = window.source_remake_mode_combo.findData(
+            SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        )
+        self.assertGreaterEqual(relay_index, 0)
+        window.source_remake_mode_combo.setCurrentIndex(relay_index)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 2.745, "Opening", track_id="V1"),
+            DirectorCue("S2", "shot", 2.745, 3.589, "Reaction", track_id="V1"),
+            DirectorCue("S3", "shot", 3.589, 7.822, "Two shot", track_id="V1"),
+            DirectorCue("S4", "shot", 7.822, 12.0, "Reply", track_id="V1"),
+        ]
+        planned = window._planned_render_segments()
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in planned],
+            [(0.0, 2.745), (2.745, 3.589), (3.589, 7.822), (7.822, 12.0)],
+        )
+        self.assertEqual([row.shot_ids for row in planned], [["S1"], ["S2"], ["S3"], ["S4"]])
+        window.project_dirty = False
+        window.close()
+
     def test_dense_shot_timeline_packs_micro_shots_into_native_windows(self):
         window = DirectorCutStudio()
         window._set_design_duration(45.0)
@@ -5890,6 +6362,81 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_full_run_commits_clean_baseline_before_next_local_shot_edit(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(45.0)
+        planned = window._planned_render_segments()
+        self.assertEqual(len(planned), 3)
+
+        # Apply may leave dirty IDs from the previous Segment partition in
+        # addition to the newly planned IDs.
+        window.render_dirty_segment_ids = {
+            *(segment.segment_id for segment in planned),
+            "legacy_pre_apply_segment_id",
+        }
+        window.render_dirty_previewed_segment_ids = {
+            planned[0].segment_id,
+            "legacy_pre_apply_segment_id",
+        }
+        window.render_isolated_shot_ids = {"S1", "S2"}
+        window.render_runtime_status = {
+            planned[0].segment_id: "running",
+            "legacy_pre_apply_segment_id": "failed",
+        }
+        window.active_generation_timeline_start = 0.0
+        window.active_generation_duration_seconds = 45.0
+        manifest = {
+            "segments": [
+                {
+                    **segment.to_dict(),
+                    "status": "complete",
+                }
+                for segment in planned
+            ]
+        }
+
+        committed = window._commit_successful_render_baseline(
+            "final", manifest, shown=True
+        )
+        self.assertTrue(committed)
+        self.assertEqual(window.render_dirty_segment_ids, set())
+        self.assertEqual(window.render_dirty_previewed_segment_ids, set())
+        self.assertEqual(window.render_isolated_shot_ids, set())
+        self.assertEqual(window.render_runtime_status, {})
+
+        # The next Shot edit now dirties only its own 15-second H3 Segment.
+        window._mark_render_range_dirty(16.0, 17.0)
+        self.assertEqual(
+            window.render_dirty_segment_ids,
+            {planned[1].segment_id},
+        )
+        window.project_dirty = False
+        window.close()
+
+    def test_partial_run_does_not_clean_dirty_segments_outside_work_area(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(45.0)
+        planned = window._planned_render_segments()
+        window.render_dirty_segment_ids = {
+            segment.segment_id for segment in planned
+        }
+        window.active_generation_timeline_start = 0.0
+        window.active_generation_duration_seconds = 15.0
+        manifest = {
+            "segments": [{**planned[0].to_dict(), "status": "complete"}]
+        }
+
+        committed = window._commit_successful_render_baseline(
+            "final", manifest, shown=True
+        )
+        self.assertFalse(committed)
+        self.assertEqual(
+            window.render_dirty_segment_ids,
+            {planned[1].segment_id, planned[2].segment_id},
+        )
+        window.project_dirty = False
+        window.close()
+
     def test_regenerate_dirty_preview_reuses_saved_final_segments_across_seed_and_profile(self):
         window = DirectorCutStudio()
         window._set_design_duration(45.0)
@@ -5932,6 +6479,35 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(
             [row.get("reuse_reason") for row in preview["segments"] if row.get("status") == "cached"],
             ["dirty_repair_saved_take", "dirty_repair_saved_take"],
+        )
+
+        # ACCEPT 1.0M must use the original production run as its clean
+        # baseline too; otherwise approving one repaired Segment queues every
+        # Shot again at full resolution.
+        accepted_path, _ = window._build_smart_render_job(
+            request_kind="accepted", megapixels=1.0, seed=97531,
+            enable_rtx_vsr=False, reuse_clean_segments=True,
+        )
+        accepted = json.loads(accepted_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [
+                str(row["segment_id"])
+                for row in accepted["segments"]
+                if row.get("status") != "cached"
+            ],
+            [dirty_id],
+        )
+        window.preview_ready = True
+        window.preview_seed = 97531
+        window.render_dirty_previewed_segment_ids = {dirty_id}
+        with patch.object(window, "_start_generation") as start_generation:
+            window.accept_pre_run_preview()
+        start_generation.assert_called_once_with(
+            "accepted",
+            1.0,
+            97531,
+            window.settings_rtx_vsr.isChecked(),
+            reuse_clean_segments=True,
         )
 
         # Once that repaired Segment has a reviewable Preview, editing a
@@ -6016,6 +6592,39 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
         shutil.rmtree(folder, ignore_errors=True)
+
+    def test_visual_editor_linked_scope_dirties_only_authored_changes(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(45.0)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 1.0, 4.0, "Opening"),
+            DirectorCue("S2", "shot", 16.0, 19.0, "Middle"),
+            DirectorCue("S3", "shot", 31.0, 34.0, "Ending"),
+        ]
+        cue = window.director_cues[1]
+        before = asdict(cue)
+        after = deepcopy(before)
+        after["subject_action"] = "The middle character turns toward camera."
+        changes = window._linked_shot_repair_changes(
+            cue, before, after, "linked_continuity"
+        )
+        self.assertEqual([target.cue_id for target, _old, _new in changes], ["S2"])
+
+        window.render_dirty_segment_ids.clear()
+        window.render_dirty_previewed_segment_ids.clear()
+        window._mark_shot_visual_editor_changes_dirty(
+            cue, "linked_continuity", changes
+        )
+        dirty_segments = [
+            segment for segment in window._planned_render_segments()
+            if segment.segment_id in window.render_dirty_segment_ids
+        ]
+        self.assertEqual(len(dirty_segments), 1)
+        self.assertLess(dirty_segments[0].start_seconds, cue.end_seconds)
+        self.assertGreater(dirty_segments[0].end_seconds, cue.start_seconds)
+
+        window.project_dirty = False
+        window.close()
 
     def test_alpha2_extending_45_to_120_preserves_approved_front_segments(self):
         window = DirectorCutStudio()
@@ -6540,11 +7149,13 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.monitor_compare_splitter,
         )
         self.assertEqual(window.monitor_display_stack.indexOf(window.generation_overlay), -1)
+        self.assertIs(window.generation_overlay.parent(), window.generated_monitor_stack)
         self.assertFalse(window.generation_overlay.isHidden())
         self.assertEqual(
             window.generation_overlay.geometry(),
-            window.monitor_display_stack.rect(),
+            window.generated_monitor_stack.rect(),
         )
+        self.assertIsNot(window.generation_overlay.parent(), window.monitor_display_stack)
         self.assertTrue(window.generated_video_widget.inherits("QLabel"))
         self.assertFalse(window.generated_video_widget.inherits("QVideoWidget"))
         self.assertEqual(window.generated_playback_path, video.resolve())
@@ -7567,6 +8178,114 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertEqual(prepared[0].source_out_seconds, 5.0)
         self.assertEqual((prepared[0].start_seconds, prepared[0].end_seconds), (13.0, 18.0))
         self.assertEqual(asset.local_path, str(source))
+        window.project_dirty = False
+        window.close()
+
+    def test_character_swap_relay_clip_recovers_from_silent_ffmpeg_crash(self):
+        window = DirectorCutStudio()
+        root = PROJECT_ROOT / ".director_cache" / "test_relay_atomic_fallback"
+        source = root / "source.mp4"
+        cache_root = root / "cache"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        source.write_bytes(b"V1-source")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        asset = MediaAsset(
+            node_id="source-video", class_type="LoadVideo", media_type="video",
+            filename=source.name, local_path=str(source), reference_id="V1",
+        )
+        commands = []
+        primary_failed = False
+
+        class Completed:
+            def __init__(self, returncode=0, stderr=b""):
+                self.returncode = returncode
+                self.stderr = stderr
+
+        def fake_probe(path, _runtime):
+            candidate = Path(path)
+            if candidate == source:
+                return {
+                    "duration": 5.0,
+                    "streams": [
+                        {"codec_type": "video"},
+                        {"codec_type": "audio"},
+                    ],
+                }
+            return {
+                "duration": 1.834,
+                "streams": [
+                    {"codec_type": "video"},
+                    {"codec_type": "audio"},
+                ],
+            }
+
+        def fake_run(command, **_kwargs):
+            nonlocal primary_failed
+            commands.append(command)
+            target = Path(command[-1])
+            if (
+                not primary_failed
+                and ".writing-" in target.name
+                and "-vf" in command
+                and "-af" in command
+            ):
+                primary_failed = True
+                return Completed(-1073741819, b"")
+            target.write_bytes(b"R" * 4096)
+            return Completed()
+
+        with patch.object(window, "_reference_asset", return_value=asset), patch(
+            "director_cut_studio.CACHE_ROOT", cache_root
+        ), patch("director_cut_studio.probe_media", side_effect=fake_probe), patch(
+            "director_cut_studio.subprocess.run", side_effect=fake_run
+        ):
+            prepared = window._source_remake_relay_source_clip(0.0, 1.813)
+
+        self.assertTrue(primary_failed)
+        self.assertTrue(prepared.is_file())
+        self.assertEqual(len(commands), 4)
+        self.assertIn("-an", commands[1])
+        self.assertIn("pcm_s16le", commands[2])
+        self.assertIn("copy", commands[3])
+        mux_maps = [
+            commands[3][index + 1]
+            for index, value in enumerate(commands[3][:-1])
+            if value == "-map"
+        ]
+        self.assertEqual(mux_maps, ["0:v:0", "1:a:0"])
+        self.assertFalse(any(".writing-" in path.name for path in cache_root.rglob("*")))
+        self.assertFalse(any(".video-" in path.name for path in cache_root.rglob("*")))
+        self.assertFalse(any(".audio-" in path.name for path in cache_root.rglob("*")))
+        window.project_dirty = False
+        window.close()
+
+    def test_source_remake_exposes_persistent_live_action_cast_toggle(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        self.assertGreaterEqual(index, 0)
+        window.special_combo.setCurrentIndex(index)
+        window.source_cast_live_action_adaptation = True
+        context = window._design_context()
+        self.assertTrue(context["source_cast_live_action_adaptation"])
+
+        with patch.object(DesignPageDialog, "refresh_checkpoints", autospec=True):
+            dialog = DesignPageDialog(
+                window.runtime,
+                context,
+                window.scan.counts,
+                window,
+                context_provider=window._design_context,
+            )
+        self.assertTrue(dialog.source_live_action_cast_check.isChecked())
+        self.assertFalse(dialog.source_live_action_cast_check.isHidden())
+        dialog.source_live_action_cast_check.setChecked(False)
+        self.assertFalse(
+            dialog._selected_design_context()[
+                "source_cast_live_action_adaptation"
+            ]
+        )
+        dialog.close()
         window.project_dirty = False
         window.close()
 

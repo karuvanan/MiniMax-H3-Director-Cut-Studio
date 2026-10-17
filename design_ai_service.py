@@ -22,6 +22,12 @@ DEFAULT_STRUCTURED_OUTPUT_TOKENS = 32768
 # filling an oversized prediction budget.  Source-video analysis reduces its
 # prose through schema/prompt constraints and retries compactly instead.
 MAX_STRUCTURED_OUTPUT_TOKENS = 32768
+# A long source-video role ledger is different from an ordinary Design Plan:
+# every source interval and every visible-role appearance is evidence that the
+# UI must retain.  Permit a larger budget only when the caller explicitly opts
+# into this forensic-analysis path; all normal Design/semantic jobs remain at
+# the conservative 32K ceiling above.
+MAX_LONG_FORM_STRUCTURED_OUTPUT_TOKENS = 65536
 
 
 def _urlopen(request: urllib.request.Request, timeout: float):
@@ -208,9 +214,12 @@ def generate(job: dict) -> dict:
         )
     except (TypeError, ValueError):
         max_output_tokens = DEFAULT_STRUCTURED_OUTPUT_TOKENS
-    max_output_tokens = max(
-        512, min(MAX_STRUCTURED_OUTPUT_TOKENS, max_output_tokens)
+    output_token_ceiling = (
+        MAX_LONG_FORM_STRUCTURED_OUTPUT_TOKENS
+        if bool(job.get("allow_large_structured_output", False))
+        else MAX_STRUCTURED_OUTPUT_TOKENS
     )
+    max_output_tokens = max(512, min(output_token_ceiling, max_output_tokens))
     if not model:
         raise ValueError("Model is required")
     if provider == "openai":
