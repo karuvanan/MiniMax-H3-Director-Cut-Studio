@@ -8578,6 +8578,8 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "used_bytes": 75 * 1024**3,
             "file_count": 12,
             "cache_path": r"D:\ComfyUI\output\__h3_removal_cache",
+            "cache_refresh_seconds": 120,
+            "resource_refresh_seconds": 5,
             "breakdown_bytes": {"windows": 74 * 1024**3},
             "resources": {
                 "gpu_name": "NVIDIA Test GPU",
@@ -8603,6 +8605,12 @@ class DirectorTimelineDragTests(unittest.TestCase):
             r"D:\ComfyUI\output\__h3_removal_cache",
             window.h3_cache_usage_label.toolTip(),
         )
+        self.assertIn("Cache Folder refresh: 120s", window.h3_cache_usage_label.toolTip())
+        self.assertIn(
+            "VRAM / DRAM / GPU / CPU refresh: 5s",
+            window.h3_cache_usage_label.toolTip(),
+        )
+        self.assertEqual(window.h3_cache_refresh_timer.interval(), 5_000)
         window.clip_start.setValue(0.0)
         window.clip_end.setMaximum(120.0)
         window.clip_end.setValue(15.0)

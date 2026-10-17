@@ -12812,8 +12812,8 @@ class DirectorCutStudio(QMainWindow):
             self.refresh_h3_relay_cache_status
         )
         # Offscreen test windows must never contact the user's configured LAN
-        # server. Production windows refresh once after layout and then once a
-        # minute; generation completion also requests an immediate refresh.
+        # server. Production windows start at the 5-second default; each API
+        # response may apply the resource interval selected in Tray Settings.
         if os.environ.get("QT_QPA_PLATFORM", "").casefold() != "offscreen":
             self.h3_cache_refresh_timer.start()
             QTimer.singleShot(1200, self.refresh_h3_relay_cache_status)
@@ -17891,6 +17891,24 @@ class DirectorCutStudio(QMainWindow):
     def _apply_h3_relay_cache_status(self, payload: dict) -> None:
         quota_bytes = 100 * 1024**3
         try:
+            resource_refresh_seconds = min(
+                300,
+                max(2, int(payload.get("resource_refresh_seconds", 5) or 5)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            resource_refresh_seconds = 5
+        try:
+            cache_refresh_seconds = min(
+                3600,
+                max(5, int(payload.get("cache_refresh_seconds", 120) or 120)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            cache_refresh_seconds = 120
+        if hasattr(self, "h3_cache_refresh_timer"):
+            self.h3_cache_refresh_timer.setInterval(
+                resource_refresh_seconds * 1000
+            )
+        try:
             used_bytes = max(0, int(payload.get("used_bytes", 0) or 0))
         except (TypeError, ValueError, OverflowError):
             self._set_h3_relay_cache_unavailable("Invalid used_bytes value")
@@ -17950,7 +17968,9 @@ class DirectorCutStudio(QMainWindow):
             "Actual ComfyUI server status\n"
             f"Used: {used_gb:.2f} GB ({percent:.1f}% of 100 GB)\n"
             f"Files: {file_count:,}\n"
-            f"Path: {cache_path}"
+            f"Path: {cache_path}\n"
+            f"Cache Folder refresh: {cache_refresh_seconds}s\n"
+            f"VRAM / DRAM / GPU / CPU refresh: {resource_refresh_seconds}s"
         )
         try:
             vram_used = int(resources.get("vram_used_bytes")) / 1024**3

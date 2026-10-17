@@ -2,6 +2,21 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.7-alpha.12] - 2026-10-18
+
+### Independent Cache and Resource Refresh Intervals
+
+- Tray Settings把旧的单一刷新值拆分为两个独立选项：`VRAM / DRAM / GPU / CPU refresh`默认5秒，`Cache Folder refresh`默认120秒。
+- 资源刷新可设2–300秒；Cache递归扫描可设5–3600秒。Cache TTL只限制大型目录扫描，资源仍按较短周期即时采样。
+- Server API回传两项实际刷新间隔；Studio会自动采用资源间隔调整Timer，并在资源Tooltip显示两项设定。
+- 旧`refresh_seconds`设定自动迁移为资源刷新间隔；没有旧Cache间隔的安装自动使用120秒，不影响既有IP及Cache路径。
+- Installer升级时保留既有API地址、Cache路径与刷新间隔，不再把用户设定重置为默认值。
+- App版本升级至`0.3.7-alpha.12`；Project Format保持`28`，Render Policy保持`38`。
+
+### Verification
+
+- 两项默认值与边界Clamp、旧设定兼容、Studio Timer/Tooltip、PowerShell Tray／Installer语法及资源监控回归测试通过。
+
 ## [0.3.7-alpha.11] - 2026-10-17
 
 ### Configurable H3 Server Status Tray

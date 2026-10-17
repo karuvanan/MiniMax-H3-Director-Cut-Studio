@@ -5,6 +5,8 @@ import unittest
 from comfyui_director_h3_cache_status.cache_status import (
     CACHE_BUDGET_BYTES,
     configured_cache_directory,
+    configured_cache_refresh_seconds,
+    configured_resource_refresh_seconds,
     measure_cache_directory,
 )
 from comfyui_director_h3_cache_status.system_status import (
@@ -68,6 +70,19 @@ class H3RelayCacheStatusTests(unittest.TestCase):
             settings.write_text("{not valid", encoding="utf-8")
             result = configured_cache_directory(default, settings)
         self.assertEqual(result, default)
+
+    def test_refresh_intervals_default_and_clamp_independently(self):
+        with self._temporary_directory() as temporary:
+            settings = Path(temporary) / "status-settings.json"
+            self.assertEqual(configured_cache_refresh_seconds(settings), 120)
+            self.assertEqual(configured_resource_refresh_seconds(settings), 5)
+            settings.write_text(
+                '{"cache_refresh_seconds": 99999, '
+                '"resource_refresh_seconds": 1}',
+                encoding="utf-8",
+            )
+            self.assertEqual(configured_cache_refresh_seconds(settings), 3600)
+            self.assertEqual(configured_resource_refresh_seconds(settings), 2)
 
     def test_nvidia_smi_parser_selects_the_busiest_gpu(self):
         status = parse_nvidia_smi_csv(

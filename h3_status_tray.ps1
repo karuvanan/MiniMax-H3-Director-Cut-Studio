@@ -20,7 +20,8 @@ function Read-TrayConfig {
     $defaults = [pscustomobject]@{
         api_url = "http://127.0.0.1:8189"
         cache_path = ""
-        refresh_seconds = 5
+        resource_refresh_seconds = 5
+        cache_refresh_seconds = 120
         server_settings_path = ""
     }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
@@ -31,9 +32,19 @@ function Read-TrayConfig {
             ConvertFrom-Json
         if ($saved.api_url) { $defaults.api_url = [string]$saved.api_url }
         if ($saved.cache_path) { $defaults.cache_path = [string]$saved.cache_path }
-        if ($saved.refresh_seconds) {
-            $defaults.refresh_seconds = [Math]::Max(
+        if ($saved.resource_refresh_seconds) {
+            $defaults.resource_refresh_seconds = [Math]::Max(
+                2, [Math]::Min(300, [int]$saved.resource_refresh_seconds)
+            )
+        } elseif ($saved.refresh_seconds) {
+            # Backward compatibility with v0.3.7-alpha.11 and earlier.
+            $defaults.resource_refresh_seconds = [Math]::Max(
                 2, [Math]::Min(300, [int]$saved.refresh_seconds)
+            )
+        }
+        if ($saved.cache_refresh_seconds) {
+            $defaults.cache_refresh_seconds = [Math]::Max(
+                5, [Math]::Min(3600, [int]$saved.cache_refresh_seconds)
             )
         }
         if ($saved.server_settings_path) {
@@ -59,6 +70,8 @@ function Write-TrayConfig {
             }
             [ordered]@{
                 cache_path = [string]$script:config.cache_path
+                cache_refresh_seconds = [int]$script:config.cache_refresh_seconds
+                resource_refresh_seconds = [int]$script:config.resource_refresh_seconds
             } | ConvertTo-Json | Set-Content -LiteralPath $serverSettingsPath -Encoding UTF8 -ErrorAction Stop
         }
         return $true
@@ -154,50 +167,76 @@ function Show-TraySettings {
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
-    $form.ClientSize = New-Object System.Drawing.Size(640, 252)
+    $form.ClientSize = New-Object System.Drawing.Size(640, 302)
     $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 
-    $refreshLabel = New-Object System.Windows.Forms.Label
-    $refreshLabel.Text = "Refresh every (seconds)"
-    $refreshLabel.Location = New-Object System.Drawing.Point(18, 22)
-    $refreshLabel.Size = New-Object System.Drawing.Size(175, 24)
-    $form.Controls.Add($refreshLabel)
+    $resourceRefreshLabel = New-Object System.Windows.Forms.Label
+    $resourceRefreshLabel.Text = "VRAM / DRAM / GPU / CPU refresh"
+    $resourceRefreshLabel.Location = New-Object System.Drawing.Point(18, 22)
+    $resourceRefreshLabel.Size = New-Object System.Drawing.Size(220, 24)
+    $form.Controls.Add($resourceRefreshLabel)
 
-    $refreshInput = New-Object System.Windows.Forms.NumericUpDown
-    $refreshInput.Minimum = 2
-    $refreshInput.Maximum = 300
-    $refreshInput.Value = [decimal][Math]::Max(2, [Math]::Min(300, [int]$script:config.refresh_seconds))
-    $refreshInput.Location = New-Object System.Drawing.Point(202, 19)
-    $refreshInput.Size = New-Object System.Drawing.Size(110, 26)
-    $form.Controls.Add($refreshInput)
+    $resourceRefreshInput = New-Object System.Windows.Forms.NumericUpDown
+    $resourceRefreshInput.Minimum = 2
+    $resourceRefreshInput.Maximum = 300
+    $resourceRefreshInput.Value = [decimal][Math]::Max(2, [Math]::Min(300, [int]$script:config.resource_refresh_seconds))
+    $resourceRefreshInput.Location = New-Object System.Drawing.Point(250, 19)
+    $resourceRefreshInput.Size = New-Object System.Drawing.Size(85, 26)
+    $form.Controls.Add($resourceRefreshInput)
+
+    $resourceSecondsLabel = New-Object System.Windows.Forms.Label
+    $resourceSecondsLabel.Text = "seconds"
+    $resourceSecondsLabel.Location = New-Object System.Drawing.Point(343, 22)
+    $resourceSecondsLabel.Size = New-Object System.Drawing.Size(70, 24)
+    $form.Controls.Add($resourceSecondsLabel)
+
+    $cacheRefreshLabel = New-Object System.Windows.Forms.Label
+    $cacheRefreshLabel.Text = "Cache Folder refresh"
+    $cacheRefreshLabel.Location = New-Object System.Drawing.Point(18, 64)
+    $cacheRefreshLabel.Size = New-Object System.Drawing.Size(220, 24)
+    $form.Controls.Add($cacheRefreshLabel)
+
+    $cacheRefreshInput = New-Object System.Windows.Forms.NumericUpDown
+    $cacheRefreshInput.Minimum = 5
+    $cacheRefreshInput.Maximum = 3600
+    $cacheRefreshInput.Value = [decimal][Math]::Max(5, [Math]::Min(3600, [int]$script:config.cache_refresh_seconds))
+    $cacheRefreshInput.Location = New-Object System.Drawing.Point(250, 61)
+    $cacheRefreshInput.Size = New-Object System.Drawing.Size(85, 26)
+    $form.Controls.Add($cacheRefreshInput)
+
+    $cacheSecondsLabel = New-Object System.Windows.Forms.Label
+    $cacheSecondsLabel.Text = "seconds"
+    $cacheSecondsLabel.Location = New-Object System.Drawing.Point(343, 64)
+    $cacheSecondsLabel.Size = New-Object System.Drawing.Size(70, 24)
+    $form.Controls.Add($cacheSecondsLabel)
 
     $apiLabel = New-Object System.Windows.Forms.Label
     $apiLabel.Text = "Monitored ComfyUI URL / IP"
-    $apiLabel.Location = New-Object System.Drawing.Point(18, 68)
+    $apiLabel.Location = New-Object System.Drawing.Point(18, 110)
     $apiLabel.Size = New-Object System.Drawing.Size(190, 24)
     $form.Controls.Add($apiLabel)
 
     $apiInput = New-Object System.Windows.Forms.TextBox
     $apiInput.Text = [string]$script:config.api_url
-    $apiInput.Location = New-Object System.Drawing.Point(202, 65)
+    $apiInput.Location = New-Object System.Drawing.Point(202, 107)
     $apiInput.Size = New-Object System.Drawing.Size(418, 26)
     $form.Controls.Add($apiInput)
 
     $cacheLabel = New-Object System.Windows.Forms.Label
     $cacheLabel.Text = "Monitored cache folder"
-    $cacheLabel.Location = New-Object System.Drawing.Point(18, 114)
+    $cacheLabel.Location = New-Object System.Drawing.Point(18, 156)
     $cacheLabel.Size = New-Object System.Drawing.Size(175, 24)
     $form.Controls.Add($cacheLabel)
 
     $cacheInput = New-Object System.Windows.Forms.TextBox
     $cacheInput.Text = [string]$script:config.cache_path
-    $cacheInput.Location = New-Object System.Drawing.Point(202, 111)
+    $cacheInput.Location = New-Object System.Drawing.Point(202, 153)
     $cacheInput.Size = New-Object System.Drawing.Size(350, 26)
     $form.Controls.Add($cacheInput)
 
     $browseButton = New-Object System.Windows.Forms.Button
     $browseButton.Text = "Browse..."
-    $browseButton.Location = New-Object System.Drawing.Point(560, 109)
+    $browseButton.Location = New-Object System.Drawing.Point(560, 151)
     $browseButton.Size = New-Object System.Drawing.Size(60, 29)
     $browseButton.Add_Click({
         $picker = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -213,15 +252,15 @@ function Show-TraySettings {
     $form.Controls.Add($browseButton)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = "Changes apply immediately. Studio and Tray will read the same cache folder."
+    $hint.Text = "Defaults: resources 5s, Cache Folder 120s. Changes apply immediately."
     $hint.ForeColor = [System.Drawing.Color]::FromArgb(70, 120, 145)
-    $hint.Location = New-Object System.Drawing.Point(202, 146)
+    $hint.Location = New-Object System.Drawing.Point(202, 188)
     $hint.Size = New-Object System.Drawing.Size(418, 36)
     $form.Controls.Add($hint)
 
     $saveButton = New-Object System.Windows.Forms.Button
     $saveButton.Text = "Save"
-    $saveButton.Location = New-Object System.Drawing.Point(446, 199)
+    $saveButton.Location = New-Object System.Drawing.Point(446, 249)
     $saveButton.Size = New-Object System.Drawing.Size(82, 32)
     $saveButton.Add_Click({
         $url = $apiInput.Text.Trim().TrimEnd("/")
@@ -260,10 +299,11 @@ function Show-TraySettings {
 
         $script:config.api_url = $url
         $script:config.cache_path = $cachePath
-        $script:config.refresh_seconds = [int]$refreshInput.Value
+        $script:config.resource_refresh_seconds = [int]$resourceRefreshInput.Value
+        $script:config.cache_refresh_seconds = [int]$cacheRefreshInput.Value
         if (-not (Write-TrayConfig)) { return }
         $script:endpoint = $script:config.api_url.TrimEnd("/") + "/director_studio/h3-relay-cache-status"
-        $script:timer.Interval = [int]$script:config.refresh_seconds * 1000
+        $script:timer.Interval = [int]$script:config.resource_refresh_seconds * 1000
         Update-H3TrayStatus
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $form.Close()
@@ -272,7 +312,7 @@ function Show-TraySettings {
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = "Cancel"
-    $cancelButton.Location = New-Object System.Drawing.Point(538, 199)
+    $cancelButton.Location = New-Object System.Drawing.Point(538, 249)
     $cancelButton.Size = New-Object System.Drawing.Size(82, 32)
     $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($cancelButton)
@@ -283,7 +323,7 @@ function Show-TraySettings {
 }
 
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = [int]$config.refresh_seconds * 1000
+$timer.Interval = [int]$config.resource_refresh_seconds * 1000
 $timer.Add_Tick({ Update-H3TrayStatus })
 $settingsItem.Add_Click({ Show-TraySettings })
 $refreshItem.Add_Click({ Update-H3TrayStatus })
