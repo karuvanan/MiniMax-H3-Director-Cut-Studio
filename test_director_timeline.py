@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
 from PIL import Image
 
 from character_swap_engine import (
+    build_character_swap_prompt,
     KEEP_V1_TARGET,
     SOURCE_REMAKE_MODE_CHARACTER_SWAP,
     SOURCE_REMAKE_MODE_CREATIVE_H3,
+    SOURCE_REMAKE_MODE_DIRECTED_SWAP,
 )
 
 from director_cut_studio import (
@@ -351,7 +353,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
-    def test_remake_engine_toolbar_follows_active_skill_automatically(self):
+    def test_remake_engine_toolbar_recommends_by_skill_but_remains_editable(self):
         window = DirectorCutStudio()
         self.assertEqual(
             window.source_remake_render_mode,
@@ -361,7 +363,7 @@ class DirectorTimelineDragTests(unittest.TestCase):
             window.source_remake_mode_combo.currentText(),
             "Create H3 Remake",
         )
-        self.assertFalse(window.source_remake_mode_combo.isEnabled())
+        self.assertTrue(window.source_remake_mode_combo.isEnabled())
 
         source_index = window.special_combo.findData(
             SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
@@ -378,6 +380,28 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.assertTrue(window._source_remake_uses_character_swap_relay())
 
+        creative_index = window.source_remake_mode_combo.findData(
+            SOURCE_REMAKE_MODE_CREATIVE_H3
+        )
+        window.source_remake_mode_combo.setCurrentIndex(creative_index)
+        self.app.processEvents()
+        self.assertEqual(
+            window.source_remake_render_mode,
+            SOURCE_REMAKE_MODE_CREATIVE_H3,
+        )
+        self.assertFalse(window._source_remake_uses_character_swap_relay())
+
+        reshape_index = window.source_remake_mode_combo.findData(
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP
+        )
+        window.source_remake_mode_combo.setCurrentIndex(reshape_index)
+        self.app.processEvents()
+        self.assertEqual(
+            window.source_remake_render_mode,
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        )
+        self.assertTrue(window._source_remake_uses_character_swap_relay())
+
         other_index = window.special_combo.findData("mtv-singing-h3")
         self.assertGreaterEqual(other_index, 0)
         window.special_combo.setCurrentIndex(other_index)
@@ -391,6 +415,42 @@ class DirectorTimelineDragTests(unittest.TestCase):
             "Create H3 Remake",
         )
         self.assertFalse(window._source_remake_uses_character_swap_relay())
+        window.project_dirty = False
+        window.close()
+
+    def test_manual_remake_engine_persists_in_project_and_design_state(self):
+        window = DirectorCutStudio()
+        source_index = window.special_combo.findData(
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        window.special_combo.setCurrentIndex(source_index)
+        reshape_index = window.source_remake_mode_combo.findData(
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP
+        )
+        window.source_remake_mode_combo.setCurrentIndex(reshape_index)
+        self.app.processEvents()
+
+        payload = window._project_payload()
+        state = window._design_workspace_state()
+        self.assertEqual(
+            payload["source_remake_render_mode"],
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        )
+        self.assertEqual(
+            state["source_remake_render_mode"],
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        )
+
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CREATIVE_H3
+        window._restore_design_workspace_state(state)
+        self.assertEqual(
+            window.source_remake_render_mode,
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        )
+        self.assertEqual(
+            window.source_remake_mode_combo.currentData(),
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        )
         window.project_dirty = False
         window.close()
 
@@ -1549,6 +1609,43 @@ class DirectorTimelineDragTests(unittest.TestCase):
         )
         self.assertEqual(listener.lip_sync_mode, "disabled")
         self.assertEqual(listener.lip_sync_target, "")
+
+        # A manual Shot Visual Editor decision must survive the automatic
+        # source-video speaker router, project serialization and reopening.
+        editor = ShotVisualEditorDialog(speaker, 4.0, window)
+        editor._choose_speech("silent_listener")
+        edited_state = editor.state()
+        self.assertTrue(edited_state["speech_visual_controls_user_edited"])
+        self.assertEqual(edited_state["speech_visual_mode"], "silent_listener")
+        self.assertEqual(edited_state["lip_sync_mode"], "disabled")
+        editor.close()
+        editor.deleteLater()
+
+        saved_speaker = director_cue_from_mapping({
+            **asdict(speaker),
+            **edited_state,
+        })
+        window.director_cues[0] = saved_speaker
+        self.assertEqual(window._normalize_source_remake_lip_sync_routes(), 0)
+        self.assertEqual(saved_speaker.speech_visual_mode, "silent_listener")
+        self.assertEqual(saved_speaker.lip_sync_mode, "disabled")
+        passes = window._source_remake_character_pass_specs(0.0, 2.0)
+        self.assertEqual(len(passes), 1)
+        self.assertFalse(passes[0]["speaker"])
+        self.assertEqual(passes[0]["performance_mode"], "silent_listener")
+        self.assertEqual(passes[0]["lip_sync_mode"], "disabled")
+        # Framing evidence remains available for adaptive reference cropping;
+        # the prompt compiler, not the pass planner, suppresses stale speech.
+        prompt = build_character_swap_prompt(passes[0])
+        self.assertNotIn("mouth moves in speech", prompt)
+
+        reopened = ShotVisualEditorDialog(saved_speaker, 4.0, window)
+        self.assertEqual(
+            reopened.speech_mode_combo.currentData(), "silent_listener"
+        )
+        self.assertEqual(reopened.lip_sync_mode_combo.currentData(), "disabled")
+        reopened.close()
+        reopened.deleteLater()
         window.project_dirty = False
         window.close()
 
@@ -7762,6 +7859,27 @@ class DirectorTimelineDragTests(unittest.TestCase):
             [next_dirty_id],
         )
 
+        # A Shot edit after Preview changes the compiled fingerprint. ACCEPT
+        # must not promote that stale reviewed file under the new controls.
+        window.smart_render_manifests["preview"]["segments"][0][
+            "authoring_fingerprint"
+        ] = "stale-before-shot-edit"
+        window.render_dirty_segment_ids = {dirty_id}
+        window.render_dirty_previewed_segment_ids = {dirty_id}
+        stale_accept_path, _ = window._build_smart_render_job(
+            request_kind="accepted", megapixels=1.0, seed=97531,
+            enable_rtx_vsr=False, reuse_clean_segments=True,
+        )
+        stale_accept = json.loads(stale_accept_path.read_text(encoding="utf-8"))
+        stale_row = next(
+            row for row in stale_accept["segments"]
+            if str(row["segment_id"]) == dirty_id
+        )
+        self.assertNotEqual(
+            stale_row.get("reuse_reason"), "reviewed_preview_locked_accept"
+        )
+        self.assertNotEqual(stale_row.get("status"), "cached")
+
         # A reopened/stale Project may retain the compact Workspace take ledger
         # even when the old Smart Render manifest is absent. It is equally
         # authoritative for clean Segment reuse.
@@ -9553,6 +9671,12 @@ class DirectorTimelineDragTests(unittest.TestCase):
             )
         self.assertTrue(dialog.source_live_action_cast_check.isChecked())
         self.assertFalse(dialog.source_live_action_cast_check.isHidden())
+        self.assertTrue(dialog.source_environment_rebuild_check.isEnabled())
+        self.assertFalse(dialog.source_environment_rebuild_check.isChecked())
+        dialog.source_environment_rebuild_check.setChecked(True)
+        self.assertTrue(
+            dialog._selected_design_context()["source_rebuild_environment"]
+        )
         dialog.source_live_action_cast_check.setChecked(False)
         self.assertFalse(
             dialog._selected_design_context()[

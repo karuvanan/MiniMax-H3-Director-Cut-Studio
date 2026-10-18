@@ -374,6 +374,30 @@ class CharacterSwapEngineTests(unittest.TestCase):
         self.assertIn("No pasted cartoon head", prompt)
         self.assertIn("FINAL MEDIUM PRIORITY", prompt)
 
+    def test_silent_listener_overrides_stale_qwen_speaking_evidence(self):
+        prompt = build_character_swap_prompt({
+            "source_role_id": "R1",
+            "source_role_ids": ["R1"],
+            "source_roles": [{
+                "source_role_id": "R1",
+                "source_visual_identity": "judge in close-up",
+                "source_bbox_normalized": [0.16, 0.02, 0.95, 0.99],
+            }],
+            "source_events": ["R1 closes the eyes while the mouth moves in speech."],
+            "speaker": False,
+            "performance_mode": "silent_listener",
+            "mouth_behavior": "lips naturally together; jaw still",
+        })
+
+        self.assertIn("SILENT LISTENER PERFORMANCE", prompt)
+        self.assertIn("must not supply mouth articulation", prompt)
+        self.assertIn("keep the selected mouth silent", prompt)
+        self.assertIn("never supplies an open-mouth pose", prompt)
+        self.assertIn("COMPLETE SOURCE-ACTOR ERASURE", prompt)
+        self.assertIn("exactly one coherent Subject 1 head and body", prompt)
+        self.assertNotIn("mouth moves in speech", prompt)
+        self.assertNotIn("visible mouth timing and complete action clock", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

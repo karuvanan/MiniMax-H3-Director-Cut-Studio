@@ -26,7 +26,7 @@ from PySide6.QtCore import (
     QEvent, QEasingCurve, QMimeData, QObject, QPoint, QRectF, QSize, Qt,
     QTimer, QUrl, QVariantAnimation, Signal,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack
+from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack, qAlpha
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -456,7 +456,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 38
+SMART_RENDER_POLICY_VERSION = 41
 PROGRAM_MONITOR_FPS = 24.0
 H3_DURATION_FRAME_MODULUS = 17
 H3_DURATION_FRAME_REMAINDER = 5
@@ -1469,6 +1469,10 @@ class DirectorCue:
     speech_visual_mode: str = "auto"
     mouth_behavior: str = ""
     voice_position: str = "auto"
+    # Once the user changes any Shot Visual Editor speech/performance control,
+    # the saved Shot becomes authoritative.  Automatic Source-Video speaker
+    # routing must never overwrite that decision on save, reload or compile.
+    speech_visual_controls_user_edited: bool = False
     # Shot-local lip-sync routing. ``auto`` preserves the existing Timeline /
     # Special Skill policy. ``enabled`` names one visible P identity and one
     # audible timing source; ``disabled`` keeps every visible mouth neutral
@@ -1508,6 +1512,9 @@ class DirectorCue:
             "auto", "on_screen", "offscreen", "behind_camera", "non_diegetic"
         }:
             self.voice_position = "auto"
+        self.speech_visual_controls_user_edited = bool(
+            self.speech_visual_controls_user_edited
+        )
         if self.lip_sync_mode not in {"auto", "enabled", "disabled"}:
             self.lip_sync_mode = "auto"
         self.lip_sync_target = normalize_picture_reference(self.lip_sync_target)
@@ -8448,6 +8455,22 @@ class ShotVisualEditorDialog(QDialog):
     def state(self) -> dict:
         action = self.action_edit.toPlainText().strip()
         environment = self.environment_edit.toPlainText().strip()
+        speech_control_state = (
+            str(self.speech_mode_combo.currentData()),
+            self.mouth_edit.text().strip(),
+            str(self.voice_position_combo.currentData()),
+            str(self.lip_sync_mode_combo.currentData()),
+            normalize_picture_reference(self.lip_sync_target_combo.currentData()),
+            str(self.lip_sync_source_combo.currentData() or "auto"),
+        )
+        original_speech_control_state = (
+            self.cue.speech_visual_mode,
+            self.cue.mouth_behavior,
+            self.cue.voice_position,
+            self.cue.lip_sync_mode,
+            self.cue.lip_sync_target,
+            self.cue.lip_sync_source,
+        )
         budgeted = normalize_shot_action_budget({
             "start_seconds": self.cue.start_seconds,
             "end_seconds": self.cue.end_seconds,
@@ -8466,6 +8489,10 @@ class ShotVisualEditorDialog(QDialog):
             "speech_visual_mode": str(self.speech_mode_combo.currentData()),
             "mouth_behavior": self.mouth_edit.text().strip(),
             "voice_position": str(self.voice_position_combo.currentData()),
+            "speech_visual_controls_user_edited": bool(
+                self.cue.speech_visual_controls_user_edited
+                or speech_control_state != original_speech_control_state
+            ),
             "lip_sync_mode": str(self.lip_sync_mode_combo.currentData()),
             "lip_sync_target": normalize_picture_reference(
                 self.lip_sync_target_combo.currentData()
@@ -9622,13 +9649,15 @@ class DesignPageDialog(QDialog):
         self.source_environment_rebuild_check.setObjectName(
             "sourceRemakeEnvironmentRebuild"
         )
-        self.source_environment_rebuild_check.setChecked(False)
-        self.source_environment_rebuild_check.setEnabled(False)
+        self.source_environment_rebuild_check.setChecked(bool(
+            self.context.get("source_rebuild_environment", False)
+        ))
+        self.source_environment_rebuild_check.setEnabled(True)
         self.source_environment_rebuild_check.setToolTip(
-            "Disabled while Source Video Cast Remake H3 automatically selects LoRA Preserve "
-            "V1. The Relay engine keeps V1's scene, performance, timing and soundtrack while "
-            "replacing only mapped character identities. Select another Skill to use Create "
-            "H3 Remake for a newly generated environment."
+            "Optional. Keep the mapped P-character identities and V1 performance/timing, but "
+            "let H3 reconstruct the environment and background from the Design Requirement. "
+            "When LoRA Preserve V1 is selected this switches the applied engine to LoRA + "
+            "Reshape Environment; clearing it returns to identity-only preservation."
         )
         self.source_environment_rebuild_check.setVisible(
             _bound_special_skill_key(self.context)
@@ -12743,6 +12772,17 @@ class DesignPageDialog(QDialog):
         plan["_source_rebuild_environment"] = bool(
             self.source_environment_rebuild_check.isChecked()
         )
+        requested_remake_mode = str(
+            self.context.get("source_remake_render_mode", "") or ""
+        )
+        if requested_remake_mode not in SOURCE_REMAKE_MODES:
+            requested_remake_mode = SOURCE_REMAKE_MODE_CREATIVE_H3
+        if self.source_environment_rebuild_check.isChecked():
+            if requested_remake_mode == SOURCE_REMAKE_MODE_CHARACTER_SWAP:
+                requested_remake_mode = SOURCE_REMAKE_MODE_DIRECTED_SWAP
+        elif requested_remake_mode == SOURCE_REMAKE_MODE_DIRECTED_SWAP:
+            requested_remake_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        plan["_source_remake_render_mode"] = requested_remake_mode
         plan["_source_cast_live_action_adaptation"] = bool(
             self.source_live_action_cast_check.isChecked()
         )
@@ -13137,7 +13177,7 @@ class DirectorCutStudio(QMainWindow):
                 self.special_combo.addItem(profile.display_name, key)
         self.special_combo.setMinimumWidth(180)
         bar.addWidget(self.special_combo)
-        self.source_remake_mode_label = QLabel("Remake Engine · AUTO")
+        self.source_remake_mode_label = QLabel("Remake Engine")
         bar.addWidget(self.source_remake_mode_label)
         self.source_remake_mode_combo = QComboBox()
         self.source_remake_mode_combo.setObjectName("sourceRemakeModeCombo")
@@ -13149,12 +13189,15 @@ class DirectorCutStudio(QMainWindow):
             "LoRA Preserve V1",
             SOURCE_REMAKE_MODE_CHARACTER_SWAP,
         )
-        self.source_remake_mode_combo.setMinimumWidth(165)
-        self.source_remake_mode_combo.setEnabled(False)
+        self.source_remake_mode_combo.addItem(
+            "LoRA + Reshape Environment",
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        )
+        self.source_remake_mode_combo.setMinimumWidth(225)
+        self.source_remake_mode_combo.setEnabled(True)
         self.source_remake_mode_combo.setToolTip(
-            "Automatically selected from the active Special Skill. Source Video Cast "
-            "Remake H3 uses Character Swap LoRA + H3 Relay to preserve V1; no Skill and "
-            "all other Skills use Create H3 Remake."
+            "The active Skill supplies a recommended default, but you may freely choose: "
+            "Create H3 Remake, LoRA Preserve V1, or LoRA + Reshape Environment."
         )
         initial_remake_index = self.source_remake_mode_combo.findData(
             self.source_remake_render_mode
@@ -15510,10 +15553,15 @@ class DirectorCutStudio(QMainWindow):
         self.source_video_role_bindings = deepcopy(
             state.get("source_video_role_bindings") or []
         )
-        # v0.3.7: engine choice is derived from the selected Skill. Ignore a
-        # legacy manual mode saved by older Projects or a cancelled Design.
-        self.source_remake_render_mode = automatic_remake_engine_for_skill(
-            self.special_combo.currentData()
+        restored_remake_mode = str(
+            state.get("source_remake_render_mode", "") or ""
+        )
+        self.source_remake_render_mode = (
+            restored_remake_mode
+            if restored_remake_mode in SOURCE_REMAKE_MODES
+            else automatic_remake_engine_for_skill(
+                self.special_combo.currentData()
+            )
         )
         self.source_cast_live_action_adaptation = bool(
             state.get(
@@ -15772,9 +15820,23 @@ class DirectorCutStudio(QMainWindow):
             if not self.original_design_requirement.strip():
                 self.original_design_requirement = authored_requirement
             self.latest_design_requirement = authored_requirement
-        self.source_remake_render_mode = automatic_remake_engine_for_skill(
-            self.special_combo.currentData()
+        requested_remake_mode = str(
+            plan.get(
+                "_source_remake_render_mode",
+                self.source_remake_render_mode,
+            ) or ""
         )
+        if requested_remake_mode not in SOURCE_REMAKE_MODES:
+            requested_remake_mode = self.source_remake_render_mode
+        reshape_environment = bool(
+            plan.get("_source_rebuild_environment", False)
+        )
+        if reshape_environment:
+            if requested_remake_mode == SOURCE_REMAKE_MODE_CHARACTER_SWAP:
+                requested_remake_mode = SOURCE_REMAKE_MODE_DIRECTED_SWAP
+        elif requested_remake_mode == SOURCE_REMAKE_MODE_DIRECTED_SWAP:
+            requested_remake_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        self.source_remake_render_mode = requested_remake_mode
         if (
             str(self.special_combo.currentData() or "").strip().casefold()
             == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
@@ -17023,6 +17085,14 @@ class DirectorCutStudio(QMainWindow):
             source_rebuild_environment = bool(
                 plan.get("_source_rebuild_environment", False)
             )
+            source_remake_render_mode = str(
+                plan.get(
+                    "_source_remake_render_mode",
+                    self.source_remake_render_mode,
+                ) or ""
+            )
+            if source_remake_render_mode not in SOURCE_REMAKE_MODES:
+                source_remake_render_mode = self.source_remake_render_mode
             source_cast_live_action_adaptation = bool(
                 plan.get(
                     "_source_cast_live_action_adaptation",
@@ -17059,6 +17129,7 @@ class DirectorCutStudio(QMainWindow):
             plan["_authored_requirement"] = authored_requirement
             plan["_design_requirement_snapshot"] = authored_requirement
             plan["_source_rebuild_environment"] = source_rebuild_environment
+            plan["_source_remake_render_mode"] = source_remake_render_mode
             plan["_source_cast_live_action_adaptation"] = (
                 source_cast_live_action_adaptation
             )
@@ -19672,7 +19743,7 @@ class DirectorCutStudio(QMainWindow):
         self.source_remake_mode_combo.setVisible(True)
 
     def _sync_remake_engine_to_skill(self) -> bool:
-        """Mirror the deterministic Skill→Remake Engine router in the toolbar."""
+        """Apply the active Skill's recommendation without locking the selector."""
 
         if not hasattr(self, "source_remake_mode_combo"):
             return False
@@ -19685,29 +19756,38 @@ class DirectorCutStudio(QMainWindow):
         self.source_remake_mode_combo.blockSignals(True)
         self.source_remake_mode_combo.setCurrentIndex(max(0, index))
         self.source_remake_mode_combo.blockSignals(False)
-        source_relay = selected == SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        source_relay = selected in {
+            SOURCE_REMAKE_MODE_CHARACTER_SWAP,
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        }
         self.source_remake_mode_combo.setToolTip(
             (
-                "AUTO · Source Video Cast Remake H3 selected: use "
-                "MiniMax-H3-Character-Swap-LoRA and H3 Relay; preserve the V1 "
-                "performance, source scene, timing and soundtrack."
+                "RECOMMENDED BY SKILL · MiniMax-H3-Character-Swap-LoRA and H3 Relay. "
+                "You may still choose Create H3 Remake or LoRA + Reshape Environment."
             )
             if source_relay
             else (
-                "AUTO · No Special Skill or another Special Skill selected: use "
-                "Studio's standard Create H3 Remake compiler. Character Swap Relay "
-                "is not loaded."
+                "RECOMMENDED BY SKILL · Studio's standard Create H3 Remake compiler. "
+                "You may manually choose either LoRA engine when the project provides "
+                "a valid V1 role ledger and P-picture bindings."
             )
         )
         return changed
 
     def _source_remake_render_mode_changed(self, _index: int = -1) -> None:
-        # The selector is read-only in v0.3.7. Keep this handler as a safety
-        # net for restored UI state and older automation that sets an index.
-        if self._sync_remake_engine_to_skill():
-            self._mark_dirty()
-            self._mark_all_render_segments_dirty()
-            self.schedule_prompt_generation()
+        selected = str(self.source_remake_mode_combo.currentData() or "")
+        if selected not in SOURCE_REMAKE_MODES:
+            return
+        if selected == self.source_remake_render_mode:
+            return
+        self.source_remake_render_mode = selected
+        self.source_remake_mode_combo.setToolTip(
+            "Manual Remake Engine choice saved with this Project. Changing Special Skill "
+            "will load that Skill's recommendation, after which you can choose again."
+        )
+        self._mark_dirty()
+        self._mark_all_render_segments_dirty()
+        self.schedule_prompt_generation()
 
     def open_special_skill_creator(self) -> None:
         dialog = SpecialSkillCreatorDialog(PROJECT_ROOT / "skill special", self)
@@ -20839,13 +20919,25 @@ class DirectorCutStudio(QMainWindow):
             )
             index = self.special_combo.findData(special)
             self.special_combo.setCurrentIndex(max(0, index))
-            # Ignore legacy manual Remake Engine choices. The active Skill is
-            # now the single routing authority.
-            self.source_remake_render_mode = automatic_remake_engine_for_skill(
-                special
+            saved_remake_mode = str(
+                payload.get("source_remake_render_mode", "") or ""
+            )
+            self.source_remake_render_mode = (
+                saved_remake_mode
+                if saved_remake_mode in SOURCE_REMAKE_MODES
+                else automatic_remake_engine_for_skill(special)
             )
             self.source_cast_live_action_adaptation = bool(
                 payload.get("source_cast_live_action_adaptation", True)
+            )
+            self._refresh_skill_binding_display()
+            # _refresh_skill_binding_display loads the Skill recommendation.
+            # Restore the Project's explicit choice afterwards so opening a
+            # saved Project never silently changes its rendering engine.
+            self.source_remake_render_mode = (
+                saved_remake_mode
+                if saved_remake_mode in SOURCE_REMAKE_MODES
+                else automatic_remake_engine_for_skill(special)
             )
             remake_index = self.source_remake_mode_combo.findData(
                 self.source_remake_render_mode
@@ -20853,7 +20945,6 @@ class DirectorCutStudio(QMainWindow):
             self.source_remake_mode_combo.blockSignals(True)
             self.source_remake_mode_combo.setCurrentIndex(max(0, remake_index))
             self.source_remake_mode_combo.blockSignals(False)
-            self._refresh_skill_binding_display()
             # Migrate generated combat choreography when an older Project is
             # opened.  This repairs vague exchanges, outcome-without-cause
             # rows, stale market targets inside Hong Kong comic projects and
@@ -23635,6 +23726,11 @@ class DirectorCutStudio(QMainWindow):
         for cue in self.director_cues:
             if cue.cue_type != "shot":
                 continue
+            # Shot Visual Editor is the final human-authored authority.  Older
+            # code normalized again immediately after SAVE SHOT and silently
+            # restored Qwen's original speaker classification.
+            if cue.speech_visual_controls_user_edited:
+                continue
             scene = self._source_scene_for_shot(cue)
             speaker_role = str(scene.get("speaker_role", "") or "").strip().upper()
             try:
@@ -25618,6 +25714,14 @@ class DirectorCutStudio(QMainWindow):
                     target, field_name, patch["value"]
                 )
             if kind == "shot":
+                if any(
+                    patch["field"] in {
+                        "speech_visual_mode", "mouth_behavior", "voice_position",
+                        "lip_sync_mode", "lip_sync_target", "lip_sync_source",
+                    }
+                    for patch in patches
+                ):
+                    after["speech_visual_controls_user_edited"] = True
                 if after.get("lip_sync_mode") not in {"auto", "enabled", "disabled"}:
                     after["lip_sync_mode"] = "auto"
                 after["lip_sync_target"] = normalize_picture_reference(
@@ -32047,6 +32151,112 @@ class DirectorCutStudio(QMainWindow):
             return preview_path
         return destination.resolve()
 
+    def _character_swap_framed_reference(
+        self,
+        source: Path,
+        pass_spec: dict,
+    ) -> tuple[Path, str]:
+        """Match a P-picture's identity scale to the selected V1 performer.
+
+        A transparent full-body cartoon supplied to a close-up source Shot made
+        Relay paste a tiny complete figure over the original actor.  For large
+        source performers, give Relay an upper-body/identity crop instead.  The
+        original Media Pool asset is never modified.
+        """
+
+        source_roles = [
+            row for row in pass_spec.get("source_roles") or []
+            if isinstance(row, dict)
+        ]
+        widths: list[float] = []
+        heights: list[float] = []
+        for row in source_roles:
+            bbox = row.get("source_bbox_normalized") or []
+            if len(bbox) != 4:
+                continue
+            try:
+                left, top, right, bottom = [float(value) for value in bbox]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            widths.append(max(0.0, right - left))
+            heights.append(max(0.0, bottom - top))
+        event_text = " ".join(
+            str(value or "") for value in pass_spec.get("source_events") or []
+        ).casefold()
+        close_up = bool(
+            "close-up" in event_text
+            or "close up" in event_text
+            or (
+                widths and heights
+                and max(widths) >= 0.55
+                and max(heights) >= 0.65
+            )
+        )
+        medium = bool(
+            not close_up
+            and widths and heights
+            and max(widths) >= 0.35
+            and max(heights) >= 0.55
+        )
+        if not close_up and not medium:
+            return source.resolve(), "original"
+        image = QImage(str(source))
+        if image.isNull() or image.width() < 8 or image.height() < 8:
+            return source.resolve(), "original"
+
+        # Transparent cut-outs get a true subject bounding box.  Opaque photos
+        # retain their full width but are still safely cropped from the top.
+        left, top, right, bottom = 0, 0, image.width() - 1, image.height() - 1
+        if image.hasAlphaChannel():
+            alpha_left, alpha_top = image.width(), image.height()
+            alpha_right = alpha_bottom = -1
+            for y in range(image.height()):
+                for x in range(image.width()):
+                    if qAlpha(image.pixel(x, y)) > 8:
+                        alpha_left = min(alpha_left, x)
+                        alpha_top = min(alpha_top, y)
+                        alpha_right = max(alpha_right, x)
+                        alpha_bottom = max(alpha_bottom, y)
+            if alpha_right >= alpha_left and alpha_bottom >= alpha_top:
+                left, top, right, bottom = (
+                    alpha_left, alpha_top, alpha_right, alpha_bottom
+                )
+        subject_width = max(1, right - left + 1)
+        subject_height = max(1, bottom - top + 1)
+        vertical_fraction = 0.52 if close_up else 0.70
+        pad_x = max(2, round(subject_width * 0.06))
+        pad_y = max(2, round(subject_height * 0.03))
+        crop_left = max(0, left - pad_x)
+        crop_top = max(0, top - pad_y)
+        crop_right = min(image.width(), right + 1 + pad_x)
+        crop_bottom = min(
+            image.height(),
+            top + round(subject_height * vertical_fraction) + pad_y,
+        )
+        if crop_bottom - crop_top < 8 or crop_right - crop_left < 8:
+            return source.resolve(), "original"
+        strategy = "close_identity_crop" if close_up else "upper_body_crop"
+        token = hashlib.sha256(
+            (
+                f"character-swap-reference-v2|{source.resolve()}|"
+                f"{source.stat().st_mtime_ns}|{strategy}|"
+                f"{crop_left},{crop_top},{crop_right},{crop_bottom}"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        cache = CACHE_ROOT / "character_swap_references"
+        cache.mkdir(parents=True, exist_ok=True)
+        destination = cache / f"{source.stem}_{strategy}_{token}.png"
+        if not destination.is_file() or destination.stat().st_size <= 128:
+            cropped = image.copy(
+                crop_left,
+                crop_top,
+                crop_right - crop_left,
+                crop_bottom - crop_top,
+            )
+            if cropped.isNull() or not cropped.save(str(destination), "PNG"):
+                return source.resolve(), "original"
+        return destination.resolve(), strategy
+
     def _compiled_character_swap_window_job(
         self,
         start: float,
@@ -32056,7 +32266,7 @@ class DirectorCutStudio(QMainWindow):
         seed: int,
         segment_id: str,
     ) -> tuple[dict, list[dict], list[dict[str, str]], str, Path, MediaAsset]:
-        """Compile sequential unique-identity LoRA passes for one source-video Shot."""
+        """Compile independent unique-identity LoRA passes for one source-video Shot."""
 
         if not CHARACTER_SWAP_WORKFLOW.is_file():
             raise FileNotFoundError(
@@ -32107,6 +32317,10 @@ class DirectorCutStudio(QMainWindow):
                 raise FileNotFoundError(
                     f"Character Swap requires @{target_reference}, but its Picture file is missing."
                 )
+            target_path, reference_framing = self._character_swap_framed_reference(
+                target_path, pass_spec
+            )
+            pass_spec["reference_framing"] = reference_framing
             pass_seed = derive_named_segment_seed(
                 seed,
                 f"{segment_id}:{pass_spec.get('source_role_id')}:{target_reference}",
@@ -32123,7 +32337,12 @@ class DirectorCutStudio(QMainWindow):
                 directed_scene_text=directed,
                 live_action_adaptation=live_action_adaptation,
             )
-            runtime_source = pass_index > 0
+            # Different identities in the same frame must never be generated
+            # serially from the preceding role's result. H3 may restore that
+            # preceding replacement while working on the next person. Compile
+            # every role from the same clean V1 plate; the worker composites
+            # only each role's tracked box after all independent passes finish.
+            runtime_source = False
             workflow, contract = compile_character_swap_pass(
                 template,
                 source_filename=source_clip.name,
@@ -32161,20 +32380,69 @@ class DirectorCutStudio(QMainWindow):
                 fingerprint_assets.append(source_upload_asset)
             patch_media_upload_names(workflow, pass_uploads)
             all_uploads.extend(pass_uploads)
+            composite_bboxes: list[list[float]] = []
+            for role_row in (pass_spec.get("source_roles") or []):
+                if not isinstance(role_row, dict):
+                    continue
+                bbox_candidates = [
+                    role_row.get("identity_audit_bbox_normalized")
+                    or role_row.get("source_bbox_normalized")
+                    or []
+                ]
+                bbox_candidates.extend(
+                    sample.get("bbox_normalized") or []
+                    for sample in (role_row.get("track_samples") or [])
+                    if isinstance(sample, dict)
+                )
+                for bbox in bbox_candidates:
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        composite_bboxes.append(list(bbox))
             pass_rows.append({
                 "pass_index": pass_index,
                 "source_role_id": str(pass_spec.get("source_role_id", "")),
                 "source_role_ids": list(pass_spec.get("source_role_ids") or []),
                 "target_media_id": target_reference,
                 "live_action_adaptation": live_action_adaptation,
+                "reference_framing": reference_framing,
                 "speaker": bool(pass_spec.get("speaker", False)),
                 "seed": pass_seed,
                 "workflow": workflow,
                 "runtime_source": runtime_source,
+                "independent_role_composite": len(pass_specs) > 1,
+                "composite_bboxes_normalized": composite_bboxes,
                 "runtime_source_loader_node_id": contract["source_loader_node_id"],
                 "runtime_source_loader_input": contract["source_loader_input"],
                 "relay_node_id": contract["relay_node_id"],
                 "relay_window_count": relay_window_count,
+                "identity_audit": {
+                    "enabled": True,
+                    "source_video_path": str(source_clip.resolve()),
+                    "source_role_ids": list(pass_spec.get("source_role_ids") or []),
+                    "source_bboxes_normalized": [
+                        list(
+                            role_row.get("identity_audit_bbox_normalized")
+                            or role_row.get("source_bbox_normalized")
+                            or []
+                        )
+                        for role_row in (pass_spec.get("source_roles") or [])
+                        if isinstance(role_row, dict)
+                        and len(
+                            role_row.get("identity_audit_bbox_normalized")
+                            or role_row.get("source_bbox_normalized")
+                            or []
+                        ) == 4
+                    ],
+                    "maximum_attempts": 3,
+                    "maximum_source_correlation": 0.88,
+                    "maximum_source_similarity": 0.88,
+                    "maximum_source_mae": 0.055,
+                    "minimum_erasure_correlation": 0.82,
+                    "minimum_erasure_similarity": 0.82,
+                    "maximum_erasure_mae": 0.12,
+                    "minimum_erasure_identity_gap": 0.10,
+                    "performance_mode": str(pass_spec.get("performance_mode", "")),
+                    "maximum_silent_mouth_motion": 0.055,
+                },
             })
         fingerprint = content_fingerprint({
             "engine": "akatz-character-swap-relay-v1",
@@ -32222,6 +32490,30 @@ class DirectorCutStudio(QMainWindow):
                 if segment.core_end_seconds is not None
                 else segment.end_seconds
             )
+            authoring_fingerprint = content_fingerprint({
+                "version": 1,
+                "window": [round(core_start, 6), round(core_end, 6)],
+                "source_remake_mode": self.source_remake_render_mode,
+                "source_cast_live_action_adaptation": bool(
+                    self.source_cast_live_action_adaptation
+                ),
+                "source_video_role_bindings": self.source_video_role_bindings,
+                "shots": [
+                    asdict(cue)
+                    for cue in self.director_cues
+                    if cue.cue_type == "shot"
+                    and ranges_intersect(
+                        cue.start_seconds, cue.end_seconds, core_start, core_end
+                    )
+                ],
+                "text_layers": [
+                    asdict(layer)
+                    for layer in self.text_layers
+                    if ranges_intersect(
+                        layer.start_seconds, layer.end_seconds, core_start, core_end
+                    )
+                ],
+            })
             if self._source_remake_uses_character_swap_relay():
                 (
                     compiled,
@@ -32241,6 +32533,7 @@ class DirectorCutStudio(QMainWindow):
                 all_media.extend(uploads)
                 row = segment.to_dict()
                 row.update({
+                    "authoring_fingerprint": authoring_fingerprint,
                     "workflow": compiled,
                     "continuity": {},
                     "download_dir": str(render_root / segment.segment_id),
@@ -32369,6 +32662,7 @@ class DirectorCutStudio(QMainWindow):
             )
             row.update(
                 {
+                    "authoring_fingerprint": authoring_fingerprint,
                     "workflow": compiled,
                     "continuity": continuity,
                     "download_dir": str(render_root / segment.segment_id),
@@ -32519,6 +32813,30 @@ class DirectorCutStudio(QMainWindow):
         for row in segment_rows:
             segment_id = str(row["segment_id"])
             dirty = segment_id in self.render_dirty_segment_ids
+            current_swap_passes = [
+                value for value in (row.get("character_swap_passes") or [])
+                if isinstance(value, dict)
+            ]
+            requires_independent_role_composite = bool(
+                len(current_swap_passes) > 1
+                and all(
+                    bool(value.get("independent_role_composite"))
+                    and not bool(value.get("runtime_source"))
+                    for value in current_swap_passes
+                )
+            )
+            cached_candidate = cached_by_id.get(segment_id) or {}
+            cached_composite = cached_candidate.get("character_swap_composite") or {}
+            if (
+                requires_independent_role_composite
+                and str(cached_composite.get("mode") or "")
+                != "independent_role_boxes"
+            ):
+                # Policy 41 fixes a destructive Relay behavior: the second
+                # role pass could restore the first actor. Never reuse such an
+                # older multi-role take, even when Project JSON marked it
+                # clean or the accepted-master ledger still points to it.
+                dirty = True
             if reuse_clean_segments and not dirty and segment_id not in cached_by_id:
                 core_start = float(
                     row.get("core_start_seconds", row.get("start_seconds", 0.0))
@@ -32552,6 +32870,8 @@ class DirectorCutStudio(QMainWindow):
                 and dirty
                 and segment_id in self.render_dirty_previewed_segment_ids
                 and reviewed_preview is not None
+                and reviewed_preview.get("authoring_fingerprint")
+                == row.get("authoring_fingerprint")
             )
             if lock_reviewed_repair_preview:
                 preview_path = Path(str(reviewed_preview.get("output_path", "")))
@@ -32579,6 +32899,10 @@ class DirectorCutStudio(QMainWindow):
                         accepted_from_reviewed_preview=True,
                         reviewed_preview_output_path=str(preview_path.resolve()),
                     )
+                    if reviewed_preview.get("character_swap_composite"):
+                        row["character_swap_composite"] = deepcopy(
+                            reviewed_preview["character_swap_composite"]
+                        )
                     continue
             core_end = float(
                 row.get("core_end_seconds", row.get("end_seconds", 0.0))
@@ -32621,6 +32945,14 @@ class DirectorCutStudio(QMainWindow):
                     if approved_locked_range and not fingerprint_match
                     else "fingerprint_match"
                 )
+                if cached.get("character_swap_composite"):
+                    # Keep the migration marker in every later manifest. If it
+                    # is dropped while reusing a clean take, the next Generate
+                    # Dirty would incorrectly treat this already-fixed Shot as
+                    # a legacy serial multi-role render and regenerate it.
+                    row["character_swap_composite"] = deepcopy(
+                        cached["character_swap_composite"]
+                    )
                 if request_kind != "preview":
                     self.render_dirty_segment_ids.discard(segment_id)
                     self.render_dirty_previewed_segment_ids.discard(segment_id)
@@ -32901,14 +33233,10 @@ class DirectorCutStudio(QMainWindow):
         return clones
 
     def _source_remake_uses_character_swap_relay(self) -> bool:
-        selected = automatic_remake_engine_for_skill(
-            self.special_combo.currentData()
-        )
-        # Compile-time routing never trusts stale Project/UI state. This is the
-        # final safety boundary that prevents LoRA Relay from being called by
-        # an unrelated Skill or an old saved manual mode.
-        self.source_remake_render_mode = selected
-        return selected == SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        return self.source_remake_render_mode in {
+            SOURCE_REMAKE_MODE_CHARACTER_SWAP,
+            SOURCE_REMAKE_MODE_DIRECTED_SWAP,
+        }
 
     def _source_remake_relay_source_clip(
         self,
@@ -33124,12 +33452,22 @@ class DirectorCutStudio(QMainWindow):
                 cue.start_seconds, cue.end_seconds, start, end
             ):
                 continue
-            rows.extend((
-                cue.h3_executable_action or cue.subject_action,
-                cue.environment_response,
-                cue.camera_movement,
-                cue.detail,
-            ))
+            if cue.speech_visual_mode in {"silent_listener", "no_human_voice"}:
+                # Old Qwen prose may still say "mouth moves in speech" or name
+                # the V1 actor as speaker. The structured Shot controls are
+                # newer and authoritative, so keep only non-speech direction.
+                rows.extend((
+                    cue.environment_response,
+                    cue.camera_movement,
+                    cue.mouth_behavior,
+                ))
+            else:
+                rows.extend((
+                    cue.h3_executable_action or cue.subject_action,
+                    cue.environment_response,
+                    cue.camera_movement,
+                    cue.detail,
+                ))
         return " ".join(
             dict.fromkeys(" ".join(str(row or "").split()) for row in rows if str(row or "").strip())
         )[:2400]
@@ -33264,7 +33602,7 @@ class DirectorCutStudio(QMainWindow):
                 })
         else:
             owner = None
-        return character_swap_passes_for_window(
+        passes = character_swap_passes_for_window(
             analysis,
             effective_bindings,
             start,
@@ -33276,6 +33614,20 @@ class DirectorCutStudio(QMainWindow):
                 owner.source_role_bbox_overrides if owner is not None else None
             ),
         )
+        if owner is not None:
+            performance_mode = str(owner.speech_visual_mode or "auto").strip().casefold()
+            for pass_spec in passes:
+                pass_spec["performance_mode"] = performance_mode
+                pass_spec["mouth_behavior"] = str(owner.mouth_behavior or "")
+                pass_spec["lip_sync_mode"] = str(owner.lip_sync_mode or "auto")
+                pass_spec["lip_sync_target"] = str(owner.lip_sync_target or "")
+                pass_spec["lip_sync_source"] = str(owner.lip_sync_source or "")
+                if performance_mode in {"silent_listener", "no_human_voice"}:
+                    pass_spec["speaker"] = False
+                    # Keep non-authoritative scene/framing evidence available
+                    # for reference scaling. build_character_swap_prompt() is
+                    # the safety boundary that suppresses stale speaking prose.
+        return passes
 
     @staticmethod
     def _relay_upload_asset(

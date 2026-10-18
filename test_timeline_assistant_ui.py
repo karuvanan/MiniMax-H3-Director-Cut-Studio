@@ -269,6 +269,27 @@ class TimelineAssistantUiTests(unittest.TestCase):
             window.project_dirty = False
             window.close()
 
+    def test_qwen_speech_patch_becomes_an_authoritative_shot_override(self):
+        window = DirectorCutStudio()
+        try:
+            cue = DirectorCue("S1", "shot", 0.0, 4.0, "Listener")
+            window.director_cues = [cue]
+            window.timeline_assistant_target_shot_id = "S1"
+            window.timeline_assistant_last_scope = "shot_only"
+            window._apply_timeline_assistant_operations([{
+                "target_kind": "shot",
+                "target_id": "S1",
+                "field": "speech_visual_mode",
+                "value": "silent_listener",
+                "reason": "Keep the visible person silent",
+                "requires_confirmation": False,
+            }])
+            self.assertEqual(cue.speech_visual_mode, "silent_listener")
+            self.assertTrue(cue.speech_visual_controls_user_edited)
+        finally:
+            window.project_dirty = False
+            window.close()
+
     def test_regenerate_dirty_action_appears_only_for_stale_segments(self):
         window = DirectorCutStudio()
         try:

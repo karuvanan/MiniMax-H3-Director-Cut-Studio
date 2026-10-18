@@ -46,7 +46,7 @@ from workflow_engine import validate_portable_media_manifest
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 38
+SMART_RENDER_POLICY_VERSION = 41
 AUDIO_JOIN_FADE_SECONDS = 0.04
 MAX_DIRECT_ASSEMBLY_SEGMENTS = 6
 LOCATION_SOUND_REFERENCE_VERSION = 1
@@ -1093,6 +1093,356 @@ def _probe_video_geometry(ffprobe: Path, source: Path) -> tuple[int, int] | None
         return None
 
 
+def _identity_region_bbox(value: object) -> list[float]:
+    """Return the face/upper-body part of a normalized actor rectangle.
+
+    Relay is meant to preserve the surrounding plate, so comparing the whole
+    frame would reward a failed swap.  The upper-centre portion concentrates
+    the audit on identity-bearing pixels while remaining usable for cropped
+    heads and half-body source performers.
+    """
+
+    try:
+        left, top, right, bottom = [float(item) for item in value][:4]
+    except (TypeError, ValueError, OverflowError):
+        return []
+    left, top = max(0.0, left), max(0.0, top)
+    right, bottom = min(1.0, right), min(1.0, bottom)
+    if right - left < 0.03 or bottom - top < 0.03:
+        return []
+    width, height = right - left, bottom - top
+    return [
+        left + width * 0.18,
+        top + height * 0.02,
+        right - width * 0.18,
+        top + height * 0.62,
+    ]
+
+
+def _mouth_region_bbox(value: object) -> list[float]:
+    """Return a conservative mouth/jaw audit rectangle for one actor box.
+
+    The Relay output is not a face-landmark product, so this deliberately uses
+    a broad lower-face band.  It is used only for the authored Silent Listener
+    contract: excessive temporal motion is a reason to try another seed, never
+    a reason to stop the whole render.
+    """
+
+    try:
+        left, top, right, bottom = [float(item) for item in value][:4]
+    except (TypeError, ValueError, OverflowError):
+        return []
+    left, top = max(0.0, left), max(0.0, top)
+    right, bottom = min(1.0, right), min(1.0, bottom)
+    if right - left < 0.03 or bottom - top < 0.03:
+        return []
+    width, height = right - left, bottom - top
+    return [
+        left + width * 0.28,
+        top + height * 0.25,
+        right - width * 0.28,
+        top + height * 0.47,
+    ]
+
+
+def temporal_frame_motion(frames: list[bytes]) -> float:
+    """Mean normalized adjacent-frame change for an equally-sized ROI series."""
+
+    if len(frames) < 2:
+        return 0.0
+    changes: list[float] = []
+    for previous, current in zip(frames, frames[1:]):
+        count = min(len(previous), len(current))
+        if count <= 0:
+            continue
+        changes.append(
+            sum(abs(left - right) for left, right in zip(previous[:count], current[:count]))
+            / (count * 255.0)
+        )
+    return sum(changes) / len(changes) if changes else 0.0
+
+
+def _extract_identity_gray_frame(
+    ffmpeg: Path,
+    source: Path,
+    time_seconds: float,
+    bbox: list[float],
+    *,
+    size: int = 96,
+) -> bytes:
+    left, top, right, bottom = bbox
+    width, height = right - left, bottom - top
+    video_filter = (
+        f"crop=iw*{width:.8f}:ih*{height:.8f}:"
+        f"iw*{left:.8f}:ih*{top:.8f},"
+        f"scale={size}:{size}:flags=bilinear,format=gray"
+    )
+    completed = subprocess.run(
+        [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error",
+            "-ss", f"{max(0.0, time_seconds):.6f}", "-i", str(source),
+            "-frames:v", "1", "-vf", video_filter,
+            "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    expected = size * size
+    if completed.returncode or len(completed.stdout) < expected:
+        detail = completed.stderr.decode("utf-8", errors="replace")[-500:]
+        raise RuntimeError("Could not sample Character Swap identity region: " + detail)
+    return completed.stdout[:expected]
+
+
+def identity_frame_metrics(source: bytes, result: bytes) -> dict[str, float]:
+    """Measure whether an output identity region remained the V1 actor."""
+
+    count = min(len(source), len(result))
+    if count <= 1:
+        raise ValueError("Identity audit frame is empty.")
+    source_values = [float(value) / 255.0 for value in source[:count]]
+    result_values = [float(value) / 255.0 for value in result[:count]]
+    source_mean = sum(source_values) / count
+    result_mean = sum(result_values) / count
+    source_var = sum((value - source_mean) ** 2 for value in source_values) / count
+    result_var = sum((value - result_mean) ** 2 for value in result_values) / count
+    covariance = sum(
+        (left - source_mean) * (right - result_mean)
+        for left, right in zip(source_values, result_values)
+    ) / count
+    denominator = math.sqrt(max(0.0, source_var * result_var))
+    correlation = covariance / denominator if denominator > 1e-12 else (
+        1.0 if abs(source_mean - result_mean) <= 1e-6 else 0.0
+    )
+    c1, c2 = 0.01**2, 0.03**2
+    similarity = (
+        (2 * source_mean * result_mean + c1) * (2 * covariance + c2)
+    ) / (
+        (source_mean**2 + result_mean**2 + c1)
+        * (source_var + result_var + c2)
+    )
+    mae = sum(
+        abs(left - right) for left, right in zip(source_values, result_values)
+    ) / count
+    return {
+        "correlation": max(-1.0, min(1.0, correlation)),
+        "similarity": max(-1.0, min(1.0, similarity)),
+        "mae": max(0.0, min(1.0, mae)),
+    }
+
+
+def inspect_character_swap_identity(
+    ffmpeg: Path,
+    ffprobe: Path,
+    source: Path,
+    result: Path,
+    spec: dict,
+) -> dict:
+    """Detect a no-op identity pass by comparing only selected actor pixels.
+
+    This is deliberately a conservative failure detector, not face
+    recognition.  It retries only when the selected identity region remains
+    simultaneously very highly correlated, structurally similar and almost
+    pixel-identical to V1.
+    """
+
+    raw_bboxes = list(spec.get("source_bboxes_normalized") or [])
+    bboxes = [bbox for bbox in (_identity_region_bbox(row) for row in raw_bboxes) if bbox]
+    if not bboxes:
+        return {
+            "passed": True,
+            "available": False,
+            "reason": "no reliable selected-person rectangle",
+            "action": "no_retry",
+        }
+    if not source.is_file() or not result.is_file():
+        return {
+            "passed": True,
+            "available": False,
+            "reason": "source or result video is missing",
+            "action": "no_retry",
+        }
+    duration = min(_probe_duration(ffprobe, source), _probe_duration(ffprobe, result))
+    if duration <= 0.08:
+        return {
+            "passed": True,
+            "available": False,
+            "reason": "video duration is too short to audit",
+            "action": "no_retry",
+        }
+    maximum_correlation = float(spec.get("maximum_source_correlation", 0.88))
+    maximum_similarity = float(spec.get("maximum_source_similarity", 0.88))
+    maximum_mae = float(spec.get("maximum_source_mae", 0.055))
+    timestamps = [duration * ratio for ratio in (0.22, 0.50, 0.78)]
+    role_results: list[dict] = []
+    for bbox_index, bbox in enumerate(bboxes):
+        samples: list[dict[str, float]] = []
+        for timestamp in timestamps:
+            source_frame = _extract_identity_gray_frame(
+                ffmpeg, source, timestamp, bbox
+            )
+            result_frame = _extract_identity_gray_frame(
+                ffmpeg, result, timestamp, bbox
+            )
+            samples.append(identity_frame_metrics(source_frame, result_frame))
+        # Median sampling tolerates a blink, fast occlusion or a single cut.
+        medians = {
+            key: sorted(sample[key] for sample in samples)[len(samples) // 2]
+            for key in ("correlation", "similarity", "mae")
+        }
+        suspicious = bool(
+            medians["correlation"] >= maximum_correlation
+            and medians["similarity"] >= maximum_similarity
+            and medians["mae"] <= maximum_mae
+        )
+        role_results.append({
+            "bbox_index": bbox_index,
+            "bbox_normalized": [round(value, 6) for value in bbox],
+            **{key: round(value, 6) for key, value in medians.items()},
+            "source_identity_retained": suspicious,
+        })
+    erasure_rows: list[dict] = []
+    for bbox_index, raw_bbox in enumerate(raw_bboxes):
+        try:
+            full_bbox = [float(value) for value in raw_bbox][:4]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if len(full_bbox) != 4 or bbox_index >= len(role_results):
+            continue
+        samples: list[dict[str, float]] = []
+        for timestamp in timestamps:
+            source_frame = _extract_identity_gray_frame(
+                ffmpeg, source, timestamp, full_bbox
+            )
+            result_frame = _extract_identity_gray_frame(
+                ffmpeg, result, timestamp, full_bbox
+            )
+            samples.append(identity_frame_metrics(source_frame, result_frame))
+        medians = {
+            key: sorted(sample[key] for sample in samples)[len(samples) // 2]
+            for key in ("correlation", "similarity", "mae")
+        }
+        identity_similarity = float(role_results[bbox_index]["similarity"])
+        similarity_gap = medians["similarity"] - identity_similarity
+        incomplete = bool(
+            not role_results[bbox_index]["source_identity_retained"]
+            and medians["correlation"] >= float(
+                spec.get("minimum_erasure_correlation", 0.82) or 0.82
+            )
+            and medians["similarity"] >= float(
+                spec.get("minimum_erasure_similarity", 0.82) or 0.82
+            )
+            and medians["mae"] <= float(
+                spec.get("maximum_erasure_mae", 0.12) or 0.12
+            )
+            and similarity_gap >= float(
+                spec.get("minimum_erasure_identity_gap", 0.10) or 0.10
+            )
+        )
+        erasure_rows.append({
+            "bbox_index": bbox_index,
+            "bbox_normalized": [round(value, 6) for value in full_bbox],
+            **{key: round(value, 6) for key, value in medians.items()},
+            "identity_similarity_gap": round(similarity_gap, 6),
+            "incomplete_source_actor_erasure": incomplete,
+        })
+    identity_failed = any(row["source_identity_retained"] for row in role_results)
+    erasure_failed = any(
+        row["incomplete_source_actor_erasure"] for row in erasure_rows
+    )
+    retention_score = max(
+        (
+            (row["correlation"] + row["similarity"]) / 2.0
+            - row["mae"]
+        )
+        for row in role_results
+    )
+    performance_mode = str(spec.get("performance_mode") or "").strip().casefold()
+    silent_mouth_result: dict = {}
+    silent_mouth_failed = False
+    if performance_mode in {"silent_listener", "no_human_voice"}:
+        mouth_rows: list[dict] = []
+        mouth_timestamps = [duration * ratio for ratio in (0.12, 0.24, 0.36, 0.50, 0.64, 0.76, 0.88)]
+        for bbox_index, raw_bbox in enumerate(raw_bboxes):
+            mouth_bbox = _mouth_region_bbox(raw_bbox)
+            if not mouth_bbox:
+                continue
+            source_frames = [
+                _extract_identity_gray_frame(ffmpeg, source, timestamp, mouth_bbox, size=80)
+                for timestamp in mouth_timestamps
+            ]
+            result_frames = [
+                _extract_identity_gray_frame(ffmpeg, result, timestamp, mouth_bbox, size=80)
+                for timestamp in mouth_timestamps
+            ]
+            source_motion = temporal_frame_motion(source_frames)
+            result_motion = temporal_frame_motion(result_frames)
+            maximum_motion = max(
+                float(spec.get("maximum_silent_mouth_motion", 0.055) or 0.055),
+                source_motion * 1.5 + 0.012,
+            )
+            violated = result_motion > maximum_motion
+            mouth_rows.append({
+                "bbox_index": bbox_index,
+                "bbox_normalized": [round(value, 6) for value in mouth_bbox],
+                "source_motion": round(source_motion, 6),
+                "result_motion": round(result_motion, 6),
+                "maximum_motion": round(maximum_motion, 6),
+                "violated": violated,
+            })
+        silent_mouth_failed = any(row["violated"] for row in mouth_rows)
+        silent_mouth_result = {
+            "checked": bool(mouth_rows),
+            "passed": not silent_mouth_failed,
+            "rows": mouth_rows,
+        }
+    failed = identity_failed or erasure_failed or silent_mouth_failed
+    mouth_penalty = max(
+        (
+            max(0.0, row["result_motion"] - row["maximum_motion"])
+            for row in silent_mouth_result.get("rows") or []
+        ),
+        default=0.0,
+    )
+    erasure_penalty = max(
+        (
+            max(0.0, row["identity_similarity_gap"] - 0.10)
+            for row in erasure_rows
+            if row["incomplete_source_actor_erasure"]
+        ),
+        default=0.0,
+    )
+    quality_risk_score = retention_score + mouth_penalty * 4.0 + erasure_penalty * 2.0
+    if identity_failed and silent_mouth_failed:
+        reason = "selected region retains the V1 actor and the authored silent mouth is moving"
+    elif identity_failed:
+        reason = "selected region still matches the original V1 actor"
+    elif erasure_failed and silent_mouth_failed:
+        reason = "source actor remains behind the replacement and the authored silent mouth is moving"
+    elif erasure_failed:
+        reason = "source actor silhouette remains behind the replacement"
+    elif silent_mouth_failed:
+        reason = "authored Silent Listener mouth shows excessive articulation"
+    else:
+        reason = "selected identity changed and authored mouth state is stable"
+    return {
+        "passed": not failed,
+        "available": True,
+        "reason": reason,
+        "action": "retry_fresh_seed" if failed else "accept",
+        "retention_score": round(float(retention_score), 6),
+        "quality_risk_score": round(float(quality_risk_score), 6),
+        "roles": role_results,
+        "complete_actor_erasure_audit": {
+            "passed": not erasure_failed,
+            "rows": erasure_rows,
+        },
+        "silent_mouth_audit": silent_mouth_result,
+    }
+
+
 def _assembly_canvas(ffprobe: Path, paths: list[Path]) -> tuple[int, int] | None:
     """Choose a stable concat canvas from the dominant source geometry.
 
@@ -1116,6 +1466,40 @@ def _assembly_canvas(ffprobe: Path, paths: list[Path]) -> tuple[int, int] | None
         ),
     )
     return width + (width % 2), height + (height % 2)
+
+
+def canvas_for_megapixels(
+    geometry: tuple[int, int] | None,
+    megapixels: float,
+) -> tuple[int, int] | None:
+    """Fit a source canvas inside an exact megapixel budget without distortion."""
+
+    if geometry is None or megapixels <= 0.0:
+        return geometry
+    width, height = geometry
+    area_limit = max(4.0, float(megapixels) * 1_000_000.0)
+    if width * height <= area_limit:
+        return width + (width % 2), height + (height % 2)
+    scale = math.sqrt(area_limit / float(width * height))
+    fitted_width = max(2, int(math.floor(width * scale / 2.0)) * 2)
+    fitted_height = max(2, int(math.floor(height * scale / 2.0)) * 2)
+    while fitted_width * fitted_height > area_limit:
+        if fitted_width >= fitted_height and fitted_width > 2:
+            fitted_width -= 2
+        elif fitted_height > 2:
+            fitted_height -= 2
+        else:
+            break
+    return fitted_width, fitted_height
+
+
+def preview_canvas(job: dict, ffprobe: Path, paths: list[Path]) -> tuple[int, int] | None:
+    """Return the actual Studio Preview canvas (not the Relay inference size)."""
+
+    base = _assembly_canvas(ffprobe, paths)
+    if str(job.get("request_kind") or "").casefold() != "preview":
+        return base
+    return canvas_for_megapixels(base, float(job.get("megapixels", 0.0) or 0.0))
 
 
 def _decoded_audio_envelope(
@@ -1436,6 +1820,61 @@ def _run_assembly_command(
         raise RuntimeError(f"FFmpeg {context} returned no playable output file.")
 
 
+def materialize_preview_proxy(job: dict, segment: dict, source: Path) -> Path:
+    """Create the user-visible 0.2MP Segment Preview after Relay inference.
+
+    LabsH3PrepareVideo currently exposes only 0.5MP and 1.0MP inference modes.
+    Studio still honours its 0.2MP Preview contract by producing a real
+    aspect-preserving 0.2MP review file before it is archived or displayed.
+    """
+
+    if (
+        str(job.get("request_kind") or "").casefold() != "preview"
+        or float(job.get("megapixels", 0.0) or 0.0) > 0.25
+        or not source.is_file()
+    ):
+        return source.resolve()
+    ffmpeg = Path(job["ffmpeg"])
+    ffprobe = Path(job["ffprobe"])
+    geometry = _probe_video_geometry(ffprobe, source)
+    canvas = canvas_for_megapixels(
+        geometry, float(job.get("megapixels", 0.2) or 0.2)
+    )
+    if canvas is None:
+        return source.resolve()
+    width, height = canvas
+    segment_id = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", str(segment.get("segment_id") or "segment")
+    )
+    destination = Path(job["master_output"]).parent / (
+        f"{segment_id}.preview_{width}x{height}.mp4"
+    )
+    source_geometry = _probe_video_geometry(ffprobe, source)
+    if source_geometry == canvas and source.resolve() == destination.resolve():
+        return source.resolve()
+    command = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", (
+            f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2,"
+            f"pad=w={width}:h={height}:x=(ow-iw)/2:y=(oh-ih)/2:color=black,"
+            "setsar=1,fps=24,format=yuv420p"
+        ),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+        str(destination),
+    ]
+    _run_assembly_command(
+        command,
+        destination,
+        timeout=max(300, int(_probe_duration(ffprobe, source) * 15)),
+        context="0.2MP Segment Preview proxy",
+    )
+    return destination.resolve()
+
+
 def _assembly_core_duration(row: dict) -> float:
     trim_strategy = str(row.get("assembly_trim_strategy", "overlap"))
     trim = (
@@ -1476,10 +1915,13 @@ def assemble_master(job: dict, segments: list[dict]) -> Path:
     ffmpeg = Path(job["ffmpeg"])
     ffprobe = Path(job["ffprobe"])
     target_duration = float(job["target_duration_seconds"])
+    paths = [Path(str(row["output_path"])) for row in segments]
+    canvas = preview_canvas(job, ffprobe, paths)
     if len(segments) <= MAX_DIRECT_ASSEMBLY_SEGMENTS:
         emit({"progress": f"Assembling {len(segments)} segments into the master video…"})
         command = build_assembly_command(
-            ffmpeg, ffprobe, segments, destination, target_duration
+            ffmpeg, ffprobe, segments, destination, target_duration,
+            canvas_override=canvas,
         )
         _run_assembly_command(
             command, destination, timeout=1800, context="master assembly"
@@ -1490,8 +1932,8 @@ def assemble_master(job: dict, segments: list[dict]) -> Path:
     # every H3 Segment was already complete, leaving a zero-byte master and a
     # modal Application Error dialog. Normalize at most six inputs per batch,
     # then concatenate the compatible batches without re-encoding them again.
-    paths = [Path(str(row["output_path"])) for row in segments]
-    canvas = _assembly_canvas(ffprobe, paths)
+    # Preview is normalized to its real 0.2MP review canvas even when clean
+    # 1.0MP production Segments are reused during a dirty repair.
     staging = destination.parent / (
         f".{destination.stem}.assembly-{uuid.uuid4().hex[:10]}"
     )
@@ -1772,8 +2214,13 @@ def queue_segment(
         and resume_status in {"queued", "monitoring", "reconnecting", "running"}
     )
     first_attempt = max(1, int(segment.get("attempts_used", 1) or 1))
-    attempt_range = [first_attempt] if resume_existing else range(1, attempts + 1)
+    # A resumed Relay prompt may complete successfully but fail the post-pass
+    # identity audit. Keep the remaining attempt range available so that case
+    # can still receive a deterministic fresh seed without re-queuing the
+    # already accepted prompt.
+    attempt_range = range(first_attempt, attempts + 1)
     guarded_candidates: list[dict] = []
+    identity_candidates: list[dict] = []
     for attempt in attempt_range:
         prompt_id = resumed_prompt_id if resume_existing else ""
         progress_stop: threading.Event | None = None
@@ -1859,6 +2306,81 @@ def queue_segment(
             video = _primary_video(downloaded)
             if video is None:
                 raise RuntimeError(f"Segment {segment['index'] + 1} produced no downloadable video.")
+            identity_audit_result: dict = {}
+            best_identity: dict | None = None
+            identity_audit_spec = dict(
+                segment.get("character_swap_identity_audit") or {}
+            )
+            if identity_audit_spec.get("enabled"):
+                identity_audit_result = inspect_character_swap_identity(
+                    Path(str(job["ffmpeg"])),
+                    Path(str(job["ffprobe"])),
+                    Path(str(identity_audit_spec.get("source_video_path") or "")),
+                    video,
+                    identity_audit_spec,
+                )
+                if not bool(identity_audit_result.get("passed", True)):
+                    snapshot = Path(segment["download_dir"]) / (
+                        f".identity_audit_attempt_{attempt}_{Path(video).name}"
+                    )
+                    shutil.copy2(video, snapshot)
+                    identity_candidates.append({
+                        "attempt": attempt,
+                        "score": float(
+                            identity_audit_result.get(
+                                "quality_risk_score",
+                                identity_audit_result.get("retention_score", 1.0),
+                            )
+                        ),
+                        "snapshot": snapshot,
+                        "prompt_id": prompt_id,
+                        "history_status": history.get("status", {}),
+                        "result": deepcopy(identity_audit_result),
+                    })
+                    identity_attempts = max(
+                        1,
+                        min(
+                            attempts,
+                            int(identity_audit_spec.get("maximum_attempts", 3) or 3),
+                        ),
+                    )
+                    if attempt < identity_attempts:
+                        emit({
+                            "progress": (
+                                f"{progress_label or ('Segment ' + str(segment['index'] + 1))} · "
+                                f"{identity_audit_result.get('reason', 'Character Swap QC failed')}; "
+                                "retrying with a fresh seed · "
+                                f"attempt {attempt + 1}/{identity_attempts}"
+                            ),
+                            "segment_index": segment["index"],
+                            "character_swap_identity_audit": identity_audit_result,
+                            "attempt": attempt,
+                            "attempts": identity_attempts,
+                        })
+                        time.sleep(0.25)
+                        continue
+                    best_identity = min(
+                        identity_candidates,
+                        key=lambda row: (float(row["score"]), int(row["attempt"])),
+                    )
+                    shutil.copy2(best_identity["snapshot"], video)
+                    prompt_id = str(best_identity["prompt_id"])
+                    identity_audit_result = dict(best_identity["result"])
+                    history = {"status": dict(best_identity["history_status"])}
+                    emit({
+                        "progress": (
+                            f"{progress_label or ('Segment ' + str(segment['index'] + 1))} · "
+                            f"Character Swap QC retry budget exhausted; keeping lowest-risk take "
+                            f"{best_identity['attempt']} without stopping the Job"
+                        ),
+                        "segment_index": segment["index"],
+                        "selected_identity_attempt": int(best_identity["attempt"]),
+                        "character_swap_identity_audit": identity_audit_result,
+                    })
+                else:
+                    best_identity = None
+                for candidate in identity_candidates:
+                    Path(candidate["snapshot"]).unlink(missing_ok=True)
             speech_guard_result: dict = {}
             speech_guard_spec = dict(segment.get("native_speech_guard") or {})
             if speech_guard is not None and speech_guard_spec.get("enabled"):
@@ -1962,6 +2484,12 @@ def queue_segment(
                 ),
                 "failure_class": "",
                 "native_speech_guard_result": speech_guard_result,
+                "character_swap_identity_audit_result": identity_audit_result,
+                "selected_identity_attempt": (
+                    int(best_identity["attempt"])
+                    if identity_audit_result and best_identity is not None
+                    else attempt
+                ),
             }
         except Exception as exc:
             last_error = exc
@@ -2035,6 +2563,129 @@ def uploaded_media_for_workflow(workflow: dict, uploaded: list[dict]) -> list[di
     ]
 
 
+def _character_swap_composite_bbox(pass_row: dict) -> list[float]:
+    """Return one padded union box for an independently generated role pass."""
+
+    audit = pass_row.get("identity_audit") or {}
+    valid: list[list[float]] = []
+    raw_bboxes = (
+        pass_row.get("composite_bboxes_normalized")
+        or audit.get("source_bboxes_normalized")
+        or []
+    )
+    for raw_bbox in raw_bboxes:
+        try:
+            left, top, right, bottom = [float(value) for value in raw_bbox][:4]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if right - left < 0.02 or bottom - top < 0.02:
+            continue
+        valid.append([
+            max(0.0, left), max(0.0, top), min(1.0, right), min(1.0, bottom)
+        ])
+    if not valid:
+        return []
+    left = min(row[0] for row in valid)
+    top = min(row[1] for row in valid)
+    right = max(row[2] for row in valid)
+    bottom = max(row[3] for row in valid)
+    width, height = right - left, bottom - top
+    # Cover hair/clothing edges omitted by face-oriented detection without
+    # reaching far enough to consume a neighboring performer.
+    pad_x = min(0.025, width * 0.06)
+    pad_y = min(0.025, height * 0.04)
+    return [
+        max(0.0, left - pad_x),
+        max(0.0, top - pad_y),
+        min(1.0, right + pad_x),
+        min(1.0, bottom + pad_y),
+    ]
+
+
+def composite_independent_character_swap_roles(
+    job: dict,
+    segment: dict,
+    passes: list[dict],
+    pass_outputs: list[Path],
+) -> Path:
+    """Feather independent per-role Relay results onto one clean V1 plate.
+
+    Sequential multi-character Relay passes are destructive: a later role can
+    restore a previously swapped person. Each input here was generated from
+    the same source plate, and only its selected role rectangle is allowed into
+    the final frame. This makes two or more replacements coexist deterministically.
+    """
+
+    if len(passes) != len(pass_outputs) or len(passes) < 2:
+        raise ValueError("Multi-character composite requires one output per role pass.")
+    source = Path(str(
+        ((passes[0].get("identity_audit") or {}).get("source_video_path") or "")
+    ))
+    if not source.is_file() or not all(path.is_file() for path in pass_outputs):
+        raise FileNotFoundError("Multi-character composite is missing its V1 plate or role take.")
+    ffmpeg = Path(job["ffmpeg"])
+    ffprobe = Path(job["ffprobe"])
+    geometry = _probe_video_geometry(ffprobe, source)
+    if geometry is None:
+        raise RuntimeError("Could not read the V1 geometry for multi-character composite.")
+    width, height = geometry
+    width += width % 2
+    height += height % 2
+    duration = _probe_duration(ffprobe, source)
+    if duration <= 0.0:
+        raise RuntimeError("Could not read the V1 duration for multi-character composite.")
+    destination = Path(str(segment["download_dir"])) / "character_swap_multi_role_composite.mp4"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-i", str(source)
+    ]
+    for output in pass_outputs:
+        command.extend(["-i", str(output)])
+    filters = [
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "setsar=1,fps=24,format=rgba[base0]"
+    ]
+    current = "base0"
+    for index, (pass_row, _output) in enumerate(zip(passes, pass_outputs), start=1):
+        bbox = _character_swap_composite_bbox(pass_row)
+        if len(bbox) != 4:
+            raise ValueError(
+                "Multi-character composite needs a selected-person rectangle for every role."
+            )
+        left, top, right, bottom = bbox
+        x = max(0, min(width - 2, round(left * width)))
+        y = max(0, min(height - 2, round(top * height)))
+        box_width = max(2, min(width - x, round((right - left) * width)))
+        box_height = max(2, min(height - y, round((bottom - top) * height)))
+        feather = max(2.0, min(box_width, box_height) * 0.025)
+        filters.extend([
+            f"[{index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,fps=24,format=rgba[role{index}]",
+            f"color=c=black:s={width}x{height}:r=24:d={duration:.6f},format=gray,"
+            f"drawbox=x={x}:y={y}:w={box_width}:h={box_height}:color=white:t=fill,"
+            f"gblur=sigma={feather:.3f}[mask{index}]",
+            f"[role{index}][mask{index}]alphamerge[masked{index}]",
+            f"[{current}][masked{index}]overlay=0:0:eof_action=pass:shortest=0[base{index}]",
+        ])
+        current = f"base{index}"
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{current}]", "-map", "0:a:0?", "-t", f"{duration:.6f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(destination),
+    ])
+    _run_assembly_command(
+        command,
+        destination,
+        timeout=max(900, int(duration * 45)),
+        context="independent multi-character composite",
+    )
+    return destination.resolve()
+
+
 def queue_character_swap_passes(
     job: dict,
     segment: dict,
@@ -2094,6 +2745,11 @@ def queue_character_swap_passes(
         for path in (segment.get("character_swap_completed_pass_outputs") or [])
         if str(path).strip()
     ]
+    independent_role_mode = bool(
+        len(passes) > 1
+        and all(bool(row.get("independent_role_composite")) for row in passes)
+        and not any(bool(row.get("runtime_source")) for row in passes)
+    )
     previous_video: Path | None = None
     if resume_active and resume_pass_index > 0:
         if len(completed_pass_outputs) < resume_pass_index:
@@ -2108,6 +2764,7 @@ def queue_character_swap_passes(
                 f"output is missing: {previous_video}"
             )
     final_result: dict = {}
+    identity_audit_results: list[dict] = []
     shot_label = str(
         next(
             (value for value in segment.get("shot_ids") or [] if str(value).strip()),
@@ -2189,6 +2846,26 @@ def queue_character_swap_passes(
             "relay_status_prefix": status_prefix,
             "relay_window_count": relay_window_count,
             "relay_node_id": str(pass_row.get("relay_node_id") or ""),
+            "character_swap_identity_audit": {
+                **dict(pass_row.get("identity_audit") or {}),
+                # Later serial passes must compare against the immediately
+                # preceding rendered plate, not the original pre-pass V1.
+                "source_video_path": str(
+                    (
+                        previous_video
+                        if (
+                            pass_row.get("runtime_source")
+                            and previous_video is not None
+                            and previous_video.is_file()
+                        )
+                        else Path(str(
+                            (pass_row.get("identity_audit") or {}).get(
+                                "source_video_path", ""
+                            )
+                        ))
+                    ).resolve()
+                ),
+            },
         }
         if resume_active and pass_index == resume_pass_index:
             pass_segment.update(
@@ -2232,6 +2909,17 @@ def queue_character_swap_passes(
             completed_pass_outputs.append(str(previous_video.resolve()))
         else:
             completed_pass_outputs[pass_index] = str(previous_video.resolve())
+        identity_audit_results.append({
+            "pass_index": pass_index + 1,
+            "source_role_id": role,
+            "target_media_id": target,
+            "selected_attempt": int(
+                final_result.get("selected_identity_attempt", 1) or 1
+            ),
+            **dict(
+                final_result.get("character_swap_identity_audit_result") or {}
+            ),
+        })
         resume_active = False
         emit({
             "progress": (
@@ -2247,6 +2935,31 @@ def queue_character_swap_passes(
                 "window_count": relay_window_count,
             },
         })
+    if independent_role_mode:
+        role_outputs = [Path(path) for path in completed_pass_outputs[:len(passes)]]
+        emit({
+            "progress": (
+                f"Segment {shot_label} · feather-compositing {len(role_outputs)} "
+                "independent Character Swap roles onto one V1 frame"
+            ),
+            "segment_index": segment["index"],
+            "character_swap_composite": {
+                "mode": "independent_role_boxes",
+                "role_count": len(role_outputs),
+            },
+        })
+        previous_video = composite_independent_character_swap_roles(
+            job, segment, passes, role_outputs
+        )
+        final_result["output_path"] = str(previous_video)
+        final_result["character_swap_composite"] = {
+            "mode": "independent_role_boxes",
+            "role_count": len(role_outputs),
+            "source": str(
+                ((passes[0].get("identity_audit") or {}).get("source_video_path") or "")
+            ),
+            "role_outputs": [str(path.resolve()) for path in role_outputs],
+        }
     return {
         **persisted,
         "status": "complete",
@@ -2257,6 +2970,10 @@ def queue_character_swap_passes(
         "error": "",
         "attempts_used": int(final_result.get("attempts_used", 1) or 1),
         "failure_class": "",
+        "character_swap_identity_audits": identity_audit_results,
+        "character_swap_composite": dict(
+            final_result.get("character_swap_composite") or {}
+        ),
     }
 
 
@@ -2330,7 +3047,8 @@ def main() -> int:
     for index, segment in enumerate(segments):
         cached = Path(str(segment.get("output_path", "")))
         if segment.get("status") == "cached" and cached.is_file():
-            segment["output_path"] = str(cached.resolve())
+            cached = materialize_preview_proxy(job, segment, cached)
+            segment["output_path"] = str(cached)
             completed.append({key: value for key, value in segment.items() if key != "workflow"})
             completed_indexes.add(index)
             previous_video = cached.resolve()
@@ -2552,6 +3270,13 @@ def main() -> int:
                     f"confidence {correlation:.2f} · detection only"
                 ),
             })
+        preview_path = materialize_preview_proxy(
+            job, segment, Path(str(result.get("output_path") or ""))
+        )
+        if preview_path != Path(str(result.get("output_path") or "")):
+            result["relay_inference_output_path"] = str(result.get("output_path") or "")
+            result["output_path"] = str(preview_path)
+            result["preview_proxy_megapixels"] = float(job.get("megapixels", 0.2) or 0.2)
         completed.append(result)
         completed_indexes.add(index)
         previous_video = Path(result["output_path"])

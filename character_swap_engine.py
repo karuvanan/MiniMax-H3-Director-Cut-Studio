@@ -2,8 +2,8 @@
 
 The published LoRA/workflow replaces one selected source character per pass.
 Studio therefore compiles one deterministic pass per mapped V1 role that is
-actually visible in the current Shot.  Multiple roles are processed
-sequentially; the previous pass becomes the next pass's source video.
+actually visible in the current Shot. Multiple roles are generated independently
+from the clean V1 plate and composited by their tracked person regions.
 """
 
 from __future__ import annotations
@@ -56,13 +56,11 @@ def character_swap_relay_window_count(duration_seconds: float) -> int:
 
 
 def automatic_remake_engine_for_skill(special_skill_key: object) -> str:
-    """Select the only valid Remake Engine for the active Special Skill.
+    """Return the recommended Remake Engine for the active Special Skill.
 
-    Character Swap Relay is intentionally exclusive to Source Video Cast
-    Remake H3 because that Skill supplies the V1 role ledger, exact source
-    Shot plate and synchronized source-audio contract. Every other selection,
-    including no Special Skill, stays on Studio's ordinary Create H3 Remake
-    compiler.
+    The Studio uses this when a Skill is selected or an old Project has no saved
+    engine choice. v0.3.8 keeps this recommendation but allows the user to
+    override it from the toolbar.
     """
 
     normalized = str(special_skill_key or "").strip().casefold()
@@ -304,11 +302,16 @@ def character_swap_passes_for_window(
             list(track_samples[0]["bbox_normalized"])
             if track_samples else ([] if sole_visible_role else scene_bbox)
         )
+        identity_audit_bbox = (
+            list(track_samples[0]["bbox_normalized"])
+            if track_samples else list(scene_bbox)
+        )
         if role in bbox_overrides:
             # Shot Visual Editor owns the explicit manual rectangle. Remove
             # older Qwen anchors from the prompt so they cannot compete with
             # the box the user deliberately placed on this Shot.
             source_bbox = list(bbox_overrides[role])
+            identity_audit_bbox = list(bbox_overrides[role])
             track_samples = []
         edge_truncated = bool(rejected_full_frame_track)
         for bbox in [source_bbox, *[
@@ -332,6 +335,7 @@ def character_swap_passes_for_window(
                 str(evidence.get("narrative_function", "") or "").split()
             ),
             "source_bbox_normalized": source_bbox,
+            "identity_audit_bbox_normalized": identity_audit_bbox,
             "source_track_samples": track_samples,
             "source_is_sole_visible_person": sole_visible_role,
             "source_edge_truncated": edge_truncated,
@@ -367,6 +371,7 @@ def character_swap_passes_for_window(
             for key in (
                 "source_role_id", "source_visual_identity", "source_wardrobe",
                 "source_narrative_function", "source_bbox_normalized",
+                "identity_audit_bbox_normalized",
                 "source_track_samples", "source_is_sole_visible_person",
                 "source_edge_truncated",
             )
@@ -478,6 +483,13 @@ def build_character_swap_prompt(
         for value in pass_spec.get("source_events") or []
         if str(value).strip()
     ]
+    performance_mode = str(
+        pass_spec.get("performance_mode", "") or ""
+    ).strip().casefold()
+    mouth_behavior = " ".join(
+        str(pass_spec.get("mouth_behavior", "") or "").split()
+    )
+    silent_performance = performance_mode in {"silent_listener", "no_human_voice"}
 
     selectors: list[str] = []
     for source_role in source_roles:
@@ -532,7 +544,10 @@ def build_character_swap_prompt(
         ) if part)
         selectors.append(f"{source_role_id}: {description}" if description else source_role_id)
     selector = "; ".join(selectors) or f"the source performer tracked as {role}"
-    event_selector = " ".join(events[:2])
+    # Qwen's original V1 event may say that this actor is speaking. A later
+    # Shot Visual Editor override is authoritative, so never leak that stale
+    # evidence back into a Silent Listener Relay prompt.
+    event_selector = "" if silent_performance else " ".join(events[:2])
     directed = " ".join(str(directed_scene_text or "").split())
     protected_rows = [
         row for row in pass_spec.get("protected_source_roles") or []
@@ -602,6 +617,43 @@ This pass may modify only the selected source performer(s) named above. Every ot
     if event_selector:
         target_clause += " Target-performance evidence: " + event_selector
 
+    if silent_performance:
+        speech_contract = (
+            "\n\nSILENT LISTENER PERFORMANCE — AUTHORITATIVE: The selected replacement "
+            "performer is not the audible speaker in this Shot. Keep the lips naturally "
+            "together and the jaw still; allow only blinking, breathing, gaze and silent "
+            "listening reactions. Never copy, infer or animate mouth articulation from "
+            "Video 1 audio or from another on-screen/off-screen voice. Picture 1 supplies "
+            "identity but never supplies an open-mouth pose, smile, visible teeth, tongue "
+            "or speaking expression. Even if Picture 1 is smiling or has an open mouth, "
+            "reconstruct that same identity with relaxed closed lips for the whole Shot."
+        )
+        if mouth_behavior:
+            speech_contract += " Authored mouth direction: " + mouth_behavior
+        source_performance_contract = (
+            "<Video 1> supplies the selected performer's position, scale, body pose, "
+            "gestures, head turns, gaze, blinking, expression outside the mouth, and "
+            "complete action clock. It must not supply mouth articulation or speaking "
+            "ownership for the selected performer."
+        )
+        retention_performance = (
+            "preserve composition, camera, body motion, silent facial reaction, action "
+            "timing, duration and soundtrack; replace only the selected identity and keep "
+            "the selected mouth silent"
+        )
+    else:
+        speech_contract = ""
+        source_performance_contract = (
+            "<Video 1> supplies the selected performer's position, scale, body pose, "
+            "gestures, head turns, gaze, blinking, expression, visible mouth timing and "
+            "complete action clock. It does not supply the selected performer's identity "
+            "after replacement."
+        )
+        retention_performance = (
+            "preserve composition, camera, motion, expressions, mouth timing, action "
+            "timing, duration and soundtrack; replace only the selected identity"
+        )
+
     medium_contract = ""
     if live_action_adaptation:
         medium_contract = """
@@ -615,12 +667,16 @@ ILLUSTRATED-CAST TO LIVE-ACTION CONTRACT:
 IN-PLACE REPLACEMENT — MANDATORY:
 This is an identity transformation of the already-visible source performer, not an insertion, compositing or cast-addition request. Transform that performer's original pixels at the original screen coordinates. Never add Picture 1 as a second person elsewhere in the frame, never leave the original actor beside the replacement, and never move the replacement toward the centre or an empty side of the image. If the source performer is partially outside the frame, preserve the exact frame-edge truncation: replace only the visible face/body portion and keep the missing portion outside the image. Do not complete the cropped body, zoom out, reframe or create an extra full-body figure.
 
+COMPLETE SOURCE-ACTOR ERASURE — MANDATORY:
+Replace the selected performer's whole tracked visible silhouette, never a face sticker or a new figure layered in front. Remove every original target pixel—hair, face, neck, shoulders, collar, wardrobe, torso and visible limbs—and rebuild Subject 1 at matching scale, pose, perspective and crop. Leave no original hair edge, collar, robe, skin patch, duplicate body, ghost or second silhouette behind. Reconstruct clean Video 1 background where exposed. The selected box must contain exactly one coherent Subject 1 head and body.
+
 subject_definitions:
 <Subject 1> is the replacement character. Its identity comes exclusively from the person visible in <Picture 1>: facial structure, apparent age, skin tone, hairstyle, body identity, clothing, colours and distinctive character design. <Picture 1> supplies identity only. Discard every reference-image pixel outside that character. Never import Picture 1's room, background, lighting, camera, crop, pose, expression or props.
 <Subject 2> is the source world from <Video 1>: background, architecture, lighting, objects, framing, camera movement and every non-target person. Preserve it from the source video.
-<Video 1> supplies the selected performer's position, scale, body pose, gestures, head turns, gaze, blinking, expression, visible mouth timing and complete action clock. It does not supply the selected performer's identity after replacement.
+{source_performance_contract}
 {medium_contract}
 {protected_contract}
+{speech_contract}
 
 summary:
 [video editing + reference character replacement] Replace the selected source identity with <Subject 1>. Preserve <Subject 2> and the exact source performance. The final face must be recognisably the Picture 1 character, never the original Video 1 actor. The final environment must remain the Video 1 environment, never the Picture 1 background.
@@ -628,7 +684,7 @@ summary:
 retention_analysis:
 <Subject 1> (throughout [Shot 1]): fully_preserved identity from Picture 1.
 <Subject 2> (throughout [Shot 1]): fully_preserved source scene from Video 1.
-<Video 1>: preserve composition, camera, motion, expressions, mouth timing, action timing, duration and soundtrack; replace only the selected identity.
+<Video 1>: {retention_performance}.
 
 [Shot 1]
 Begin with the same composition and viewpoint as <Video 1>. Put <Subject 1> exactly where the selected source performer stands and transfer the performance moment by moment. Maintain Picture 1 facial identity through every expression, occlusion and viewing angle. Adapt only Subject 1's illumination and perspective so the replacement belongs naturally in the Video 1 scene. Preserve interactions and foreground/background occlusion order. Do not replace, blend, merge, duplicate or restyle any non-target person. Do not show Picture 1 itself or any part of its background.
@@ -649,6 +705,10 @@ Retain Video 1's existing music, if present; add no new music."""
             "exactly, preserve its character identity and signature design only; the visible "
             "rendering medium must remain physically realistic live-action cinema."
         )
+    if silent_performance:
+        # Keep this last so an authored directed-scene note cannot accidentally
+        # re-enable an obsolete Qwen speaker/mouth instruction.
+        prompt += speech_contract
     return prompt
 
 

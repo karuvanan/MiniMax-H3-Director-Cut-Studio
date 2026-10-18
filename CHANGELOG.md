@@ -2,6 +2,27 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.8-alpha.1] - 2026-10-19
+
+### Free Remake Engine Selection
+
+- 顶部`Remake Engine`解除只读锁定，用户可以自由选择`Create H3 Remake`、`LoRA Preserve V1`及`LoRA + Reshape Environment`。
+- Special Skill仍会提供安全的推荐默认值：`Source Video Cast Remake H3`推荐`LoRA Preserve V1`，其他Skill推荐`Create H3 Remake`；推荐不再是强制路由，选择Skill后仍可手动覆盖。
+- 手动Remake Engine选择写入Project、Design Undo/Redo状态及生成fingerprint；重新打开Project、恢复Design或开始Compile时不会再被Skill静默改回。
+- Character Swap Relay的实际编译依据当前选择，而不是重新从Skill推导。选择任一LoRA模式都会建立24fps V1 Relay Shot；选择`Create H3 Remake`则走标准H3重制流程。
+
+### Design Reshape Environment
+
+- `RESHAPE ENVIRONMENT / BACKGROUND · KEEP MAPPED CHARACTERS`由禁用说明改为可勾选控制。
+- 勾选后，Qwen Design会保留映射P角色、V1动作／表演／时间及同步声音，但根据当前Design Requirement重新设计场景、灯光、背景与环境关系。
+- 当前引擎为`LoRA Preserve V1`时，勾选会在Apply后自动切换为`LoRA + Reshape Environment`；取消勾选会安全返回`LoRA Preserve V1`。`Create H3 Remake`保持完整二创路径。
+- 同画面多替换角色继续采用独立干净V1 Pass及人物框羽化合成，避免后一个角色Pass还原前一个角色；旧双角色缓存会按Render Policy 41自动重生相关Shot。
+
+### Verification
+
+- Remake Engine三模式切换、Skill推荐、Design环境勾选、Project持久化、Character Swap及Smart Render回归测试通过。
+- App版本升级至`0.3.8-alpha.1`；Project Format保持`29`，Render Policy为`41`。
+
 ## [0.3.7-alpha.20] - 2026-10-18
 
 ### KEEP V1 and Character Swap Pass Control
@@ -11,11 +32,14 @@ Every user-visible correction receives an application version and a dated entry 
 - 相同P Picture的多个目标角色继续合并为一个Pass；不同P Picture维持模型所需的串行Pass；所有`KEEP V1／无需替换`角色均跳过。
 - Character Swap进度明确显示`Segment · Role · Pass · Window`，区分一次Job内部的Relay window，避免把同一Pass的窗口误认成重复生成。
 - Shot角色窗口保存后，再点击Shot Visual Editor的`SAVE SHOT`，`REGENERATE DIRTY`及`RUN + QUEUE`都会从最新Shot状态重新编译P Picture、SWAP选择、手动人物框及KEEP设置；只有受影响的Dirty Segment重生。
-- App版本升级至`0.3.7-alpha.20`；Project Format保持`28`，Render Policy保持`38`，旧Project无需迁移。
+- 修复Shot Visual Editor保存`Silent listener`后，Source Video Cast Remake自动对嘴路由立即按照旧Qwen speaker ledger恢复成`On-screen speaker`／默认值的问题。
+- 新增持久化的Shot人工发声控制所有权：只要用户修改并保存发声状态、嘴形、声音位置、Lip Sync开关、目标角色或时间声源，重新打开Project、`REGENERATE DIRTY`、`RUN + QUEUE`及生成前标准化都必须保留该决定；未手动编辑的Shot仍继续自动路由。
+- Timeline Ask Qwen若修改同一组发声字段，也会自动建立人工覆盖，避免生成时被旧分析覆盖。
+- App版本保持`0.3.7-alpha.20`；Project Format升级至`29`，Render Policy保持`38`。旧Project缺少新标记时安全默认为自动路由，不需手工迁移。
 
 ### Verification
 
-- Shot Visual Editor自动关闭／手动恢复SWAP交互测试、10项Character Swap Engine测试及Python编译通过。
+- Shot Visual Editor自动关闭／手动恢复SWAP交互测试、Silent listener保存／序列化／重开／自动路由保护测试、10项Character Swap Engine测试及Python编译通过。
 
 ## [0.3.7-alpha.19] - 2026-10-18
 

@@ -7,15 +7,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from smart_render_worker import (
+    _character_swap_composite_bbox,
     _mix_complete_location_reference,
     best_envelope_offset,
     _patch_continuity,
     build_native_ambience_workflow,
     build_render_progress,
     build_assembly_command,
+    canvas_for_megapixels,
     assemble_master,
     classify_generation_error,
     extract_tail_frames,
+    identity_frame_metrics,
     main,
     patch_complete_location_reference,
     prefer_server_character_swap_lora,
@@ -23,11 +26,40 @@ from smart_render_worker import (
     queue_character_swap_passes,
     queue_segment,
     speech_guard_result_score,
+    temporal_frame_motion,
 )
 from runtime_paths import PROJECT_ROOT, load_runtime_paths
 
 
 class SmartRenderWorkerTests(unittest.TestCase):
+    def test_preview_canvas_is_a_real_aspect_preserving_point_two_megapixels(self):
+        canvas = canvas_for_megapixels((832, 1184), 0.2)
+        self.assertIsNotNone(canvas)
+        width, height = canvas
+        self.assertLessEqual(width * height, 200_000)
+        self.assertEqual(width % 2, 0)
+        self.assertEqual(height % 2, 0)
+        self.assertAlmostEqual(width / height, 832 / 1184, delta=0.01)
+
+    def test_temporal_motion_detects_articulation_but_accepts_still_mouth(self):
+        closed = bytes([80]) * 64
+        speaking = bytes([220]) * 64
+        self.assertEqual(temporal_frame_motion([closed, closed, closed]), 0.0)
+        self.assertGreater(
+            temporal_frame_motion([closed, speaking, closed, speaking]), 0.4
+        )
+
+    def test_identity_metrics_separate_noop_from_material_replacement(self):
+        source = bytes(range(256)) * 36
+        unchanged = identity_frame_metrics(source, source)
+        changed = identity_frame_metrics(source, bytes(reversed(source)))
+
+        self.assertGreater(unchanged["correlation"], 0.99)
+        self.assertGreater(unchanged["similarity"], 0.99)
+        self.assertLess(unchanged["mae"], 0.001)
+        self.assertLess(changed["correlation"], 0.0)
+        self.assertGreater(changed["mae"], 0.2)
+
     def test_character_swap_prefers_server_v15_and_preserves_turbo_lora(self):
         job = {
             "segments": [{
@@ -74,6 +106,87 @@ class SmartRenderWorkerTests(unittest.TestCase):
 
     def test_character_swap_runs_visible_roles_as_sequential_source_passes(self):
         root = PROJECT_ROOT / ".director_cache" / "character_swap_pass_test"
+        shutil.rmtree(root, ignore_errors=True)
+
+    def test_character_swap_composite_bbox_prefers_full_track_samples(self):
+        bbox = _character_swap_composite_bbox({
+            "composite_bboxes_normalized": [
+                [0.10, 0.20, 0.30, 0.80],
+                [0.15, 0.18, 0.36, 0.82],
+            ],
+            "identity_audit": {
+                "source_bboxes_normalized": [[0.60, 0.10, 0.90, 0.90]],
+            },
+        })
+        self.assertLess(bbox[0], 0.10)
+        self.assertLess(bbox[1], 0.18)
+        self.assertGreater(bbox[2], 0.36)
+        self.assertGreater(bbox[3], 0.82)
+        self.assertLess(bbox[2], 0.45)
+
+    def test_independent_character_swap_passes_use_clean_v1_and_are_composited(self):
+        root = PROJECT_ROOT / ".director_cache" / "character_swap_composite_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "v1.mp4"
+        first = root / "pass1.mp4"
+        second = root / "pass2.mp4"
+        composite = root / "composite.mp4"
+        for path, content in (
+            (source, b"source"), (first, b"first"), (second, b"second"),
+            (composite, b"composite"),
+        ):
+            path.write_bytes(content)
+        workflows = []
+
+        def fake_queue(_job, _segment, workflow, _uploaded, **_kwargs):
+            workflows.append(workflow)
+            output = first if len(workflows) == 1 else second
+            return {"output_path": str(output), "prompt_id": f"p{len(workflows)}"}
+
+        segment = {
+            "segment_id": "S1",
+            "index": 0,
+            "seed": 10,
+            "download_dir": str(root),
+            "character_swap_passes": [
+                {
+                    "source_role_id": "R1", "target_media_id": "P1", "seed": 11,
+                    "runtime_source": False, "independent_role_composite": True,
+                    "identity_audit": {"source_video_path": str(source)},
+                    "workflow": {"30": {"class_type": "LoadVideo", "inputs": {"file": "v1.mp4"}}},
+                },
+                {
+                    "source_role_id": "R2", "target_media_id": "P2", "seed": 12,
+                    "runtime_source": False, "independent_role_composite": True,
+                    "identity_audit": {"source_video_path": str(source)},
+                    "workflow": {"30": {"class_type": "LoadVideo", "inputs": {"file": "v1.mp4"}}},
+                },
+            ],
+            "shot_ids": ["S1"],
+        }
+        with (
+            patch("smart_render_worker.queue_segment", side_effect=fake_queue),
+            patch(
+                "smart_render_worker.composite_independent_character_swap_roles",
+                return_value=composite.resolve(),
+            ) as composite_roles,
+            patch("smart_render_worker.upload_file") as runtime_upload,
+            patch("smart_render_worker.emit"),
+        ):
+            result = queue_character_swap_passes(
+                {"server": "http://127.0.0.1:8188", "http_timeout": 1},
+                segment,
+                [],
+            )
+        self.assertEqual(len(workflows), 2)
+        runtime_upload.assert_not_called()
+        composite_roles.assert_called_once()
+        self.assertEqual(result["output_path"], str(composite.resolve()))
+        self.assertEqual(
+            result["character_swap_composite"]["mode"],
+            "independent_role_boxes",
+        )
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
         first = root / "pass1.mp4"
@@ -412,6 +525,88 @@ class SmartRenderWorkerTests(unittest.TestCase):
         )
         video.unlink(missing_ok=True)
         root.rmdir()
+
+    def test_character_swap_identity_failure_retries_with_fresh_seed(self):
+        root = PROJECT_ROOT / ".director_cache" / "identity_retry_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        video = root / "segment.mp4"
+        source = root / "source.mp4"
+        source.write_bytes(b"source")
+        job = {
+            "server": "http://127.0.0.1:8188",
+            "http_timeout": 1,
+            "segment_attempts": 3,
+            "segment_count": 1,
+            "history_poll_interval": 0.1,
+            "generation_timeout": 10,
+            "ffmpeg": "ffmpeg",
+            "ffprobe": "ffprobe",
+        }
+        segment = {
+            "segment_id": "seg-identity",
+            "index": 0,
+            "seed": 456,
+            "download_dir": str(root),
+            "character_swap_identity_audit": {
+                "enabled": True,
+                "source_video_path": str(source),
+                "source_bboxes_normalized": [[0.1, 0.1, 0.8, 0.9]],
+                "maximum_attempts": 3,
+            },
+        }
+        workflows = []
+        audit_results = [
+            {
+                "passed": False,
+                "available": True,
+                "retention_score": 0.93,
+                "action": "retry_fresh_seed",
+            },
+            {
+                "passed": True,
+                "available": True,
+                "retention_score": 0.31,
+                "action": "accept",
+            },
+        ]
+
+        def queue(request, _timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            workflows.append(payload["prompt"])
+            return {"prompt_id": f"identity-{len(workflows)}"}
+
+        def download(*_args, **_kwargs):
+            video.write_bytes(f"attempt-{len(workflows)}".encode("ascii"))
+            return [{"kind": "videos", "local_path": str(video)}]
+
+        with (
+            patch("smart_render_worker._request_json", side_effect=queue),
+            patch("smart_render_worker.wait_for_history", return_value=({}, {})),
+            patch("smart_render_worker.download_outputs", side_effect=download),
+            patch(
+                "smart_render_worker.inspect_character_swap_identity",
+                side_effect=audit_results,
+            ) as inspect_identity,
+            patch("smart_render_worker.time.sleep"),
+            patch("smart_render_worker.emit"),
+        ):
+            result = queue_segment(
+                job,
+                segment,
+                {"1": {"inputs": {"seed": 456}}},
+                [],
+            )
+
+        self.assertEqual(inspect_identity.call_count, 2)
+        self.assertEqual(result["attempts_used"], 2)
+        self.assertTrue(result["character_swap_identity_audit_result"]["passed"])
+        self.assertNotEqual(
+            workflows[0]["1"]["inputs"]["seed"],
+            workflows[1]["1"]["inputs"]["seed"],
+        )
+        self.assertEqual(video.read_bytes(), b"attempt-2")
+        shutil.rmtree(root, ignore_errors=True)
 
     def test_retry_exhaustion_keeps_lowest_risk_guarded_take(self):
         root = PROJECT_ROOT / ".director_cache" / "smart_render_best_speech_take_test"
