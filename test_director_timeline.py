@@ -17,12 +17,13 @@ from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QDialog, QGraphicsView, QListView,
-    QLabel, QMessageBox, QPushButton, QToolButton, QWidget,
+    QComboBox, QLabel, QMessageBox, QPushButton, QToolButton, QWidget,
 )
 
 from PIL import Image
 
 from character_swap_engine import (
+    KEEP_V1_TARGET,
     SOURCE_REMAKE_MODE_CHARACTER_SWAP,
     SOURCE_REMAKE_MODE_CREATIVE_H3,
 )
@@ -217,6 +218,37 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertAlmostEqual(edits[0][1][0], 0.39, delta=0.02)
         self.assertAlmostEqual(edits[0][1][2], 0.61, delta=0.02)
         self.assertEqual(picker._roles["R8"]["position_source"], "manual_shot_override")
+        picker.close()
+
+    def test_v1_person_picker_focus_is_translucent_and_above_overlapping_roles(self):
+        pixmap = QPixmap(200, 100)
+        pixmap.fill(Qt.red)
+        picker = V1PersonPickerWidget(
+            pixmap,
+            {
+                "R1": {"bbox_normalized": [0.1, 0.1, 0.9, 0.9]},
+                "R2": {"bbox_normalized": [0.1, 0.1, 0.9, 0.9]},
+            },
+        )
+        picker.resize(520, 270)
+        picker.set_selected_roles({"R1", "R2"})
+        picker.set_focused_role("R1")
+        picker.show()
+        self.app.processEvents()
+
+        self.assertEqual(picker._focused_role, "R1")
+        self.assertEqual(
+            picker._role_for_press(["R1", "R2"]),
+            "R1",
+        )
+        rendered = QImage(picker.size(), QImage.Format_ARGB32)
+        rendered.fill(Qt.transparent)
+        picker.render(rendered)
+        # A point inside both role boxes but away from labels and handles must
+        # still reveal the red V1 frame through the translucent fills.
+        colour = rendered.pixelColor(200, 100)
+        self.assertGreater(colour.red(), 100)
+        self.assertLess(colour.green(), 100)
         picker.close()
 
     def test_director_cue_preserves_manual_source_role_boxes(self):
@@ -546,6 +578,17 @@ class DirectorTimelineDragTests(unittest.TestCase):
             role_two_swap = identity_dialog.findChild(
                 QWidget, "shotRoleSwap_R2"
             )
+            role_two_target = identity_dialog.findChild(
+                QComboBox, "shotRoleTarget_R2"
+            )
+            self.assertIsNotNone(role_two_target)
+            keep_index = role_two_target.findData(KEEP_V1_TARGET)
+            self.assertGreaterEqual(keep_index, 0)
+            role_two_target.setCurrentIndex(keep_index)
+            self.assertFalse(role_two_swap.isChecked())
+            role_two_swap.setChecked(True)
+            self.assertTrue(role_two_swap.isChecked())
+            self.assertEqual(role_two_target.currentData(), "P1")
             role_one_swap.setChecked(False)
             role_two_swap.setChecked(False)
             QTest.mouseClick(role_two, Qt.LeftButton)
@@ -614,7 +657,10 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.analysis_paths[v1.node_id] = [
             ("source scene 01 0.00-5.00s midpoint", v1_frame)
         ]
-        cue = DirectorCue("S1", "shot", 0.0, 5.0, "two people")
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 5.0, "two people",
+            source_role_swap_selection=["R1"],
+        )
         window.director_cues = [cue]
         editor = ShotVisualEditorDialog(cue, 5.0, window)
         calls = []
@@ -630,6 +676,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
                 QWidget, "shotIdentityCurrentRole"
             )
             self.assertEqual(len(current_rows), 2)
+            self.assertTrue(
+                identity_dialog.findChild(QWidget, "shotRoleSwap_R2").isChecked()
+            )
             return QDialog.Accepted
 
         def immediate_qwen_scan(item, callback):
@@ -649,6 +698,9 @@ class DirectorTimelineDragTests(unittest.TestCase):
         self.assertTrue(detected["detected_unbound"])
         self.assertEqual(detected["detected_scene_index"], 1)
         self.assertEqual(detected["target_reference"], "P1")
+        # R2 was appended to the old explicit R1 subset.  Both visible roles
+        # are now enabled, which is serialized as the legacy/all-roles form.
+        self.assertEqual(editor.state()["source_role_swap_selection"], [])
         editor.close()
         editor.deleteLater()
         window.project_dirty = False
@@ -1172,6 +1224,84 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_save_shot_local_binding_overrides_old_design_ledger_for_generation(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [{"role_id": "R1", "scene_indexes": [1]}],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1"],
+            }],
+        })
+        window.source_video_role_bindings = [{
+            "source_role_id": "R1",
+            "target_media_id": "P1",
+            "scene_indexes": [1],
+        }]
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "replace known role")
+        window.director_cues = [cue]
+
+        class AcceptedKnownRoleEditor:
+            pending_qwen_request = None
+            pending_navigation_cue_id = ""
+
+            def __init__(self, item, _duration, _parent):
+                self.item = item
+
+            def exec(self):
+                return QDialog.Accepted
+
+            def deleteLater(self):
+                return None
+
+            def state(self):
+                state = asdict(self.item)
+                state["source_role_bbox_overrides"] = {
+                    "R1": [0.08, 0.1, 0.44, 0.96]
+                }
+                state["source_role_swap_selection"] = ["R1"]
+                return state
+
+            def repair_scope(self):
+                return "shot_only"
+
+            def identity_changes(self):
+                return [{
+                    "source_reference": "P1",
+                    "target_reference": "P2",
+                    "scope": "shot_only",
+                    "target_direction": "",
+                    "source_role_id": "R1",
+                }]
+
+        with patch(
+            "director_cut_studio.ShotVisualEditorDialog",
+            AcceptedKnownRoleEditor,
+        ):
+            window.edit_director_cue(cue)
+
+        self.assertEqual(cue.source_role_identity_overrides, {"R1": "P2"})
+        self.assertEqual(
+            window.source_video_role_bindings[0]["target_media_id"], "P1"
+        )
+        passes = window._source_remake_character_pass_specs(0.0, 5.0)
+        self.assertEqual(passes[0]["target_media_id"], "P2")
+        self.assertEqual(
+            passes[0]["source_roles"][0]["source_bbox_normalized"],
+            [0.08, 0.1, 0.44, 0.96],
+        )
+        window.project_dirty = False
+        window.close()
+
     def test_source_role_override_is_local_to_the_owning_shot(self):
         window = DirectorCutStudio()
         index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
@@ -1227,6 +1357,55 @@ class DirectorTimelineDragTests(unittest.TestCase):
             reloaded.source_role_bbox_overrides,
             {"R1": [0.05, 0.15, 0.4, 0.9]},
         )
+        window.project_dirty = False
+        window.close()
+
+    def test_detected_shot_role_overlays_stale_design_ledger_for_regenerate(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        window.source_remake_render_mode = SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        # Design knew only R1.  R9 was found later by Detect V1 People in this
+        # Shot and therefore exists only in the Shot-local replacement state.
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [{"role_id": "R1", "scene_indexes": [1]}],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1"],
+            }],
+        })
+        window.source_video_role_bindings = [{
+            "source_role_id": "R1",
+            "target_media_id": "P1",
+            "scene_indexes": [1],
+        }]
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 5.0, "newly detected performer",
+            source_role_identity_overrides={"R9": "P2"},
+            source_role_bbox_overrides={"R9": [0.58, 0.08, 0.92, 0.96]},
+            source_role_swap_selection=["R9"],
+        )
+        window.director_cues = [cue]
+
+        passes = window._source_remake_character_pass_specs(0.0, 5.0)
+
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0]["source_role_ids"], ["R9"])
+        self.assertEqual(passes[0]["target_media_id"], "P2")
+        self.assertEqual(
+            passes[0]["source_roles"][0]["source_bbox_normalized"],
+            [0.58, 0.08, 0.92, 0.96],
+        )
+        # The overlay must remain generation-local: Design data and adjacent
+        # Shots are not polluted by this repair.
+        persisted = parse_source_video_analysis(v1.semantic_enrichment)
+        self.assertEqual(persisted["scenes"][0]["active_source_roles"], ["R1"])
         window.project_dirty = False
         window.close()
 
@@ -1799,11 +1978,11 @@ class DirectorTimelineDragTests(unittest.TestCase):
         r1_combo = dialog.source_role_binding_combos["R1"][0]
         r1_later_combo = dialog.source_role_binding_combos["R1"][1]
         r2_combo = dialog.source_role_binding_combos["R2"][0]
-        v1_default_index = r1_combo.findData("__SOURCE_V1_FACE__")
+        v1_default_index = r1_combo.findData("__KEEP_V1__")
         self.assertGreaterEqual(v1_default_index, 0)
         self.assertEqual(
             r1_combo.itemText(v1_default_index),
-            "V1 DEFAULT · Keep source actor",
+            "KEEP V1 · No Character Swap",
         )
         self.assertEqual(r1_combo.currentData(), r1_later_combo.currentData())
         r1_combo.setCurrentIndex(
@@ -1834,32 +2013,17 @@ class DirectorTimelineDragTests(unittest.TestCase):
             ["P1", "P1", "P1"],
         )
         self.assertTrue(dialog._validate_source_role_bindings())
-        face = PROJECT_ROOT / ".director_cache" / "source_role_face_ui_test.png"
-        Image.new("RGB", (64, 64), (40, 80, 120)).save(face)
-        try:
-            with (
-                patch.object(dialog, "_representative_source_role_frame", return_value=face),
-                patch.object(
-                    window, "ensure_source_video_role_thumbnail_asset", return_value="P3"
-                ),
-            ):
-                r1_combo.setCurrentIndex(
-                    r1_combo.findData(
-                        "__SOURCE_V1_FACE__"
-                    )
-                )
-            r1 = next(
-                row for row in window.source_video_role_bindings
-                if row["source_role_id"] == "R1"
-            )
-            self.assertEqual(r1["target_media_id"], "P3")
-            self.assertTrue(r1["source_thumbnail"])
-            self.assertEqual(
-                [combo.currentData() for combo in dialog.source_role_binding_combos["R1"]],
-                ["__SOURCE_V1_FACE__", "P1"],
-            )
-        finally:
-            face.unlink(missing_ok=True)
+        r1_combo.setCurrentIndex(r1_combo.findData("__KEEP_V1__"))
+        r1 = next(
+            row for row in window.source_video_role_bindings
+            if row["source_role_id"] == "R1"
+        )
+        self.assertEqual(r1["target_media_id"], "KEEP_V1")
+        self.assertTrue(r1["source_thumbnail"])
+        self.assertEqual(
+            [combo.currentData() for combo in dialog.source_role_binding_combos["R1"]],
+            ["__KEEP_V1__", "P1"],
+        )
         dialog.source_role_binding_table.setRowCount(12)
         dialog._resize_source_role_binding_grid()
         dialog.show()

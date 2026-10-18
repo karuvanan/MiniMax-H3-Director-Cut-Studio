@@ -2,6 +2,50 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.7-alpha.20] - 2026-10-18
+
+### KEEP V1 and Character Swap Pass Control
+
+- `KEEP V1`成为明确的零Pass状态：选择后自动取消同排`SWAP`，不向Character Swap Relay提交该人物，只把它加入其他替换Pass的非目标人物保护名单。
+- `KEEP V1`不再永久锁死SWAP。用户手动重新勾选时，Studio会恢复该行最近使用的P Picture；没有历史时采用第一个可用P Picture。若Media Pool没有任何P Picture，则保持关闭并显示说明，避免勾选无目标的假Pass。
+- 相同P Picture的多个目标角色继续合并为一个Pass；不同P Picture维持模型所需的串行Pass；所有`KEEP V1／无需替换`角色均跳过。
+- Character Swap进度明确显示`Segment · Role · Pass · Window`，区分一次Job内部的Relay window，避免把同一Pass的窗口误认成重复生成。
+- Shot角色窗口保存后，再点击Shot Visual Editor的`SAVE SHOT`，`REGENERATE DIRTY`及`RUN + QUEUE`都会从最新Shot状态重新编译P Picture、SWAP选择、手动人物框及KEEP设置；只有受影响的Dirty Segment重生。
+- App版本升级至`0.3.7-alpha.20`；Project Format保持`28`，Render Policy保持`38`，旧Project无需迁移。
+
+### Verification
+
+- Shot Visual Editor自动关闭／手动恢复SWAP交互测试、10项Character Swap Engine测试及Python编译通过。
+
+## [0.3.7-alpha.19] - 2026-10-18
+
+### Multi-Person V1 Box Layering and Swap Isolation
+
+- 点击`CURRENT ROLE`会立即将对应V1人物框设为focused并最后绘制，相当于提升至最高z-level；重叠框的边界、控制点及角色标签不再被后续角色遮住。
+- 修复角色框绘制控制点后没有重置`QPainter` brush，导致下一人物框以不透明黑色填满并盖住V1画面的问题；focused、selected及普通框现在均使用不同强度的半透明填充。
+- 修复多人画面只勾选一位角色时，被错误标记为`the only existing foreground person`的问题；唯一人物判断现在依据画面完整可见角色，而不是本轮SWAP子集。
+- 每个Character Swap pass新增其他可见人物的保护身份及位置框，明确禁止修改非目标人物、串脸、身体合并、身份互换或覆盖上一Pass已经完成的替换。
+- 增加实际`SAVE SHOT`链路测试：Shot局部P Picture绑定及手动画框会在`REGENERATE DIRTY`时优先覆盖旧Design ledger，同时保持全局ledger及相邻Shot不变。
+- App版本升级至`0.3.7-alpha.19`；Project Format保持`28`，Render Policy保持`38`，旧Project无需迁移。
+
+### Verification
+
+- 19项Character Swap、多人保护、V1框层级、半透明绘制、逐帧Detect、Save Shot覆盖及旧ledger回归测试通过；Python编译通过。
+
+## [0.3.7-alpha.18] - 2026-10-18
+
+### Detect V1 People Now Drives Regenerate Dirty
+
+- 修复`DETECT V1 PEOPLE`新增的V1人物只更新Shot Visual Editor／局部框，但Character Swap生成仍依赖旧Design角色ledger，导致`REGENERATE DIRTY`找不到新source role并继续替换旧人物的问题。
+- Shot局部`source_role_identity_overrides`及`source_role_bbox_overrides`现在会在每次生成前建立私有analysis overlay：把新R角色加入当前Shot覆盖的scene、补齐Shot专属P Picture binding，并让手动画框覆盖旧Qwen轨迹。
+- 局部overlay只存在于当前Relay生成窗口，不会写坏原始V1语义分析，也不会把新角色或框泄漏到相邻Shot。
+- 当Shot原本只启用部分角色时，Detect新发现的人物会自动加入SWAP选择；重新打开角色视窗后仍可手动取消。
+- App版本升级至`0.3.7-alpha.18`；Project Format保持`28`，Render Policy保持`38`，旧Project无需迁移。
+
+### Verification
+
+- 16项Character Swap、Shot局部角色、逐帧Detect、角色选择、手动框及旧ledger回归测试通过；Python编译通过。
+
 ## [0.3.7-alpha.17] - 2026-10-18
 
 ### Qwen Role Discovery v2 · 96-Frame V1 Storyboard

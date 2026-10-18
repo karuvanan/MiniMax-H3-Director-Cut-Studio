@@ -30,6 +30,29 @@ SOURCE_REMAKE_MODES = {
     SOURCE_REMAKE_MODE_CREATIVE_H3,
 }
 SOURCE_VIDEO_CAST_REMAKE_SKILL_KEY = "source-video-cast-remake-h3"
+KEEP_V1_TARGET = "KEEP_V1"
+
+RELAY_FPS = 24
+RELAY_WINDOW_FRAMES = 124
+RELAY_HISTORY_FRAMES = 18
+H3_FRAME_MODULUS = 17
+H3_FRAME_REMAINDER = 5
+
+
+def character_swap_relay_window_count(duration_seconds: float) -> int:
+    """Return the adaptive Relay window count for one H3 Shot pass."""
+
+    requested = max(5, round(max(0.0, float(duration_seconds)) * RELAY_FPS))
+    frame_count = requested + (
+        H3_FRAME_REMAINDER - (requested % H3_FRAME_MODULUS)
+    ) % H3_FRAME_MODULUS
+    advance = max(1, RELAY_WINDOW_FRAMES - RELAY_HISTORY_FRAMES)
+    if frame_count <= RELAY_WINDOW_FRAMES:
+        return 1
+    return 1 + max(
+        0,
+        (frame_count - RELAY_WINDOW_FRAMES + advance - 1) // advance,
+    )
 
 
 def automatic_remake_engine_for_skill(special_skill_key: object) -> str:
@@ -172,11 +195,18 @@ def character_swap_passes_for_window(
                 visible_roles.append(normalized)
             if visible_event:
                 events_by_role.setdefault(normalized, []).append(visible_event)
+    # Keep the complete cast before applying the user's SWAP subset.  The old
+    # code filtered first and then called a selected actor "the only existing
+    # foreground person".  In a two-person frame that instruction authorizes
+    # H3 to absorb or redraw the listener and is a major source of cross-role
+    # interference.
+    all_visible_roles = list(visible_roles)
     if selected_roles:
         visible_roles = [role for role in visible_roles if role in selected_roles]
-    sole_visible_role = len(visible_roles) == 1
+    sole_visible_role = len(all_visible_roles) == 1
 
     mapped: dict[str, str] = {}
+    keep_v1_roles: set[str] = set()
     for binding in bindings:
         if not isinstance(binding, Mapping):
             continue
@@ -186,10 +216,24 @@ def character_swap_passes_for_window(
             int(value) for value in binding.get("scene_indexes") or []
             if isinstance(value, (int, float))
         }
+        keep_v1 = bool(binding.get("source_thumbnail", False)) or (
+            target == KEEP_V1_TARGET
+        )
+        if (
+            role in all_visible_roles
+            and (not indexes or bool(indexes & scene_indexes))
+            and keep_v1
+        ):
+            keep_v1_roles.add(role)
+            # KEEP V1 is authoritative for this role/scene.  It must never be
+            # materialized as a P Picture or compiled into a LoRA pass.
+            mapped.pop(role, None)
+            continue
         if (
             role in visible_roles
             and target.startswith("P")
             and (not indexes or bool(indexes & scene_indexes))
+            and role not in keep_v1_roles
         ):
             mapped.setdefault(role, target)
 
@@ -331,9 +375,71 @@ def character_swap_passes_for_window(
             [*group["source_events"], *row.get("source_events", [])]
         ))[:6]
         group["speaker"] = bool(group["speaker"] or row.get("speaker"))
+    def protected_role_row(role_id: str) -> dict[str, Any]:
+        evidence = roles.get(role_id, {})
+        source_bbox = list(bbox_overrides.get(role_id) or [])
+        if not source_bbox:
+            for track in evidence.get("shot_scan_tracks") or []:
+                if not isinstance(track, Mapping):
+                    continue
+                for sample in track.get("samples") or []:
+                    if not isinstance(sample, Mapping):
+                        continue
+                    try:
+                        sample_time = float(sample.get("time_seconds", 0.0) or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if (
+                        sample_time >= start_seconds - 0.25
+                        and sample_time <= end_seconds + 0.25
+                    ):
+                        source_bbox = _normalized_person_bbox(
+                            sample.get("bbox_normalized") or []
+                        )
+                        if source_bbox:
+                            break
+                if source_bbox:
+                    break
+        if not source_bbox:
+            for appearance in evidence.get("appearance_evidence") or []:
+                if not isinstance(appearance, Mapping):
+                    continue
+                try:
+                    appearance_scene = int(appearance.get("scene_index", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if appearance_scene not in scene_indexes:
+                    continue
+                source_bbox = _normalized_person_bbox(
+                    appearance.get("thumbnail_bbox_normalized") or []
+                )
+                if source_bbox:
+                    break
+        if not source_bbox:
+            source_bbox = _normalized_person_bbox(
+                evidence.get("thumbnail_bbox_normalized") or []
+            )
+        return {
+            "source_role_id": role_id,
+            "source_visual_identity": " ".join(
+                str(evidence.get("visual_identity", "") or "").split()
+            ),
+            "source_bbox_normalized": source_bbox,
+            "keep_v1": role_id in keep_v1_roles,
+        }
+
+    protection_rows = {
+        role_id: protected_role_row(role_id) for role_id in all_visible_roles
+    }
     result = [grouped[target] for target in order]
     for row in result:
         row["source_role_id"] = "+".join(row["source_role_ids"])
+        target_roles = set(row["source_role_ids"])
+        row["protected_source_roles"] = [
+            protection_rows[role_id]
+            for role_id in all_visible_roles
+            if role_id not in target_roles
+        ]
     # Replace non-speakers first. The final pass owns the visible speaking
     # face(s), so it receives the cleanest source-audio/mouth alignment.
     result.sort(key=lambda row: (
@@ -428,6 +534,48 @@ def build_character_swap_prompt(
     selector = "; ".join(selectors) or f"the source performer tracked as {role}"
     event_selector = " ".join(events[:2])
     directed = " ".join(str(directed_scene_text or "").split())
+    protected_rows = [
+        row for row in pass_spec.get("protected_source_roles") or []
+        if isinstance(row, Mapping)
+    ]
+    protected_selectors: list[str] = []
+    for protected in protected_rows:
+        protected_role = str(
+            protected.get("source_role_id", "") or ""
+        ).strip().upper()
+        protected_identity = " ".join(
+            str(protected.get("source_visual_identity", "") or "").split()
+        )
+        keep_v1 = bool(protected.get("keep_v1", False))
+        protected_bbox = protected.get("source_bbox_normalized") or []
+        protected_location = ""
+        if len(protected_bbox) == 4:
+            try:
+                x1, y1, x2, y2 = (float(value) for value in protected_bbox)
+                protected_location = (
+                    f"protected box x={round(x1 * 100)}-{round(x2 * 100)}%, "
+                    f"y={round(y1 * 100)}-{round(y2 * 100)}%"
+                )
+            except (TypeError, ValueError, OverflowError):
+                protected_location = ""
+        protected_description = ", ".join(
+            value for value in (
+                "KEEP V1 — preserve the original source actor exactly" if keep_v1 else "",
+                protected_identity,
+                protected_location,
+            ) if value
+        )
+        protected_selectors.append(
+            f"{protected_role}: {protected_description}"
+            if protected_description else protected_role
+        )
+    protected_contract = ""
+    if protected_selectors:
+        protected_contract = """
+
+MULTI-PERSON IDENTITY ISOLATION — MANDATORY:
+This pass may modify only the selected source performer(s) named above. Every other visible person is a protected non-target and must remain pixel-position, face, body, wardrobe, pose, expression and identity stable through this pass: %s. Do not transfer Picture 1 identity, face, hair, clothing or colour into a protected person. Do not merge adjacent bodies, exchange faces, duplicate the target, or use a protected person's mouth or head as the replacement destination. When target and protected boxes overlap, follow the selected performer's original body contour inside the selected target box; preserve the person outside that contour. A later character-swap pass may already have replaced a protected person, so preserve the current input pixels rather than restoring the original V1 actor.
+""" % "; ".join(protected_selectors)
     # Keep the author workflow's explicit Subject contract.  A previous compact
     # rewrite let H3 keep the V1 face while importing Picture 1's room, which is
     # exactly the inverse of a character swap.  The separation below makes the
@@ -472,6 +620,7 @@ subject_definitions:
 <Subject 2> is the source world from <Video 1>: background, architecture, lighting, objects, framing, camera movement and every non-target person. Preserve it from the source video.
 <Video 1> supplies the selected performer's position, scale, body pose, gestures, head turns, gaze, blinking, expression, visible mouth timing and complete action clock. It does not supply the selected performer's identity after replacement.
 {medium_contract}
+{protected_contract}
 
 summary:
 [video editing + reference character replacement] Replace the selected source identity with <Subject 1>. Preserve <Subject 2> and the exact source performance. The final face must be recognisably the Picture 1 character, never the original Video 1 actor. The final environment must remain the Video 1 environment, never the Picture 1 background.
@@ -534,8 +683,8 @@ def compile_character_swap_pass(
     prepare["duration_seconds"] = 0
     relay = workflow[relay_id].setdefault("inputs", {})
     relay.update({
-        "window_frames": "124",
-        "history_frames": "18",
+        "window_frames": str(RELAY_WINDOW_FRAMES),
+        "history_frames": str(RELAY_HISTORY_FRAMES),
         "seed": int(seed),
         "steps": 8,
         "cfg": 1,

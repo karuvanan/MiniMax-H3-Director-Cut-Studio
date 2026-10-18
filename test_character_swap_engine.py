@@ -3,10 +3,12 @@ import unittest
 from pathlib import Path
 
 from character_swap_engine import (
+    KEEP_V1_TARGET,
     SOURCE_REMAKE_MODE_CHARACTER_SWAP,
     SOURCE_REMAKE_MODE_CREATIVE_H3,
     automatic_remake_engine_for_skill,
     build_character_swap_prompt,
+    character_swap_relay_window_count,
     character_swap_passes_for_window,
     compile_character_swap_pass,
     load_character_swap_workflow,
@@ -68,6 +70,52 @@ class CharacterSwapEngineTests(unittest.TestCase):
         )
         self.assertFalse(passes[0]["speaker"])
         self.assertTrue(passes[1]["speaker"])
+
+    def test_keep_v1_never_compiles_a_pass_and_protects_the_source_actor(self):
+        analysis = {
+            "principal_roles": [
+                {"role_id": "R1", "visual_identity": "woman on the left"},
+                {"role_id": "R2", "visual_identity": "man on the right"},
+            ],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 12.0,
+                "active_source_roles": ["R1", "R2"],
+            }],
+        }
+        passes = character_swap_passes_for_window(
+            analysis,
+            [
+                {
+                    "source_role_id": "R1",
+                    "target_media_id": KEEP_V1_TARGET,
+                    "scene_indexes": [1],
+                    "source_thumbnail": True,
+                },
+                {
+                    "source_role_id": "R2",
+                    "target_media_id": "P2",
+                    "scene_indexes": [1],
+                },
+            ],
+            0.0,
+            12.0,
+        )
+
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0]["source_role_ids"], ["R2"])
+        self.assertEqual(passes[0]["target_media_id"], "P2")
+        protected = passes[0]["protected_source_roles"]
+        self.assertEqual([row["source_role_id"] for row in protected], ["R1"])
+        self.assertTrue(protected[0]["keep_v1"])
+        prompt = build_character_swap_prompt(passes[0])
+        self.assertIn("KEEP V1", prompt)
+        self.assertIn("protected non-target", prompt)
+
+    def test_relay_window_count_matches_h3_frame_grid(self):
+        self.assertEqual(character_swap_relay_window_count(4.132), 1)
+        self.assertEqual(character_swap_relay_window_count(11.648), 3)
 
     def test_compiled_pass_resets_foreign_relay_checkpoints(self):
         template = load_character_swap_workflow(self.template_path)
@@ -212,10 +260,20 @@ class CharacterSwapEngineTests(unittest.TestCase):
         self.assertEqual(passes[0]["source_role_ids"], ["R2"])
         self.assertEqual(passes[0]["target_media_id"], "P2")
         self.assertEqual(len(passes[0]["source_roles"][0]["source_track_samples"]), 2)
+        self.assertFalse(
+            passes[0]["source_roles"][0]["source_is_sole_visible_person"]
+        )
+        self.assertEqual(
+            [row["source_role_id"] for row in passes[0]["protected_source_roles"]],
+            ["R1"],
+        )
         prompt = build_character_swap_prompt(passes[0])
         self.assertIn("tracked anchors 1.000s", prompt)
         self.assertIn("2.000s box", prompt)
-        self.assertNotIn("woman on the left", prompt)
+        self.assertIn("MULTI-PERSON IDENTITY ISOLATION", prompt)
+        self.assertIn("woman on the left", prompt)
+        self.assertIn("protected non-target", prompt)
+        self.assertNotIn("only existing foreground person", prompt)
 
     def test_edge_cropped_sole_performer_uses_in_place_replacement(self):
         analysis = {

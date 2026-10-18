@@ -81,6 +81,7 @@ class SmartRenderWorkerTests(unittest.TestCase):
         first.write_bytes(b"first")
         second.write_bytes(b"second")
         workflows = []
+        progress_events = []
 
         def fake_queue(_job, _segment, workflow, _uploaded, **_kwargs):
             workflows.append(workflow)
@@ -95,21 +96,25 @@ class SmartRenderWorkerTests(unittest.TestCase):
             "character_swap_passes": [
                 {
                     "source_role_id": "R1", "target_media_id": "P1", "seed": 11,
+                    "relay_window_count": 3,
                     "runtime_source": False,
                     "workflow": {"30": {"class_type": "LoadVideo", "inputs": {"file": "v1.mp4"}}},
                 },
                 {
                     "source_role_id": "R2", "target_media_id": "P2", "seed": 12,
+                    "relay_window_count": 3,
                     "runtime_source": True,
                     "runtime_source_loader_node_id": "30",
                     "runtime_source_loader_input": "file",
                     "workflow": {"30": {"class_type": "LoadVideo", "inputs": {"file": "placeholder.mp4"}}},
                 },
             ],
+            "shot_ids": ["S3"],
         }
         with (
             patch("smart_render_worker.queue_segment", side_effect=fake_queue),
             patch("smart_render_worker.upload_file", return_value={"name": "runtime-pass1.mp4"}),
+            patch("smart_render_worker.emit", side_effect=progress_events.append),
         ):
             result = queue_character_swap_passes(
                 {"server": "http://127.0.0.1:8188", "http_timeout": 1},
@@ -119,6 +124,12 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertEqual(result["output_path"], str(second.resolve()))
         self.assertEqual(len(workflows), 2)
         self.assertEqual(workflows[1]["30"]["inputs"]["file"], "runtime-pass1.mp4")
+        labels = [str(row.get("progress") or "") for row in progress_events]
+        self.assertIn("Segment S3 · Role R1 · Pass 1/2 · Window 1/3", labels)
+        self.assertIn(
+            "Segment S3 · Role R2 · Pass 2/2 · Window 3/3 · complete",
+            labels,
+        )
         shutil.rmtree(root, ignore_errors=True)
 
     def test_timing_audit_detects_offset_without_requesting_regeneration(self):

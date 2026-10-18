@@ -4549,6 +4549,32 @@ On-screen text: "EXACT TITLE"'''
             ["P1", "P1"],
         )
 
+        keep_plan = normalize_design_plan(
+            payload,
+            {"image": 9, "video": 3, "audio": 3},
+            existing_media=inventory,
+            repair_media_plan=True,
+            authored_requirement="Use @V1 with @P1.",
+            special_skill_key=SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL,
+            source_role_bindings=[
+                {
+                    "source_role_id": "R1",
+                    "target_media_id": "KEEP_V1",
+                    "source_thumbnail": True,
+                },
+                {"source_role_id": "R2", "target_media_id": "P1"},
+            ],
+        )
+        self.assertEqual(
+            [
+                (row["source_role_id"], row["target_media_id"], row["source_thumbnail"])
+                for row in keep_plan["source_role_bindings"]
+            ],
+            [("R1", "KEEP_V1", True), ("R2", "P1", False)],
+        )
+        self.assertIn("KEEP V1", keep_plan["shots"][0]["subject_action"])
+        self.assertNotIn("@KEEP_V1", keep_plan["shots"][0]["subject_action"])
+
     def test_source_video_same_role_can_change_picture_per_scene(self):
         payload = sample_design()
         base = payload["shots"][0]

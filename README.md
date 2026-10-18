@@ -1,6 +1,6 @@
 # MiniMax H3 Director Cut Studio
 
-> v0.3.7-alpha.17：升级Source Video Cast Remake的Qwen场景取样至`Role Discovery v2`；最多96张Early／Midpoint／Late角色发现帧及6张清晰Storyboard，避免场景多时全部退化为Midpoint而漏掉短暂出场角色。
+> v0.3.7-alpha.20：优化Shot Character Swap Pass。选择`KEEP V1`会自动关闭该行`SWAP`并跳过Relay；若手动重新勾选，Studio会恢复最近使用的P Picture，确保是有效替换Pass。保存Shot后，`REGENERATE DIRTY`与`RUN + QUEUE`都会采用最新角色绑定、人物框及SWAP选择。
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
@@ -24,7 +24,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.7-alpha.17`](VERSION)
+- 当前应用版本：[`v0.3.7-alpha.20`](VERSION)
 - v0.3.7 MiniMax-H3 Character-Swap LoRA与自动Remake Engine：[`v0.3.7 readme.md`](v0.3.7%20readme.md)
 - Character-Swap／Remake Engine论坛文章：[`forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md`](forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md)
 - v0.3.6 Shot Visual Editor 与 Timeline Qwen Assistant：[`v0.3.6 readme.md`](v0.3.6%20readme.md)
@@ -116,6 +116,8 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 6. 在Studio选择`Source Video Cast Remake H3`，顶部应自动显示只读`LoRA Preserve V1`；切换为None或其他Skill时应自动显示`Create H3 Remake`。
 
 Shot Visual Editor中，`CURRENT ROLE · V1 SOURCE`显示当前Shot实际V1人物脸孔；点击任一Current Role卡，上方V1预览会自动加载该角色最清晰的24fps轨迹帧、实际时间与位置框，并同时勾选同排`SWAP`。角色专属画面仍显示同一帧内其他有可靠bbox的人物，因此可按住`Ctrl`点击其他人物框继续加入替换；没有可靠原始帧坐标的角色不会再显示误导性的整屏框，而会提示执行`DETECT V1 PEOPLE`。`REPLACE WITH`显示目标P Picture。若某位画内人物未被识别，点击`DETECT V1 PEOPLE`：Studio会按24fps逐帧解码该Shot、每32帧交给Qwen识别，并保存帧号、时间、人物位置框和轨迹锚点。选择对应P图并保存，再执行`REGENERATE DIRTY`即可补做该Shot，不必重新Design整片。
+
+为了节省Relay时间，建议每个Shot只勾选实际需要替换的角色，其余行选择`KEEP V1`。`KEEP V1`会自动关闭同排`SWAP`，只作为非目标人物保护，不建立Character Swap Pass；你仍可手动重新勾选，Studio会自动恢复该行最近使用的P Picture（没有历史时使用第一个可用P Picture）。先保存角色窗口，再点击Shot Visual Editor的`SAVE SHOT`后，`REGENERATE DIRTY`会从当前Shot状态重新编译受影响Segment，采用最新P Picture、SWAP、人物框和KEEP设置；未保存的临时修改不会进入生成。
 
 > 模型、代码与源影片的下载、使用、二创和商用许可必须分别核对。Studio不会随源码分发这些权重。
 

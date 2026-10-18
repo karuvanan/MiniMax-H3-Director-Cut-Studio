@@ -186,12 +186,14 @@ from source_video_analysis import (
 )
 from character_swap_engine import (
     CHARACTER_SWAP_WORKFLOW_NAME,
+    KEEP_V1_TARGET,
     SOURCE_REMAKE_MODE_CHARACTER_SWAP,
     SOURCE_REMAKE_MODE_CREATIVE_H3,
     SOURCE_REMAKE_MODE_DIRECTED_SWAP,
     SOURCE_REMAKE_MODES,
     automatic_remake_engine_for_skill,
     build_character_swap_prompt,
+    character_swap_relay_window_count,
     character_swap_passes_for_window,
     compile_character_swap_pass,
     load_character_swap_workflow,
@@ -1534,7 +1536,13 @@ class DirectorCue:
                 for raw_role, raw_target in self.source_role_identity_overrides.items()
                 if (role := str(raw_role or "").strip().upper())
                 and re.fullmatch(r"R[1-9]\d*", role)
-                and (target := normalize_picture_reference(raw_target))
+                and (
+                    target := (
+                        KEEP_V1_TARGET
+                        if str(raw_target or "").strip().upper() == KEEP_V1_TARGET else
+                        normalize_picture_reference(raw_target)
+                    )
+                )
             }
         if not isinstance(self.source_role_swap_selection, list):
             self.source_role_swap_selection = []
@@ -6289,6 +6297,14 @@ class V1PersonPickerWidget(QWidget):
         }
         self.update()
 
+    def set_focused_role(self, role_id: str) -> None:
+        """Raise one Current Role above every overlapping V1 rectangle."""
+
+        self._focused_role = str(role_id or "").strip().upper()
+        self._last_hit_roles = []
+        self._last_hit_index = -1
+        self.update()
+
     def selected_roles(self) -> set[str]:
         return set(self._selected_roles)
 
@@ -6454,30 +6470,41 @@ class V1PersonPickerWidget(QWidget):
             return
         painter.drawPixmap(image_rect.toRect(), self._pixmap)
         drawn_rects: list[QRectF] = []
-        for role_id, payload in self._roles.items():
+        # The focused Current Role is intentionally painted last.  This is the
+        # QWidget equivalent of raising it to the highest z-level and keeps its
+        # border, handles and label usable when several people overlap.
+        role_rows = list(self._roles.items())
+        role_rows.sort(key=lambda row: row[0] == self._focused_role)
+        for role_id, payload in role_rows:
             rect = self._role_rect(payload)
             if rect.isEmpty():
                 continue
+            focused = role_id == self._focused_role
+            selected = role_id in self._selected_roles
             overlap_index = sum(
                 1 for previous in drawn_rects
                 if self._rect_overlap_ratio(rect, previous) >= 0.82
             )
             drawn_rects.append(QRectF(rect))
-            inset = min(10.0, float(overlap_index * 3))
+            inset = 0.0 if focused else min(10.0, float(overlap_index * 3))
             visible_rect = rect.adjusted(inset, inset, -inset, -inset)
             if visible_rect.width() < 8 or visible_rect.height() < 8:
                 visible_rect = rect
-            focused = role_id == self._focused_role
-            selected = role_id in self._selected_roles
             colour = QColor(
                 "#ffe66d" if focused else "#18e7f2" if selected else "#f0b94b"
             )
+            painter.save()
             painter.setPen(QPen(colour, 4 if focused or selected else 2))
-            if focused or selected:
-                painter.fillRect(visible_rect, QColor(24, 231, 242, 34))
+            fill_colour = QColor(colour)
+            fill_colour.setAlpha(38 if focused else 26 if selected else 12)
+            painter.fillRect(visible_rect, fill_colour)
+            # drawRoundedRect uses the current brush.  Leaving the opaque dark
+            # handle brush from the previous role active caused the next role
+            # to become a solid black panel over the V1 frame.
+            painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(visible_rect, 4, 4)
             if focused or selected:
-                painter.setBrush(QColor("#071017"))
+                painter.setBrush(QColor(7, 16, 23, 190))
                 painter.setPen(QPen(colour, 2))
                 for point in (
                     visible_rect.topLeft(), visible_rect.topRight(),
@@ -6492,6 +6519,7 @@ class V1PersonPickerWidget(QWidget):
             painter.fillRect(label_rect, QColor(3, 12, 18, 220))
             painter.setPen(colour)
             painter.drawText(label_rect, Qt.AlignCenter, role_id)
+            painter.restore()
 
     @staticmethod
     def _rect_overlap_ratio(left: QRectF, right: QRectF) -> float:
@@ -7119,13 +7147,15 @@ class ShotVisualEditorDialog(QDialog):
                         icon = QIcon(pixmap)
                         break
             source_face = "[V1_SOURCE_FACE:" in str(asset.clip_prompt or "")
+            # Legacy builds materialized KEEP V1 as a synthetic P Picture.
+            # Do not expose those files as replacement identities: KEEP V1 is
+            # now a first-class no-generation choice in the role row.
+            if source_face:
+                continue
             choices[media_id] = {
                 "media_id": media_id,
                 "icon": icon,
-                "label": (
-                    f"V1 DEFAULT · source actor · @{media_id}"
-                    if source_face else f"@{media_id}"
-                ),
+                "label": f"@{media_id}",
                 "direction": " ".join(filter(None, (
                     str(asset.clip_prompt or "").strip(),
                     str(asset.recognition or "").strip(),
@@ -7546,7 +7576,7 @@ class ShotVisualEditorDialog(QDialog):
                 "This Shot has no structured @P identity to replace.",
             )
             return
-        if not self._identity_choices:
+        if not self._identity_choices and not self._source_remake_editor:
             QMessageBox.information(
                 self,
                 "Character identity",
@@ -7610,6 +7640,19 @@ class ShotVisualEditorDialog(QDialog):
                         or fallback_target
                     )
                 })
+                # An empty selection means "all roles".  When this Shot was
+                # already narrowed to an explicit subset, however, a freshly
+                # detected person used to be rendered unchecked and therefore
+                # disappeared again when Regenerate Dirty built the Relay
+                # passes.  A Detect action is an explicit request to make the
+                # newly discovered V1 source people available for replacement,
+                # so add them to that subset without locking the user out of
+                # unchecking them in the reopened dialog.
+                if missing and self._source_role_swap_selection:
+                    self._source_role_swap_selection = list(dict.fromkeys([
+                        *self._source_role_swap_selection,
+                        *(str(role).strip().upper() for role in missing),
+                    ]))
                 visual_resolver = getattr(
                     self.parentWidget(), "_source_role_visuals_for_shot", None
                 )
@@ -7660,7 +7703,13 @@ class ShotVisualEditorDialog(QDialog):
             for source, _baseline, is_source_role in identity_sources
             if is_source_role
         ]
-        selected_roles = set(self._source_role_swap_selection or source_role_ids)
+        keep_role_ids = {
+            role for role, picture in source_role_bindings.items()
+            if picture == KEEP_V1_TARGET
+        }
+        selected_roles = set(
+            self._source_role_swap_selection or source_role_ids
+        ) - keep_role_ids
         picker = None
         frame_label = None
         picker_payload = self._source_role_picker_payload
@@ -7721,9 +7770,18 @@ class ShotVisualEditorDialog(QDialog):
         matrix.addWidget(swap_heading, 0, 2)
         identity_rows: list[tuple[str, str, bool, QComboBox, QCheckBox]] = []
         source_role_widgets: dict[str, tuple[QWidget, QComboBox, QCheckBox]] = {}
+        # KEEP V1 is the safe default, but it must not permanently lock a role
+        # out of Character Swap.  Remember the most recent real P Picture for
+        # each row so manually re-enabling SWAP can restore a valid target.
+        last_non_keep_targets: dict[str, str] = {}
         for row_index, (source, baseline_target, is_source_role) in enumerate(identity_sources, 1):
-            staged_target = normalize_picture_reference(
-                (staged_by_source.get(source) or {}).get("target_reference")
+            raw_staged_target = str(
+                (staged_by_source.get(source) or {}).get("target_reference") or ""
+            ).strip().upper()
+            staged_target = (
+                KEEP_V1_TARGET
+                if raw_staged_target == KEEP_V1_TARGET else
+                normalize_picture_reference(raw_staged_target)
             ) or baseline_target
             current_choice = next(
                 (
@@ -7772,7 +7830,11 @@ class ShotVisualEditorDialog(QDialog):
             if not has_current_avatar:
                 current_avatar.setText(source if is_source_role else f"@{baseline_target}")
             current_text = QLabel(
-                f"{source} · V1 source\nreplace with @{baseline_target}"
+                (
+                    f"{source} · V1 source\nKEEP V1 · no Character Swap"
+                    if baseline_target == KEEP_V1_TARGET else
+                    f"{source} · V1 source\nreplace with @{baseline_target}"
+                )
                 if is_source_role else
                 (f"@{source}" if baseline_target == source
                  else f"@{source}\ncurrently @{baseline_target}")
@@ -7786,8 +7848,13 @@ class ShotVisualEditorDialog(QDialog):
             current_layout.addWidget(current_text, 1)
             matrix.addWidget(current_widget, row_index, 0)
             target_combo = QComboBox()
+            target_combo.setObjectName(f"shotRoleTarget_{source}")
             target_combo.setMinimumHeight(62)
             target_combo.setIconSize(QSize(48, 48))
+            if is_source_role:
+                target_combo.addItem(
+                    "KEEP V1 · No Character Swap", KEEP_V1_TARGET
+                )
             for choice in self._identity_choices:
                 target_combo.addItem(
                     choice["icon"], choice["label"], choice["media_id"]
@@ -7795,18 +7862,40 @@ class ShotVisualEditorDialog(QDialog):
             if target_combo.findData(staged_target) < 0:
                 target_combo.addItem(f"@{staged_target}", staged_target)
             target_combo.setCurrentIndex(max(0, target_combo.findData(staged_target)))
+            remembered_target = (
+                staged_target if staged_target != KEEP_V1_TARGET else
+                baseline_target if baseline_target != KEEP_V1_TARGET else
+                next(
+                    (
+                        str(choice.get("media_id", "")).strip().upper()
+                        for choice in self._identity_choices
+                        if normalize_picture_reference(choice.get("media_id"))
+                    ),
+                    "",
+                )
+            )
+            if normalize_picture_reference(remembered_target):
+                last_non_keep_targets[source] = remembered_target
             matrix.addWidget(target_combo, row_index, 1)
             swap_checkbox = QCheckBox()
             swap_checkbox.setObjectName(f"shotRoleSwap_{source}")
-            swap_checkbox.setChecked(not is_source_role or source in selected_roles)
+            swap_checkbox.setChecked(
+                not is_source_role
+                or (source in selected_roles and staged_target != KEEP_V1_TARGET)
+            )
             swap_checkbox.setEnabled(is_source_role)
             swap_checkbox.setToolTip(
-                f"Replace {source} in this Shot" if is_source_role
+                (
+                    f"Replace {source} in this Shot. KEEP V1 turns this off automatically; "
+                    "checking it again restores the last P Picture."
+                ) if is_source_role
                 else "Legacy Media Pool identity replacement"
             )
             matrix.addWidget(swap_checkbox, row_index, 2, Qt.AlignCenter)
             if is_source_role:
-                target_combo.setEnabled(swap_checkbox.isChecked())
+                target_combo.setEnabled(
+                    swap_checkbox.isChecked() or staged_target == KEEP_V1_TARGET
+                )
                 source_role_widgets[source] = (
                     current_widget, target_combo, swap_checkbox
                 )
@@ -7814,18 +7903,53 @@ class ShotVisualEditorDialog(QDialog):
                 source, baseline_target, is_source_role, target_combo, swap_checkbox
             ))
 
+        def target_choice_changed(role_id: str, target: object) -> None:
+            """KEEP V1 defaults SWAP off while preserving a reversible target."""
+
+            role_id = str(role_id or "").strip().upper()
+            if role_id not in source_role_widgets:
+                return
+            _widget, combo, checkbox = source_role_widgets[role_id]
+            keep_v1 = str(target or "").strip().upper() == KEEP_V1_TARGET
+            checkbox.blockSignals(True)
+            checkbox.setChecked(not keep_v1)
+            checkbox.blockSignals(False)
+            if keep_v1:
+                selected_roles.discard(role_id)
+            else:
+                normalized_target = normalize_picture_reference(target)
+                if normalized_target:
+                    last_non_keep_targets[role_id] = normalized_target
+                selected_roles.add(role_id)
+            combo.setEnabled(True)
+            if picker is not None:
+                picker.set_selected_roles(selected_roles)
+
+        for source_role, (_widget, combo, _checkbox) in source_role_widgets.items():
+            combo.currentIndexChanged.connect(
+                lambda _index, role=source_role, control=combo:
+                target_choice_changed(role, control.currentData())
+            )
+
         def focus_source_role(role_id: str) -> None:
             """Navigate V1 evidence and enable the clicked role's SWAP row."""
 
             role_id = str(role_id or "").strip().upper()
             if role_id not in source_role_widgets:
                 return
-            selected_roles.add(role_id)
             _role_widget, role_combo, role_checkbox = source_role_widgets[role_id]
+            keep_v1 = str(role_combo.currentData() or "").upper() == KEEP_V1_TARGET
+            if not keep_v1:
+                selected_roles.add(role_id)
             role_checkbox.blockSignals(True)
-            role_checkbox.setChecked(True)
+            role_checkbox.setChecked(not keep_v1)
             role_checkbox.blockSignals(False)
             role_combo.setEnabled(True)
+            if picker is not None:
+                # Raise immediately even if this role has no dedicated evidence
+                # frame.  set_frame_content below will retain the same focus
+                # when a role-specific frame is available.
+                picker.set_focused_role(role_id)
             view = picker_role_views.get(role_id, {})
             if picker is None or not isinstance(view, dict):
                 return
@@ -7878,12 +8002,21 @@ class ShotVisualEditorDialog(QDialog):
             else:
                 selected_roles.clear()
                 selected_roles.add(role_id)
+            selected_roles.difference_update({
+                source_role
+                for source_role, (_widget, combo, _checkbox)
+                in source_role_widgets.items()
+                if str(combo.currentData() or "").upper() == KEEP_V1_TARGET
+            })
             for source_role, (_widget, combo, checkbox) in source_role_widgets.items():
                 checked = source_role in selected_roles
                 checkbox.blockSignals(True)
                 checkbox.setChecked(checked)
                 checkbox.blockSignals(False)
-                combo.setEnabled(checked)
+                combo.setEnabled(
+                    checked
+                    or str(combo.currentData() or "").upper() == KEEP_V1_TARGET
+                )
             if picker is not None:
                 picker.set_selected_roles(selected_roles)
             role_widget, role_combo, _checkbox = source_role_widgets[role_id]
@@ -7891,11 +8024,39 @@ class ShotVisualEditorDialog(QDialog):
             role_combo.setFocus(Qt.MouseFocusReason)
 
         def checkbox_changed(role_id: str, checked: bool) -> None:
+            _widget, combo, checkbox = source_role_widgets[role_id]
+            if (
+                checked
+                and str(combo.currentData() or "").upper() == KEEP_V1_TARGET
+            ):
+                # A checked KEEP row would be contradictory and would still be
+                # skipped by the Relay compiler.  Restore a real P target so
+                # the user's explicit click immediately enables a valid pass.
+                restored_target = last_non_keep_targets.get(role_id, "")
+                restored_index = combo.findData(restored_target)
+                if restored_index < 0:
+                    restored_index = next(
+                        (
+                            index for index in range(combo.count())
+                            if normalize_picture_reference(combo.itemData(index))
+                        ),
+                        -1,
+                    )
+                if restored_index < 0:
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(False)
+                    checkbox.blockSignals(False)
+                    selected_roles.discard(role_id)
+                    combo.setEnabled(True)
+                    checkbox.setToolTip(
+                        f"Load a P Picture before enabling Character Swap for {role_id}."
+                    )
+                    return
+                combo.setCurrentIndex(restored_index)
             if checked:
                 selected_roles.add(role_id)
             else:
                 selected_roles.discard(role_id)
-            _widget, combo, _checkbox = source_role_widgets[role_id]
             combo.setEnabled(checked)
             if picker is not None:
                 picker.set_selected_roles(selected_roles)
@@ -7991,7 +8152,14 @@ class ShotVisualEditorDialog(QDialog):
             for source, _baseline, is_source_role, _combo, checkbox in identity_rows
             if is_source_role and checkbox.isChecked()
         }
-        if source_role_ids and not selected_roles:
+        keep_rows = {
+            source
+            for source, _baseline, is_source_role, target_combo, _checkbox
+            in identity_rows
+            if is_source_role
+            and str(target_combo.currentData() or "").upper() == KEEP_V1_TARGET
+        }
+        if source_role_ids and not selected_roles and keep_rows != set(source_role_ids):
             QMessageBox.warning(
                 self,
                 "Select a V1 person",
@@ -8000,9 +8168,14 @@ class ShotVisualEditorDialog(QDialog):
             return
         changes: list[dict[str, str]] = []
         for source, baseline_target, is_source_role, target_combo, checkbox in identity_rows:
-            if is_source_role and not checkbox.isChecked():
+            raw_target = str(target_combo.currentData() or "").strip().upper()
+            keep_v1 = raw_target == KEEP_V1_TARGET
+            if is_source_role and not checkbox.isChecked() and not keep_v1:
                 continue
-            target = normalize_picture_reference(target_combo.currentData())
+            target = (
+                KEEP_V1_TARGET if keep_v1 else
+                normalize_picture_reference(target_combo.currentData())
+            )
             detected_unbound = self._detected_unbound_source_roles.get(source, {})
             if not target or (target == baseline_target and not detected_unbound):
                 continue
@@ -9822,6 +9995,7 @@ class DesignPageDialog(QDialog):
             if isinstance(row, dict)
             and bool(row.get("loaded", False))
             and str(row.get("media_type", "")).casefold() == "image"
+            and "[V1_SOURCE_FACE:" not in str(row.get("clip_prompt", ""))
             and re.fullmatch(r"P[1-9][0-9]*", self._inventory_media_id(row))
         }
         return sorted(values, key=lambda media_id: int(media_id[1:]))
@@ -10029,18 +10203,10 @@ class DesignPageDialog(QDialog):
                 role = self.source_role_binding_card_roles.get(combo, {})
                 scene_index = int(role.get("appearance_scene_index", 0) or 0)
                 selected = str(combo.currentData() or "").strip()
-                use_source_thumbnail = selected == "__SOURCE_V1_FACE__"
-                media_id = selected.upper()
-                if use_source_thumbnail:
-                    owner = self.parentWidget()
-                    materialize = getattr(
-                        owner, "ensure_source_video_role_thumbnail_asset", None
-                    )
-                    source = self._representative_source_role_frame(role)
-                    media_id = (
-                        str(materialize(role, source) or "").strip().upper()
-                        if callable(materialize) and source is not None else ""
-                    )
+                use_source_thumbnail = selected in {
+                    "__SOURCE_V1_FACE__", "__KEEP_V1__"
+                }
+                media_id = KEEP_V1_TARGET if use_source_thumbnail else selected.upper()
                 if not media_id or scene_index <= 0:
                     continue
                 result.append({
@@ -10090,7 +10256,7 @@ class DesignPageDialog(QDialog):
                 continue
             role_id = str(row.get("source_role_id", "")).strip().upper()
             selected = (
-                "__SOURCE_V1_FACE__"
+                "__KEEP_V1__"
                 if bool(row.get("source_thumbnail", False))
                 else str(row.get("target_media_id", "")).strip().upper()
             )
@@ -10150,13 +10316,13 @@ class DesignPageDialog(QDialog):
             source_pixmap = self._source_role_square_pixmap(role)
             combo.addItem(
                 QIcon(source_pixmap),
-                "V1 DEFAULT · Keep source actor",
-                "__SOURCE_V1_FACE__",
+                "KEEP V1 · No Character Swap",
+                "__KEEP_V1__",
             )
             combo.setItemData(
-                combo.findData("__SOURCE_V1_FACE__"),
-                "Keep this exact V1 appearance for this time card. Studio materializes "
-                "its face crop as a controlled P identity; it does not require P2-P4.",
+                combo.findData("__KEEP_V1__"),
+                "Keep this exact V1 actor. The role is protected as a non-target and "
+                "is never submitted to Character Swap.",
                 Qt.ToolTipRole,
             )
             combo.addItem("Select P…", "")
@@ -11203,8 +11369,7 @@ class DesignPageDialog(QDialog):
                 (
                     f"{str(binding.get('source_role_id', '')).strip().upper()} scene(s) "
                     f"{','.join(str(int(value)) for value in binding.get('scene_indexes') or [])} "
-                    "keeps original V1 face via "
-                    f"@{str(binding.get('target_media_id', '')).strip().upper()}"
+                    "=KEEP V1 (protected non-target; no Character Swap pass)"
                     if bool(binding.get("source_thumbnail", False)) else
                     f"{str(binding.get('source_role_id', '')).strip().upper()} scene(s) "
                     f"{','.join(str(int(value)) for value in binding.get('scene_indexes') or [])}="
@@ -22119,7 +22284,11 @@ class DirectorCutStudio(QMainWindow):
         normalized = [
             {
                 "source_role_id": str(row.get("source_role_id", "")).strip().upper(),
-                "target_media_id": str(row.get("target_media_id", "")).strip().upper(),
+                "target_media_id": (
+                    KEEP_V1_TARGET
+                    if bool(row.get("source_thumbnail", False)) else
+                    str(row.get("target_media_id", "")).strip().upper()
+                ),
                 "scene_indexes": [
                     int(value) for value in row.get("scene_indexes") or []
                     if isinstance(value, (int, float))
@@ -22130,7 +22299,14 @@ class DirectorCutStudio(QMainWindow):
             for row in bindings
             if isinstance(row, dict)
             and str(row.get("source_role_id", "")).strip()
-            and re.fullmatch(r"P[1-9][0-9]*", str(row.get("target_media_id", "")).strip(), re.I)
+            and (
+                bool(row.get("source_thumbnail", False))
+                or re.fullmatch(
+                    r"P[1-9][0-9]*",
+                    str(row.get("target_media_id", "")).strip(),
+                    re.I,
+                )
+            )
         ]
         if normalized == self.source_video_role_bindings:
             return
@@ -23429,7 +23605,11 @@ class DirectorCutStudio(QMainWindow):
         for row in self.source_video_role_bindings:
             if str(row.get("source_role_id", "")).strip().upper() != role:
                 continue
-            picture = normalize_picture_reference(row.get("target_media_id"))
+            picture = (
+                KEEP_V1_TARGET
+                if bool(row.get("source_thumbnail", False)) else
+                normalize_picture_reference(row.get("target_media_id"))
+            )
             if not picture:
                 continue
             indexes = {
@@ -23476,7 +23656,7 @@ class DirectorCutStudio(QMainWindow):
                         flags=re.I,
                     )
                     target = normalize_picture_reference(match.group(1)) if match else ""
-                if target:
+                if target and target != KEEP_V1_TARGET:
                     desired = ("on_screen_speaker", "enabled", target, "V1")
                 else:
                     # Never guess another visible face when the ledger is incomplete.
@@ -23523,19 +23703,32 @@ class DirectorCutStudio(QMainWindow):
         result: dict[str, str] = {}
         for row in self.source_video_role_bindings if bindings is None else bindings:
             role = str(row.get("source_role_id", "")).strip().upper()
-            picture = normalize_picture_reference(row.get("target_media_id"))
+            picture = (
+                KEEP_V1_TARGET
+                if bool(row.get("source_thumbnail", False)) else
+                normalize_picture_reference(row.get("target_media_id"))
+            )
             indexes = {
                 int(value) for value in row.get("scene_indexes") or []
                 if isinstance(value, (int, float))
             }
             if role and picture and (not indexes or scene_index in indexes):
                 result[role] = picture
-        result.update({
-            str(role).strip().upper(): normalize_picture_reference(picture)
-            for role, picture in (cue.source_role_identity_overrides or {}).items()
-            if re.fullmatch(r"R[1-9]\d*", str(role).strip(), flags=re.I)
-            and normalize_picture_reference(picture)
-        })
+        for raw_role, raw_picture in (cue.source_role_identity_overrides or {}).items():
+            role = str(raw_role or "").strip().upper()
+            raw_target = str(raw_picture or "").strip().upper()
+            picture = normalize_picture_reference(raw_target)
+            target_asset = self._reference_asset(picture) if picture else None
+            legacy_keep_v1 = bool(
+                target_asset
+                and "[V1_SOURCE_FACE:" in str(target_asset.clip_prompt or "")
+            )
+            if not re.fullmatch(r"R[1-9]\d*", role, flags=re.I):
+                continue
+            if raw_target == KEEP_V1_TARGET or legacy_keep_v1:
+                result[role] = KEEP_V1_TARGET
+            elif picture:
+                result[role] = picture
         return result
 
     def _all_shot_binding_collision_messages(self) -> list[str]:
@@ -23544,7 +23737,11 @@ class DirectorCutStudio(QMainWindow):
             if cue.cue_type != "shot":
                 continue
             collisions = role_picture_binding_collisions(
-                self._shot_role_picture_bindings(cue)
+                {
+                    role: picture
+                    for role, picture in self._shot_role_picture_bindings(cue).items()
+                    if picture != KEEP_V1_TARGET
+                }
             )
             messages.extend(
                 f"{cue.cue_id}: @{picture} is assigned to {', '.join(roles)}"
@@ -26107,8 +26304,13 @@ class DirectorCutStudio(QMainWindow):
                     )
                     identity_target_rows.append((identity_change, identity_targets))
                     if source_role_id:
-                        target_reference = normalize_picture_reference(
-                            identity_change.get("target_reference")
+                        raw_target_reference = str(
+                            identity_change.get("target_reference") or ""
+                        ).strip().upper()
+                        target_reference = (
+                            KEEP_V1_TARGET
+                            if raw_target_reference == KEEP_V1_TARGET else
+                            normalize_picture_reference(raw_target_reference)
                         )
                         if bool(identity_change.get("detected_unbound", False)):
                             try:
@@ -31893,6 +32095,7 @@ class DirectorCutStudio(QMainWindow):
             illustrated_cast_count >= 2
             and illustrated_cast_count / max(1, len(loaded_cast_assets)) >= 0.6
         )
+        relay_window_count = character_swap_relay_window_count(end - start)
         for pass_index, pass_spec in enumerate(pass_specs):
             target_reference = str(pass_spec.get("target_media_id", "")).upper()
             target_asset = self._reference_asset(target_reference)
@@ -31970,6 +32173,8 @@ class DirectorCutStudio(QMainWindow):
                 "runtime_source": runtime_source,
                 "runtime_source_loader_node_id": contract["source_loader_node_id"],
                 "runtime_source_loader_input": contract["source_loader_input"],
+                "relay_node_id": contract["relay_node_id"],
+                "relay_window_count": relay_window_count,
             })
         fingerprint = content_fingerprint({
             "engine": "akatz-character-swap-relay-v1",
@@ -32935,7 +33140,9 @@ class DirectorCutStudio(QMainWindow):
         end: float,
     ) -> list[dict]:
         source = self._reference_asset("V1")
-        analysis = parse_source_video_analysis(source.semantic_enrichment) if source else {}
+        analysis = deepcopy(
+            parse_source_video_analysis(source.semantic_enrichment) if source else {}
+        )
         effective_bindings = deepcopy(self.source_video_role_bindings)
         overlapping_shots = [
             cue for cue in self.director_cues
@@ -32953,10 +33160,108 @@ class DirectorCutStudio(QMainWindow):
                     min(end, cue.end_seconds) - max(start, cue.start_seconds),
                 ),
             )
-            for role, target in owner.source_role_identity_overrides.items():
+            owner_scene_indexes: list[int] = []
+            owner_scenes: list[dict] = []
+            for scene in analysis.get("scenes") or []:
+                if not isinstance(scene, dict):
+                    continue
+                try:
+                    scene_start = float(scene.get("start_seconds", 0.0) or 0.0)
+                    scene_end = float(scene.get("end_seconds", scene_start) or scene_start)
+                    scene_index = int(scene.get("scene_index", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if ranges_intersect(
+                    scene_start,
+                    scene_end,
+                    owner.start_seconds,
+                    owner.end_seconds,
+                ):
+                    owner_scenes.append(scene)
+                    if scene_index and scene_index not in owner_scene_indexes:
+                        owner_scene_indexes.append(scene_index)
+
+            local_role_ids = {
+                str(role or "").strip().upper()
+                for role in (
+                    list(owner.source_role_identity_overrides)
+                    + list(owner.source_role_bbox_overrides)
+                )
+                if str(role or "").strip()
+            }
+            principal_roles = analysis.setdefault("principal_roles", [])
+            principal_by_id = {
+                str(row.get("role_id", "") or "").strip().upper(): row
+                for row in principal_roles
+                if isinstance(row, dict)
+            }
+            # Shot-local Detect V1 People results are newer and more precise
+            # than the original Design ledger.  Overlay them onto a private
+            # generation copy so Relay receives the newly selected source box
+            # even when the saved global analysis still contains only the old
+            # actor list.
+            for role in sorted(local_role_ids):
+                role_row = principal_by_id.get(role)
+                if role_row is None:
+                    role_row = {
+                        "role_id": role,
+                        "visual_identity": "Shot-local detected V1 performer",
+                        "wardrobe": "",
+                        "narrative_function": "Shot-local replacement source",
+                        "scene_indexes": list(owner_scene_indexes),
+                        "appearance_evidence": [],
+                    }
+                    principal_roles.append(role_row)
+                    principal_by_id[role] = role_row
+                else:
+                    role_row["scene_indexes"] = list(dict.fromkeys([
+                        *(role_row.get("scene_indexes") or []),
+                        *owner_scene_indexes,
+                    ]))
+                for scene in owner_scenes:
+                    active_roles = [
+                        str(value or "").strip().upper()
+                        for value in scene.get("active_source_roles") or []
+                        if str(value or "").strip()
+                    ]
+                    if role not in active_roles:
+                        scene["active_source_roles"] = [*active_roles, role]
+
+            for raw_role, raw_target in owner.source_role_identity_overrides.items():
+                role = str(raw_role or "").strip().upper()
+                normalized_target = normalize_picture_reference(raw_target)
+                target_asset = (
+                    self._reference_asset(normalized_target)
+                    if normalized_target else None
+                )
+                keep_v1 = bool(
+                    str(raw_target or "").strip().upper() == KEEP_V1_TARGET
+                    or (
+                        target_asset
+                        and "[V1_SOURCE_FACE:" in str(target_asset.clip_prompt or "")
+                    )
+                )
+                target = (
+                    KEEP_V1_TARGET if keep_v1 else
+                    normalized_target
+                )
+                if not role or not target:
+                    continue
                 for row in effective_bindings:
                     if str(row.get("source_role_id", "")).strip().upper() == role:
                         row["target_media_id"] = target
+                        row["source_thumbnail"] = keep_v1
+                # Do not require the new source role to have existed in the
+                # original global binding table.  Insert a Shot-scoped binding
+                # first so it wins setdefault() resolution for this Relay
+                # window, while neighboring Shots keep their own mappings.
+                effective_bindings.insert(0, {
+                    "source_role_id": role,
+                    "target_media_id": target,
+                    "scene_indexes": list(owner_scene_indexes),
+                    "identity_lock": "strict",
+                    "source_thumbnail": keep_v1,
+                })
         else:
             owner = None
         return character_swap_passes_for_window(

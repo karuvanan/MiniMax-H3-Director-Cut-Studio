@@ -2660,9 +2660,12 @@ def enforce_source_video_cast_remake_plan(
             continue
         role_id = str(raw.get("source_role_id", "")).strip().upper()
         media_id = _normalized_media_id(raw.get("target_media_id", ""))
+        uses_source_thumbnail = bool(raw.get("source_thumbnail", False))
         if not role_id or role_id not in source_role_ids:
             continue
-        if media_id not in available_cast_id_set:
+        if uses_source_thumbnail:
+            media_id = "KEEP_V1"
+        elif media_id not in available_cast_id_set:
             raise ValueError(
                 f"Source role {role_id} is bound to unavailable @{media_id or '(missing)'}."
             )
@@ -2676,9 +2679,7 @@ def enforce_source_video_cast_remake_plan(
         ]
         for scene_index in scene_indexes:
             role_scene_to_media[(role_id, scene_index)] = media_id
-            role_scene_uses_source_thumbnail[(role_id, scene_index)] = bool(
-                raw.get("source_thumbnail", False)
-            )
+            role_scene_uses_source_thumbnail[(role_id, scene_index)] = uses_source_thumbnail
     # Missing cards inherit a deterministic actor from the available pool.
     # With only P1 loaded this intentionally maps every V1 role/appearance to
     # P1.  With several Pictures, roles cycle through the pool while every
@@ -2706,9 +2707,11 @@ def enforce_source_video_cast_remake_plan(
         for role_id, scene_index in required_role_scenes
         if (role_id, scene_index) in role_scene_to_media
     ]
-    cast_ids = list(dict.fromkeys(
+    mapped_cast_ids = list(dict.fromkeys(
         row["target_media_id"] for row in canonical_bindings
-    )) or available_cast_ids
+        if not row.get("source_thumbnail", False)
+    ))
+    cast_ids = mapped_cast_ids if canonical_bindings else available_cast_ids
     cast_id_set = set(cast_ids)
     cast_label = ", ".join("@" + media_id for media_id in cast_ids)
     role_to_speaker = {
@@ -2718,7 +2721,8 @@ def enforce_source_video_cast_remake_plan(
     cast_mapping = ", ".join(
         (
             f"{row['source_role_id']} scene {row['scene_indexes'][0]} keeps its user-selected "
-            f"V1 face as {role_to_speaker[row['source_role_id']]}=@{row['target_media_id']}"
+            f"V1 actor as {role_to_speaker[row['source_role_id']]}=KEEP V1; it is a protected "
+            "non-target and receives no Character Swap pass"
             if row.get("source_thumbnail", False)
             else f"{row['source_role_id']} scene {row['scene_indexes'][0]} becomes "
                  f"{role_to_speaker[row['source_role_id']]}=@{row['target_media_id']}"
@@ -2731,7 +2735,10 @@ def enforce_source_video_cast_remake_plan(
     plan["source_role_bindings"] = canonical_bindings
 
     def media_for_role_scene(role_id: str, scene_index: int) -> str:
-        return role_scene_to_media.get((str(role_id).strip().upper(), int(scene_index)), "")
+        media_id = role_scene_to_media.get(
+            (str(role_id).strip().upper(), int(scene_index)), ""
+        )
+        return "" if media_id == "KEEP_V1" else media_id
 
     def ledger_scene_for(start: float, end: float, ordinal: int) -> dict:
         if 0 <= ordinal < len(source_ledger_scenes):
@@ -2949,7 +2956,10 @@ def enforce_source_video_cast_remake_plan(
             for role_id in source_active_roles
             if media_for_role_scene(role_id, source_scene_index)
         ]
-        active_cast = list(dict.fromkeys(mapped_cast)) or active_cast_for_shot(shot)
+        active_cast = (
+            list(dict.fromkeys(mapped_cast))
+            if source_active_roles else active_cast_for_shot(shot)
+        )
         active_role_instances = [
             (
                 role_id,
@@ -3003,8 +3013,8 @@ def enforce_source_video_cast_remake_plan(
             "setup, action, reaction and handoff, but generate a fresh cinematic performance. "
             + (
                 "For " + ", ".join(active_original_source_roles)
-                + ", preserve the exact user-selected original V1 face through its materialized P reference; "
-                  "do not copy the surrounding source frame."
+                + ", KEEP V1: preserve each original source actor exactly as a protected non-target; "
+                  "do not submit those roles to Character Swap."
                 if active_original_source_roles else
                 "Do not reproduce or retain any source actor."
             )
@@ -5276,7 +5286,10 @@ DESIGN_JSON_SCHEMA = {
                 ],
                 "properties": {
                     "source_role_id": {"type": "string"},
-                    "target_media_id": {"type": "string", "pattern": "^P[1-9][0-9]*$"},
+                    "target_media_id": {
+                        "type": "string",
+                        "pattern": "^(?:P[1-9][0-9]*|KEEP_V1)$",
+                    },
                     "scene_indexes": {"type": "array", "items": {"type": "integer"}},
                     "identity_lock": {"type": "string", "enum": ["strict"]},
                     "source_thumbnail": {"type": "boolean"},

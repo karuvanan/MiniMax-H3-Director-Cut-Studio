@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1642,6 +1643,102 @@ def speech_guard_result_score(result: dict) -> float:
     return score if violations else 1.0
 
 
+def _start_relay_progress_watcher(
+    server: str,
+    client_id: str,
+    segment: dict,
+    prompt_ref: dict[str, str],
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    """Forward exact H3 Relay window progress from ComfyUI's websocket.
+
+    H3 Relay reports its adaptive-window progress through the ordinary ComfyUI
+    progress event.  This observer is optional: a missing websocket dependency
+    or an older server never blocks generation, and the normal history poll
+    remains the completion authority.
+    """
+
+    window_count = max(1, int(segment.get("relay_window_count", 1) or 1))
+    relay_node_id = str(segment.get("relay_node_id") or "").strip()
+    status_prefix = str(segment.get("relay_status_prefix") or "").strip()
+    if window_count <= 1 or not relay_node_id or not status_prefix:
+        return None, None
+    stop = threading.Event()
+    ready = threading.Event()
+
+    def observe() -> None:
+        try:
+            from websockets.sync.client import connect
+        except Exception:
+            ready.set()
+            return
+        endpoint = server.rstrip("/")
+        if endpoint.startswith("https://"):
+            endpoint = "wss://" + endpoint[len("https://"):]
+        elif endpoint.startswith("http://"):
+            endpoint = "ws://" + endpoint[len("http://"):]
+        uri = endpoint + "/ws?clientId=" + client_id
+        last_window = 1
+        try:
+            with connect(uri, open_timeout=3, close_timeout=1) as socket:
+                ready.set()
+                while not stop.is_set():
+                    try:
+                        raw = socket.recv(timeout=1.0)
+                    except TimeoutError:
+                        continue
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        message = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if str(message.get("type") or "") != "progress":
+                        continue
+                    data = message.get("data") or {}
+                    if str(data.get("node") or "") != relay_node_id:
+                        continue
+                    expected_prompt = str(prompt_ref.get("prompt_id") or "")
+                    event_prompt = str(data.get("prompt_id") or "")
+                    if expected_prompt and event_prompt and event_prompt != expected_prompt:
+                        continue
+                    try:
+                        value = int(data.get("value", 0) or 0)
+                        maximum = int(data.get("max", 0) or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    # H3RelayWindowedEdit exposes one absolute progress unit per
+                    # adaptive window. Ignore sampler-internal step bars whose
+                    # maximum is unrelated, rather than inventing a window.
+                    if maximum != window_count:
+                        continue
+                    window_index = min(window_count, max(1, value))
+                    if window_index <= last_window:
+                        continue
+                    last_window = window_index
+                    emit({
+                        "progress": (
+                            f"{status_prefix} · Window {window_index}/{window_count}"
+                        ),
+                        "segment_index": segment.get("index", 0),
+                        "character_swap_window": {
+                            "index": window_index,
+                            "count": window_count,
+                        },
+                    })
+        except Exception:
+            ready.set()
+            return
+
+    thread = threading.Thread(
+        target=observe,
+        name="h3-relay-progress",
+        daemon=True,
+    )
+    thread.start()
+    ready.wait(timeout=1.5)
+    return stop, thread
+
+
 def queue_segment(
     job: dict,
     segment: dict,
@@ -1679,13 +1776,18 @@ def queue_segment(
     guarded_candidates: list[dict] = []
     for attempt in attempt_range:
         prompt_id = resumed_prompt_id if resume_existing else ""
+        progress_stop: threading.Event | None = None
+        progress_thread: threading.Thread | None = None
         attempt_workflow = _workflow_for_attempt(
             workflow, int(segment.get("seed", 0) or 0), attempt
         )
         try:
+            progress_label = str(segment.get("progress_label") or "").strip()
             if resume_existing:
                 emit({
                     "progress": (
+                        f"{progress_label} · resumed from server prompt · {prompt_id}"
+                        if progress_label else
                         f"Segment {segment['index'] + 1}/{job['segment_count']} resumed from "
                         f"server prompt · {prompt_id}"
                     ),
@@ -1698,10 +1800,18 @@ def queue_segment(
                     },
                 })
             else:
+                client_id = "h3-smart-render-" + uuid.uuid4().hex
+                prompt_ref = {"prompt_id": ""}
+                progress_stop, progress_thread = _start_relay_progress_watcher(
+                    server,
+                    client_id,
+                    segment,
+                    prompt_ref,
+                )
                 payload = json.dumps(
                     {
                         "prompt": attempt_workflow,
-                        "client_id": "h3-smart-render-" + uuid.uuid4().hex,
+                        "client_id": client_id,
                     },
                     ensure_ascii=False,
                 ).encode("utf-8")
@@ -1713,12 +1823,17 @@ def queue_segment(
                 )
                 queued = _request_json(request, http_timeout)
                 prompt_id = str(queued.get("prompt_id", ""))
+                prompt_ref["prompt_id"] = prompt_id
                 if not prompt_id:
                     raise RuntimeError("ComfyUI did not return a prompt_id.")
                 if on_queued is not None:
                     on_queued(prompt_id, attempt, queued)
                 emit({
-                    "progress": f"Segment {segment['index'] + 1}/{job['segment_count']} queued · {prompt_id}",
+                    "progress": (
+                        f"{progress_label} · queued · {prompt_id}"
+                        if progress_label else
+                        f"Segment {segment['index'] + 1}/{job['segment_count']} queued · {prompt_id}"
+                    ),
                     "segment_index": segment["index"],
                     "queued": queued,
                 })
@@ -1888,6 +2003,10 @@ def queue_segment(
                 # or silently change the accepted quality contract.
                 time.sleep(2.0 if failure_class == "oom" else 1.0)
         finally:
+            if progress_stop is not None:
+                progress_stop.set()
+            if progress_thread is not None:
+                progress_thread.join(timeout=1.5)
             resume_existing = False
     raise RuntimeError(str(last_error or "Unknown segment generation error"))
 
@@ -1989,10 +2108,23 @@ def queue_character_swap_passes(
                 f"output is missing: {previous_video}"
             )
     final_result: dict = {}
+    shot_label = str(
+        next(
+            (value for value in segment.get("shot_ids") or [] if str(value).strip()),
+            segment.get("segment_id") or f"{segment.get('index', 0) + 1}",
+        )
+    ).strip()
     for pass_index, pass_row in enumerate(passes):
         workflow = deepcopy(pass_row.get("workflow") or {})
         role = str(pass_row.get("source_role_id") or f"pass-{pass_index + 1}")
         target = str(pass_row.get("target_media_id") or "")
+        relay_window_count = max(
+            1, int(pass_row.get("relay_window_count", 1) or 1)
+        )
+        status_prefix = (
+            f"Segment {shot_label} · Role {role} · "
+            f"Pass {pass_index + 1}/{len(passes)}"
+        )
         if resume_active and pass_index < resume_pass_index:
             previous_video = Path(completed_pass_outputs[pass_index])
             continue
@@ -2030,8 +2162,7 @@ def queue_character_swap_passes(
             })
         emit({
             "progress": (
-                f"Segment {segment['index'] + 1} · Character Swap pass "
-                f"{pass_index + 1}/{len(passes)} · {role} → @{target}"
+                f"{status_prefix} · Window 1/{relay_window_count}"
             ),
             "segment_index": segment["index"],
             "character_swap_pass": {
@@ -2052,6 +2183,12 @@ def queue_character_swap_passes(
                 / f"character_swap_pass_{pass_index + 1:02d}_{role}"
             ),
             "native_speech_guard": {"enabled": False},
+            "progress_label": (
+                f"{status_prefix} · Window 1/{relay_window_count}"
+            ),
+            "relay_status_prefix": status_prefix,
+            "relay_window_count": relay_window_count,
+            "relay_node_id": str(pass_row.get("relay_node_id") or ""),
         }
         if resume_active and pass_index == resume_pass_index:
             pass_segment.update(
@@ -2096,6 +2233,20 @@ def queue_character_swap_passes(
         else:
             completed_pass_outputs[pass_index] = str(previous_video.resolve())
         resume_active = False
+        emit({
+            "progress": (
+                f"{status_prefix} · Window {relay_window_count}/{relay_window_count} · complete"
+            ),
+            "segment_index": segment["index"],
+            "character_swap_pass": {
+                "index": pass_index + 1,
+                "count": len(passes),
+                "source_role_id": role,
+                "target_media_id": target,
+                "window_index": relay_window_count,
+                "window_count": relay_window_count,
+            },
+        })
     return {
         **persisted,
         "status": "complete",
