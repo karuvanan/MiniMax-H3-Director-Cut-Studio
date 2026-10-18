@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 from media_engine import (
+    SOURCE_VIDEO_ROLE_DISCOVERY_PROFILE,
     create_audio_waveform,
     create_image_analysis_regions,
     create_video_analysis_frames,
@@ -142,10 +143,9 @@ def main() -> int:
                 )
                 frame_dir = Path(
                     str(cache_base)
-                    # v3 adds early/late samples per edit so Qwen can inspect
-                    # performance changes and richer set evidence instead of
-                    # inferring a whole Shot from one midpoint still.
-                    + ("_full_scene_frames_v3" if full_duration_analysis else "_frames")
+                    # v4 invalidates the old 48-frame / midpoint-only cache and
+                    # carries the role-discovery v2 temporal sampling plan.
+                    + ("_full_scene_frames_v4" if full_duration_analysis else "_frames")
                 )
                 _emit({"job": job["job"], "progress": 0.25, "stage": "extracting frames"})
                 frames = create_video_analysis_frames(
@@ -191,6 +191,12 @@ def main() -> int:
                         "full_duration_analysis": bool(
                             media_type == "video" and full_duration_analysis
                         ),
+                        "analysis_sampling_profile": (
+                            SOURCE_VIDEO_ROLE_DISCOVERY_PROFILE
+                            if media_type == "video" and full_duration_analysis
+                            else "standard"
+                        ),
+                        "analysis_frame_count": len(analysis_sources),
                         "scene_cut_times": (
                             scene_cut_times if media_type == "video" else []
                         ),

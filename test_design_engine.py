@@ -1867,6 +1867,56 @@ On-screen text: "EXACT TITLE"'''
         self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
         self.assertEqual(result["input_images_used"], 1)
 
+    def test_source_role_discovery_can_send_six_storyboard_sheets(self):
+        root = Path(__file__).parent / ".director_cache" / "six_qwen_storyboards"
+        root.mkdir(parents=True, exist_ok=True)
+        images = []
+        for index in range(1, 8):
+            image = root / f"sheet_{index}.jpg"
+            image.write_bytes(f"sheet-{index}".encode("ascii"))
+            images.append(image)
+        calls = []
+
+        def fake_request(url, *, api_key, timeout, payload=None):
+            calls.append((url, payload))
+            if url.endswith("/models"):
+                return {"data": [{"id": "qwen-vl-local"}]}
+            return {
+                "choices": [{
+                    "message": {"content": "{}"},
+                    "finish_reason": "stop",
+                }],
+            }
+
+        try:
+            with patch("design_ai_service.request_json", side_effect=fake_request):
+                result = handle_design_ai_job({
+                    "action": "generate",
+                    "provider": "lm_studio",
+                    "base_url": "http://127.0.0.1:1234/v1",
+                    "model": "qwen-vl-local",
+                    "system_prompt": "Return JSON.",
+                    "user_prompt": "Inspect every storyboard sheet.",
+                    "schema": {"type": "object"},
+                    "input_image_paths": [str(path) for path in images],
+                    "max_input_images": 6,
+                    "require_image_input": True,
+                })
+            completion = next(
+                payload for url, payload in calls
+                if url.endswith("/chat/completions")
+            )
+            image_parts = [
+                item for item in completion["messages"][-1]["content"]
+                if item.get("type") == "image_url"
+            ]
+            self.assertEqual(len(image_parts), 6)
+            self.assertEqual(result["input_images_used"], 6)
+        finally:
+            for image in images:
+                image.unlink(missing_ok=True)
+            root.rmdir()
+
     def test_design_ai_preserves_empty_length_stop_for_ui_recovery(self):
         def fake_request(url, *, api_key, timeout, payload=None):
             if url.endswith("/models"):

@@ -19,6 +19,14 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus"}
 
+# Source-Video Cast Remake uses a richer, versioned frame plan than ordinary
+# Media Pool video.  Six 4x4 sheets keep each panel readable while giving Qwen
+# enough temporal coverage to discover brief performers near either edge of a
+# detected source scene.
+SOURCE_VIDEO_ROLE_DISCOVERY_PROFILE = "role_discovery_v2"
+SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES = 96
+SOURCE_VIDEO_ROLE_DISCOVERY_MAX_SHEETS = 6
+
 
 def remove_solid_background(
     source: str | Path,
@@ -203,6 +211,90 @@ def create_video_thumbnail(
     return destination
 
 
+def plan_scene_analysis_samples(
+    scenes: list[tuple[int, float, float]],
+    max_frames: int = SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES,
+) -> list[tuple[str, float]]:
+    """Plan role-discovery frames without a midpoint-only quality cliff.
+
+    Up to 32 scenes receive early/mid/late coverage.  Medium scene counts keep
+    both temporal edges, adding midpoints while capacity remains.  When there
+    are more scenes than can receive two frames, every scene keeps one anchor
+    and the spare budget is spread chronologically across early/late edges.
+    Only an extreme source with more scenes than the complete frame budget is
+    uniformly thinned, and even then the retained panels cycle through early,
+    midpoint and late instead of sampling every scene at the same phase.
+    """
+
+    normalized = [
+        (int(index), float(start), float(end))
+        for index, start, end in scenes
+        if float(end) - float(start) >= 0.12
+    ]
+    if not normalized:
+        return []
+    budget = max(3, int(max_frames))
+
+    def evenly_selected_positions(length: int, count: int) -> list[int]:
+        count = max(0, min(int(count), length))
+        if count <= 0:
+            return []
+        if count >= length:
+            return list(range(length))
+        if count == 1:
+            return [length // 2]
+        return sorted({
+            round(offset * (length - 1) / (count - 1))
+            for offset in range(count)
+        })
+
+    fractions = {"early": 0.15, "midpoint": 0.50, "late": 0.85}
+    panel_order = ("early", "midpoint", "late")
+
+    if len(normalized) > budget:
+        retained_positions = evenly_selected_positions(len(normalized), budget)
+        samples: list[tuple[str, float]] = []
+        for retained_order, position in enumerate(retained_positions):
+            index, start, end = normalized[position]
+            panel = panel_order[retained_order % len(panel_order)]
+            samples.append((
+                f"source scene {index:02d} {start:.2f}-{end:.2f}s {panel}",
+                start + (end - start) * fractions[panel],
+            ))
+        return samples
+
+    selected_panels: list[set[str]] = [{"midpoint"} for _scene in normalized]
+    spare = budget - len(normalized)
+    if spare >= len(normalized):
+        # Two samples per scene should favour the temporal edges; these expose
+        # entrances, exits and reaction cuts that one midpoint commonly misses.
+        selected_panels = [{"early", "late"} for _scene in normalized]
+        spare -= len(normalized)
+        for position in evenly_selected_positions(
+            len(normalized), min(spare, len(normalized))
+        ):
+            selected_panels[position].add("midpoint")
+    elif spare:
+        # No abrupt all-midpoint fallback: distribute the available edge views
+        # over the full chronology, alternating early and late evidence.
+        for order, position in enumerate(
+            evenly_selected_positions(len(normalized), spare)
+        ):
+            selected_panels[position].add("early" if order % 2 == 0 else "late")
+
+    samples = []
+    for (index, start, end), panels in zip(normalized, selected_panels):
+        span = end - start
+        for panel in panel_order:
+            if panel not in panels:
+                continue
+            samples.append((
+                f"source scene {index:02d} {start:.2f}-{end:.2f}s {panel}",
+                start + span * fractions[panel],
+            ))
+    return samples
+
+
 def create_video_analysis_frames(
     path: str | Path,
     destination_dir: str | Path,
@@ -231,43 +323,13 @@ def create_video_analysis_frames(
             for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1)
             if end - start >= 0.12
         ]
-        # Two temporal samples per edit let the vision model distinguish a
-        # speaking mouth from a static reaction and preserve more blocking/set
-        # detail.  Fall back to one midpoint only when a long edit would exceed
-        # the bounded 48-frame analysis budget.
-        samples: list[tuple[str, float]] = []
-        two_per_scene = bool(scenes and len(scenes) * 2 <= max(3, int(max_frames)))
-        for index, start, end in scenes:
-            span = end - start
-            if two_per_scene and span >= 0.36:
-                samples.extend((
-                    (
-                        f"source scene {index:02d} {start:.2f}-{end:.2f}s early",
-                        start + span * 0.34,
-                    ),
-                    (
-                        f"source scene {index:02d} {start:.2f}-{end:.2f}s late",
-                        start + span * 0.68,
-                    ),
-                ))
-            else:
-                samples.append((
-                    f"source scene {index:02d} {start:.2f}-{end:.2f}s midpoint",
-                    (start + end) / 2.0,
-                ))
-        if len(samples) < 3:
+        samples = plan_scene_analysis_samples(scenes, max_frames=max_frames)
+        if not samples:
             samples = [
                 ("source opening 10%", duration * 0.10),
                 ("source middle 50%", duration * 0.50),
                 ("source ending 90%", duration * 0.90),
             ]
-        if len(samples) > max(3, int(max_frames)):
-            wanted = max(3, int(max_frames))
-            indexes = {
-                round(index * (len(samples) - 1) / (wanted - 1))
-                for index in range(wanted)
-            }
-            samples = [sample for index, sample in enumerate(samples) if index in indexes]
     else:
         samples = [
             ("opening 10%", duration * 0.10),

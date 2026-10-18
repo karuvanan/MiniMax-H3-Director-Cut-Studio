@@ -7,11 +7,13 @@ from PIL import Image
 from audio_engine import SAMPLE_RATE, estimate_tempo, stream_audio_chunks, voice_activity
 from blip_service import is_cuda_fallback_error
 from media_engine import (
+    SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES,
     create_image_analysis_regions,
     create_labeled_contact_sheet,
     create_video_analysis_frames,
     create_video_shot_frame_scan,
     media_type_for_path,
+    plan_scene_analysis_samples,
     probe_media,
     remove_solid_background,
 )
@@ -102,7 +104,7 @@ class MediaEngineTests(unittest.TestCase):
         self.assertAlmostEqual(frames[-1]["time_seconds"], 23 / 24, places=6)
         self.assertTrue(all(Path(row["path"]).is_file() for row in frames))
 
-    def test_scene_aware_scan_keeps_three_frames_for_single_scene_video(self):
+    def test_scene_aware_scan_keeps_early_midpoint_late_for_single_scene_video(self):
         source = PROJECT_ROOT / ".director_cache" / "runtime_smoke" / "sample.mp4"
         if not source.exists():
             self.skipTest("runtime smoke video is not present")
@@ -112,7 +114,49 @@ class MediaEngineTests(unittest.TestCase):
         )
         self.assertEqual(len(frames), 3)
         self.assertTrue(all(path.is_file() for _, path in frames))
-        self.assertIn("source opening", frames[0][0])
+        self.assertIn("source scene 01", frames[0][0])
+        self.assertIn("early", frames[0][0])
+        self.assertIn("midpoint", frames[1][0])
+        self.assertIn("late", frames[2][0])
+
+    def test_role_discovery_sampling_has_no_midpoint_only_scene_cliff(self):
+        scenes = [
+            (index, float(index - 1), float(index))
+            for index in range(1, 61)
+        ]
+        samples = plan_scene_analysis_samples(
+            scenes,
+            max_frames=SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES,
+        )
+        labels = [label for label, _seconds in samples]
+        self.assertEqual(len(samples), 96)
+        self.assertEqual(
+            {
+                int(label.split()[2])
+                for label in labels
+            },
+            set(range(1, 61)),
+        )
+        self.assertTrue(any(" early" in label for label in labels))
+        self.assertTrue(any(" late" in label for label in labels))
+        self.assertFalse(all("midpoint" in label for label in labels))
+
+    def test_role_discovery_sampling_uses_three_panels_when_capacity_allows(self):
+        scenes = [
+            (index, float(index - 1), float(index))
+            for index in range(1, 31)
+        ]
+        samples = plan_scene_analysis_samples(scenes, max_frames=96)
+        self.assertEqual(len(samples), 90)
+        for scene_index in range(1, 31):
+            labels = [
+                label for label, _seconds in samples
+                if f"scene {scene_index:02d} " in label
+            ]
+            self.assertEqual(len(labels), 3)
+            self.assertTrue(any(" early" in label for label in labels))
+            self.assertTrue(any(" midpoint" in label for label in labels))
+            self.assertTrue(any(" late" in label for label in labels))
 
     def test_image_analysis_regions_include_overlay_resistant_scene_crops(self):
         root = PROJECT_ROOT / ".director_cache" / "image_region_test"

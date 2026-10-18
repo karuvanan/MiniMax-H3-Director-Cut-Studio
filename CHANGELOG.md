@@ -2,6 +2,54 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.7-alpha.17] - 2026-10-18
+
+### Qwen Role Discovery v2 · 96-Frame V1 Storyboard
+
+- 确认旧Source Video Cast Remake分析最多48帧：场景数不超过24时每场抽取约34% Early及68% Late；超过24场后会突然退化为每场单一Midpoint，超过48场还会均匀删除部分场景，容易遗漏只在场景开头／结尾短暂出现的关键角色。
+- 新`Role Discovery v2`将完整V1分析上限提高至96帧，并允许Source分析专用请求向Qwen发送最多6张清晰4×4 Storyboard；普通Design仍保持原来的三图上限。
+- 场景数量允许时每场抽取15% Early、50% Midpoint及85% Late三帧，扩大角色进入／离开画面的覆盖范围。
+- 中长影片采用渐进式预算：优先保留每个场景，再按全片时间均匀增加Early／Late证据；不再出现超过24场后全部只剩Midpoint的质量断崖。
+- 极端超过96个检测场景的素材才会均匀缩减场景，但保留帧会轮换Early／Midpoint／Late，不会全片固定在同一相位。
+- Qwen指令明确要求读取sheet 1至sheet 6全部面板，并把只出现于单一时间面板的人物视为有效principal-role候选。
+- 新分析使用`role_discovery_v2`版本标记及V4 frame cache；旧48帧Project下次点击Design时会自动重新抽帧及重新运行Qwen，不需重新导入V1。
+- App版本升级至`0.3.7-alpha.17`；Project Format保持`28`，Render Policy保持`38`。
+
+### Verification
+
+- 36项媒体抽帧、96帧预算、六图Qwen请求、V1结构化分析、旧取样自动失效及Current Role回归测试通过；Python编译通过。
+
+## [0.3.7-alpha.16] - 2026-10-18
+
+### Detect V1 People Now Creates Visible Current Roles
+
+- 修复`DETECT V1 PEOPLE`已经识别并保存新人物及位置框，但`Character → Unlock All Characters`仍只从旧的全局V1角色ledger建立列表，导致新人物没有出现在`CURRENT ROLE`的问题。
+- 新识别的`R`角色现在会立即加入当前Shot的角色绑定列表；即使尚未手动选择P Picture，也会先用可用P Picture作为可编辑建议，不再静默隐藏。
+- Shot本地保存的`source_role_bbox_overrides`现在也是持久角色证据；关闭视窗、储存Project或重新打开后，新角色仍会恢复为独立Current Role行。
+- Current Role头像优先使用该Shot实际角色框裁切V1画面，不再把旧全局ledger缺少的新角色错误显示成整幅画面。
+- 收紧Qwen逐帧角色合并：同一批／同画面的两个人不会只因感知哈希接近而合并；跨帧的同一人物仍可凭脸部、服装与身份描述的组合证据延续同一R编号。
+- App版本升级至`0.3.7-alpha.16`；Project Format保持`28`，Render Policy保持`38`。
+
+### Verification
+
+- 18项Current Role、Qwen逐帧检测、多人角色、角色框、重复P绑定及Source Video Cast Remake相关测试通过；Python编译通过。
+
+## [0.3.7-alpha.15] - 2026-10-18
+
+### Reviewed Dirty Preview Is Now the Accepted Take
+
+- 修复在Shot执行`DETECT V1 PEOPLE`并更新角色后，`REGENERATE DIRTY` Preview正确，但`ACCEPT 1.0`再次从原始V1运行Character Swap，导致同一Prompt／P Picture／角色框／seed在不同解析度下重新选错人物、视觉上像退回原装设定的问题。
+- Dirty Segment的成功Preview现在是用户已经审核的权威画面；Accept会直接提升该Preview为正式Take，不再向H3重新提交原始V1。
+- 若Project已有旧1.0MP Segment，Studio会读取其最终画布，以Lanczos及中心裁切确定性适配审核过的Preview；只改变编码画布，不重新解释人物、角色框或身份。
+- Clean Segment继续复用既有1.0MP Take；只有已审核的Dirty Segment使用锁定Preview，因此不会重新生成全片，也不会污染邻近Shot。
+- 锁定来源、Preview路径及`reviewed_preview_locked_accept`原因会写入Smart Render Manifest，方便恢复Project及诊断。
+- App版本升级至`0.3.7-alpha.15`；Project Format保持`28`，Render Policy保持`38`。
+
+### Verification
+
+- 使用实际失败Project `a_cartoon_character_with_a_suit_and_tie`核对：Preview与Accept的角色Prompt、P3、R4/R5框及seed完全相同，但旧1.0MP重跑把正确替换移到原人物背后；新锁定Take成功由704×704确定性适配为1024×960、24fps。
+- Dirty Preview复用／Accept回归测试及Python编译通过。
+
 ## [0.3.7-alpha.14] - 2026-10-18
 
 ### Completed-Prompt Output Download Recovery

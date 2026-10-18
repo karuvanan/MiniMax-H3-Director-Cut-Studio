@@ -102,6 +102,9 @@ from blip_summary import (
     render_blip_summary,
 )
 from media_engine import (
+    SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES,
+    SOURCE_VIDEO_ROLE_DISCOVERY_MAX_SHEETS,
+    SOURCE_VIDEO_ROLE_DISCOVERY_PROFILE,
     create_labeled_contact_sheet,
     create_video_thumbnail,
     media_type_for_path,
@@ -7483,12 +7486,54 @@ class ShotVisualEditorDialog(QDialog):
 
     def _edit_identity(self) -> None:
         overrides = self.cue.character_identity_overrides or {}
+        source_role_bindings = dict(self._source_role_bindings)
+        if self._source_remake_editor:
+            fallback_target = normalize_picture_reference(
+                self._identity_choices[0].get("media_id")
+                if self._identity_choices else ""
+            )
+            # A freshly detected person is a real CURRENT ROLE even before the
+            # user assigns a P Picture.  Previously this dialog rebuilt its
+            # rows only from the persistent binding ledger, so an unbound Qwen
+            # result could have a valid frame/box yet remain invisible.
+            # The same rule also recovers Shot-local boxes from a saved Project
+            # whose older global ledger no longer contains that R role.
+            detected_role_ids = {
+                *self._detected_unbound_source_roles,
+                *self._source_role_visuals,
+            }
+            for raw_role in detected_role_ids:
+                role = str(raw_role or "").strip().upper()
+                if not re.fullmatch(r"R[1-9]\d*", role):
+                    continue
+                payload = self._detected_unbound_source_roles.get(role) or {}
+                if role not in source_role_bindings:
+                    payload = self._detected_unbound_source_roles.setdefault(
+                        role,
+                        {
+                            "target_media_id": fallback_target,
+                            "scene_index": int(
+                                (self._source_role_visuals.get(role) or {}).get(
+                                    "scene_index", 0
+                                ) or 0
+                            ),
+                            "activate_source_role": bool(
+                                (self._source_role_visuals.get(role) or {}).get(
+                                    "activate_source_role", True
+                                )
+                            ),
+                        },
+                    )
+                target = normalize_picture_reference(
+                    (payload or {}).get("target_media_id")
+                ) or fallback_target
+                source_role_bindings.setdefault(role, target)
         identity_sources = (
             [
                 (role, picture, True)
-                for role, picture in self._source_role_bindings.items()
+                for role, picture in source_role_bindings.items()
             ]
-            if self._source_role_bindings else
+            if source_role_bindings else
             [
                 (source, overrides.get(source, source), False)
                 for source in self._character_source_references(self.cue)
@@ -7550,10 +7595,20 @@ class ShotVisualEditorDialog(QDialog):
                     if role not in self._source_role_bindings
                 }
                 self._detected_unbound_source_roles.update(deepcopy(missing))
+                fallback_target = normalize_picture_reference(
+                    self._identity_choices[0].get("media_id")
+                    if self._identity_choices else ""
+                )
                 self._source_role_bindings.update({
-                    role: normalize_picture_reference(payload.get("target_media_id"))
+                    role: (
+                        normalize_picture_reference(payload.get("target_media_id"))
+                        or fallback_target
+                    )
                     for role, payload in missing.items()
-                    if normalize_picture_reference(payload.get("target_media_id"))
+                    if (
+                        normalize_picture_reference(payload.get("target_media_id"))
+                        or fallback_target
+                    )
                 })
                 visual_resolver = getattr(
                     self.parentWidget(), "_source_role_visuals_for_shot", None
@@ -21537,10 +21592,13 @@ class DirectorCutStudio(QMainWindow):
                     "media": asset.local_path,
                     "timeline_seconds": self.scan.duration_seconds,
                     "full_duration_analysis": full_duration_analysis,
-                    # Source-video reconstruction needs one visual sample for
-                    # every detected scene. The former cap of 18 could silently
-                    # omit late scenes from longer social/video edits.
-                    "max_analysis_frames": 48 if full_duration_analysis else 18,
+                    # Source-video reconstruction needs temporal edge evidence,
+                    # not only one midpoint per detected scene. Role-discovery
+                    # v2 supplies up to six readable 4x4 Qwen storyboards.
+                    "max_analysis_frames": (
+                        SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES
+                        if full_duration_analysis else 18
+                    ),
                     "cache_root": str(CACHE_ROOT),
                 }
             )
@@ -21629,6 +21687,8 @@ class DirectorCutStudio(QMainWindow):
             marker = (
                 "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage="
                 f"{float(result.get('analysis_duration_seconds', 0.0)):.3f}s · "
+                f"sampling={str(result.get('analysis_sampling_profile', 'legacy'))} · "
+                f"frames={int(result.get('analysis_frame_count', 0) or 0)} · "
                 f"scene_cuts={','.join(cut_values) if cut_values else 'none'}"
             )
             asset.recognition = (asset.recognition.rstrip() + "\n" + marker).strip()
@@ -21681,21 +21741,30 @@ class DirectorCutStudio(QMainWindow):
     def _source_video_remake_frames_complete(self, asset: MediaAsset) -> bool:
         recognition = str(asset.recognition or "")
         marker = re.search(
-            r"SOURCE VIDEO BREAKDOWN · full_duration=yes[^\n]*scene_cuts=([^\n]+)",
+            r"SOURCE VIDEO BREAKDOWN · full_duration=yes[^\n]*"
+            rf"sampling={re.escape(SOURCE_VIDEO_ROLE_DISCOVERY_PROFILE)}[^\n]*"
+            r"frames=(\d+)[^\n]*scene_cuts=([^\n]+)",
             recognition,
             flags=re.I,
         )
         if not marker:
             return False
-        cut_text = marker.group(1).strip()
+        prepared_frames = int(marker.group(1) or 0)
+        cut_text = marker.group(2).strip()
         expected_scenes = (
             3
             if cut_text.casefold() == "none"
             else len(re.findall(r"\d+(?:\.\d+)?", cut_text)) + 1
         )
-        required_frames = min(48, max(3, expected_scenes))
-        prepared_frames = len(self.analysis_paths.get(asset.node_id, []))
-        return prepared_frames >= required_frames
+        required_frames = min(
+            SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES,
+            max(3, expected_scenes),
+        )
+        available_frames = len(self.analysis_paths.get(asset.node_id, []))
+        return (
+            prepared_frames >= required_frames
+            and available_frames >= required_frames
+        )
 
     def _source_video_remake_qwen_complete(self, asset: MediaAsset) -> bool:
         # The schema marker may advance while a saved project's complete V1
@@ -21756,9 +21825,8 @@ class DirectorCutStudio(QMainWindow):
             ).encode("utf-8", errors="replace")
         ).hexdigest()[:16]
         try:
-            # Keep every panel readable to the vision model.  A single dense
-            # sheet made later scenes too small; up to 48 source scenes become
-            # three consecutive 4x4 sheets, matching the service image limit.
+            # Keep every panel readable to the vision model. Role-discovery v2
+            # carries as many as 96 chronological panels in six 4x4 sheets.
             storyboard_paths: list[Path] = []
             for sheet_index, offset in enumerate(
                 range(0, len(labeled_frames), 16), 1
@@ -21770,6 +21838,9 @@ class DirectorCutStudio(QMainWindow):
                     columns=4,
                     cell_size=(384, 216),
                 ))
+            storyboard_paths = storyboard_paths[
+                :SOURCE_VIDEO_ROLE_DISCOVERY_MAX_SHEETS
+            ]
             settings = load_design_settings(DESIGN_SETTINGS_ENV)
             # Full V1 vision ledgers are materially heavier than an ordinary
             # Design request. Give both the HTTP call and worker watchdog a
@@ -21847,6 +21918,7 @@ class DirectorCutStudio(QMainWindow):
                 "user_prompt": user_prompt,
                 "schema": SOURCE_VIDEO_DIRECTOR_ANALYSIS_SCHEMA,
                 "input_image_paths": [str(path) for path in storyboard_paths],
+                "max_input_images": SOURCE_VIDEO_ROLE_DISCOVERY_MAX_SHEETS,
                 "require_image_input": True,
                 "require_exact_model": True,
             })
@@ -22153,6 +22225,14 @@ class DirectorCutStudio(QMainWindow):
             }
         })
         active_roles.update(self._shot_role_picture_bindings(cue).keys())
+        # Shot-local DETECT V1 PEOPLE boxes are durable role evidence too.
+        # Keep them visible even when an older/global ledger was deduplicated,
+        # replaced, or has not yet received a P-picture binding.
+        active_roles.update(
+            str(role_id or "").strip().upper()
+            for role_id in cue.source_role_bbox_overrides
+            if re.fullmatch(r"R[1-9]\d*", str(role_id or "").strip(), re.I)
+        )
         if not active_roles:
             return {}
 
@@ -22219,6 +22299,7 @@ class DirectorCutStudio(QMainWindow):
             pixmap = QPixmap(str(frame)) if frame is not None else QPixmap()
             bbox = (
                 ([0.0, 0.0, 1.0, 1.0] if shot_scan_thumbnail.is_file() else None)
+                or cue.source_role_bbox_overrides.get(role_id)
                 or evidence.get("thumbnail_bbox_normalized")
                 or role.get("thumbnail_bbox_normalized")
                 or [0.0, 0.0, 1.0, 1.0]
@@ -22655,18 +22736,50 @@ class DirectorCutStudio(QMainWindow):
                 and str(person.get("visual_identity", "")).strip().casefold()
                 == str(role.get("visual_identity", "")).strip().casefold()
             )
-            qualifies = (
-                face_score >= 0.92
-                or (face_score >= 0.84 and identity_score >= 0.42)
-                or (
-                    identity_score >= 0.82 and wardrobe_score >= 0.64
-                    and (not overlaps or face_score >= 0.78 or exact_identity)
+            candidate_from_current_scan = role_id in detected_roles
+            if candidate_from_current_scan and overlaps:
+                # Two people visible at the same time must remain two CURRENT
+                # ROLE rows.  Perceptual hashes of small/blurred face crops can
+                # be almost identical when lighting and background dominate;
+                # never collapse co-visible people on hash similarity alone.
+                qualifies = (
+                    (
+                        face_score >= 0.98 and wardrobe_score >= 0.90
+                        and identity_score >= 0.35
+                    )
+                    or (
+                        exact_identity and face_score >= 0.90
+                        and wardrobe_score >= 0.45
+                    )
                 )
-                or (
-                    frame_gap <= 48 and identity_score >= 0.62
-                    and wardrobe_score >= 0.50
+            elif candidate_from_current_scan:
+                # Reuse one person across consecutive 24fps batches, but keep
+                # the threshold conservative enough to preserve a newly
+                # entering performer.
+                qualifies = (
+                    (face_score >= 0.95 and identity_score >= 0.35)
+                    or (face_score >= 0.84 and identity_score >= 0.42)
+                    or (
+                        identity_score >= 0.84 and wardrobe_score >= 0.66
+                        and frame_gap <= 48
+                    )
                 )
-            )
+            else:
+                # Matching an unlabelled Qwen row to the pre-existing global
+                # ledger is riskier than tracking within this scan.  Require
+                # both visual and textual evidence; otherwise allocate a new
+                # R role so the user can see and decide it in CURRENT ROLE.
+                qualifies = (
+                    (face_score >= 0.97 and identity_score >= 0.48)
+                    or (
+                        face_score >= 0.91 and identity_score >= 0.74
+                        and wardrobe_score >= 0.50
+                    )
+                    or (
+                        exact_identity and face_score >= 0.88
+                        and wardrobe_score >= 0.70
+                    )
+                )
             score = (
                 face_score * 0.55
                 + identity_score * 0.30
@@ -31622,6 +31735,116 @@ class DirectorCutStudio(QMainWindow):
             return None
         return destination.resolve()
 
+    def _materialize_reviewed_preview_lock(
+        self,
+        *,
+        segment_id: str,
+        preview_path: Path,
+        previous_final_path: Path | None,
+        workspace: Path,
+    ) -> Path:
+        """Promote the exact reviewed repair Preview without asking H3 again.
+
+        Character Swap is not resolution-invariant: submitting the same V1,
+        role boxes, P Picture and seed at 1.0MP can select a different person
+        than the already-approved 0.2MP Preview.  Accept therefore treats the
+        reviewed Preview as the visual authority.  When an older production
+        take supplies a final canvas, FFmpeg deterministically fits the
+        Preview to that canvas so the master remains resolution-consistent.
+
+        The original Preview is returned on any probe/transcode failure.  The
+        Smart Render assembler can still normalize that valid movie, whereas
+        silently falling back to a new H3 generation would discard the user's
+        reviewed character selection.
+        """
+
+        preview_path = preview_path.resolve()
+        if not preview_path.is_file():
+            return preview_path
+        target = (
+            previous_final_path.resolve()
+            if previous_final_path is not None and previous_final_path.is_file()
+            else None
+        )
+        if target is None:
+            return preview_path
+        try:
+            preview_info = probe_media(preview_path, self.runtime)
+            target_info = probe_media(target, self.runtime)
+
+            def geometry(info: dict) -> tuple[int, int] | None:
+                for stream in info.get("streams", []):
+                    if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+                        continue
+                    width = int(stream.get("width", 0) or 0)
+                    height = int(stream.get("height", 0) or 0)
+                    if width > 0 and height > 0:
+                        return width + (width % 2), height + (height % 2)
+                return None
+
+            source_geometry = geometry(preview_info)
+            target_geometry = geometry(target_info)
+            if target_geometry is None or source_geometry == target_geometry:
+                return preview_path
+            width, height = target_geometry
+            has_audio = any(
+                isinstance(stream, dict) and stream.get("codec_type") == "audio"
+                for stream in preview_info.get("streams", [])
+            )
+        except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError):
+            return preview_path
+
+        token = hashlib.sha256(
+            (
+                f"reviewed-preview-lock-v1|{preview_path}|{preview_path.stat().st_mtime_ns}|"
+                f"{target}|{target.stat().st_mtime_ns}|{width}x{height}|{segment_id}"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        destination = (
+            workspace / "cache" / "accepted_preview_locks"
+            / f"{segment_id}_{token}_{width}x{height}.mp4"
+        )
+        if destination.is_file() and destination.stat().st_size > 1024:
+            return destination.resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(self.runtime.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(preview_path), "-map", "0:v:0",
+        ]
+        if has_audio:
+            command.extend(["-map", "0:a:0"])
+        command.extend([
+            "-vf",
+            (
+                f"scale=w={width}:h={height}:flags=lanczos:"
+                "force_original_aspect_ratio=increase:force_divisible_by=2,"
+                f"crop=w={width}:h={height},setsar=1,fps=24"
+            ),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+            "-pix_fmt", "yuv420p",
+        ])
+        if has_audio:
+            command.extend(["-c:a", "aac", "-b:a", "192k"])
+        else:
+            command.append("-an")
+        command.extend(["-movflags", "+faststart", str(destination)])
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=max(180, int(float(preview_info.get("duration", 0.0) or 0.0) * 15)),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            destination.unlink(missing_ok=True)
+            return preview_path
+        if completed.returncode or not destination.is_file() or destination.stat().st_size <= 1024:
+            destination.unlink(missing_ok=True)
+            return preview_path
+        return destination.resolve()
+
     def _compiled_character_swap_window_job(
         self,
         start: float,
@@ -31984,6 +32207,26 @@ class DirectorCutStudio(QMainWindow):
 
         cache_key = "preview" if request_kind == "preview" else "production"
         cached_manifest = self.smart_render_manifests.get(cache_key, {})
+        production_rows_by_id = {
+            str(cached_row.get("segment_id", "")): dict(cached_row)
+            for cached_row in (
+                self.smart_render_manifests.get("production", {}).get("segments") or []
+            )
+            if isinstance(cached_row, dict)
+            and str(cached_row.get("segment_id", "")).strip()
+            and Path(str(cached_row.get("output_path", ""))).is_file()
+        }
+        reviewed_preview_rows_by_id = {
+            str(cached_row.get("segment_id", "")): dict(cached_row)
+            for cached_row in (
+                self.smart_render_manifests.get("preview", {}).get("segments") or []
+            )
+            if isinstance(cached_row, dict)
+            and str(cached_row.get("segment_id", "")).strip()
+            and str(cached_row.get("status", "")).lower()
+            in {"cached", "complete", "completed", "reusable"}
+            and Path(str(cached_row.get("output_path", ""))).is_file()
+        }
         # In-flight rows intentionally have no local output_path yet. Keep them
         # separate from the durable-output merge below so Generate Dirty can
         # resume their accepted ComfyUI prompt instead of submitting it again.
@@ -32097,6 +32340,41 @@ class DirectorCutStudio(QMainWindow):
                     }
             cached = cached_by_id.get(segment_id)
             pending = pending_by_id.get(segment_id)
+            reviewed_preview = reviewed_preview_rows_by_id.get(segment_id)
+            lock_reviewed_repair_preview = bool(
+                request_kind != "preview"
+                and reuse_clean_segments
+                and dirty
+                and segment_id in self.render_dirty_previewed_segment_ids
+                and reviewed_preview is not None
+            )
+            if lock_reviewed_repair_preview:
+                preview_path = Path(str(reviewed_preview.get("output_path", "")))
+                previous_final = production_rows_by_id.get(segment_id, {})
+                previous_final_path = Path(
+                    str(previous_final.get("output_path", ""))
+                )
+                locked_path = self._materialize_reviewed_preview_lock(
+                    segment_id=segment_id,
+                    preview_path=preview_path,
+                    previous_final_path=(
+                        previous_final_path if previous_final_path.is_file() else None
+                    ),
+                    workspace=workspace,
+                )
+                if locked_path.is_file():
+                    # ACCEPT means accepting the take the user actually
+                    # reviewed.  Never submit the original V1 to H3 again here:
+                    # Character Swap can choose a different person when only
+                    # the resolution changes from Preview to 1.0MP.
+                    row.update(
+                        status="cached",
+                        output_path=str(locked_path.resolve()),
+                        reuse_reason="reviewed_preview_locked_accept",
+                        accepted_from_reviewed_preview=True,
+                        reviewed_preview_output_path=str(preview_path.resolve()),
+                    )
+                    continue
             core_end = float(
                 row.get("core_end_seconds", row.get("end_seconds", 0.0))
                 or row.get("end_seconds", 0.0)

@@ -654,6 +654,179 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_fresh_detected_unbound_person_always_gets_a_current_role_row(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        root = PROJECT_ROOT / ".director_cache" / "fresh_current_role_row_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        p1_path = root / "p1.png"
+        Image.new("RGB", (96, 96), (35, 120, 190)).save(p1_path)
+        p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        p1.reference_id = "P1"
+        assign_local_media(window.scan, p1, p1_path)
+        window.source_video_role_bindings = [{
+            "source_role_id": "R1",
+            "target_media_id": "P1",
+            "scene_indexes": [1],
+        }]
+        cue = DirectorCue("S1", "shot", 0.0, 5.0, "new person enters")
+        window.director_cues = [cue]
+        editor = ShotVisualEditorDialog(cue, 5.0, window)
+        editor._source_role_bindings = {"R1": "P1"}
+        editor._detected_unbound_source_roles = {
+            "R9": {
+                "target_media_id": "",
+                "scene_index": 1,
+                "activate_source_role": True,
+            }
+        }
+        observed_roles: list[set[str]] = []
+
+        def inspect_identity_dialog(identity_dialog):
+            observed_roles.append({
+                str(getattr(row, "role_id", ""))
+                for row in identity_dialog.findChildren(
+                    QWidget, "shotIdentityCurrentRole"
+                )
+            })
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", new=inspect_identity_dialog):
+            editor._edit_identity()
+        self.assertEqual(observed_roles, [{"R1", "R9"}])
+        editor.close()
+        editor.deleteLater()
+        window.project_dirty = False
+        window.close()
+
+    def test_source_remake_rejects_legacy_48_frame_sampling_marker(self):
+        window = DirectorCutStudio()
+        asset = next(item for item in window.scan.assets if item.media_type == "video")
+        root = PROJECT_ROOT / ".director_cache" / "role_discovery_marker_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        frames = []
+        for index in range(3):
+            frame = root / f"frame_{index}.jpg"
+            Image.new("RGB", (32, 18), (20 + index, 40, 60)).save(frame)
+            frames.append((f"source frame {index}", frame))
+        window.analysis_paths[asset.node_id] = frames
+        asset.recognition = (
+            "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=5.000s · "
+            "scene_cuts=none"
+        )
+        self.assertFalse(window._source_video_remake_frames_complete(asset))
+        asset.recognition = (
+            "SOURCE VIDEO BREAKDOWN · full_duration=yes · coverage=5.000s · "
+            "sampling=role_discovery_v2 · frames=3 · scene_cuts=none"
+        )
+        self.assertTrue(window._source_video_remake_frames_complete(asset))
+        window.project_dirty = False
+        window.close()
+
+    def test_shot_local_bbox_role_survives_a_stale_global_role_ledger(self):
+        window = DirectorCutStudio()
+        index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
+        window.special_combo.setCurrentIndex(index)
+        root = PROJECT_ROOT / ".director_cache" / "saved_local_current_role_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        p1_path = root / "p1.png"
+        Image.new("RGB", (96, 96), (80, 145, 205)).save(p1_path)
+        p1 = next(asset for asset in window.scan.assets if asset.media_type == "image")
+        p1.reference_id = "P1"
+        assign_local_media(window.scan, p1, p1_path)
+        v1 = next(asset for asset in window.scan.assets if asset.media_type == "video")
+        v1.reference_id = "V1"
+        v1.semantic_enrichment = render_source_video_analysis({
+            "media_id": "V1",
+            "duration_seconds": 5.0,
+            "principal_roles": [{"role_id": "R1", "scene_indexes": [1]}],
+            "scenes": [{
+                "scene_index": 1,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "active_source_roles": ["R1"],
+            }],
+        })
+        cue = DirectorCue(
+            "S1", "shot", 0.0, 5.0, "manual new role",
+            source_role_bbox_overrides={"R9": [0.2, 0.1, 0.6, 0.95]},
+        )
+        window.director_cues = [cue]
+        window.source_video_role_bindings = [{
+            "source_role_id": "R1",
+            "target_media_id": "P1",
+            "scene_indexes": [1],
+        }]
+        visuals = window._source_role_visuals_for_shot(cue)
+        self.assertEqual(set(visuals), {"R1", "R9"})
+        editor = ShotVisualEditorDialog(cue, 5.0, window)
+        observed_roles: list[set[str]] = []
+
+        def inspect_identity_dialog(identity_dialog):
+            observed_roles.append({
+                str(getattr(row, "role_id", ""))
+                for row in identity_dialog.findChildren(
+                    QWidget, "shotIdentityCurrentRole"
+                )
+            })
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", new=inspect_identity_dialog):
+            editor._edit_identity()
+        self.assertEqual(observed_roles, [{"R1", "R9"}])
+        editor.close()
+        editor.deleteLater()
+        window.project_dirty = False
+        window.close()
+
+    def test_qwen_scan_does_not_merge_two_covisible_people_by_hash_alone(self):
+        window = DirectorCutStudio()
+        root = PROJECT_ROOT / ".director_cache" / "covisible_people_scan_test"
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        frame = root / "frame_000000.jpg"
+        Image.new("RGB", (160, 90), (120, 90, 60)).save(frame)
+        state = {
+            "cache_dir": root,
+            "known_roles": {},
+            "detected_roles": {},
+            "next_role_number": 1,
+            "frames_by_index": {
+                0: {"path": str(frame), "time_seconds": 0.0},
+            },
+        }
+        common = {
+            "matched_role_id": "",
+            "first_frame_index": 0,
+            "last_frame_index": 0,
+            "best_frame_index": 0,
+            "face_visibility": "front",
+            "confidence": "high",
+        }
+        window._merge_qwen_source_role_batch(state, {
+            "people": [
+                {
+                    **common,
+                    "visual_identity": "woman with short brown hair",
+                    "wardrobe": "black blazer",
+                    "bbox_normalized": [0.05, 0.08, 0.45, 0.95],
+                },
+                {
+                    **common,
+                    "visual_identity": "heavyset grey-haired man with mustache",
+                    "wardrobe": "white lab coat over blue shirt",
+                    "bbox_normalized": [0.55, 0.08, 0.95, 0.95],
+                },
+            ]
+        })
+        self.assertEqual(set(state["detected_roles"]), {"R1", "R2"})
+        window.project_dirty = False
+        window.close()
+
     def test_unlock_all_characters_keeps_save_visible_with_many_roles(self):
         window = DirectorCutStudio()
         index = window.special_combo.findData(SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL)
@@ -7386,6 +7559,40 @@ class DirectorTimelineDragTests(unittest.TestCase):
             [
                 str(row["segment_id"])
                 for row in follow_up["segments"]
+                if row.get("status") != "cached"
+            ],
+            [next_dirty_id],
+        )
+
+        # ACCEPT must promote the exact reviewed dirty Preview instead of
+        # submitting the original source again at another resolution. H3
+        # Character Swap can otherwise choose a different visible person even
+        # with identical role boxes, P Picture and seed.
+        accepted_lock_path, _ = window._build_smart_render_job(
+            request_kind="accepted", megapixels=1.0, seed=97531,
+            enable_rtx_vsr=False, reuse_clean_segments=True,
+        )
+        accepted_lock = json.loads(
+            accepted_lock_path.read_text(encoding="utf-8")
+        )
+        locked_row = next(
+            row for row in accepted_lock["segments"]
+            if str(row["segment_id"]) == dirty_id
+        )
+        self.assertEqual(locked_row["status"], "cached")
+        self.assertEqual(
+            locked_row["reuse_reason"],
+            "reviewed_preview_locked_accept",
+        )
+        self.assertTrue(locked_row["accepted_from_reviewed_preview"])
+        self.assertEqual(
+            Path(locked_row["output_path"]),
+            repaired_preview_output.resolve(),
+        )
+        self.assertEqual(
+            [
+                str(row["segment_id"])
+                for row in accepted_lock["segments"]
                 if row.get("status") != "cached"
             ],
             [next_dirty_id],

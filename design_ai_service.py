@@ -190,6 +190,14 @@ def generate(job: dict) -> dict:
     system_prompt = str(job.get("system_prompt", ""))
     user_prompt = str(job.get("user_prompt", ""))
     require_image_input = bool(job.get("require_image_input", False))
+    try:
+        max_input_images = int(job.get("max_input_images", 3) or 3)
+    except (TypeError, ValueError, OverflowError):
+        max_input_images = 3
+    # Ordinary Design stays at the proven three-image ceiling. The caller must
+    # explicitly opt into a larger forensic storyboard request; six images are
+    # enough for 96 readable 4x4 panels without sending an unbounded payload.
+    max_input_images = max(1, min(6, max_input_images))
     input_images: list[str] = []
     for raw_path in job.get("input_image_paths") or []:
         path = Path(str(raw_path)).expanduser()
@@ -198,7 +206,7 @@ def generate(job: dict) -> dict:
         mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         input_images.append(f"data:{mime_type};base64,{encoded}")
-        if len(input_images) >= 3:
+        if len(input_images) >= max_input_images:
             break
     if require_image_input and not input_images:
         raise ValueError(
