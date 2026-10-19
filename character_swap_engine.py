@@ -130,10 +130,16 @@ def _normalized_person_bbox(value: object) -> list[float]:
     right, bottom = min(1.0, right), min(1.0, bottom)
     if right <= left or bottom <= top:
         return []
-    # Qwen and old Shot scans used [0,0,1,1] when localization failed. Passing
-    # that to Relay makes it interpret the complete scene as the actor and may
-    # insert Picture 1 beside the source performer instead of replacing them.
-    if left <= 0.001 and top <= 0.001 and right >= 0.999 and bottom >= 0.999:
+    # Qwen, old Shot scans, and an early manual-box UI fallback could record a
+    # nearly full-frame rectangle when localization failed. Passing that to
+    # Relay makes it interpret the complete scene as the actor and commonly
+    # pastes Picture 1 over the plate instead of replacing the performer.
+    width, height = right - left, bottom - top
+    if (
+        (left <= 0.001 and top <= 0.001 and right >= 0.999 and bottom >= 0.999)
+        or width * height >= 0.82
+        or (width >= 0.94 and height >= 0.82)
+    ):
         return []
     return [left, top, right, bottom]
 
@@ -679,6 +685,9 @@ This pass may modify only the selected source performer(s) named above. Every ot
 
 ILLUSTRATED-CAST TO LIVE-ACTION CONTRACT:
 <Picture 1> may be a cartoon, anime, comic, cel-shaded or otherwise illustrated design. Preserve its semantic identity cues—apparent age, moustache or facial-hair design, hairstyle silhouette and colour, facial proportions, wardrobe design, colour blocking and signature accessories—but do not preserve its drawing medium as pixels. Reconstruct Subject 1 as a physically plausible live-action human photographed in the same production as <Video 1>. Use realistic anatomy and head-to-body scale, dimensional skin, individual hair, real cloth weave, natural pores, subsurface skin colour, scene-matched highlights and shadows, lens softness, depth of field, motion blur and film grain. Match Video 1 exposure, white balance, shadow direction, edge softness and occlusion. No pasted cartoon head, sticker edge, black ink outline, flat cel shading, paper cutout, oversized head, illustrated hands or mixed 2D/photographic surfaces. The result must remain recognisable as the Picture 1 character's live-action film interpretation.
+
+FULL DESIGN-SHEET INTERPRETATION — MANDATORY:
+Treat the complete Picture 1 person as a character design sheet, never as a crop, decal, face patch or ready-made foreground layer. Rebuild one coherent head, neck, shoulders, torso, wardrobe and any visible limbs on the original Video 1 body geometry. The head size, shoulder width, perspective, frame-edge truncation and camera distance come only from the selected Video 1 performer. Never enlarge Picture 1's face to fill the selected rectangle, never paste its original flat pixels, and never leave the source actor's hair, collar, robe or body underneath it.
 """
 
     prompt = f"""{target_clause}

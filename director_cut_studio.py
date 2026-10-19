@@ -456,7 +456,7 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 41
+SMART_RENDER_POLICY_VERSION = 42
 PROGRAM_MONITOR_FPS = 24.0
 H3_DURATION_FRAME_MODULUS = 17
 H3_DURATION_FRAME_REMAINDER = 5
@@ -19991,6 +19991,7 @@ class DirectorCutStudio(QMainWindow):
         mandatory_story_boundaries = {start, end}
         isolated_repair_boundaries: set[float] = set()
         relay_shot_boundaries: set[float] = set()
+        relay_window_split_boundaries: set[float] = set()
         logical_shots = self._coalesce_beat_synced_campus_bridge_cues([
             cue for cue in self.director_cues if cue.cue_type == "shot"
         ])
@@ -20018,6 +20019,27 @@ class DirectorCutStudio(QMainWindow):
                     if start + 1e-6 < boundary < end - 1e-6:
                         mandatory_story_boundaries.add(boundary)
                         relay_shot_boundaries.add(boundary)
+                # Relay's second adaptive window may restore the original V1
+                # actor after a successful first window.  Split an over-limit
+                # authored Shot into balanced Studio jobs so every piece gets
+                # the P reference and LoRA from frame one.  Balanced halves
+                # avoid the unusable one- or two-frame tail produced by simply
+                # cutting at the 124-frame Relay ceiling.
+                cue_start = max(start, float(cue.start_seconds))
+                cue_end = min(end, float(cue.end_seconds))
+                relay_parts = character_swap_relay_window_count(
+                    cue_end - cue_start
+                )
+                if cue_end > cue_start and relay_parts > 1:
+                    for part_index in range(1, relay_parts):
+                        boundary = round(
+                            cue_start
+                            + (cue_end - cue_start) * part_index / relay_parts,
+                            6,
+                        )
+                        if start + 1e-6 < boundary < end - 1e-6:
+                            mandatory_story_boundaries.add(boundary)
+                            relay_window_split_boundaries.add(boundary)
             if not (
                 self._is_beat_synced_campus_bridge_shot(cue)
                 or self._is_beat_synced_p4_campus_composite_shot(cue)
@@ -20050,7 +20072,11 @@ class DirectorCutStudio(QMainWindow):
                     # neighbouring face/action into the regenerated request.
                     grid_seconds=(
                         0.001
-                        if isolated_repair_boundaries or relay_shot_boundaries
+                        if (
+                            isolated_repair_boundaries
+                            or relay_shot_boundaries
+                            or relay_window_split_boundaries
+                        )
                         else TIMELINE_SNAP_SECONDS
                     ),
                 ))
@@ -20133,6 +20159,16 @@ class DirectorCutStudio(QMainWindow):
                 # A repaired Shot begins from the accepted previous frame but
                 # does not regenerate or rewrite either neighboring Shot.
                 segment.continuity_mode = "motion_reference"
+            elif any(
+                abs(segment.start_seconds - boundary)
+                <= (1.0 / PROGRAM_MONITOR_FPS) / 2 + 1e-6
+                for boundary in relay_window_split_boundaries
+            ):
+                # This remains the same authored Shot, but each Relay job must
+                # start from its own exact V1 slice and full P identity sheet.
+                # Do not inject the preceding generated actor as a competing
+                # visual source.
+                segment.continuity_mode = "hard_cut"
             elif any(
                 abs(segment.start_seconds - boundary)
                 <= TIMELINE_SNAP_SECONDS / 2 + 1e-6
@@ -32187,6 +32223,8 @@ class DirectorCutStudio(QMainWindow):
         self,
         source: Path,
         pass_spec: dict,
+        *,
+        preserve_full_design: bool = False,
     ) -> tuple[Path, str]:
         """Match a P-picture's identity scale to the selected V1 performer.
 
@@ -32195,6 +32233,14 @@ class DirectorCutStudio(QMainWindow):
         source performers, give Relay an upper-body/identity crop instead.  The
         original Media Pool asset is never modified.
         """
+
+        # Illustrated cast pictures are design sheets, not source pixels to
+        # crop and paste.  Keeping the complete character gives Relay the
+        # head/body/wardrobe relationship it needs to reconstruct the person
+        # on the V1 pose.  Cropping these assets was the common factor in the
+        # oversized cartoon-face failures seen in close-up Shots.
+        if preserve_full_design:
+            return source.resolve(), "illustrated_full_design"
 
         source_roles = [
             row for row in pass_spec.get("source_roles") or []
@@ -32349,8 +32395,11 @@ class DirectorCutStudio(QMainWindow):
                 raise FileNotFoundError(
                     f"Character Swap requires @{target_reference}, but its Picture file is missing."
                 )
+            target_is_illustrated = _looks_like_illustrated_cast(target_asset)
             target_path, reference_framing = self._character_swap_framed_reference(
-                target_path, pass_spec
+                target_path,
+                pass_spec,
+                preserve_full_design=target_is_illustrated,
             )
             pass_spec["reference_framing"] = reference_framing
             pass_seed = derive_named_segment_seed(
@@ -32360,7 +32409,7 @@ class DirectorCutStudio(QMainWindow):
             live_action_adaptation = bool(
                 self.source_cast_live_action_adaptation
                 and (
-                    _looks_like_illustrated_cast(target_asset)
+                    target_is_illustrated
                     or illustrated_cast_pool
                 )
             )
@@ -32561,6 +32610,22 @@ class DirectorCutStudio(QMainWindow):
                     "minimum_erasure_similarity": 0.82,
                     "maximum_erasure_mae": 0.12,
                     "minimum_erasure_identity_gap": 0.10,
+                    # A valid identity edit may change the selected actor, but
+                    # it must not jump to another V1 Shot/role.  The worker
+                    # checks non-target plate regions and retries a fresh seed
+                    # when no part of the surrounding source plate survives.
+                    "minimum_plate_anchor_similarity": 0.50,
+                    "minimum_plate_median_similarity": 0.30,
+                    "minimum_plate_median_mae": 0.12,
+                    "strict_temporal_coverage": any(
+                        marker in " ".join(
+                            str(value or "")
+                            for value in pass_spec.get("source_events") or []
+                        ).casefold()
+                        for marker in ("close-up", "close up", "tight close")
+                    ),
+                    "reference_framing": reference_framing,
+                    "target_reference_path": str(target_path.resolve()),
                     "performance_mode": str(pass_spec.get("performance_mode", "")),
                     "maximum_silent_mouth_motion": 0.055,
                 },

@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from character_swap_engine import (
+    _normalized_person_bbox,
     KEEP_V1_TARGET,
     SOURCE_REMAKE_MODE_CHARACTER_SWAP,
     SOURCE_REMAKE_MODE_CREATIVE_H3,
@@ -381,7 +382,16 @@ class CharacterSwapEngineTests(unittest.TestCase):
         self.assertIn("moustache or facial-hair design", prompt)
         self.assertIn("Match Video 1 exposure", prompt)
         self.assertIn("No pasted cartoon head", prompt)
+        self.assertIn("FULL DESIGN-SHEET INTERPRETATION", prompt)
+        self.assertIn("never as a crop, decal, face patch", prompt)
         self.assertIn("FINAL MEDIUM PRIORITY", prompt)
+
+    def test_near_full_frame_actor_box_is_rejected(self):
+        self.assertEqual(_normalized_person_bbox([0.0, 0.0, 1.0, 0.923704]), [])
+        self.assertEqual(
+            _normalized_person_bbox([0.10, 0.05, 0.58, 0.91]),
+            [0.10, 0.05, 0.58, 0.91],
+        )
 
     def test_silent_listener_overrides_stale_qwen_speaking_evidence(self):
         prompt = build_character_swap_prompt({

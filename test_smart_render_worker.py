@@ -29,6 +29,7 @@ from smart_render_worker import (
     queue_sam31_role_output_masks,
     queue_sam31_v1_role_masks,
     queue_segment,
+    source_plate_drifted,
     speech_guard_result_score,
     temporal_frame_motion,
 )
@@ -63,6 +64,24 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertLess(unchanged["mae"], 0.001)
         self.assertLess(changed["correlation"], 0.0)
         self.assertGreater(changed["mae"], 0.2)
+
+    def test_source_plate_drift_requires_loss_of_every_strong_anchor(self):
+        spec = {
+            "minimum_plate_anchor_similarity": 0.50,
+            "minimum_plate_median_similarity": 0.30,
+            "minimum_plate_median_mae": 0.12,
+        }
+        drifted = [
+            {"similarity": 0.12, "mae": 0.20},
+            {"similarity": 0.42, "mae": 0.19},
+        ]
+        preserved = [
+            {"similarity": 0.18, "mae": 0.19},
+            {"similarity": 0.66, "mae": 0.08},
+            {"similarity": 0.57, "mae": 0.13},
+        ]
+        self.assertTrue(source_plate_drifted(drifted, spec))
+        self.assertFalse(source_plate_drifted(preserved, spec))
 
     def test_character_swap_prefers_server_v15_and_preserves_turbo_lora(self):
         job = {

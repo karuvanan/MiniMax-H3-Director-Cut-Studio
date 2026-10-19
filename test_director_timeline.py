@@ -7504,6 +7504,32 @@ class DirectorTimelineDragTests(unittest.TestCase):
         window.project_dirty = False
         window.close()
 
+    def test_character_swap_balances_a_shot_that_exceeds_one_relay_window(self):
+        window = DirectorCutStudio()
+        window._set_design_duration(5.202)
+        skill_index = window.special_combo.findData(
+            SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        self.assertGreaterEqual(skill_index, 0)
+        window.special_combo.setCurrentIndex(skill_index)
+        relay_index = window.source_remake_mode_combo.findData(
+            SOURCE_REMAKE_MODE_CHARACTER_SWAP
+        )
+        self.assertGreaterEqual(relay_index, 0)
+        window.source_remake_mode_combo.setCurrentIndex(relay_index)
+        window.director_cues = [
+            DirectorCue("S1", "shot", 0.0, 5.202, "Exchange", track_id="V1"),
+        ]
+        planned = window._planned_render_segments()
+        self.assertEqual(
+            [(row.start_seconds, row.end_seconds) for row in planned],
+            [(0.0, 2.6), (2.6, 5.2)],
+        )
+        self.assertTrue(all(row.shot_ids == ["S1"] for row in planned))
+        self.assertEqual(planned[1].continuity_mode, "hard_cut")
+        window.project_dirty = False
+        window.close()
+
     def test_dense_shot_timeline_packs_micro_shots_into_native_windows(self):
         window = DirectorCutStudio()
         window._set_design_duration(45.0)

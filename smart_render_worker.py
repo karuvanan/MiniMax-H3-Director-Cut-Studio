@@ -46,7 +46,7 @@ from workflow_engine import validate_portable_media_manifest
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 MINIMUM_FREE_DISK_BYTES = 2 * 1024**3
-SMART_RENDER_POLICY_VERSION = 41
+SMART_RENDER_POLICY_VERSION = 42
 AUDIO_JOIN_FADE_SECONDS = 0.04
 MAX_DIRECT_ASSEMBLY_SEGMENTS = 6
 LOCATION_SOUND_REFERENCE_VERSION = 1
@@ -1256,6 +1256,65 @@ def identity_frame_metrics(source: bytes, result: bytes) -> dict[str, float]:
     }
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _source_plate_regions(bboxes: list[list[float]]) -> list[list[float]]:
+    """Return sizeable plate strips outside the selected actor union."""
+
+    if not bboxes:
+        return []
+    left = min(float(row[0]) for row in bboxes)
+    top = min(float(row[1]) for row in bboxes)
+    right = max(float(row[2]) for row in bboxes)
+    bottom = max(float(row[3]) for row in bboxes)
+    candidates = [
+        [0.0, 0.0, left, 1.0],
+        [right, 0.0, 1.0, 1.0],
+        [left, 0.0, right, top],
+        [left, bottom, right, 1.0],
+    ]
+    return [
+        row for row in candidates
+        if row[2] - row[0] >= 0.08
+        and row[3] - row[1] >= 0.08
+        and (row[2] - row[0]) * (row[3] - row[1]) >= 0.035
+    ]
+
+
+def source_plate_drifted(rows: list[dict], spec: dict) -> bool:
+    """Classify a Relay take that jumped to another V1 Shot or role.
+
+    One region may legitimately change because hair, a hand, or the selected
+    body crosses its coarse box.  Drift is therefore reported only when at
+    least two outside regions exist, even the strongest anchor is lost, the
+    median structure is weak, and the median pixel error is material.
+    """
+
+    if len(rows) < 2:
+        return False
+    similarities = [float(row.get("similarity", 0.0)) for row in rows]
+    maes = [float(row.get("mae", 1.0)) for row in rows]
+    return bool(
+        max(similarities) < float(
+            spec.get("minimum_plate_anchor_similarity", 0.50) or 0.50
+        )
+        and _median(similarities) < float(
+            spec.get("minimum_plate_median_similarity", 0.30) or 0.30
+        )
+        and _median(maes) >= float(
+            spec.get("minimum_plate_median_mae", 0.12) or 0.12
+        )
+    )
+
+
 def inspect_character_swap_identity(
     ffmpeg: Path,
     ffprobe: Path,
@@ -1299,10 +1358,15 @@ def inspect_character_swap_identity(
     maximum_similarity = float(spec.get("maximum_source_similarity", 0.88))
     maximum_mae = float(spec.get("maximum_source_mae", 0.055))
     timestamps = [duration * ratio for ratio in (0.22, 0.50, 0.78)]
+    strict_temporal_coverage = bool(spec.get("strict_temporal_coverage", False))
+    identity_timestamps = (
+        [duration * ratio for ratio in (0.12, 0.30, 0.50, 0.70, 0.82)]
+        if strict_temporal_coverage else timestamps
+    )
     role_results: list[dict] = []
     for bbox_index, bbox in enumerate(bboxes):
         samples: list[dict[str, float]] = []
-        for timestamp in timestamps:
+        for timestamp in identity_timestamps:
             source_frame = _extract_identity_gray_frame(
                 ffmpeg, source, timestamp, bbox
             )
@@ -1315,17 +1379,66 @@ def inspect_character_swap_identity(
             key: sorted(sample[key] for sample in samples)[len(samples) // 2]
             for key in ("correlation", "similarity", "mae")
         }
-        suspicious = bool(
+        suspicious_samples = sum(
+            1 for sample in samples
+            if sample["correlation"] >= maximum_correlation
+            and sample["similarity"] >= maximum_similarity
+            and sample["mae"] <= maximum_mae
+        )
+        median_suspicious = bool(
             medians["correlation"] >= maximum_correlation
             and medians["similarity"] >= maximum_similarity
             and medians["mae"] <= maximum_mae
         )
+        partial_noop = bool(
+            strict_temporal_coverage
+            and suspicious_samples >= 2
+            and suspicious_samples >= math.ceil(len(samples) * 0.34)
+        )
+        suspicious = median_suspicious or partial_noop
         role_results.append({
             "bbox_index": bbox_index,
             "bbox_normalized": [round(value, 6) for value in bbox],
             **{key: round(value, 6) for key, value in medians.items()},
+            "source_retained_samples": suspicious_samples,
+            "sample_count": len(samples),
+            "partial_noop": partial_noop,
             "source_identity_retained": suspicious,
         })
+
+    plate_bboxes: list[list[float]] = []
+    for raw_bbox in raw_bboxes:
+        try:
+            left, top, right, bottom = [float(value) for value in raw_bbox][:4]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        left, top = max(0.0, left), max(0.0, top)
+        right, bottom = min(1.0, right), min(1.0, bottom)
+        if right - left >= 0.03 and bottom - top >= 0.03:
+            plate_bboxes.append([left, top, right, bottom])
+    plate_rows: list[dict] = []
+    for region_index, plate_bbox in enumerate(
+        _source_plate_regions(plate_bboxes)
+    ):
+        samples: list[dict[str, float]] = []
+        for timestamp in timestamps:
+            source_frame = _extract_identity_gray_frame(
+                ffmpeg, source, timestamp, plate_bbox
+            )
+            result_frame = _extract_identity_gray_frame(
+                ffmpeg, result, timestamp, plate_bbox
+            )
+            samples.append(identity_frame_metrics(source_frame, result_frame))
+        medians = {
+            key: _median([sample[key] for sample in samples])
+            for key in ("correlation", "similarity", "mae")
+        }
+        plate_rows.append({
+            "region_index": region_index,
+            "bbox_normalized": [round(value, 6) for value in plate_bbox],
+            **{key: round(value, 6) for key, value in medians.items()},
+        })
+    plate_failed = source_plate_drifted(plate_rows, spec)
     erasure_rows: list[dict] = []
     for bbox_index, raw_bbox in enumerate(raw_bboxes):
         try:
@@ -1371,9 +1484,47 @@ def inspect_character_swap_identity(
             "identity_similarity_gap": round(similarity_gap, 6),
             "incomplete_source_actor_erasure": incomplete,
         })
+    lower_body_rows: list[dict] = []
+    if strict_temporal_coverage:
+        for bbox_index, raw_bbox in enumerate(raw_bboxes):
+            try:
+                left, top, right, bottom = [float(value) for value in raw_bbox][:4]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if right - left < 0.03 or bottom - top < 0.08:
+                continue
+            height = bottom - top
+            lower_bbox = [left, top + height * 0.78, right, bottom]
+            samples = []
+            for timestamp in timestamps:
+                source_frame = _extract_identity_gray_frame(
+                    ffmpeg, source, timestamp, lower_bbox
+                )
+                result_frame = _extract_identity_gray_frame(
+                    ffmpeg, result, timestamp, lower_bbox
+                )
+                samples.append(identity_frame_metrics(source_frame, result_frame))
+            medians = {
+                key: _median([sample[key] for sample in samples])
+                for key in ("correlation", "similarity", "mae")
+            }
+            retained = bool(
+                medians["correlation"] >= 0.90
+                and medians["similarity"] >= 0.90
+                and medians["mae"] <= 0.06
+            )
+            lower_body_rows.append({
+                "bbox_index": bbox_index,
+                "bbox_normalized": [round(value, 6) for value in lower_bbox],
+                **{key: round(value, 6) for key, value in medians.items()},
+                "source_body_retained": retained,
+            })
     identity_failed = any(row["source_identity_retained"] for row in role_results)
     erasure_failed = any(
         row["incomplete_source_actor_erasure"] for row in erasure_rows
+    )
+    lower_body_failed = any(
+        row["source_body_retained"] for row in lower_body_rows
     )
     retention_score = max(
         (
@@ -1421,7 +1572,10 @@ def inspect_character_swap_identity(
             "passed": not silent_mouth_failed,
             "rows": mouth_rows,
         }
-    failed = identity_failed or erasure_failed or silent_mouth_failed
+    failed = (
+        identity_failed or erasure_failed or lower_body_failed
+        or silent_mouth_failed or plate_failed
+    )
     mouth_penalty = max(
         (
             max(0.0, row["result_motion"] - row["maximum_motion"])
@@ -1437,7 +1591,28 @@ def inspect_character_swap_identity(
         ),
         default=0.0,
     )
-    quality_risk_score = retention_score + mouth_penalty * 4.0 + erasure_penalty * 2.0
+    plate_penalty = (
+        max(
+            0.0,
+            float(spec.get("minimum_plate_anchor_similarity", 0.50) or 0.50)
+            - max((row["similarity"] for row in plate_rows), default=0.0),
+        ) * 3.0
+        if plate_failed else 0.0
+    )
+    lower_body_penalty = max(
+        (
+            max(0.0, row["similarity"] - 0.90)
+            + max(0.0, 0.06 - row["mae"])
+            for row in lower_body_rows
+            if row["source_body_retained"]
+        ),
+        default=0.0,
+    )
+    quality_risk_score = (
+        retention_score + mouth_penalty * 4.0
+        + erasure_penalty * 2.0 + plate_penalty
+        + lower_body_penalty * 3.0
+    )
     if identity_failed and silent_mouth_failed:
         reason = "selected region retains the V1 actor and the authored silent mouth is moving"
     elif identity_failed:
@@ -1446,6 +1621,10 @@ def inspect_character_swap_identity(
         reason = "source actor remains behind the replacement and the authored silent mouth is moving"
     elif erasure_failed:
         reason = "source actor silhouette remains behind the replacement"
+    elif lower_body_failed:
+        reason = "replacement is only a face layer; the V1 body remains underneath"
+    elif plate_failed:
+        reason = "output drifted away from the selected V1 Shot/plate"
     elif silent_mouth_failed:
         reason = "authored Silent Listener mouth shows excessive articulation"
     else:
@@ -1461,6 +1640,16 @@ def inspect_character_swap_identity(
         "complete_actor_erasure_audit": {
             "passed": not erasure_failed,
             "rows": erasure_rows,
+        },
+        "whole_character_integration_audit": {
+            "checked": bool(lower_body_rows),
+            "passed": not lower_body_failed,
+            "rows": lower_body_rows,
+        },
+        "source_plate_continuity_audit": {
+            "checked": len(plate_rows) >= 2,
+            "passed": not plate_failed,
+            "rows": plate_rows,
         },
         "silent_mouth_audit": silent_mouth_result,
     }
