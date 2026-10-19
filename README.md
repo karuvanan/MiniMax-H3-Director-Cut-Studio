@@ -1,6 +1,6 @@
 # MiniMax H3 Director Cut Studio
 
-> v0.3.8-alpha.1：Remake Engine解除只读限制，可自由选择`Create H3 Remake`、`LoRA Preserve V1`或`LoRA + Reshape Environment`。Design中的`RESHAPE ENVIRONMENT / BACKGROUND`现在可以直接勾选，在保留映射人物与V1表演时间的同时，按Design Requirement重新塑造环境。
+> v0.3.8-alpha.2：多角色Character Swap改用SAM3.1双轮廓联合合成。Studio分别追踪V1原人物与H3换角后人物，使用`V1 Mask ∪ Generated Mask`完整覆盖旧身体和新身体，减少原演员残影、边缘穿帮及双角色Layer互相遮盖；旧合成缓存会自动标记Dirty。
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
@@ -24,7 +24,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.8-alpha.1`](VERSION)
+- 当前应用版本：[`v0.3.8-alpha.2`](VERSION)
 - v0.3.8 自由Remake Engine与环境重塑：[`v0.3.8 readme.md`](v0.3.8%20readme.md)
 - v0.3.7 MiniMax-H3 Character-Swap LoRA与自动Remake Engine：[`v0.3.7 readme.md`](v0.3.7%20readme.md)
 - Character-Swap／Remake Engine论坛文章：[`forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md`](forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md)
@@ -105,6 +105,7 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 | Qwen encoder | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `ComfyUI/models/text_encoders/` | 是 |
 | Video VAE | `minimax_h3_video_vae_fp16.safetensors` | `ComfyUI/models/vae/` | 是 |
 | Audio VAE | `minimax_h3_audio_vae_fp32.safetensors` | `ComfyUI/models/vae/` | 是 |
+| SAM3.1 Multiplex | `sam3.1_multiplex_fp16.safetensors` | `ComfyUI/models/checkpoints/` | 多角色换角联合Mask必需 |
 | System runtime | `ffmpeg`与`ffprobe`可从PATH执行 | Server操作系统 | 是 |
 
 安装步骤：
@@ -112,13 +113,15 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 1. 关闭ComfyUI，把当前`h3-relay`安装到`ComfyUI/custom_nodes/h3-relay`。如果曾安装独立旧版`labs-video-prep`，先移除重复副本，避免同名节点冲突。
 2. 按上表放置全部模型；文件名必须与API JSON完全一致。
 3. 确认项目根目录保留`akatz-labs-character-swap-turbo8-adaptive-window-api.json`，不需要把它复制到ComfyUI模型目录。
-4. 重新启动ComfyUI；确认没有`IMPORT FAILED`，并能找到`LabsH3PrepareVideo`与`H3RelayWindowedEdit`。
+4. 重新启动ComfyUI；确认没有`IMPORT FAILED`，并能找到`LabsH3PrepareVideo`、`H3RelayWindowedEdit`、`SAM3_VideoTrack`与`SAM3_TrackToMask`。
 5. 如需工具栏与Windows Tray实时资源显示，在ComfyUI主机执行`install_h3_cache_status_server.bat`；默认安装到`C:\ai program\Data\Packages\ComfyUI-GPU-1`并连接`http://127.0.0.1:8189`。其他位置可把ComfyUI根目录作为第一个参数、API地址作为第二个参数传入，例如`install_h3_cache_status_server.bat "D:\ComfyUI" "http://192.168.0.185:8189"`。安装程序会复制只读API、启动隐藏Tray并建立Windows登录自启动。重启ComfyUI后，Studio在`ESTIMATE`右侧及Tray都会显示Cache、VRAM、DRAM、GPU、CPU；无法读取的指标明确显示`N/A`。API不返回进程清单、文件名，也不提供删除操作。
 6. 在Studio选择`Source Video Cast Remake H3`，顶部会推荐`LoRA Preserve V1`；选择器保持可编辑，可改用`Create H3 Remake`或`LoRA + Reshape Environment`。切换为None或其他Skill时会推荐`Create H3 Remake`，但不会锁定选择。
 
 Shot Visual Editor中，`CURRENT ROLE · V1 SOURCE`显示当前Shot实际V1人物脸孔；点击任一Current Role卡，上方V1预览会自动加载该角色最清晰的24fps轨迹帧、实际时间与位置框，并同时勾选同排`SWAP`。角色专属画面仍显示同一帧内其他有可靠bbox的人物，因此可按住`Ctrl`点击其他人物框继续加入替换；没有可靠原始帧坐标的角色不会再显示误导性的整屏框，而会提示执行`DETECT V1 PEOPLE`。`REPLACE WITH`显示目标P Picture。若某位画内人物未被识别，点击`DETECT V1 PEOPLE`：Studio会按24fps逐帧解码该Shot、每32帧交给Qwen识别，并保存帧号、时间、人物位置框和轨迹锚点。选择对应P图并保存，再执行`REGENERATE DIRTY`即可补做该Shot，不必重新Design整片。
 
 为了节省Relay时间，建议每个Shot只勾选实际需要替换的角色，其余行选择`KEEP V1`。`KEEP V1`会自动关闭同排`SWAP`，只作为非目标人物保护，不建立Character Swap Pass；你仍可手动重新勾选，Studio会自动恢复该行最近使用的P Picture（没有历史时使用第一个可用P Picture）。先保存角色窗口，再点击Shot Visual Editor的`SAVE SHOT`后，`REGENERATE DIRTY`会从当前Shot状态重新编译受影响Segment，采用最新P Picture、SWAP、人物框和KEEP设置；未保存的临时修改不会进入生成。
+
+多角色Shot采用SAM3.1联合遮罩合成。每个角色仍从同一份干净V1独立执行H3 Relay；完成后Studio对V1只做一次共享人物追踪，并对每个换角结果追踪新人物。最终可见区域为`V1原人物Mask ∪ 换角后人物Mask`：V1部分负责彻底覆盖需要消失的旧头发、衣服和肢体，新人物部分负责容纳不同身形、发型及动作范围。角色框与逐帧时间证据只负责身份匹配、时间门控及前后景排序，不会作为矩形贴图；`KEEP V1`人物不会进入联合Mask。旧固定矩形、V1-only及Generated-only多角色合成缓存会自动标记Dirty，重新执行`REGENERATE DIRTY`即可采用新模式。
 
 > 模型、代码与源影片的下载、使用、二创和商用许可必须分别核对。Studio不会随源码分发这些权重。
 
@@ -832,7 +835,7 @@ skill special/
 - `beat-synced-entrance-18s` 当前执行19秒五段实体因果链：P1走到并绕过第一个走廊转角遇见P2，P2再绕过第二个转角遇见P3，随后由视线切回P1。系统只自动建立一张P5 Z-Image校外生活环境母版，包含校园出口、道路、巴士站及背书包放学、等车、聊天、观察道路和过马路的背景人物。12.00–14.00秒是不可省略的独立过场Segment：P1正面走出校园、显示惊讶，再以墙面／门框遮满画面。14.00–19.00秒由P5独占建筑、地面、日光、镜头轴线与背景生活，P4只锁定前景主体身份、外观、数量及排列并舍弃原背景；过场最后24帧只延续遮挡时机与摄影机运动，不再冒充校园环境。固定生成窗口为0.00–12.00、12.00–14.00及14.00–19.00秒；P4主体以45–60%体感速度、极慢水平横移和最后0.5秒Final Hold收尾，A1始终按Timeline Source Window以1倍速连续播放。
 - `comic-talk-show-h3` 会根据 P1 实际可见的完整前景主角动态建立 `S1…SN`，不会预设一定是五人。角色按画面从左到右登记，跨 Shot 保持身份、脸、服装、排列与原始照片／漫画／3D／插画媒介；裁切边缘残影、海报、反射、雕像及背景路人不计入主角。每名主角各有一个主要喜剧发言 Beat 和独立 Text Layer，非当前 Speaker 只能作无声反应。v0.3.5-alpha.9 起，每条语音还拥有独立 `Voice Gender`，两人项目不会再误建 S3；每个语音事件拥有独立可见轨道，普通 AUTO 对白句间保留 1.0 秒闭嘴释放区。短台词不会再把整段 Shot 都视为可发声，原句结束后禁止即兴、复读、翻译、提早接话、含字笑声、耳语和背景交谈。Studio 会在原生 H3及外部TTS项目的无对白空档与完整静音尾段检查额外人声，并自动重生异常 Segment。普通模式把 P1 作为全片唯一人物母版，不建立人物类 `media_requests`，因此不会用 P2–P9 或 Z-Image 陌生人替换原角色。使用时加载群像图为 P1，选择该 Skill 后点击 `DESIGN`，在自动模板末尾填写主题，再执行 Create JSON；Apply 前检查 Speaker Ledger、`S1…SN` 与每条 Text Layer 的 Voice Gender 即可。
 - `cinematic-story-60s-director` 用于把用户粘贴的长篇故事、背景资料或粗略构思改编成约60秒写实电影短剧。它先提炼核心冲突和反转，再规划8至12个连续Shot，自动生成简洁普通话对白／旁白并写入独立Text Layer；默认使用AUTO多轨，允许真实剧情重叠，语音确实无法继续压缩时同步延长Shot与Timeline，避免出现无Shot Segment。明确指定的Media Pool素材始终高于自动人物／场景设计。
-- `source-video-cast-remake-h3`会推荐`LoRA Preserve V1`：V1按24fps Shot板进入H3 Relay，Character-Swap LoRA v1.5映射P演员，同时保留源动作、表情、构图、节奏和原声。同画面多角色从干净V1分别生成，再依照人物轨迹框羽化合成，后一个Pass不会还原前一个角色。用户也可改选`Create H3 Remake`，或在Design勾选`RESHAPE ENVIRONMENT / BACKGROUND`进入`LoRA + Reshape Environment`。卡通／插画P图可配合`ILLUSTRATED CAST → LIVE-ACTION CINEMA`重塑为真实电影演员，但身份特征仍由绑定P图控制。
+- `source-video-cast-remake-h3`会推荐`LoRA Preserve V1`：V1按24fps Shot板进入H3 Relay，Character-Swap LoRA v1.5映射P演员，同时保留源动作、表情、构图、节奏和原声。同画面多角色从干净V1分别生成；SAM3.1再分别追踪V1原人物及换角后人物，以两者Mask并集完成合成，既清除旧人物超出新身形的残影，也保留新角色超出旧轮廓的头发、服装与肢体。人物框只用于角色匹配、时间门控及前后景排序，不会成为可见矩形贴图，`KEEP V1`人物亦不会被误合成。用户也可改选`Create H3 Remake`，或在Design勾选`RESHAPE ENVIRONMENT / BACKGROUND`进入`LoRA + Reshape Environment`。卡通／插画P图可配合`ILLUSTRATED CAST → LIVE-ACTION CINEMA`重塑为真实电影演员，但身份特征仍由绑定P图控制。
 - `short-drama-h3-director` 是适配 Studio 的短剧 Special Skill，默认采用 `Default + Special`。它把短剧冲突、人物因果、伏笔反转、集尾钩子及竖屏构图转换为完整时间范围的 Shot Blocks，同时逐字保护 `text_layers`，优先复用 `existing_media_uses`，仅为缺失证据建立 `media_requests`，并遵守每 5 秒动作预算、环境因果、声音层与 Final Hold 规则。英文主文件、中文对照版及第三方许可证均位于 `skill special/short-drama-h3-director/`。
 - `long-form-h3-director` 是长片 Default-bound Special Skill。它输出一份覆盖完整总时长的 Design JSON，而不是每批一份 JSON；默认按约 30 秒规划安全批准点，保持 15 秒原生 Segment 的 Incoming／Outgoing State、上一段最后 24 帧运动上下文、逐字对白、稳定 Reference ID 与唯一项目终点 Final Hold。选择它会让主页自动采用 Incremental production；不选择时仍保留 Full Range 一次过处理。
 - `dark-rescue-h3` 是严格第一人称暗场救援 Special Skill，默认采用 `Default + Special`。除了救援者双眼位置的文字锁定，每个Shot还必须出现近镜头手套、前臂/袖口、手电、头盔边缘或救援工具作为POV证明，并使用视线高度、身体运动视差与受困者看向救援者眼睛的互动防止镜头退化为第三人称。它会从五套已验证的场景语法中改编地点，自动建立普通话对白／克制旁白、九镜救援因果链、现场环境声、可解释光源与15秒边界连续性；没有明确 `@P/@V/@A` 时不会虚构Media Pool编号。

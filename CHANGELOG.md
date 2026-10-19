@@ -2,6 +2,24 @@
 
 Every user-visible correction receives an application version and a dated entry in this file. Application versions follow Semantic Versioning pre-release notation. The `.h3director.json` project-format version is maintained separately and changes only when the saved schema changes.
 
+## [0.3.8-alpha.2] - 2026-10-19
+
+### SAM3.1 V1 + Generated Character Union Masks
+
+- 修复只使用V1人物Mask时，新角色发型、服装、手臂或身形超出旧轮廓而被裁切的问题；同时修复只使用换角后人物Mask时，V1原人物较大的头发、衣服和身体轮廓残留在背景中的问题。
+- 多角色Character Swap现在建立双来源角色遮罩：共享扫描一次干净V1得到原人物Mask，再分别扫描每个H3角色输出得到换角后人物Mask，最终以`V1 Mask ∪ Generated Mask`作为该角色可见合成范围。
+- V1 Mask负责完整移除原演员，新人物Mask负责容纳换角后不同的身体比例、发型、服装和动作；联合结果只做轻微边缘扩张及羽化，不再使用整块矩形人物框。
+- V1角色框、24fps轨迹和出现时间继续用于SAM对象身份匹配、时间门控及前后景排序；`KEEP V1`与邻近非目标人物不会加入替换角色的联合Mask。
+- 每个角色仍从同一份干净V1独立执行H3 Relay，避免后续角色Pass恢复或覆盖前一个替换角色；双角色Layer按V1深度顺序合成，降低同画面角色互盖。
+- 新增合成模式`sam31_v1_plus_role_output_instance_masks_v3`。旧固定矩形、V1-only及Generated-only多角色缓存会自动标记Dirty；单角色Shot与无关Segment继续复用。
+- Character Swap部署清单新增`sam3.1_multiplex_fp16.safetensors`及`SAM3_VideoTrack`／`SAM3_TrackToMask`节点检查。
+
+### Verification
+
+- 在`192.168.0.185:8189`以双角色V1 Shot完成实际SAM3.1共享V1扫描、两个角色绑定及联合遮罩合成；完成后执行`/free`释放模型与VRAM。
+- 51项Smart Render、Character Swap、Shot角色绑定及Relay回归测试通过；Python编译通过。
+- App版本升级至`0.3.8-alpha.2`；Project Format保持`29`，Render Policy保持`41`。
+
 ## [0.3.8-alpha.1] - 2026-10-19
 
 ### Free Remake Engine Selection
@@ -16,12 +34,15 @@ Every user-visible correction receives an application version and a dated entry 
 - `RESHAPE ENVIRONMENT / BACKGROUND · KEEP MAPPED CHARACTERS`由禁用说明改为可勾选控制。
 - 勾选后，Qwen Design会保留映射P角色、V1动作／表演／时间及同步声音，但根据当前Design Requirement重新设计场景、灯光、背景与环境关系。
 - 当前引擎为`LoRA Preserve V1`时，勾选会在Apply后自动切换为`LoRA + Reshape Environment`；取消勾选会安全返回`LoRA Preserve V1`。`Create H3 Remake`保持完整二创路径。
-- 同画面多替换角色继续采用独立干净V1 Pass及人物框羽化合成，避免后一个角色Pass还原前一个角色；旧双角色缓存会按Render Policy 41自动重生相关Shot。
+- 修复`a_cartoon_character_with_a_mustache_and_a_yellow_shirt_7`暴露的多人物穿帮：不再把固定矩形人物框直接羽化贴回画面，而是比较干净V1与每个独立角色Pass，建立逐帧人物变化轮廓遮罩；人物框只作为扩大的搜索区域，因此伸出框外的手臂、袖子、头发仍可完整替换，未变化的背景及相邻演员不会被整块覆盖。
+- 角色轨迹现在保留`first_frame_index / last_frame_index`。一个Relay Segment内部发生硬切、两个角色先后出现时，每个角色遮罩只在自己的真实出现帧启用，不会再把前后镜头的角色输出同时合成。
+- 修复编译器误读`track_samples`而遗漏实际`source_track_samples`的问题；人工调整人物框后也只覆盖空间范围，不再丢掉Qwen逐帧时间证据。
+- 旧版`independent_role_boxes`固定矩形缓存会在载入Project时自动标记Dirty，只重做受影响的多角色Shot；其余单角色缓存继续复用。
 
 ### Verification
 
 - Remake Engine三模式切换、Skill推荐、Design环境勾选、Project持久化、Character Swap及Smart Render回归测试通过。
-- App版本升级至`0.3.8-alpha.1`；Project Format保持`29`，Render Policy为`41`。
+- App版本升级至`0.3.8-alpha.1`；Project Format保持`29`，Render Policy保持`41`；本次以合成模式迁移精准失效旧双角色缓存。
 
 ## [0.3.7-alpha.20] - 2026-10-18
 

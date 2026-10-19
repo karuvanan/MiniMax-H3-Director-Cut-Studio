@@ -15744,6 +15744,7 @@ class DirectorCutStudio(QMainWindow):
             for value in state.get("render_dirty_previewed_segment_ids", [])
             if str(value).strip()
         } & self.render_dirty_segment_ids
+        self._mark_legacy_character_swap_composites_dirty()
         self.active_dirty_regeneration_ids.clear()
         self.render_runtime_status.clear()
         self._refresh_render_status_bar()
@@ -20263,6 +20264,31 @@ class DirectorCutStudio(QMainWindow):
             rows.append(row)
         return rows
 
+    def _mark_legacy_character_swap_composites_dirty(self) -> set[str]:
+        """Invalidate multi-role takes that predate SAM3.1 instance compositing."""
+
+        migrated: set[str] = set()
+        for manifest in self.smart_render_manifests.values():
+            if not isinstance(manifest, dict):
+                continue
+            for row in manifest.get("segments") or []:
+                if not isinstance(row, dict):
+                    continue
+                composite = row.get("character_swap_composite") or {}
+                mode = str(composite.get("mode") or "")
+                if not mode or mode in {
+                    "sam31_v1_plus_role_output_instance_masks_v3",
+                    "sam31_v1_plus_role_output_masks_v3_fallback_delta",
+                }:
+                    continue
+                segment_id = str(row.get("segment_id") or "").strip()
+                if segment_id:
+                    migrated.add(segment_id)
+        if migrated:
+            self.render_dirty_segment_ids.update(migrated)
+            self.render_dirty_previewed_segment_ids.difference_update(migrated)
+        return migrated
+
     def _refresh_render_status_bar(self) -> None:
         if hasattr(self, "timeline"):
             self.timeline.set_render_segments(self._render_status_rows())
@@ -21088,6 +21114,12 @@ class DirectorCutStudio(QMainWindow):
                 str(value)
                 for value in payload.get("render_dirty_previewed_segment_ids", [])
             } & self.render_dirty_segment_ids
+            migrated_composites = self._mark_legacy_character_swap_composites_dirty()
+            if migrated_composites:
+                integrity_repairs.append(
+                    "Marked legacy fixed-box Character Swap composites dirty: "
+                    + ", ".join(sorted(migrated_composites))
+                )
             # A saved repair Preview can suppress the button only while it is
             # still the active reviewable Preview after reopening the Project.
             if not self.preview_ready:
@@ -32381,9 +32413,18 @@ class DirectorCutStudio(QMainWindow):
             patch_media_upload_names(workflow, pass_uploads)
             all_uploads.extend(pass_uploads)
             composite_bboxes: list[list[float]] = []
+            composite_track_samples: list[dict[str, object]] = []
+            composite_time_ranges: list[list[float]] = []
+            has_unbounded_composite_role = False
             for role_row in (pass_spec.get("source_roles") or []):
                 if not isinstance(role_row, dict):
                     continue
+                track_samples = [
+                    sample for sample in (
+                        role_row.get("source_track_samples") or []
+                    )
+                    if isinstance(sample, dict)
+                ]
                 bbox_candidates = [
                     role_row.get("identity_audit_bbox_normalized")
                     or role_row.get("source_bbox_normalized")
@@ -32391,12 +32432,86 @@ class DirectorCutStudio(QMainWindow):
                 ]
                 bbox_candidates.extend(
                     sample.get("bbox_normalized") or []
-                    for sample in (role_row.get("track_samples") or [])
-                    if isinstance(sample, dict)
+                    for sample in track_samples
                 )
                 for bbox in bbox_candidates:
                     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
                         composite_bboxes.append(list(bbox))
+                if not track_samples:
+                    has_unbounded_composite_role = True
+                    continue
+                if not all(
+                    bool(sample.get("frame_span_explicit"))
+                    for sample in track_samples
+                ):
+                    # Older ledgers recorded isolated sampling instants but not
+                    # the role's visible start/end frames. Treat those roles as
+                    # spatial-only rather than flashing the matte for one frame
+                    # around each thumbnail sample.
+                    has_unbounded_composite_role = True
+                    continue
+                for sample in track_samples:
+                    try:
+                        frame_index = int(sample.get("frame_index", 0) or 0)
+                        raw_first_frame = sample.get("first_frame_index")
+                        raw_last_frame = sample.get("last_frame_index")
+                        first_frame = int(
+                            frame_index
+                            if raw_first_frame is None
+                            else raw_first_frame
+                        )
+                        last_frame = int(
+                            frame_index
+                            if raw_last_frame is None
+                            else raw_last_frame
+                        )
+                        raw_sample_time = sample.get("time_seconds")
+                        sample_time = float(
+                            start if raw_sample_time is None else raw_sample_time
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    absolute_start = sample_time + (
+                        first_frame - frame_index
+                    ) / PROGRAM_MONITOR_FPS
+                    absolute_end = sample_time + (
+                        last_frame + 1 - frame_index
+                    ) / PROGRAM_MONITOR_FPS
+                    relative_start = max(0.0, absolute_start - start)
+                    relative_end = min(end - start, absolute_end - start)
+                    if relative_end > relative_start + 1e-6:
+                        composite_time_ranges.append([
+                            relative_start, relative_end
+                        ])
+                    sample_bbox = sample.get("bbox_normalized") or []
+                    if isinstance(sample_bbox, (list, tuple)) and len(sample_bbox) == 4:
+                        composite_track_samples.append({
+                            "source_role_id": str(
+                                role_row.get("source_role_id", "")
+                            ).strip().upper(),
+                            "time_seconds": max(
+                                0.0, min(end - start, sample_time - start)
+                            ),
+                            "start_seconds": max(0.0, relative_start),
+                            "end_seconds": max(relative_start, relative_end),
+                            "bbox_normalized": list(sample_bbox),
+                        })
+            if has_unbounded_composite_role:
+                composite_time_ranges = []
+            elif composite_time_ranges:
+                merged_ranges: list[list[float]] = []
+                for range_start, range_end in sorted(composite_time_ranges):
+                    if (
+                        merged_ranges
+                        and range_start
+                        <= merged_ranges[-1][1] + 1.0 / PROGRAM_MONITOR_FPS
+                    ):
+                        merged_ranges[-1][1] = max(
+                            merged_ranges[-1][1], range_end
+                        )
+                    else:
+                        merged_ranges.append([range_start, range_end])
+                composite_time_ranges = merged_ranges
             pass_rows.append({
                 "pass_index": pass_index,
                 "source_role_id": str(pass_spec.get("source_role_id", "")),
@@ -32410,6 +32525,12 @@ class DirectorCutStudio(QMainWindow):
                 "runtime_source": runtime_source,
                 "independent_role_composite": len(pass_specs) > 1,
                 "composite_bboxes_normalized": composite_bboxes,
+                # SAM3.1 Multiplex uses these authored Current Role anchors to
+                # associate its anonymous object tracks with the correct H3
+                # role pass. Keep values relative to this Segment so a hard
+                # cut may safely reuse a SAM object index later in time.
+                "composite_track_samples": composite_track_samples,
+                "composite_time_ranges_seconds": composite_time_ranges,
                 "runtime_source_loader_node_id": contract["source_loader_node_id"],
                 "runtime_source_loader_input": contract["source_loader_input"],
                 "relay_node_id": contract["relay_node_id"],
@@ -32830,12 +32951,15 @@ class DirectorCutStudio(QMainWindow):
             if (
                 requires_independent_role_composite
                 and str(cached_composite.get("mode") or "")
-                != "independent_role_boxes"
+                not in {
+                    "sam31_v1_plus_role_output_instance_masks_v3",
+                    "sam31_v1_plus_role_output_masks_v3_fallback_delta",
+                }
             ):
-                # Policy 41 fixes a destructive Relay behavior: the second
-                # role pass could restore the first actor. Never reuse such an
-                # older multi-role take, even when Project JSON marked it
-                # clean or the accepted-master ledger still points to it.
+                # SAM3.1 role-output v2 measures every matte on its generated
+                # H3 actor, not the differently shaped source V1 performer.
+                # Invalidate only multi-role composites; single-role H3 takes
+                # remain reusable and do not force a whole-project rerender.
                 dirty = True
             if reuse_clean_segments and not dirty and segment_id not in cached_by_id:
                 core_start = float(

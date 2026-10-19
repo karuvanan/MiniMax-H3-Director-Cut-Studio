@@ -50,6 +50,9 @@ SMART_RENDER_POLICY_VERSION = 41
 AUDIO_JOIN_FADE_SECONDS = 0.04
 MAX_DIRECT_ASSEMBLY_SEGMENTS = 6
 LOCATION_SOUND_REFERENCE_VERSION = 1
+SAM31_MULTIPLEX_CHECKPOINT = "sam3.1_multiplex_fp16.safetensors"
+SAM31_COMPOSITE_MODE = "sam31_v1_plus_role_output_instance_masks_v3"
+SAM31_FALLBACK_COMPOSITE_MODE = "sam31_v1_plus_role_output_masks_v3_fallback_delta"
 COMPLETE_LOCATION_SOUND_CONTRACT = (
     "COMPLETE LOCATION-SOUND REFERENCE CONTRACT — MANDATORY. The supplied authored "
     "speech Audio reference is one authoritative, already synchronized production "
@@ -787,12 +790,15 @@ def _mix_complete_location_reference(
     return destination
 
 
-def _queue_auxiliary_workflow(
+def _queue_auxiliary_outputs(
     job: dict,
     segment: dict,
     workflow: dict,
     destination: Path,
-) -> Path:
+    *,
+    client_prefix: str,
+    progress_label: str,
+) -> tuple[str, list[dict]]:
     server = str(job["server"]).rstrip("/")
     http_timeout = max(1, int(job.get("http_timeout", 30)))
     reconnect_timeout = max(
@@ -808,7 +814,7 @@ def _queue_auxiliary_workflow(
         ),
     )
     payload = json.dumps(
-        {"prompt": workflow, "client_id": "h3-native-ambience-" + uuid.uuid4().hex},
+        {"prompt": workflow, "client_id": client_prefix + uuid.uuid4().hex},
         ensure_ascii=False,
     ).encode("utf-8")
     queued = _request_json(
@@ -822,14 +828,14 @@ def _queue_auxiliary_workflow(
     )
     prompt_id = str(queued.get("prompt_id", ""))
     if not prompt_id:
-        raise RuntimeError("ComfyUI did not return a prompt_id for native ambience.")
+        raise RuntimeError(f"ComfyUI did not return a prompt_id for {progress_label}.")
     emit({
         "progress": (
             f"Segment {segment['index'] + 1}/{job['segment_count']} · "
-            f"native ambience pass queued · {prompt_id}"
+            f"{progress_label} queued · {prompt_id}"
         ),
         "segment_index": segment["index"],
-        "native_ambience_prompt_id": prompt_id,
+        "auxiliary_prompt_id": prompt_id,
     })
     _history, outputs = wait_for_history(
         server,
@@ -838,7 +844,7 @@ def _queue_auxiliary_workflow(
         generation_timeout=max(10, int(job.get("generation_timeout", 1800))),
         http_timeout=http_timeout,
         reconnect_timeout=reconnect_timeout,
-        segment_id=str(segment.get("segment_id", "")) + ":native-ambience",
+        segment_id=str(segment.get("segment_id", "")) + ":" + progress_label,
     )
     downloaded = download_outputs(
         server,
@@ -847,8 +853,25 @@ def _queue_auxiliary_workflow(
         http_timeout,
         reconnect_timeout=reconnect_timeout,
         prompt_id=prompt_id,
-        segment_id=str(segment.get("segment_id", "")) + ":native-ambience",
+        segment_id=str(segment.get("segment_id", "")) + ":" + progress_label,
         download_recovery_timeout=output_download_recovery_timeout,
+    )
+    return prompt_id, downloaded
+
+
+def _queue_auxiliary_workflow(
+    job: dict,
+    segment: dict,
+    workflow: dict,
+    destination: Path,
+) -> Path:
+    _prompt_id, downloaded = _queue_auxiliary_outputs(
+        job,
+        segment,
+        workflow,
+        destination,
+        client_prefix="h3-native-ambience-",
+        progress_label="native ambience pass",
     )
     video = _primary_video(downloaded)
     if video is None:
@@ -2563,6 +2586,511 @@ def uploaded_media_for_workflow(workflow: dict, uploaded: list[dict]) -> list[di
     ]
 
 
+def _workflow_string_input_for_class(
+    workflow: dict,
+    class_type: str,
+    input_name: str,
+) -> str:
+    for node in workflow.values():
+        if not isinstance(node, dict) or str(node.get("class_type") or "") != class_type:
+            continue
+        value = (node.get("inputs") or {}).get(input_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def build_sam31_multiplex_mask_workflow(
+    source_filename: str,
+    *,
+    object_count: int,
+    output_token: str,
+) -> tuple[dict[str, dict], dict[str, int]]:
+    """Build one native ComfyUI SAM3.1 joint multi-person tracking graph."""
+
+    count = max(2, min(12, int(object_count)))
+    workflow: dict[str, dict] = {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": source_filename}},
+        "2": {
+            "class_type": "LabsH3PrepareVideo",
+            "inputs": {"video": ["1", 0], "resolution": "480", "duration_seconds": 0},
+        },
+        "3": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": SAM31_MULTIPLEX_CHECKPOINT},
+        },
+        "4": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": "person", "clip": ["3", 1]},
+        },
+        "5": {
+            "class_type": "SAM3_VideoTrack",
+            "inputs": {
+                "images": ["2", 0],
+                "model": ["3", 0],
+                "conditioning": ["4", 0],
+                "detection_threshold": 0.35,
+                "max_objects": count,
+                # Every frame is inspected: brief appearances and hard cuts
+                # must not inherit another actor's stale object matte.
+                "detect_interval": 1,
+            },
+        },
+    }
+    save_nodes: dict[str, int] = {}
+    safe_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", output_token).strip("_")
+    for object_index in range(count):
+        base = 20 + object_index * 4
+        track_id = str(base)
+        image_id = str(base + 1)
+        video_id = str(base + 2)
+        save_id = str(base + 3)
+        workflow[track_id] = {
+            "class_type": "SAM3_TrackToMask",
+            "inputs": {"track_data": ["5", 0], "object_indices": str(object_index)},
+        }
+        workflow[image_id] = {
+            "class_type": "MaskToImage",
+            "inputs": {"mask": [track_id, 0]},
+        }
+        workflow[video_id] = {
+            "class_type": "CreateVideo",
+            "inputs": {"images": [image_id, 0], "fps": 24.0},
+        }
+        workflow[save_id] = {
+            "class_type": "SaveVideo",
+            "inputs": {
+                "video": [video_id, 0],
+                "filename_prefix": (
+                    f"h3-studio-sam31/{safe_token}_object{object_index:02d}"
+                ),
+                "format": "mp4",
+                "codec": "h264",
+            },
+        }
+        save_nodes[save_id] = object_index
+    return workflow, save_nodes
+
+
+def _normalized_bbox(values: object) -> list[float]:
+    try:
+        left, top, right, bottom = [float(value) for value in values][:4]
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if right <= left or bottom <= top:
+        return []
+    return [
+        max(0.0, min(1.0, left)),
+        max(0.0, min(1.0, top)),
+        max(0.0, min(1.0, right)),
+        max(0.0, min(1.0, bottom)),
+    ]
+
+
+def _bbox_iou(first: list[float], second: list[float]) -> float:
+    if len(first) != 4 or len(second) != 4:
+        return 0.0
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 1e-9 else 0.0
+
+
+def _mask_frame_stats(
+    ffmpeg: Path,
+    ffprobe: Path,
+    mask_video: Path,
+    *,
+    sample_fps: float = 4.0,
+) -> list[dict]:
+    """Read sparse binary SAM frames and return normalized visible bboxes."""
+
+    geometry = _probe_video_geometry(ffprobe, mask_video)
+    if geometry is None:
+        return []
+    width, height = geometry
+    completed = subprocess.run(
+        [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-i", str(mask_video),
+            "-vf", f"fps={sample_fps:.6f},format=gray", "-an", "-f", "rawvideo",
+            "-pix_fmt", "gray", "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+        timeout=max(120, int(max(1.0, _probe_duration(ffprobe, mask_video)) * 20)),
+    )
+    if completed.returncode:
+        return []
+    frame_bytes = width * height
+    if frame_bytes <= 0:
+        return []
+    from PIL import Image
+
+    stats: list[dict] = []
+    payload = completed.stdout
+    for frame_index, offset in enumerate(range(0, len(payload) - frame_bytes + 1, frame_bytes)):
+        frame = Image.frombytes("L", (width, height), payload[offset:offset + frame_bytes])
+        bbox = frame.point(lambda value: 255 if value >= 96 else 0).getbbox()
+        if not bbox:
+            continue
+        left, top, right, bottom = bbox
+        stats.append({
+            "time_seconds": frame_index / sample_fps,
+            "bbox_normalized": [
+                left / width, top / height, right / width, bottom / height,
+            ],
+            "area": ((right - left) * (bottom - top)) / float(frame_bytes),
+        })
+    return stats
+
+
+def _time_ranges_overlap(first: list[list[float]], second: list[list[float]]) -> bool:
+    # No bounded range means the role may be visible throughout the Segment.
+    if not first or not second:
+        return True
+    return any(
+        float(a[0]) < float(b[1]) - 1e-6
+        and float(a[1]) > float(b[0]) + 1e-6
+        for a in first for b in second
+        if len(a) >= 2 and len(b) >= 2
+    )
+
+
+def _sam_role_targets(passes: list[dict]) -> list[dict]:
+    targets: list[dict] = []
+    for pass_index, pass_row in enumerate(passes):
+        role_ids = [
+            str(value).strip().upper()
+            for value in (
+                pass_row.get("source_role_ids")
+                or [pass_row.get("source_role_id")]
+            )
+            if str(value).strip()
+        ]
+        samples = [
+            dict(value) for value in pass_row.get("composite_track_samples") or []
+            if isinstance(value, dict)
+            and len(_normalized_bbox(value.get("bbox_normalized") or [])) == 4
+        ]
+        raw_bboxes = [
+            bbox for bbox in (
+                _normalized_bbox(value)
+                for value in pass_row.get("composite_bboxes_normalized") or []
+            ) if bbox
+        ]
+        if not role_ids:
+            role_ids = [f"PASS_{pass_index + 1}"]
+        for role_offset, role_id in enumerate(role_ids):
+            role_samples = [
+                sample for sample in samples
+                if str(sample.get("source_role_id") or "").strip().upper() == role_id
+            ]
+            candidates = [
+                _normalized_bbox(sample.get("bbox_normalized") or [])
+                for sample in role_samples
+            ]
+            candidates = [bbox for bbox in candidates if bbox]
+            if not candidates and raw_bboxes:
+                # Legacy jobs do not identify which box belongs to which role.
+                candidates = [raw_bboxes[min(role_offset, len(raw_bboxes) - 1)]]
+            ranges = [
+                [float(sample.get("start_seconds", 0.0)),
+                 float(sample.get("end_seconds", 0.0))]
+                for sample in role_samples
+                if float(sample.get("end_seconds", 0.0) or 0.0)
+                > float(sample.get("start_seconds", 0.0) or 0.0)
+            ]
+            if not ranges:
+                ranges = [
+                    [float(value[0]), float(value[1])]
+                    for value in pass_row.get("composite_time_ranges_seconds") or []
+                    if isinstance(value, (list, tuple)) and len(value) >= 2
+                ]
+            targets.append({
+                "pass_index": pass_index,
+                "role_id": role_id,
+                "samples": role_samples,
+                "candidate_bboxes": candidates,
+                "time_ranges": ranges,
+            })
+    return targets
+
+
+def _sam_target_score(target: dict, stats: list[dict]) -> float:
+    ranges = target.get("time_ranges") or []
+    samples = target.get("samples") or []
+    candidates = target.get("candidate_bboxes") or []
+    frame_scores: list[float] = []
+    for stat in stats:
+        sample_time = float(stat.get("time_seconds", 0.0) or 0.0)
+        if ranges and not any(
+            float(value[0]) - 0.26 <= sample_time <= float(value[1]) + 0.26
+            for value in ranges if len(value) >= 2
+        ):
+            continue
+        expected = candidates
+        if samples:
+            nearest = min(
+                samples,
+                key=lambda row: abs(
+                    float(row.get("time_seconds", 0.0) or 0.0) - sample_time
+                ),
+            )
+            nearest_bbox = _normalized_bbox(nearest.get("bbox_normalized") or [])
+            if nearest_bbox:
+                expected = [nearest_bbox]
+        actual = _normalized_bbox(stat.get("bbox_normalized") or [])
+        if not actual or not expected:
+            continue
+        best = 0.0
+        for bbox in expected:
+            iou = _bbox_iou(actual, bbox)
+            ax = (actual[0] + actual[2]) * 0.5
+            ay = (actual[1] + actual[3]) * 0.5
+            bx = (bbox[0] + bbox[2]) * 0.5
+            by = (bbox[1] + bbox[3]) * 0.5
+            center = max(0.0, 1.0 - math.hypot(ax - bx, ay - by) / math.sqrt(2.0))
+            actual_area = max(1e-6, (actual[2] - actual[0]) * (actual[3] - actual[1]))
+            bbox_area = max(1e-6, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            area = min(actual_area, bbox_area) / max(actual_area, bbox_area)
+            best = max(best, iou * 0.65 + center * 0.25 + area * 0.10)
+        frame_scores.append(best)
+    if not frame_scores:
+        return 0.0
+    frame_scores.sort(reverse=True)
+    keep = frame_scores[:max(1, min(8, len(frame_scores)))]
+    return sum(keep) / len(keep)
+
+
+def match_sam31_masks_to_passes(
+    passes: list[dict],
+    mask_rows: list[dict],
+) -> tuple[list[list[Path]], list[dict]]:
+    """Associate anonymous SAM objects with Current Roles in space and time."""
+
+    targets = _sam_role_targets(passes)
+    if not targets:
+        raise RuntimeError("SAM3.1 has no Current Role targets to associate.")
+    valid_masks = [row for row in mask_rows if row.get("stats")]
+    if not valid_masks:
+        raise RuntimeError("SAM3.1 found no visible person instances in this Segment.")
+    ranked: list[tuple[float, int, int]] = []
+    for target_index, target in enumerate(targets):
+        for mask_index, mask_row in enumerate(valid_masks):
+            ranked.append((
+                _sam_target_score(target, mask_row.get("stats") or []),
+                target_index,
+                mask_index,
+            ))
+    ranked.sort(reverse=True)
+    assigned: dict[int, int] = {}
+    for score, target_index, mask_index in ranked:
+        if target_index in assigned or score < 0.08:
+            continue
+        conflict = any(
+            other_mask == mask_index
+            and _time_ranges_overlap(
+                targets[target_index].get("time_ranges") or [],
+                targets[other_target].get("time_ranges") or [],
+            )
+            for other_target, other_mask in assigned.items()
+        )
+        if not conflict:
+            assigned[target_index] = mask_index
+    if len(assigned) != len(targets):
+        missing = ", ".join(
+            targets[index]["role_id"] for index in range(len(targets))
+            if index not in assigned
+        )
+        raise RuntimeError(f"SAM3.1 could not associate Current Role(s): {missing}")
+    by_pass: list[list[Path]] = [[] for _ in passes]
+    diagnostics: list[dict] = []
+    for target_index, mask_index in assigned.items():
+        target = targets[target_index]
+        mask_row = valid_masks[mask_index]
+        path = Path(str(mask_row["path"]))
+        pass_masks = by_pass[int(target["pass_index"])]
+        if path not in pass_masks:
+            pass_masks.append(path)
+        diagnostics.append({
+            "source_role_id": target["role_id"],
+            "pass_index": int(target["pass_index"]) + 1,
+            "sam_object_index": int(mask_row["object_index"]),
+            "match_score": round(
+                _sam_target_score(target, mask_row.get("stats") or []), 4
+            ),
+            "time_ranges_seconds": target.get("time_ranges") or [],
+        })
+    if any(not values for values in by_pass):
+        raise RuntimeError("SAM3.1 did not provide a mask for every Character Swap pass.")
+    return by_pass, diagnostics
+
+
+def queue_sam31_role_output_masks(
+    job: dict,
+    segment: dict,
+    passes: list[dict],
+    pass_outputs: list[Path],
+) -> tuple[list[list[Path]], list[dict], list[str]]:
+    """Track the newly generated actor silhouette in every independent H3 take.
+
+    V1 remains the spatial identity ledger only. It must never be the final
+    matte because a replacement can have different hair, wardrobe, limbs and
+    body proportions. Each H3 role output is therefore segmented separately;
+    the V1 Current Role box merely selects the correct person inside that take.
+    """
+
+    if len(passes) != len(pass_outputs):
+        raise ValueError("SAM3.1 role-output tracking needs one H3 take per pass.")
+    server = str(job["server"]).rstrip("/")
+    http_timeout = max(1, int(job.get("http_timeout", 30)))
+    ffmpeg = Path(str(job["ffmpeg"]))
+    ffprobe = Path(str(job["ffprobe"]))
+    all_masks: list[list[Path]] = []
+    all_diagnostics: list[dict] = []
+    prompt_ids: list[str] = []
+    segment_token = str(segment.get("segment_id") or "segment")
+    for pass_index, (pass_row, role_output) in enumerate(
+        zip(passes, pass_outputs)
+    ):
+        if not role_output.is_file():
+            raise FileNotFoundError(
+                f"SAM3.1 cannot inspect missing H3 role take: {role_output}"
+            )
+        role = str(pass_row.get("source_role_id") or f"pass{pass_index + 1}")
+        upload_name = (
+            f"h3sam_{segment_token}_pass_{pass_index + 1:02d}_{role}.mp4"
+        )
+        uploaded = upload_file(server, role_output, http_timeout, upload_name)
+        remote_name = str((uploaded or {}).get("name") or upload_name)
+        role_count = max(1, len(pass_row.get("source_role_ids") or []))
+        workflow, save_nodes = build_sam31_multiplex_mask_workflow(
+            remote_name,
+            object_count=min(12, max(4, role_count + 2)),
+            output_token=f"{segment_token}_generated_pass_{pass_index + 1:02d}_{role}",
+        )
+        destination = (
+            Path(str(segment["download_dir"]))
+            / "sam31_generated_role_masks"
+            / f"pass_{pass_index + 1:02d}_{role}"
+        )
+        prompt_id, downloaded = _queue_auxiliary_outputs(
+            job,
+            segment,
+            workflow,
+            destination,
+            client_prefix="h3-sam31-role-output-",
+            progress_label=(
+                f"SAM3.1 generated-role mask {pass_index + 1}/{len(passes)} · {role}"
+            ),
+        )
+        prompt_ids.append(prompt_id)
+        mask_rows: list[dict] = []
+        for row in downloaded:
+            node_id = str(row.get("node_id") or "")
+            if node_id not in save_nodes:
+                continue
+            path = Path(str(row.get("local_path") or ""))
+            if not path.is_file():
+                continue
+            mask_rows.append({
+                "object_index": save_nodes[node_id],
+                "source_pass_index": pass_index,
+                "path": path.resolve(),
+                "stats": _mask_frame_stats(ffmpeg, ffprobe, path),
+            })
+        pass_masks, diagnostics = match_sam31_masks_to_passes(
+            [pass_row], mask_rows
+        )
+        all_masks.append(pass_masks[0])
+        all_diagnostics.extend({
+            **row,
+            "pass_index": pass_index + 1,
+            "mask_source": "generated_role_output",
+            "generated_role_output": str(role_output.resolve()),
+        } for row in diagnostics)
+    return all_masks, all_diagnostics, prompt_ids
+
+
+def queue_sam31_v1_role_masks(
+    job: dict,
+    segment: dict,
+    passes: list[dict],
+) -> tuple[list[list[Path]], list[dict], str]:
+    """Track the original V1 silhouettes that must be completely removed.
+
+    Generated-role masks cover the replacement actor but cannot cover source
+    hair, limbs or wardrobe that extend beyond that new silhouette. This
+    shared V1 pass supplies the complementary half of the final union matte.
+    Current Role space/time samples select only the intended V1 person, so an
+    adjacent KEEP V1 actor is never unioned into the replacement layer.
+    """
+
+    if not passes:
+        raise ValueError("SAM3.1 V1 tracking needs at least one role pass.")
+    source = Path(str(
+        ((passes[0].get("identity_audit") or {}).get("source_video_path") or "")
+    ))
+    if not source.is_file():
+        raise FileNotFoundError(f"SAM3.1 cannot inspect missing V1 plate: {source}")
+    server = str(job["server"]).rstrip("/")
+    http_timeout = max(1, int(job.get("http_timeout", 30)))
+    ffmpeg = Path(str(job["ffmpeg"]))
+    ffprobe = Path(str(job["ffprobe"]))
+    segment_token = str(segment.get("segment_id") or "segment")
+    upload_name = f"h3sam_{segment_token}_v1_plate.mp4"
+    uploaded = upload_file(server, source, http_timeout, upload_name)
+    remote_name = str((uploaded or {}).get("name") or upload_name)
+    requested_roles = sum(
+        max(1, len(row.get("source_role_ids") or [])) for row in passes
+    )
+    workflow, save_nodes = build_sam31_multiplex_mask_workflow(
+        remote_name,
+        object_count=min(12, max(4, requested_roles + 3)),
+        output_token=f"{segment_token}_v1_source_roles",
+    )
+    destination = (
+        Path(str(segment["download_dir"])) / "sam31_v1_role_masks"
+    )
+    prompt_id, downloaded = _queue_auxiliary_outputs(
+        job,
+        segment,
+        workflow,
+        destination,
+        client_prefix="h3-sam31-v1-source-",
+        progress_label="SAM3.1 V1 source-silhouette masks",
+    )
+    mask_rows: list[dict] = []
+    for row in downloaded:
+        node_id = str(row.get("node_id") or "")
+        if node_id not in save_nodes:
+            continue
+        path = Path(str(row.get("local_path") or ""))
+        if not path.is_file():
+            continue
+        mask_rows.append({
+            "object_index": save_nodes[node_id],
+            "path": path.resolve(),
+            "stats": _mask_frame_stats(ffmpeg, ffprobe, path),
+        })
+    masks, diagnostics = match_sam31_masks_to_passes(passes, mask_rows)
+    return masks, [
+        {
+            **row,
+            "mask_source": "v1_source",
+            "v1_source": str(source.resolve()),
+        }
+        for row in diagnostics
+    ], prompt_id
+
+
 def _character_swap_composite_bbox(pass_row: dict) -> list[float]:
     """Return one padded union box for an independently generated role pass."""
 
@@ -2590,10 +3118,12 @@ def _character_swap_composite_bbox(pass_row: dict) -> list[float]:
     right = max(row[2] for row in valid)
     bottom = max(row[3] for row in valid)
     width, height = right - left, bottom - top
-    # Cover hair/clothing edges omitted by face-oriented detection without
-    # reaching far enough to consume a neighboring performer.
-    pad_x = min(0.025, width * 0.06)
-    pad_y = min(0.025, height * 0.04)
+    # This is now only a permissive search region for a per-frame delta mask,
+    # not the actual pasted rectangle. Expand far enough to include arms,
+    # loose hair and clothing extending beyond a face/body detector box. The
+    # dynamic mask below still rejects unchanged background and neighbours.
+    pad_x = min(0.20, max(0.08, width * 0.65))
+    pad_y = min(0.10, max(0.03, height * 0.12))
     return [
         max(0.0, left - pad_x),
         max(0.0, top - pad_y),
@@ -2602,22 +3132,228 @@ def _character_swap_composite_bbox(pass_row: dict) -> list[float]:
     ]
 
 
+def _character_swap_depth_score(pass_row: dict) -> float:
+    """Estimate source occlusion order: lower/background first, foreground last."""
+
+    valid = [
+        bbox for bbox in (
+            _normalized_bbox(value)
+            for value in pass_row.get("composite_bboxes_normalized") or []
+        ) if bbox
+    ]
+    if not valid:
+        return 0.0
+    # Larger, lower bodies are normally closer to camera. This order only
+    # resolves the tiny SAM feather overlap; the instance masks themselves
+    # remain the primary visible-occlusion authority.
+    values = []
+    for left, top, right, bottom in valid:
+        area = (right - left) * (bottom - top)
+        values.append(area * 0.75 + bottom * 0.25)
+    return max(values)
+
+
+def _composite_sam31_character_swap_roles(
+    job: dict,
+    segment: dict,
+    passes: list[dict],
+    pass_outputs: list[Path],
+    role_mask_videos: list[list[Path]],
+    v1_role_mask_videos: list[list[Path]],
+) -> Path:
+    """Composite H3 takes through the union of V1 and generated silhouettes."""
+
+    if (
+        len(role_mask_videos) != len(passes)
+        or len(v1_role_mask_videos) != len(passes)
+        or any(not row for row in role_mask_videos)
+        or any(not row for row in v1_role_mask_videos)
+    ):
+        raise ValueError(
+            "SAM3.1 composite requires generated and V1 masks for every role pass."
+        )
+    source = Path(str(
+        ((passes[0].get("identity_audit") or {}).get("source_video_path") or "")
+    ))
+    if not source.is_file() or not all(path.is_file() for path in pass_outputs):
+        raise FileNotFoundError("SAM3.1 composite is missing its V1 plate or role take.")
+    mask_occurrences = [
+        ("generated", pass_index, mask_offset, path.resolve())
+        for pass_index, values in enumerate(role_mask_videos)
+        for mask_offset, path in enumerate(values)
+    ] + [
+        ("v1", pass_index, mask_offset, path.resolve())
+        for pass_index, values in enumerate(v1_role_mask_videos)
+        for mask_offset, path in enumerate(values)
+    ]
+    if not all(path.is_file() for _, _, _, path in mask_occurrences):
+        raise FileNotFoundError("SAM3.1 composite is missing one or more instance masks.")
+
+    ffmpeg = Path(str(job["ffmpeg"]))
+    ffprobe = Path(str(job["ffprobe"]))
+    geometry = _probe_video_geometry(ffprobe, source)
+    if geometry is None:
+        raise RuntimeError("Could not read the V1 geometry for SAM3.1 composite.")
+    width, height = geometry
+    width += width % 2
+    height += height % 2
+    duration = _probe_duration(ffprobe, source)
+    if duration <= 0.0:
+        raise RuntimeError("Could not read the V1 duration for SAM3.1 composite.")
+    destination = Path(str(segment["download_dir"])) / (
+        "character_swap_sam31_multi_role_composite.mp4"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-i", str(source)
+    ]
+    for output in pass_outputs:
+        command.extend(["-i", str(output)])
+    mask_input_indexes: dict[tuple[str, int, int], int] = {}
+    for mask_kind, pass_index, mask_offset, path in mask_occurrences:
+        command.extend(["-i", str(path)])
+        mask_input_indexes[(mask_kind, pass_index, mask_offset)] = (
+            len(pass_outputs) + len(mask_input_indexes) + 1
+        )
+
+    filters = [
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "setsar=1,fps=24,setpts=PTS-STARTPTS,format=yuv444p[base0]"
+    ]
+    # Deterministic source-depth order prevents the arbitrary second H3 pass
+    # from covering a nearer first role. SAM visible masks handle the actual
+    # silhouettes; only their 2-3px feather overlap follows this ordering.
+    ordered = sorted(
+        range(len(passes)),
+        key=lambda index: (_character_swap_depth_score(passes[index]), index),
+    )
+    current = "base0"
+    for layer_number, pass_index in enumerate(ordered, start=1):
+        input_index = pass_index + 1
+        pass_row = passes[pass_index]
+        filters.append(
+            f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,fps=24,setpts=PTS-STARTPTS,format=rgba[role{layer_number}]"
+        )
+        kind_unions: dict[str, str] = {}
+        for mask_kind, role_masks in (
+            ("generated", role_mask_videos[pass_index]),
+            ("v1", v1_role_mask_videos[pass_index]),
+        ):
+            mask_labels: list[str] = []
+            for mask_offset, _mask_path in enumerate(role_masks):
+                mask_label = f"sam{mask_kind}{layer_number}_{mask_offset + 1}"
+                filters.append(
+                    f"[{mask_input_indexes[(mask_kind, pass_index, mask_offset)]}:v]"
+                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    "setsar=1,fps=24,setpts=PTS-STARTPTS,format=gray,"
+                    f"lut=y='if(gte(val,96),255,0)'[{mask_label}]"
+                )
+                mask_labels.append(mask_label)
+            combined_kind = mask_labels[0]
+            for mask_offset, next_label in enumerate(mask_labels[1:], start=2):
+                output_label = f"sam{mask_kind}Union{layer_number}_{mask_offset}"
+                filters.append(
+                    f"[{combined_kind}][{next_label}]"
+                    f"blend=all_mode=lighten[{output_label}]"
+                )
+                combined_kind = output_label
+            kind_unions[mask_kind] = combined_kind
+        combined = f"samV1GeneratedUnion{layer_number}"
+        filters.append(
+            f"[{kind_unions['v1']}][{kind_unions['generated']}]"
+            f"blend=all_mode=lighten[{combined}]"
+        )
+
+        time_ranges: list[tuple[float, float]] = []
+        for raw_range in pass_row.get("composite_time_ranges_seconds") or []:
+            try:
+                range_start, range_end = [float(value) for value in raw_range][:2]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            range_start = max(0.0, min(duration, range_start))
+            range_end = max(range_start, min(duration, range_end))
+            if range_end > range_start + 1e-6:
+                time_ranges.append((range_start, range_end))
+        mask_source = combined
+        if time_ranges:
+            expression = "+".join(
+                f"between(t\\,{range_start:.6f}\\,{range_end:.6f})"
+                for range_start, range_end in time_ranges
+            )
+            gate = f"samGate{layer_number}"
+            gated = f"samGated{layer_number}"
+            filters.extend([
+                f"color=c=black:s={width}x{height}:r=24:d={duration:.6f},format=gray,"
+                f"drawbox=x=0:y=0:w={width}:h={height}:color=white:t=fill:"
+                f"enable='{expression}'[{gate}]",
+                f"[{combined}][{gate}]blend=all_mode=multiply[{gated}]",
+            ])
+            mask_source = gated
+        # The union covers both the old V1 body that must disappear and the
+        # replacement body that may extend beyond it. A small final expansion
+        # removes compression halos without turning either instance into a
+        # rectangular or neighbouring-person matte.
+        final_mask = f"samFinal{layer_number}"
+        filters.append(
+            f"[{mask_source}]dilation,dilation,gblur=sigma=1.4[{final_mask}]"
+        )
+        masked_role = f"roleMasked{layer_number}"
+        output_base = f"base{layer_number}"
+        filters.extend([
+            f"[role{layer_number}][{final_mask}]alphamerge[{masked_role}]",
+            f"[{current}][{masked_role}]overlay=format=auto[{output_base}]",
+        ])
+        current = output_base
+
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{current}]", "-map", "0:a:0?", "-t", f"{duration:.6f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(destination),
+    ])
+    _run_assembly_command(
+        command,
+        destination,
+        timeout=max(900, int(duration * 45)),
+        context="SAM3.1 Multiplex multi-character composite",
+    )
+    return destination.resolve()
+
+
 def composite_independent_character_swap_roles(
     job: dict,
     segment: dict,
     passes: list[dict],
     pass_outputs: list[Path],
+    role_mask_videos: list[list[Path]] | None = None,
+    v1_role_mask_videos: list[list[Path]] | None = None,
 ) -> Path:
-    """Feather independent per-role Relay results onto one clean V1 plate.
+    """Merge independent per-role Relay results through per-frame delta masks.
 
     Sequential multi-character Relay passes are destructive: a later role can
     restore a previously swapped person. Each input here was generated from
-    the same source plate, and only its selected role rectangle is allowed into
-    the final frame. This makes two or more replacements coexist deterministically.
+    the same source plate. The selected-person rectangle is only a permissive
+    search region; the actual matte follows pixels changed by that role pass and
+    is active only over the role's tracked frame span. This keeps limbs outside
+    the detector box while rejecting unchanged V1 actors and background.
     """
 
     if len(passes) != len(pass_outputs) or len(passes) < 2:
         raise ValueError("Multi-character composite requires one output per role pass.")
+    if role_mask_videos is not None and v1_role_mask_videos is not None:
+        return _composite_sam31_character_swap_roles(
+            job,
+            segment,
+            passes,
+            pass_outputs,
+            role_mask_videos,
+            v1_role_mask_videos,
+        )
     source = Path(str(
         ((passes[0].get("identity_audit") or {}).get("source_video_path") or "")
     ))
@@ -2641,10 +3377,15 @@ def composite_independent_character_swap_roles(
     ]
     for output in pass_outputs:
         command.extend(["-i", str(output)])
+    source_labels = ["base0"] + [
+        f"source{index}" for index in range(1, len(pass_outputs) + 1)
+    ]
     filters = [
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        "setsar=1,fps=24,format=rgba[base0]"
+        "setsar=1,fps=24,setpts=PTS-STARTPTS,format=yuv444p,"
+        f"split={len(source_labels)}"
+        + "".join(f"[{label}]" for label in source_labels)
     ]
     current = "base0"
     for index, (pass_row, _output) in enumerate(zip(passes, pass_outputs), start=1):
@@ -2658,16 +3399,46 @@ def composite_independent_character_swap_roles(
         y = max(0, min(height - 2, round(top * height)))
         box_width = max(2, min(width - x, round((right - left) * width)))
         box_height = max(2, min(height - y, round((bottom - top) * height)))
-        feather = max(2.0, min(box_width, box_height) * 0.025)
+        feather = max(2.0, min(10.0, min(box_width, box_height) * 0.015))
+        time_ranges = []
+        for raw_range in pass_row.get("composite_time_ranges_seconds") or []:
+            try:
+                range_start, range_end = [float(value) for value in raw_range][:2]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            range_start = max(0.0, min(duration, range_start))
+            range_end = max(range_start, min(duration, range_end))
+            if range_end > range_start + 1e-6:
+                time_ranges.append((range_start, range_end))
+        enable = ""
+        if time_ranges:
+            expression = "+".join(
+                f"between(t\\,{range_start:.6f}\\,{range_end:.6f})"
+                for range_start, range_end in time_ranges
+            )
+            enable = f":enable='{expression}'"
         filters.extend([
             f"[{index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"setsar=1,fps=24,format=rgba[role{index}]",
+            f"setsar=1,fps=24,setpts=PTS-STARTPTS,format=yuv444p,split=2"
+            f"[roleColor{index}][roleDelta{index}]",
+            f"[roleColor{index}]format=rgba[role{index}]",
+            # Build a per-frame subject-change mask. H3 re-encodes the whole
+            # frame, so low-level codec/background noise is rejected before
+            # dilation closes holes inside the new body and blur feathers only
+            # the real silhouette, never a rectangular slab.
+            f"[source{index}][roleDelta{index}]blend=all_mode=difference,"
+            "format=gray,lut=y='(val-8)*16',dilation,dilation,dilation,"
+            f"gblur=sigma={feather:.3f}[delta{index}]",
             f"color=c=black:s={width}x{height}:r=24:d={duration:.6f},format=gray,"
-            f"drawbox=x={x}:y={y}:w={box_width}:h={box_height}:color=white:t=fill,"
-            f"gblur=sigma={feather:.3f}[mask{index}]",
-            f"[role{index}][mask{index}]alphamerge[masked{index}]",
-            f"[{current}][masked{index}]overlay=0:0:eof_action=pass:shortest=0[base{index}]",
+            f"drawbox=x={x}:y={y}:w={box_width}:h={box_height}:color=white:t=fill"
+            f"{enable}[roi{index}]",
+            f"[delta{index}][roi{index}]blend=all_mode=multiply[mask{index}]",
+            # maskedmerge applies the gray mask only to luma and leaves chroma
+            # half blended on common YUV builds, producing a visible washed-out
+            # rectangle. Attach the matte as a true alpha plane before overlay.
+            f"[role{index}][mask{index}]alphamerge[roleMasked{index}]",
+            f"[{current}][roleMasked{index}]overlay=format=auto[base{index}]",
         ])
         current = f"base{index}"
     command.extend([
@@ -2937,28 +3708,134 @@ def queue_character_swap_passes(
         })
     if independent_role_mode:
         role_outputs = [Path(path) for path in completed_pass_outputs[:len(passes)]]
+        role_mask_videos: list[list[Path]] | None = None
+        v1_role_mask_videos: list[list[Path]] | None = None
+        sam_diagnostics: list[dict] = []
+        sam_prompt_ids: list[str] = []
+        sam_fallback_reason = ""
         emit({
             "progress": (
-                f"Segment {shot_label} · feather-compositing {len(role_outputs)} "
-                "independent Character Swap roles onto one V1 frame"
+                f"Segment {shot_label} · SAM3.1 tracking V1 + generated silhouettes for "
+                f"{len(role_outputs)} Character Swap role layers"
             ),
             "segment_index": segment["index"],
             "character_swap_composite": {
-                "mode": "independent_role_boxes",
+                "mode": SAM31_COMPOSITE_MODE,
                 "role_count": len(role_outputs),
             },
         })
-        previous_video = composite_independent_character_swap_roles(
-            job, segment, passes, role_outputs
-        )
+        try:
+            role_mask_videos, sam_diagnostics, sam_prompt_ids = (
+                queue_sam31_role_output_masks(
+                    job, segment, passes, role_outputs
+                )
+            )
+            v1_masks, v1_diagnostics, v1_prompt_id = queue_sam31_v1_role_masks(
+                job, segment, passes
+            )
+            v1_role_mask_videos = v1_masks
+            sam_diagnostics.extend(v1_diagnostics)
+            sam_prompt_ids.append(v1_prompt_id)
+        except Exception as exc:
+            if classify_generation_error(exc) == "oom":
+                released = release_comfy_memory(server, http_timeout)
+                emit({
+                    "progress": (
+                        f"Segment {shot_label} · SAM3.1 CUDA OOM · {released} · retrying once"
+                    ),
+                    "segment_index": segment["index"],
+                })
+                try:
+                    role_mask_videos = None
+                    v1_role_mask_videos = None
+                    sam_diagnostics = []
+                    sam_prompt_ids = []
+                    role_mask_videos, sam_diagnostics, sam_prompt_ids = (
+                        queue_sam31_role_output_masks(
+                            job, segment, passes, role_outputs
+                        )
+                    )
+                    v1_masks, v1_diagnostics, v1_prompt_id = (
+                        queue_sam31_v1_role_masks(job, segment, passes)
+                    )
+                    v1_role_mask_videos = v1_masks
+                    sam_diagnostics.extend(v1_diagnostics)
+                    sam_prompt_ids.append(v1_prompt_id)
+                except Exception as retry_exc:
+                    sam_fallback_reason = str(retry_exc)
+            else:
+                sam_fallback_reason = str(exc)
+        if sam_fallback_reason:
+            emit({
+                "progress": (
+                    f"Segment {shot_label} · SAM3.1 instance mask unavailable; "
+                    f"using H3 delta-mask fallback · {sam_fallback_reason}"
+                ),
+                "segment_index": segment["index"],
+                "character_swap_composite": {
+                    "mode": SAM31_FALLBACK_COMPOSITE_MODE,
+                    "sam31_error": sam_fallback_reason,
+                },
+            })
+        try:
+            previous_video = composite_independent_character_swap_roles(
+                job,
+                segment,
+                passes,
+                role_outputs,
+                role_mask_videos=role_mask_videos,
+                v1_role_mask_videos=v1_role_mask_videos,
+            )
+        except Exception as exc:
+            if role_mask_videos is None or v1_role_mask_videos is None:
+                raise
+            sam_fallback_reason = f"SAM3.1 compositor failed: {exc}"
+            emit({
+                "progress": (
+                    f"Segment {shot_label} · {sam_fallback_reason} · "
+                    "using H3 delta-mask fallback"
+                ),
+                "segment_index": segment["index"],
+            })
+            role_mask_videos = None
+            v1_role_mask_videos = None
+            previous_video = composite_independent_character_swap_roles(
+                job, segment, passes, role_outputs
+            )
         final_result["output_path"] = str(previous_video)
         final_result["character_swap_composite"] = {
-            "mode": "independent_role_boxes",
+            "mode": (
+                SAM31_COMPOSITE_MODE
+                if role_mask_videos is not None and v1_role_mask_videos is not None
+                else SAM31_FALLBACK_COMPOSITE_MODE
+            ),
             "role_count": len(role_outputs),
             "source": str(
                 ((passes[0].get("identity_audit") or {}).get("source_video_path") or "")
             ),
             "role_outputs": [str(path.resolve()) for path in role_outputs],
+            "sam31_checkpoint": (
+                SAM31_MULTIPLEX_CHECKPOINT
+                if role_mask_videos is not None and v1_role_mask_videos is not None
+                else ""
+            ),
+            "sam31_prompt_id": sam_prompt_ids[0] if sam_prompt_ids else "",
+            "sam31_prompt_ids": sam_prompt_ids,
+            "sam31_mask_source": (
+                "v1_plus_generated_role_outputs"
+                if role_mask_videos is not None and v1_role_mask_videos is not None
+                else ""
+            ),
+            "sam31_role_matches": sam_diagnostics,
+            "sam31_mask_outputs": (
+                [[str(path.resolve()) for path in values] for values in role_mask_videos]
+                if role_mask_videos is not None else []
+            ),
+            "sam31_v1_mask_outputs": (
+                [[str(path.resolve()) for path in values] for values in v1_role_mask_videos]
+                if v1_role_mask_videos is not None else []
+            ),
+            "fallback_reason": sam_fallback_reason,
         }
     return {
         **persisted,

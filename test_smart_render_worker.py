@@ -12,6 +12,7 @@ from smart_render_worker import (
     best_envelope_offset,
     _patch_continuity,
     build_native_ambience_workflow,
+    build_sam31_multiplex_mask_workflow,
     build_render_progress,
     build_assembly_command,
     canvas_for_megapixels,
@@ -20,10 +21,13 @@ from smart_render_worker import (
     extract_tail_frames,
     identity_frame_metrics,
     main,
+    match_sam31_masks_to_passes,
     patch_complete_location_reference,
     prefer_server_character_swap_lora,
     preflight_smart_render,
     queue_character_swap_passes,
+    queue_sam31_role_output_masks,
+    queue_sam31_v1_role_masks,
     queue_segment,
     speech_guard_result_score,
     temporal_frame_motion,
@@ -122,7 +126,7 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertLess(bbox[1], 0.18)
         self.assertGreater(bbox[2], 0.36)
         self.assertGreater(bbox[3], 0.82)
-        self.assertLess(bbox[2], 0.45)
+        self.assertLess(bbox[2], 0.60)
 
     def test_independent_character_swap_passes_use_clean_v1_and_are_composited(self):
         root = PROJECT_ROOT / ".director_cache" / "character_swap_composite_test"
@@ -168,6 +172,28 @@ class SmartRenderWorkerTests(unittest.TestCase):
         with (
             patch("smart_render_worker.queue_segment", side_effect=fake_queue),
             patch(
+                "smart_render_worker.queue_sam31_role_output_masks",
+                return_value=(
+                    [[root / "mask0.mp4"], [root / "mask1.mp4"]],
+                    [
+                        {"source_role_id": "R1", "sam_object_index": 0},
+                        {"source_role_id": "R2", "sam_object_index": 1},
+                    ],
+                    ["sam-prompt-1", "sam-prompt-2"],
+                ),
+            ),
+            patch(
+                "smart_render_worker.queue_sam31_v1_role_masks",
+                return_value=(
+                    [[root / "v1mask0.mp4"], [root / "v1mask1.mp4"]],
+                    [
+                        {"source_role_id": "R1", "sam_object_index": 0},
+                        {"source_role_id": "R2", "sam_object_index": 1},
+                    ],
+                    "sam-v1-prompt",
+                ),
+            ),
+            patch(
                 "smart_render_worker.composite_independent_character_swap_roles",
                 return_value=composite.resolve(),
             ) as composite_roles,
@@ -185,8 +211,205 @@ class SmartRenderWorkerTests(unittest.TestCase):
         self.assertEqual(result["output_path"], str(composite.resolve()))
         self.assertEqual(
             result["character_swap_composite"]["mode"],
-            "independent_role_boxes",
+            "sam31_v1_plus_role_output_instance_masks_v3",
         )
+        self.assertEqual(
+            result["character_swap_composite"]["sam31_prompt_ids"],
+            ["sam-prompt-1", "sam-prompt-2", "sam-v1-prompt"],
+        )
+        self.assertEqual(
+            result["character_swap_composite"]["sam31_mask_source"],
+            "v1_plus_generated_role_outputs",
+        )
+        call_kwargs = composite_roles.call_args.kwargs
+        self.assertEqual(
+            call_kwargs["v1_role_mask_videos"],
+            [[root / "v1mask0.mp4"], [root / "v1mask1.mp4"]],
+        )
+        shutil.rmtree(root, ignore_errors=True)
+
+    def test_sam31_workflow_tracks_all_people_in_one_shared_pass(self):
+        workflow, save_nodes = build_sam31_multiplex_mask_workflow(
+            "shot3.mp4", object_count=4, output_token="segment S3"
+        )
+        self.assertEqual(workflow["1"]["inputs"]["file"], "shot3.mp4")
+        self.assertEqual(
+            workflow["3"]["inputs"]["ckpt_name"],
+            "sam3.1_multiplex_fp16.safetensors",
+        )
+        self.assertEqual(workflow["5"]["inputs"]["detect_interval"], 1)
+        self.assertEqual(workflow["5"]["inputs"]["max_objects"], 4)
+        self.assertEqual(len(save_nodes), 4)
+        self.assertEqual(
+            sorted(
+                node["inputs"]["object_indices"]
+                for node in workflow.values()
+                if node.get("class_type") == "SAM3_TrackToMask"
+            ),
+            ["0", "1", "2", "3"],
+        )
+
+    def test_sam31_role_matching_allows_track_reuse_only_across_nonoverlap(self):
+        passes = [
+            {
+                "source_role_id": "R1",
+                "source_role_ids": ["R1"],
+                "composite_track_samples": [{
+                    "source_role_id": "R1", "time_seconds": 0.5,
+                    "start_seconds": 0.0, "end_seconds": 1.0,
+                    "bbox_normalized": [0.05, 0.1, 0.45, 0.95],
+                }],
+            },
+            {
+                "source_role_id": "R2",
+                "source_role_ids": ["R2"],
+                "composite_track_samples": [{
+                    "source_role_id": "R2", "time_seconds": 2.5,
+                    "start_seconds": 2.0, "end_seconds": 3.0,
+                    "bbox_normalized": [0.55, 0.1, 0.95, 0.95],
+                }],
+            },
+        ]
+        shared = Path("sam-object0.mp4")
+        masks, diagnostics = match_sam31_masks_to_passes(
+            passes,
+            [{
+                "object_index": 0,
+                "path": shared,
+                "stats": [
+                    {"time_seconds": 0.5, "bbox_normalized": [0.05, 0.1, 0.45, 0.95]},
+                    {"time_seconds": 2.5, "bbox_normalized": [0.55, 0.1, 0.95, 0.95]},
+                ],
+            }],
+        )
+        self.assertEqual(masks, [[shared], [shared]])
+        self.assertEqual([row["sam_object_index"] for row in diagnostics], [0, 0])
+
+    def test_sam31_final_masks_are_measured_on_each_generated_role_take(self):
+        root = PROJECT_ROOT / ".director_cache" / "sam31_role_output_mask_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        role_outputs = [root / "generated_r1.mp4", root / "generated_r2.mp4"]
+        mask_outputs = [root / "mask_r1.mp4", root / "mask_r2.mp4"]
+        for path in [*role_outputs, *mask_outputs]:
+            path.write_bytes(b"video")
+        passes = [
+            {
+                "source_role_id": "R1", "source_role_ids": ["R1"],
+                "composite_bboxes_normalized": [[0.05, 0.1, 0.45, 0.95]],
+            },
+            {
+                "source_role_id": "R2", "source_role_ids": ["R2"],
+                "composite_bboxes_normalized": [[0.55, 0.1, 0.95, 0.95]],
+            },
+        ]
+        queued_workflows = []
+
+        def fake_aux(_job, _segment, workflow, _destination, **_kwargs):
+            queued_workflows.append(workflow)
+            index = len(queued_workflows) - 1
+            return f"sam-{index + 1}", [{
+                "node_id": "23", "local_path": str(mask_outputs[index]),
+            }]
+
+        stats = [
+            [{"time_seconds": 0.5, "bbox_normalized": [0.05, 0.1, 0.45, 0.95]}],
+            [{"time_seconds": 0.5, "bbox_normalized": [0.55, 0.1, 0.95, 0.95]}],
+        ]
+        try:
+            with (
+                patch(
+                    "smart_render_worker.upload_file",
+                    side_effect=[{"name": "generated-r1.mp4"}, {"name": "generated-r2.mp4"}],
+                ) as upload,
+                patch("smart_render_worker._queue_auxiliary_outputs", side_effect=fake_aux),
+                patch("smart_render_worker._mask_frame_stats", side_effect=stats),
+            ):
+                masks, diagnostics, prompt_ids = queue_sam31_role_output_masks(
+                    {
+                        "server": "http://127.0.0.1:8188", "http_timeout": 1,
+                        "ffmpeg": "ffmpeg", "ffprobe": "ffprobe",
+                    },
+                    {"segment_id": "S3", "index": 0, "download_dir": str(root)},
+                    passes,
+                    role_outputs,
+                )
+            self.assertEqual(upload.call_count, 2)
+            self.assertEqual(
+                [workflow["1"]["inputs"]["file"] for workflow in queued_workflows],
+                ["generated-r1.mp4", "generated-r2.mp4"],
+            )
+            self.assertEqual(masks, [[mask_outputs[0].resolve()], [mask_outputs[1].resolve()]])
+            self.assertEqual(prompt_ids, ["sam-1", "sam-2"])
+            self.assertTrue(all(
+                row["mask_source"] == "generated_role_output" for row in diagnostics
+            ))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_sam31_v1_masks_are_selected_from_one_shared_source_pass(self):
+        root = PROJECT_ROOT / ".director_cache" / "sam31_v1_mask_test"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        source = root / "v1.mp4"
+        masks = [root / "mask0.mp4", root / "mask1.mp4"]
+        for path in [source, *masks]:
+            path.write_bytes(b"video")
+        passes = [
+            {
+                "source_role_id": "R1", "source_role_ids": ["R1"],
+                "identity_audit": {"source_video_path": str(source)},
+                "composite_bboxes_normalized": [[0.05, 0.1, 0.45, 0.95]],
+            },
+            {
+                "source_role_id": "R2", "source_role_ids": ["R2"],
+                "identity_audit": {"source_video_path": str(source)},
+                "composite_bboxes_normalized": [[0.55, 0.1, 0.95, 0.95]],
+            },
+        ]
+        queued_workflows = []
+
+        def fake_aux(_job, _segment, workflow, _destination, **_kwargs):
+            queued_workflows.append(workflow)
+            return "sam-v1", [
+                {"node_id": "23", "local_path": str(masks[0])},
+                {"node_id": "27", "local_path": str(masks[1])},
+            ]
+
+        stats = [
+            [{"time_seconds": 0.5, "bbox_normalized": [0.05, 0.1, 0.45, 0.95]}],
+            [{"time_seconds": 0.5, "bbox_normalized": [0.55, 0.1, 0.95, 0.95]}],
+        ]
+        try:
+            with (
+                patch(
+                    "smart_render_worker.upload_file",
+                    return_value={"name": "uploaded-v1.mp4"},
+                ) as upload,
+                patch("smart_render_worker._queue_auxiliary_outputs", side_effect=fake_aux),
+                patch("smart_render_worker._mask_frame_stats", side_effect=stats),
+            ):
+                selected, diagnostics, prompt_id = queue_sam31_v1_role_masks(
+                    {
+                        "server": "http://127.0.0.1:8188", "http_timeout": 1,
+                        "ffmpeg": "ffmpeg", "ffprobe": "ffprobe",
+                    },
+                    {"segment_id": "S3", "index": 0, "download_dir": str(root)},
+                    passes,
+                )
+            upload.assert_called_once()
+            self.assertEqual(queued_workflows[0]["1"]["inputs"]["file"], "uploaded-v1.mp4")
+            self.assertEqual(
+                selected,
+                [[masks[0].resolve()], [masks[1].resolve()]],
+            )
+            self.assertEqual(prompt_id, "sam-v1")
+            self.assertTrue(all(row["mask_source"] == "v1_source" for row in diagnostics))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_character_swap_sequential_passes_report_exact_window_progress(self):
+        root = PROJECT_ROOT / ".director_cache" / "character_swap_sequential_test"
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
         first = root / "pass1.mp4"

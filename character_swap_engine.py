@@ -270,6 +270,18 @@ def character_swap_passes_for_window(
                 track_samples.append({
                     "frame_index": int(sample.get("frame_index", 0) or 0),
                     "time_seconds": sample_time,
+                    "frame_span_explicit": (
+                        sample.get("first_frame_index") is not None
+                        and sample.get("last_frame_index") is not None
+                    ),
+                    "first_frame_index": int(
+                        sample.get("first_frame_index", sample.get("frame_index", 0))
+                        or 0
+                    ),
+                    "last_frame_index": int(
+                        sample.get("last_frame_index", sample.get("frame_index", 0))
+                        or 0
+                    ),
                     "bbox_normalized": bbox_values,
                 })
         track_samples.sort(key=lambda row: row["time_seconds"])
@@ -308,11 +320,18 @@ def character_swap_passes_for_window(
         )
         if role in bbox_overrides:
             # Shot Visual Editor owns the explicit manual rectangle. Remove
-            # older Qwen anchors from the prompt so they cannot compete with
-            # the box the user deliberately placed on this Shot.
+            # older Qwen geometry from the prompt so it cannot compete with
+            # the box the user deliberately placed on this Shot. Preserve the
+            # frame/time spans, however: an internal hard cut may show R2 and
+            # R1 consecutively rather than simultaneously, and the compositor
+            # needs those spans to avoid applying both identity passes to the
+            # same frame.
             source_bbox = list(bbox_overrides[role])
             identity_audit_bbox = list(bbox_overrides[role])
-            track_samples = []
+            track_samples = [
+                {**dict(sample), "bbox_normalized": list(bbox_overrides[role])}
+                for sample in track_samples
+            ]
         edge_truncated = bool(rejected_full_frame_track)
         for bbox in [source_bbox, *[
             row.get("bbox_normalized") or [] for row in track_samples

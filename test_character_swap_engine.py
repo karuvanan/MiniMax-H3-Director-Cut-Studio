@@ -330,6 +330,8 @@ class CharacterSwapEngineTests(unittest.TestCase):
                 "shot_scan_tracks": [{
                     "samples": [{
                         "frame_index": 12,
+                        "first_frame_index": 8,
+                        "last_frame_index": 20,
                         "time_seconds": 0.5,
                         "bbox_normalized": [0.55, 0.1, 0.95, 0.9],
                     }],
@@ -351,10 +353,17 @@ class CharacterSwapEngineTests(unittest.TestCase):
         )
         role = passes[0]["source_roles"][0]
         self.assertEqual(role["source_bbox_normalized"], [0.05, 0.12, 0.45, 0.92])
-        self.assertEqual(role["source_track_samples"], [])
+        self.assertEqual(len(role["source_track_samples"]), 1)
+        self.assertEqual(
+            role["source_track_samples"][0]["bbox_normalized"],
+            [0.05, 0.12, 0.45, 0.92],
+        )
+        self.assertEqual(role["source_track_samples"][0]["first_frame_index"], 8)
+        self.assertEqual(role["source_track_samples"][0]["last_frame_index"], 20)
+        self.assertTrue(role["source_track_samples"][0]["frame_span_explicit"])
         prompt = build_character_swap_prompt(passes[0])
         self.assertIn("x=5-45%", prompt)
-        self.assertNotIn("tracked anchors", prompt)
+        self.assertIn("tracked anchors", prompt)
 
     def test_illustrated_reference_can_be_adapted_as_live_action_identity(self):
         prompt = build_character_swap_prompt(
