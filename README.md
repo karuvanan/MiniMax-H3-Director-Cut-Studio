@@ -24,7 +24,7 @@
 
 ## 版本、下载与教程
 
-- 当前应用版本：[`v0.3.8-alpha.2`](VERSION)
+- 当前应用版本：[`v0.3.8-alpha.3`](VERSION)
 - v0.3.8 自由Remake Engine与环境重塑：[`v0.3.8 readme.md`](v0.3.8%20readme.md)
 - v0.3.7 MiniMax-H3 Character-Swap LoRA与自动Remake Engine：[`v0.3.7 readme.md`](v0.3.7%20readme.md)
 - Character-Swap／Remake Engine论坛文章：[`forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md`](forum/MiniMax_H3_Character_Swap_LoRA_Auto_Remake_Engine.md)
