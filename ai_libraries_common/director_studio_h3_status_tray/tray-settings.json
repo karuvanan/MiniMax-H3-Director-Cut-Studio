@@ -1,0 +1,20 @@
+﻿{
+    "api_url":  "http://127.0.0.1:8189",
+    "cache_path":  "C:\\ai program\\Data\\Packages\\ComfyUI-GPU-1\\output\\__h3_removal_cache",
+    "resource_refresh_seconds":  5,
+    "cache_refresh_seconds":  300,
+    "server_settings_path":  "C:\\ai program\\Data\\Packages\\ComfyUI-GPU-1\\custom_nodes\\comfyui_director_h3_cache_status\\status-settings.json",
+    "lm_studio_url":  "http://127.0.0.1:47831/v1",
+    "qwen_model":  "iq3_s",
+    "qwen_key_filter":  "qwen3",
+    "auto_load_qwen_when_free":  true,
+    "codex_exe":  "",
+    "watch_leaked_tool_call":  true,
+    "codex_sessions_path":  "",
+    "leaked_toolcall_grace_seconds":  45,
+    "leaked_toolcall_max_age_minutes":  180,
+    "watch_dead_turns":  false,
+    "dead_turn_grace_seconds":  20,
+    "dead_turn_max_wakes_per_thread":  8,
+    "defer_unload_for_active_turn_seconds":  150
+}
