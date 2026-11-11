@@ -81,6 +81,8 @@ def _lm_model_aliases(value: str) -> set[str]:
 
 def unload_lm_studio(base_url: str, selected_model: str, timeout: float) -> list[str]:
     origin = lm_origin(base_url)
+    if _is_strata_host(origin, timeout):
+        return _unload_strata(origin, selected_model, timeout)
     catalog = request(origin + "/api/v1/models", timeout)
     selected = selected_model.strip().casefold()
     selected_aliases = _lm_model_aliases(selected_model)
@@ -126,6 +128,93 @@ def unload_lm_studio(base_url: str, selected_model: str, timeout: float) -> list
             # A model can disappear between catalogue discovery and unload. In
             # that race it is already in the desired state.
             if "model_not_found" in detail or "is not loaded" in detail:
+                continue
+            errors.append(f"{instance_id}: {exc}")
+    if errors and not unloaded:
+        raise RuntimeError("; ".join(errors))
+    return unloaded
+
+
+_HOST_KINDS: dict[str, str] = {}
+
+
+def _host_kind(origin: str, timeout: float) -> str:
+    """'strata' or 'lmstudio' for an inference host origin (cached per origin).
+
+    LM Studio answers GET /api/v1/models; the Strata native host 404s that route
+    but answers GET /api/models. Studio's UNLOAD ALL has to speak the right
+    dialect, otherwise Qwen stays resident in VRAM while ComfyUI needs the GPU.
+    """
+    cached = _HOST_KINDS.get(origin)
+    if cached:
+        return cached
+    kind = "lmstudio"
+    try:
+        request(origin + "/api/v1/models", timeout)
+    except Exception:
+        try:
+            probe = request(origin + "/api/models", timeout)
+        except Exception:
+            probe = None
+        if isinstance(probe, dict) and ("variants" in probe or "mode" in probe):
+            kind = "strata"
+    _HOST_KINDS[origin] = kind
+    return kind
+
+
+def _is_strata_host(origin: str, timeout: float) -> bool:
+    return _host_kind(origin, timeout) == "strata"
+
+
+def _unload_strata(origin: str, selected_model: str, timeout: float) -> list[str]:
+    """Unload the Strata native instance(s).
+
+    Strata runs one model on automatic GPU placement. The live instance is listed
+    by the OpenAI-shaped GET /v1/models, whose meta.instanceId is the id
+    POST /api/native/instances/{id}/unload expects. When the caller names a model,
+    match it against id + aliases + label before unloading so a model that belongs
+    to another session is left alone.
+    """
+    payload = request(origin + "/v1/models", timeout)
+    selected = {
+        alias
+        for alias in (
+            _lm_model_aliases(selected_model)
+            | {item.casefold() for item in str(selected_model or "").split() if item}
+        )
+        if alias
+    }
+    targets: list[str] = []
+    for entry in payload.get("data") or []:
+        if not isinstance(entry, dict):
+            continue
+        meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
+        model_id = str(entry.get("id") or "")
+        label = str(meta.get("label") or "")
+        names = {model_id.casefold(), label.casefold()}
+        names.update(str(a).casefold() for a in (meta.get("aliases") or []) if str(a))
+        instance_id = str(meta.get("instanceId") or meta.get("instance_id") or "")
+        if not instance_id:
+            continue
+        if selected:
+            matched = bool(selected & names) or any(
+                needle and (needle in name or name in needle)
+                for name in names
+                for needle in selected
+            )
+            if not matched:
+                continue
+        targets.append(instance_id)
+
+    unloaded: list[str] = []
+    errors: list[str] = []
+    for instance_id in dict.fromkeys(targets):
+        try:
+            request(f"{origin}/api/native/instances/{instance_id}/unload", timeout, {})
+            unloaded.append(instance_id)
+        except Exception as exc:
+            detail = str(exc).casefold()
+            if "no longer loaded" in detail or "is not loaded" in detail:
                 continue
             errors.append(f"{instance_id}: {exc}")
     if errors and not unloaded:

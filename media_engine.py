@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import re
 import subprocess
@@ -139,6 +140,176 @@ def _run(command: list[str], timeout: int = 45) -> subprocess.CompletedProcess[s
     )
 
 
+def _rate_to_float(value: Any) -> float:
+    """Parse an FFprobe ``12000/1001``-style rate, tolerating ``0/0`` and N/A."""
+    text = str(value or "").strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE"}:
+        return 0.0
+    try:
+        if "/" in text:
+            numerator, denominator = text.split("/", 1)
+            denominator_value = float(denominator)
+            if denominator_value == 0.0:
+                return 0.0
+            return float(numerator) / denominator_value
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+# (resolved path, mtime_ns) -> (measured span seconds, frame interval seconds)
+_DECODE_SPAN_CACHE: dict[tuple[str, int], tuple[float, float]] = {}
+
+
+def decode_safe_video_span(
+    path: str | Path,
+    duration: float | None = None,
+    runtime: RuntimePaths | None = None,
+    ffprobe: str | Path | None = None,
+) -> float:
+    """Return the latest timestamp FFmpeg can still return a frame from.
+
+    Phone, WhatsApp and VFR screen captures commonly publish a container/stream
+    duration that runs slightly past the last *seekable* video frame (the tail
+    packets sit behind an edit list or carry display timestamps beyond the last
+    decodable picture).  An ``-ss`` beyond that point decodes zero frames, and
+    current FFmpeg builds then fail inside the encoder setup and blame the
+    MJPEG codec — "Non full-range YUV is non-standard, set strict_std
+    compliance to at most unofficial to use it." plus "Error while opening
+    encoder - maybe incorrect parameters such as bit_rate, rate, width or
+    height." That wording reads like a colour-space or content-moderation
+    problem, yet the real cause is simply a seek past the end of the picture
+    track: FFmpeg also reports "No filtered frames for output stream" and
+    "Nothing was written into output file" in the same pass.
+
+    ``ffprobe`` overrides the probe binary of the configured runtime, so a
+    render worker that carries its own FFmpeg bundle measures the same decoder
+    it is about to run.
+
+    Returns ``0.0`` when the span cannot be measured, so callers keep their own
+    duration instead of trusting a guess.
+    """
+    runtime = runtime or load_runtime_paths()
+    if ffprobe is not None:
+        # Measure the span with the same FFprobe build that will be used to
+        # decode the frames, which matters for a render worker that ships its
+        # own FFmpeg bundle instead of the one configured for the UI.
+        runtime = replace(runtime, ffprobe=Path(ffprobe))
+    source = Path(path)
+    try:
+        signature = (str(source.resolve()), int(source.stat().st_mtime_ns))
+    except OSError:
+        signature = (str(source), 0)
+    measured = _DECODE_SPAN_CACHE.get(signature)
+    if measured is None:
+        span = 0.0
+        frame_interval = 0.0
+        result = _run(
+            [
+                str(runtime.ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration,nb_frames,avg_frame_rate:format=duration",
+                "-of",
+                "json",
+                str(source),
+            ]
+        )
+        # A probe that answered without a usable payload — a stubbed reply in a
+        # test, or a process that produced nothing at all — only means the span
+        # could not be measured.  The caller decides what to do about that.
+        reply_stdout = getattr(result, "stdout", "") or ""
+        if not getattr(result, "returncode", 1):
+            try:
+                payload = json.loads(reply_stdout or "{}")
+            except ValueError:
+                payload = {}
+            streams = payload.get("streams") or []
+            stream = streams[0] if streams and isinstance(streams[0], dict) else {}
+            durations: list[float] = []
+            for section in (stream, payload.get("format") or {}):
+                try:
+                    seconds = float(section.get("duration"))
+                except (TypeError, ValueError):
+                    continue
+                if seconds > 0.05:
+                    durations.append(seconds)
+            if durations:
+                span = min(durations)
+            # r_frame_rate is unreliable on these captures (WhatsApp reports
+            # 90000/1), so prefer avg_frame_rate and fall back to the decoded
+            # frame count rather than trusting the nominal rate.
+            fps = _rate_to_float(stream.get("avg_frame_rate"))
+            if fps <= 0.0 and span > 0.0:
+                try:
+                    frame_count = int(stream.get("nb_frames") or 0)
+                except (TypeError, ValueError):
+                    frame_count = 0
+                if frame_count > 1:
+                    fps = frame_count / span
+            if 0.0 < fps < 1000.0:
+                frame_interval = 1.0 / fps
+        measured = (span, frame_interval)
+        _DECODE_SPAN_CACHE[signature] = measured
+    span, frame_interval = measured
+    if span <= 0.0 and duration is not None:
+        try:
+            span = max(0.0, float(duration))
+        except (TypeError, ValueError):
+            span = 0.0
+    if span <= 0.0:
+        return 0.0
+    if duration is not None:
+        try:
+            span = min(span, max(0.0, float(duration)))
+        except (TypeError, ValueError):
+            pass
+    # Short clips cannot afford the same safety band as a long video, so the
+    # band is capped at a tenth of the measurable span.
+    margin = min(max(0.30, 4.0 * frame_interval), max(0.05, span * 0.10))
+    return max(0.05, span - margin)
+
+
+def clamp_seek_to_decode_span(
+    path: str | Path,
+    seek_seconds: float,
+    duration: float | None = None,
+    runtime: RuntimePaths | None = None,
+    ffprobe: str | Path | None = None,
+) -> float:
+    """Pull a requested seek back into the range FFmpeg can still decode.
+
+    ``decode_safe_video_span`` explains why a seek into the published tail of a
+    phone or WhatsApp plate makes FFmpeg fail inside the encoder ("Conversion
+    failed!") instead of simply producing nothing.  Rendering, proxy and slice
+    paths keep their own timing rules and only need the safe number: when the
+    span cannot be measured, or the request is already inside it, the requested
+    position is returned untouched so nothing about a healthy file changes.  A
+    request of zero is answered without probing at all, because the beginning of
+    a file is always reachable.
+    """
+    try:
+        requested = max(0.0, float(seek_seconds or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if requested == 0.0:
+        # The beginning of a file is always reachable, so a Shot that starts at
+        # zero costs no probe at all.
+        return 0.0
+    try:
+        safe_span = decode_safe_video_span(path, duration, runtime, ffprobe=ffprobe)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        # A render step must not die because the probe binary is missing or the
+        # probe stalled; that measurement is an optimisation, not a requirement.
+        return requested
+    if safe_span <= 0.0 or requested <= safe_span:
+        return requested
+    return safe_span
+
+
 def probe_media(path: str | Path, runtime: RuntimePaths | None = None) -> dict[str, Any]:
     source = Path(path)
     kind = media_type_for_path(source)
@@ -188,27 +359,68 @@ def create_video_thumbnail(
     seek_seconds: float = 0.0,
     runtime: RuntimePaths | None = None,
 ) -> Path:
+    """Extract one frame without letting an out-of-range seek break an analysis.
+
+    ``decode_safe_video_span`` explains why FFmpeg blames the MJPEG encoder when
+    a seek lands past the last seekable picture.  The requested position is
+    clamped into the decodable range, then retried just before EOF and finally
+    at the opening frame, so one unreachable tail timestamp degrades into
+    slightly earlier evidence instead of aborting Qwen/BLIP analysis of the
+    whole asset.
+    """
     runtime = runtime or load_runtime_paths()
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    result = _run(
-        [
-            str(runtime.ffmpeg),
-            "-y",
-            "-ss",
-            f"{max(0.0, seek_seconds):.3f}",
-            "-i",
-            str(path),
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=960:-2:force_original_aspect_ratio=decrease",
-            str(destination),
-        ]
+    requested = max(0.0, float(seek_seconds or 0.0))
+    safe_span = decode_safe_video_span(path, runtime=runtime)
+    clamped = requested if safe_span <= 0.0 else min(requested, safe_span)
+
+    attempts: list[list[str]] = []
+    if clamped > 0.001:
+        attempts.append(["-ss", f"{clamped:.3f}"])
+    if requested > clamped:
+        # If even the clamped position turned out to be unreachable, half a
+        # second before EOF is the closest real substitute to what was asked.
+        attempts.append(["-sseof", "-0.5"])
+    attempts.append([])
+
+    failure: list[str] = []
+    for prefix in attempts:
+        result = _run(
+            [
+                str(runtime.ffmpeg),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+            ]
+            + prefix
+            + [
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-an",
+                "-vf",
+                "scale=960:-2:force_original_aspect_ratio=decrease",
+                str(destination),
+            ]
+        )
+        if (
+            not result.returncode
+            and destination.is_file()
+            and destination.stat().st_size > 0
+        ):
+            return destination
+        lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+        if lines:
+            failure = lines
+        destination.unlink(missing_ok=True)
+    detail = " / ".join(failure[:3]) or "FFmpeg returned no frame"
+    raise RuntimeError(
+        f"Unable to extract a frame from {Path(path).name} "
+        f"(requested {requested:.2f}s): {detail}"
     )
-    if result.returncode or not destination.exists():
-        raise RuntimeError(result.stderr.strip() or "Unable to create video thumbnail")
-    return destination
 
 
 def plan_scene_analysis_samples(
@@ -315,6 +527,13 @@ def create_video_analysis_frames(
     destination_dir = Path(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
     duration = max(0.05, duration)
+    # Sample planning must stay inside the picture track.  A scene cut that
+    # FFmpeg scores a few frames before the real end otherwise produces
+    # early/midpoint/late requests beyond the last seekable frame, which used to
+    # fail the entire Media Pool preparation pass.
+    safe_span = decode_safe_video_span(path, duration, runtime)
+    if 0.0 < safe_span < duration:
+        duration = safe_span
     if scene_aware:
         cuts = detect_video_scene_changes(path, duration, runtime=runtime)
         boundaries = [0.0, *cuts, duration]
@@ -386,6 +605,15 @@ def create_video_shot_frame_scan(
     start = max(0.0, float(start_seconds or 0.0))
     end = max(start + 1.0 / max(1.0, scan_fps), float(end_seconds or 0.0))
     fps = max(1.0, min(60.0, float(scan_fps or 24.0)))
+    # A Shot band that begins past the last seekable picture of its plate would
+    # make FFmpeg decode nothing at all and fail with an unrelated encoder
+    # message, so the unusable range is reported as an editable Shot instead.
+    safe_span = decode_safe_video_span(source, None, runtime)
+    if safe_span > 0.0 and start >= safe_span:
+        raise ValueError(
+            f"Shot starts at {start:.2f}s, but {source.name} only decodes to "
+            f"{safe_span:.2f}s. Move the Shot earlier before DETECT V1 PEOPLE."
+        )
     expected = max(1, int(round((end - start) * fps)))
     ceiling = max(1, int(max_frames))
     if expected > ceiling:

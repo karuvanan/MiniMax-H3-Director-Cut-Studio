@@ -23,6 +23,9 @@ function Read-TrayConfig {
         resource_refresh_seconds = 5
         cache_refresh_seconds = 120
         server_settings_path = ""
+        lm_studio_url = ""
+        qwen_model = "qwen3.8-uncensored-mtp"
+        qwen_key_filter = "qwen3"
     }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         return $defaults
@@ -50,6 +53,9 @@ function Read-TrayConfig {
         if ($saved.server_settings_path) {
             $defaults.server_settings_path = [string]$saved.server_settings_path
         }
+        if ($saved.lm_studio_url) { $defaults.lm_studio_url = [string]$saved.lm_studio_url }
+        if ($saved.qwen_model) { $defaults.qwen_model = [string]$saved.qwen_model }
+        if ($saved.qwen_key_filter) { $defaults.qwen_key_filter = [string]$saved.qwen_key_filter }
     } catch {}
     return $defaults
 }
@@ -96,8 +102,55 @@ function Format-Gigabytes($bytes) {
     try { return ("{0:0.0}GB" -f ([double]$bytes / 1GB)) } catch { return "N/A" }
 }
 
+function Get-QwenLoadedInstances {
+    if (-not $script:lmEndpointBase) { return @() }
+    try {
+        $catalog = Invoke-RestMethod -Uri ($script:lmEndpointBase.TrimEnd("/") + "/api/v1/models") -Method Get -TimeoutSec 4
+        $needle = [string]$config.qwen_key_filter
+        if (-not $needle) { return @() }
+        $out = @()
+        foreach ($model in $catalog.models) {
+            # -match is case-insensitive, mirroring the staged driver's key filter.
+            if ([string]$model.key -match [regex]::Escape($needle)) {
+                foreach ($inst in $model.loaded_instances) {
+                    if ($null -eq $inst) { continue }
+                    if ($inst -is [System.Management.Automation.PSCustomObject]) { $out += [string]$inst.id }
+                    else { $out += [string]$inst }
+                }
+            }
+        }
+        return $out
+    } catch {}
+    return @()
+}
+
+function Invoke-TrayAction([string]$Title, [scriptblock]$Body) {
+    try {
+        & $Body | Out-Null
+        Update-H3TrayStatus
+        $notify.BalloonTipTitle = "H3 Status Tray"
+        $notify.BalloonTipText = "$Title : done"
+        $notify.ShowBalloonTip(2500)
+    } catch {
+        Update-H3TrayStatus
+        [System.Windows.Forms.MessageBox]::Show(
+            "$Title failed:`r`n$($_.Exception.Message)",
+            "H3 Status Tray",
+            [System.Windows.Forms.MessageBoxButtons].OK,
+            [System.Windows.Forms.MessageBoxIcon].Warning
+        ) | Out-Null
+    }
+}
+
 $config = Read-TrayConfig
 $endpoint = $config.api_url.TrimEnd("/") + "/director_studio/h3-relay-cache-status"
+$lmEndpointBase = [string]$config.lm_studio_url
+if (-not $lmEndpointBase) {
+    try {
+        $parsedApiUrl = [Uri]$config.api_url
+        $lmEndpointBase = "http://$($parsedApiUrl.Host):1234"
+    } catch { $lmEndpointBase = "" }
+}
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = [System.Drawing.SystemIcons]::Information
 $notify.Visible = $true
@@ -121,6 +174,15 @@ $menu.Items.Add($openComfyItem) | Out-Null
 $openCacheItem = New-Object System.Windows.Forms.ToolStripMenuItem
 $openCacheItem.Text = "Open H3 cache folder"
 $menu.Items.Add($openCacheItem) | Out-Null
+$unloadQwenItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$unloadQwenItem.Text = "Unload Qwen (free GPU for H3)"
+$menu.Items.Add($unloadQwenItem) | Out-Null
+$loadQwenItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$loadQwenItem.Text = "Load Qwen (for Design / agent)"
+$menu.Items.Add($loadQwenItem) | Out-Null
+$freeComfyItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$freeComfyItem.Text = "Free ComfyUI (/free)"
+$menu.Items.Add($freeComfyItem) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem
 $exitItem.Text = "Exit H3 Status Tray"
@@ -137,7 +199,9 @@ function Update-H3TrayStatus {
         $dram = Format-Percent $resources.dram_percent
         $gpu = Format-Percent $resources.gpu_percent
         $cpu = Format-Percent $resources.cpu_percent
-        $summary = "Cache $cache/100GB | VRAM $vram | DRAM $dram | GPU $gpu | CPU $cpu"
+        $qwenInstances = Get-QwenLoadedInstances
+        $ownerState = if ($qwenInstances.Count -gt 0) { "QWEN loaded (agent owns GPU)" } else { "GPU free for H3" }
+        $summary = "$ownerState | Cache $cache/100GB | VRAM $vram | DRAM $dram | GPU $gpu | CPU $cpu"
         $statusItem.Text = $summary
         $notify.Text = if ($summary.Length -gt 63) {
             $summary.Substring(0, 63)
@@ -146,7 +210,10 @@ function Update-H3TrayStatus {
             $resources.vram_percent, $resources.dram_percent,
             $resources.gpu_percent, $resources.cpu_percent
         ) | Where-Object { $null -ne $_ } | Measure-Object -Maximum
-        if ([double]$high.Maximum -ge 95 -or [double]$payload.used_bytes -ge 90GB) {
+        if ($qwenInstances.Count -gt 0 -and $null -ne $resources.vram_percent -and [double]$resources.vram_percent -ge 80) {
+            # Agent side owns the GPU: Qwen resident, H3 would OOM without unload-qwen.
+            $notify.Icon = [System.Drawing.SystemIcons]::Warning
+        } elseif ([double]$high.Maximum -ge 95 -or [double]$payload.used_bytes -ge 90GB) {
             $notify.Icon = [System.Drawing.SystemIcons]::Error
         } elseif ([double]$high.Maximum -ge 80 -or [double]$payload.used_bytes -ge 70GB) {
             $notify.Icon = [System.Drawing.SystemIcons]::Warning
@@ -154,7 +221,8 @@ function Update-H3TrayStatus {
             $notify.Icon = [System.Drawing.SystemIcons]::Information
         }
     } catch {
-        $statusItem.Text = "ComfyUI unavailable | Cache/VRAM/DRAM/GPU/CPU N/A"
+        $qwenState = if ((Get-QwenLoadedInstances).Count -gt 0) { "QWEN loaded" } else { "GPU free for H3" }
+        $statusItem.Text = "ComfyUI unavailable | $qwenState | Cache/VRAM/DRAM/GPU/CPU N/A"
         $notify.Text = "H3 Server Status - ComfyUI unavailable"
         $notify.Icon = [System.Drawing.SystemIcons]::Warning
     }
@@ -167,7 +235,7 @@ function Show-TraySettings {
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
-    $form.ClientSize = New-Object System.Drawing.Size(640, 302)
+    $form.ClientSize = New-Object System.Drawing.Size(640, 418)
     $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 
     $resourceRefreshLabel = New-Object System.Windows.Forms.Label
@@ -251,16 +319,40 @@ function Show-TraySettings {
     })
     $form.Controls.Add($browseButton)
 
+    $lmLabel = New-Object System.Windows.Forms.Label
+    $lmLabel.Text = "LM Studio URL (empty = ComfyUI host:1234)"
+    $lmLabel.Location = New-Object System.Drawing.Point(18, 196)
+    $lmLabel.Size = New-Object System.Drawing.Size(175, 24)
+    $form.Controls.Add($lmLabel)
+
+    $lmInput = New-Object System.Windows.Forms.TextBox
+    $lmInput.Text = [string]$config.lm_studio_url
+    $lmInput.Location = New-Object System.Drawing.Point(202, 193)
+    $lmInput.Size = New-Object System.Drawing.Size(418, 26)
+    $form.Controls.Add($lmInput)
+
+    $modelLabel = New-Object System.Windows.Forms.Label
+    $modelLabel.Text = "Qwen model for Load Qwen"
+    $modelLabel.Location = New-Object System.Drawing.Point(18, 238)
+    $modelLabel.Size = New-Object System.Drawing.Size(175, 24)
+    $form.Controls.Add($modelLabel)
+
+    $modelInput = New-Object System.Windows.Forms.TextBox
+    $modelInput.Text = [string]$config.qwen_model
+    $modelInput.Location = New-Object System.Drawing.Point(202, 235)
+    $modelInput.Size = New-Object System.Drawing.Size(418, 26)
+    $form.Controls.Add($modelInput)
+
     $hint = New-Object System.Windows.Forms.Label
     $hint.Text = "Defaults: resources 5s, Cache Folder 120s. Changes apply immediately."
     $hint.ForeColor = [System.Drawing.Color]::FromArgb(70, 120, 145)
-    $hint.Location = New-Object System.Drawing.Point(202, 188)
+    $hint.Location = New-Object System.Drawing.Point(202, 278)
     $hint.Size = New-Object System.Drawing.Size(418, 36)
     $form.Controls.Add($hint)
 
     $saveButton = New-Object System.Windows.Forms.Button
     $saveButton.Text = "Save"
-    $saveButton.Location = New-Object System.Drawing.Point(446, 249)
+    $saveButton.Location = New-Object System.Drawing.Point(446, 320)
     $saveButton.Size = New-Object System.Drawing.Size(82, 32)
     $saveButton.Add_Click({
         $url = $apiInput.Text.Trim().TrimEnd("/")
@@ -297,12 +389,24 @@ function Show-TraySettings {
             return
         }
 
+        $lmUrlText = [string]$lmInput.Text.Trim().TrimEnd("/")
+        if ($lmUrlText -and $lmUrlText -notmatch "^https?://") { $lmUrlText = "http://" + $lmUrlText }
         $script:config.api_url = $url
         $script:config.cache_path = $cachePath
+        $script:config.lm_studio_url = $lmUrlText
+        if ([string]$modelInput.Text.Trim()) { $script:config.qwen_model = [string]$modelInput.Text.Trim() }
         $script:config.resource_refresh_seconds = [int]$resourceRefreshInput.Value
         $script:config.cache_refresh_seconds = [int]$cacheRefreshInput.Value
         if (-not (Write-TrayConfig)) { return }
         $script:endpoint = $script:config.api_url.TrimEnd("/") + "/director_studio/h3-relay-cache-status"
+        if ($script:config.lm_studio_url) {
+            $script:lmEndpointBase = [string]$script:config.lm_studio_url
+        } else {
+            try {
+                $reparsedApiUrl = [Uri]$script:config.api_url
+                $script:lmEndpointBase = "http://$($reparsedApiUrl.Host):1234"
+            } catch { $script:lmEndpointBase = "" }
+        }
         $script:timer.Interval = [int]$script:config.resource_refresh_seconds * 1000
         Update-H3TrayStatus
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
@@ -312,7 +416,7 @@ function Show-TraySettings {
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = "Cancel"
-    $cancelButton.Location = New-Object System.Drawing.Point(538, 249)
+    $cancelButton.Location = New-Object System.Drawing.Point(538, 320)
     $cancelButton.Size = New-Object System.Drawing.Size(82, 32)
     $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($cancelButton)
@@ -337,6 +441,28 @@ $openCacheItem.Add_Click({
         Start-Process explorer.exe -ArgumentList ('"' + $target + '"')
     }
 })
+$unloadQwenItem.Add_Click({
+    Invoke-TrayAction "Unload Qwen" {
+        if (-not $script:lmEndpointBase) { throw "LM Studio URL not configured (Settings...)" }
+        $instances = Get-QwenLoadedInstances
+        if ($instances.Count -eq 0) { throw "no loaded Qwen instance found" }
+        foreach ($iid in $instances) {
+            Invoke-RestMethod -Uri ($script:lmEndpointBase.TrimEnd("/") + "/api/v1/models/unload") -Method Post -ContentType "application/json" -Body (@{instance_id = $iid} | ConvertTo-Json) -TimeoutSec 30
+        }
+    }
+})
+$loadQwenItem.Add_Click({
+    Invoke-TrayAction "Load Qwen" {
+        if (-not $script:lmEndpointBase) { throw "LM Studio URL not configured (Settings...)" }
+        $body = @{ model = [string]$config.qwen_model; messages = @(@{role = "user"; content = "reply with the single word ok"}); max_tokens = 6 } | ConvertTo-Json -Depth 4
+        Invoke-RestMethod -Uri ($script:lmEndpointBase.TrimEnd("/") + "/v1/chat/completions") -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
+    }
+})
+$freeComfyItem.Add_Click({
+    Invoke-TrayAction "Free ComfyUI" {
+        Invoke-RestMethod -Uri ($config.api_url.TrimEnd("/") + "/free") -Method Post -ContentType "application/json" -Body (@{unload_models = $true; free_memory = $true} | ConvertTo-Json) -TimeoutSec 30
+    }
+})
 $notify.Add_DoubleClick({ Start-Process $config.api_url })
 $context = New-Object System.Windows.Forms.ApplicationContext
 $exitItem.Add_Click({
@@ -350,7 +476,7 @@ try {
     Update-H3TrayStatus
     $timer.Start()
     $notify.BalloonTipTitle = "H3 Server Status"
-    $notify.BalloonTipText = "Tray monitoring is active. Double-click to open ComfyUI."
+    $notify.BalloonTipText = "Tray monitors Qwen (LM Studio) + ComfyUI; menu can load/unload either side. Double-click opens ComfyUI."
     $notify.ShowBalloonTip(2500)
     [System.Windows.Forms.Application]::Run($context)
 } finally {

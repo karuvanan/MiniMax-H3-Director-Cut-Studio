@@ -532,25 +532,60 @@ def main() -> int:
     if not prompt_id or not job.get("wait_for_completion", True):
         print(json.dumps({"uploaded": uploaded, "queued": queued}, ensure_ascii=False), flush=True)
         return 0
-    history, outputs = wait_for_history(
-        server,
-        prompt_id,
-        poll_interval=max(0.1, float(job.get("history_poll_interval", 1.0))),
-        generation_timeout=max(10, int(job.get("generation_timeout", 1800))),
-        http_timeout=http_timeout,
-        reconnect_timeout=reconnect_timeout,
-    )
-    downloaded = outputs
-    if job.get("download_dir") and outputs:
-        downloaded = download_outputs(
+    # Round 113: renew the GPU claim while this process waits.  A single-shot submit can sit for many
+    # minutes with the ComfyUI queue momentarily empty, and the status tray releases a claim whose ts
+    # has aged past its 120-second liveness grace - which is how Qwen gets loaded back onto the VRAM
+    # this job is still using.
+    try:
+        import staged_model_driver as _h3_claim_driver
+
+        _h3_claim_driver.start_comfy_claim_lease(note="submit-gpu-phase")
+    except Exception:
+        pass
+    try:
+        history, outputs = wait_for_history(
             server,
-            outputs,
-            Path(job["download_dir"]),
-            http_timeout,
+            prompt_id,
+            poll_interval=max(0.1, float(job.get("history_poll_interval", 1.0))),
+            generation_timeout=max(10, int(job.get("generation_timeout", 1800))),
+            http_timeout=http_timeout,
             reconnect_timeout=reconnect_timeout,
-            prompt_id=prompt_id,
-            download_recovery_timeout=output_download_recovery_timeout,
         )
+        downloaded = outputs
+        if job.get("download_dir") and outputs:
+            downloaded = download_outputs(
+                server,
+                outputs,
+                Path(job["download_dir"]),
+                http_timeout,
+                reconnect_timeout=reconnect_timeout,
+                prompt_id=prompt_id,
+                download_recovery_timeout=output_download_recovery_timeout,
+            )
+    finally:
+        # Constraint (free after every test): single-shot jobs release ComfyUI
+        # models + VRAM on exit, success or failure, then clear the claim file
+        # so the status tray can auto-load Qwen again.
+        try:
+            free_request = urllib.request.Request(
+                server + "/free",
+                data=json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _request_json(free_request, http_timeout)
+        except Exception as exc:  # cleanup must never discard a completed take
+            print(json.dumps({"progress": f"ComfyUI cleanup skipped: {exc}"}, ensure_ascii=False), flush=True)
+        try:
+            import staged_model_driver as _h3_claim_driver
+
+            # Stop renewing first: a live lease would re-arm the file this clear has just deleted,
+            # and the status tray would never see the GPU as free again (the parking the driver
+            # comment records for 2026-11-10: unload 12:42:47 -> reload 14:13:03).
+            _h3_claim_driver.stop_comfy_claim_lease()
+            _h3_claim_driver.clear_comfy_claim()
+        except Exception:
+            pass
     # Retired final_hold_* job metadata is deliberately ignored.
     print(
         json.dumps(

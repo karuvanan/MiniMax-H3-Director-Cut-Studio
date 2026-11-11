@@ -481,6 +481,183 @@ def plan_shot_render_segments(
     return result
 
 
+RELAY_WINDOW_FRAMES = 124
+RELAY_WINDOW_FPS = 24.0
+# One Character Swap Relay window is 124 frames at H3's 24 fps output rate, about
+# 5.17 s.  A render Segment shorter than that gets a single Relay pass whose
+# 18-frame history handle is a visible slice of its own duration, and every extra
+# fragment cold-starts its own H3 request with its own seed.  The pink-dress
+# project measured the cost exactly: an authored 13.568 s clip planned as
+# 1.589 s + 11.420 s + 0.559 s with three different seeds, so the swap had to
+# re-establish the character three times and only the middle piece came out
+# right.  The accepted manual ComfyUI run submitted the same clip as one job.
+RELAY_WINDOW_SECONDS = round(RELAY_WINDOW_FRAMES / RELAY_WINDOW_FPS, 6)
+MINIMUM_RELAY_SEGMENT_SECONDS = 1.0
+
+
+def _absorb_relay_segment(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    """Extend the earlier fused unit so it covers the later fragment."""
+
+    dst["end_seconds"] = max(float(dst["end_seconds"]), float(src["end_seconds"]))
+    if dst["core_end_seconds"] is not None and src["core_end_seconds"] is not None:
+        dst["core_end_seconds"] = max(
+            float(dst["core_end_seconds"]), float(src["core_end_seconds"])
+        )
+    else:
+        dst["core_end_seconds"] = None
+    dst["overlap_after_seconds"] = float(src["overlap_after_seconds"])
+    for cue_id in src["shot_ids"]:
+        if cue_id not in dst["shot_ids"]:
+            dst["shot_ids"].append(cue_id)
+
+
+def _relay_row_from_segment(row: RenderSegment) -> dict[str, Any]:
+    return {
+        "start_seconds": float(row.start_seconds),
+        "end_seconds": float(row.end_seconds),
+        "core_start_seconds": (
+            None if row.core_start_seconds is None else float(row.core_start_seconds)
+        ),
+        "core_end_seconds": (
+            None if row.core_end_seconds is None else float(row.core_end_seconds)
+        ),
+        "overlap_before_seconds": float(row.overlap_before_seconds or 0.0),
+        "overlap_after_seconds": float(row.overlap_after_seconds or 0.0),
+        "continuity_mode": str(row.continuity_mode or "none"),
+        "shot_ids": list(row.shot_ids or []),
+    }
+
+
+def merge_segments_for_relay_window(
+    segments: Iterable[RenderSegment],
+    *,
+    window_seconds: float = RELAY_WINDOW_SECONDS,
+    minimum_seconds: float = MINIMUM_RELAY_SEGMENT_SECONDS,
+    maximum_seconds: float = MAX_NATIVE_SECONDS,
+    grid_seconds: float = TIMELINE_GRID_SECONDS,
+) -> list[RenderSegment]:
+    """Fuse Relay Segments shorter than one native Relay window.
+
+    A fragment first absorbs the units that follow it, so a short Shot keeps its
+    own start boundary and the Relay chains forward through the performance; only
+    a tail fragment falls back onto its predecessor.  No fusion is allowed to
+    exceed the native duration limit.  After that, anything still under the hard
+    ``minimum_seconds`` floor absorbs a neighbour, and when neither neighbour can
+    take it without breaking the limit the shared boundary is rebalanced instead,
+    so a sub-second generation unit never survives to become a phantom FFmpeg
+    seek at EOF.  Fused units re-derive their identity from the new range, which
+    is what correctly marks the fused job dirty.
+    """
+
+    rows = [
+        _relay_row_from_segment(row)
+        for row in segments
+        if isinstance(row, RenderSegment)
+    ]
+    if len(rows) < 2:
+        return [
+            RenderSegment(
+                segment_id=_segment_id(index, row["start_seconds"], row["end_seconds"]),
+                index=index,
+                start_seconds=row["start_seconds"],
+                end_seconds=row["end_seconds"],
+                overlap_before_seconds=row["overlap_before_seconds"],
+                overlap_after_seconds=row["overlap_after_seconds"],
+                core_start_seconds=row["core_start_seconds"],
+                core_end_seconds=row["core_end_seconds"],
+                shot_ids=row["shot_ids"],
+                continuity_mode=row["continuity_mode"],
+            )
+            for index, row in enumerate(rows)
+        ]
+    window = max(0.0, float(window_seconds))
+    minimum = max(0.0, float(minimum_seconds))
+    maximum = float(maximum_seconds)
+    if maximum <= 0:
+        raise ValueError("Maximum segment duration must be positive.")
+
+    ordered = sorted(rows, key=lambda row: (row["start_seconds"], row["end_seconds"]))
+    fused: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(ordered):
+        core = dict(ordered[cursor])
+        while (
+            core["end_seconds"] - core["start_seconds"] < window - 1e-6
+            and cursor + 1 < len(ordered)
+            and ordered[cursor + 1]["end_seconds"] - core["start_seconds"]
+            <= maximum + 1e-6
+        ):
+            cursor += 1
+            _absorb_relay_segment(core, ordered[cursor])
+        if (
+            core["end_seconds"] - core["start_seconds"] < window - 1e-6
+            and fused
+            and core["end_seconds"] - fused[-1]["start_seconds"] <= maximum + 1e-6
+        ):
+            _absorb_relay_segment(fused[-1], core)
+        else:
+            fused.append(core)
+        cursor += 1
+
+    # Hard floor: nothing that a Relay pass cannot even measure survives.
+    for index in range(len(fused) - 1, -1, -1):
+        core = fused[index]
+        duration = core["end_seconds"] - core["start_seconds"]
+        if duration >= minimum - 1e-6:
+            continue
+        absorbed = False
+        if index > 0 and core["end_seconds"] - fused[index - 1]["start_seconds"] <= (
+            maximum + 1e-6
+        ):
+            _absorb_relay_segment(fused[index - 1], core)
+            del fused[index]
+            absorbed = True
+        elif index + 1 < len(fused) and (
+            fused[index + 1]["end_seconds"] - core["start_seconds"] <= maximum + 1e-6
+        ):
+            _absorb_relay_segment(core, fused[index + 1])
+            del fused[index + 1]
+            absorbed = True
+        elif index > 0:
+            # The neighbour would overflow the native limit, so move the shared
+            # boundary instead of inventing a sub-second generation unit.
+            previous = fused[index - 1]
+            needed = minimum - duration + grid_seconds
+            give = min(needed, (previous["end_seconds"] - previous["start_seconds"]) - minimum)
+            give = max(0.0, snap_seconds(give, grid_seconds))
+            if give > 0:
+                moved = snap_seconds(core["start_seconds"] - give, grid_seconds)
+                previous["end_seconds"] = moved
+                previous["overlap_after_seconds"] = 0.0
+                if previous["core_end_seconds"] is not None:
+                    previous["core_end_seconds"] = moved
+                core["start_seconds"] = moved
+                if core["core_start_seconds"] is not None:
+                    core["core_start_seconds"] = moved
+        if not absorbed:
+            continue
+
+    merged: list[RenderSegment] = []
+    for index, core in enumerate(fused):
+        merged.append(
+            RenderSegment(
+                segment_id=_segment_id(
+                    index, core["start_seconds"], core["end_seconds"]
+                ),
+                index=index,
+                start_seconds=core["start_seconds"],
+                end_seconds=core["end_seconds"],
+                overlap_before_seconds=round(core["overlap_before_seconds"], 6),
+                overlap_after_seconds=round(core["overlap_after_seconds"], 6),
+                core_start_seconds=core["core_start_seconds"],
+                core_end_seconds=core["core_end_seconds"],
+                shot_ids=core["shot_ids"],
+                continuity_mode=core["continuity_mode"],
+            )
+        )
+    return merged
+
+
 def protect_segment_boundaries_from_speech(
     segments: Iterable[RenderSegment],
     speech_rows: Iterable[Mapping[str, Any]],

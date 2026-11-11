@@ -1,0 +1,76 @@
+Replace the person in <Video 1> with the character shown in <Picture 1>.
+
+subject_definitions:
+<Subject 1> is the replacement character whose appearance comes from <Picture 1> and whose performance comes from the person being replaced in <Video 1>. Preserve the reference character's facial features, hairstyle, skin tone, body proportions, clothing, colors, and distinctive visual style. The reference image supplies appearance only, not the character's pose, expression, background, or framing.
+<Subject 2> is the surrounding scene from <Video 1>, including its background, lighting, objects, and any people other than the person being replaced.
+<Video 1> is the source video being edited and supplies the shot composition, camera movement, timing, and sequence of actions.
+
+summary:
+[video editing + reference generation] The target video is an edited version of <Video 1>. Replace the original person with <Subject 1>, transferring their complete visible performance to the reference character while preserving <Subject 2> and the source video's framing and timing.
+
+retention_analysis:
+<Subject 1> (throughout [Shot 1]): fully_preserved - maintain the character's referenced identity, clothing, proportions, and visual style consistently as the character performs the source person's movements. For this character, clothing means the complete garment design shown in <Picture 1>: its cut, layers, colours, trim, footwear and held props. The source person's own clothing leaves the frame with their body, and no substitute outfit may be invented.
+<Subject 2> (throughout [Shot 1]): fully_preserved - retain the surrounding scene and its changes over time. Retain its background surfaces, walls, fabric, furniture and props exactly as <Video 1> shows them: plain surfaces stay plain, and no lattice, honeycomb, grid, wallpaper motif, dotted texture, embroidery or other ornamental pattern may appear unless it is already visible at the same position in <Video 1>.
+<Video 1>: partially_preserved - retain composition, camera motion, action timing, and duration; replace only the selected person's appearance.
+
+detailed_description:
+Preserve the source scene's visual treatment while retaining the replacement character's distinctive design. Adapt illumination, shading, and perspective to the source scene.
+[Shot 1] Begin with the same composition and camera viewpoint as <Video 1>. <Subject 1> occupies the original person's position and follows their movement through the frame. Match the original performance moment by moment: body posture, gestures, head turns, gaze, blinking, facial expressions, and a relaxed closed mouth with the jaw still.
+Maintain the reference character's identity through every expression and viewing angle. Hair and clothing move naturally with the transferred performance. Preserve interactions with source-scene objects and the ordering of foreground and background occlusions.
+Keep the source video's crop and shot scale. Show only the portions of the replacement character that belong within that framing; do not widen the shot to reproduce the full-body reference. Do not import the reference image's background, static pose, or handheld props. Preserve the source camera movement and action timing through the final frame.
+
+overall_soundscape:
+Retain the source clip's existing sound without adding new dialogue or sound effects.
+
+non_diegetic_music:
+Retain existing source music, if present; add no new music.
+
+STUDIO TARGET LOCATOR — AUTHORITATIVE:
+Replace only this selected source performer in <Video 1> with the character shown in <Picture 1>: R1: Juggling orange balls while smiling at camera, source-frame box x=35-65%, y=15-45%.
+
+
+IN-PLACE REPLACEMENT — MANDATORY:
+Transform the selected performer in place. Never add Picture 1 as a second person. Preserve exact frame-edge truncation, scale and occlusion.
+
+COMPLETE SOURCE-ACTOR ERASURE — MANDATORY:
+Replace the whole visible silhouette, not a face sticker. Leave no original actor, ghost or duplicate underneath; the selected box must contain exactly one coherent Subject 1 head and body.
+
+
+COMPLETE WARDROBE REPLACEMENT — MANDATORY:
+Replace the selected performer's entire visible wardrobe with Picture 1's wardrobe exactly as drawn in its design sheet: every garment layer, shape, pattern, trim, collar, fastener, accessory and colour blocking comes from Picture 1. No original Video 1 garment remains underneath or on top of it — no original robe hem, sleeve, collar, sash, belt, fabric edge or under-layer visible anywhere on the body. Where Picture 1 does not fully show a garment, continue that same design coherently in the same medium and palette; never borrow missing garments from Video 1.
+
+
+NO INVENTED CHARACTER DETAILS — MANDATORY:
+Every visible detail of the replacement must already exist in Picture 1's design sheet. Do not add facial hair, glasses, jewellery, ornaments, badges, embroidery or patterns that Picture 1 does not show, and do not remove details it shows (moustache, hat, collar dots). Where a detail is ambiguous at this distance, keep it exactly as Picture 1 draws it.
+
+<Picture 1> supplies identity only. Never import Picture 1's room or background. The final face must be recognisably the Picture 1 character, never the original Video 1 actor. Preserve Video 1 action clock; the selected mouth follows the silent performance contract below.
+Do not replace, blend, merge, duplicate or restyle any non-target person.
+
+
+MULTI-PERSON IDENTITY ISOLATION — MANDATORY:
+This pass may modify only the selected source performer(s) named above. Every other visible person is a protected non-target and must remain pixel-position, face, body, wardrobe, pose, expression and identity stable through this pass: R2: KEEP V1 — preserve the original source actor exactly, Person in green shirt and cap standing in background left, protected box x=15-30%, y=25-45%. Do not transfer Picture 1 identity, face, hair, clothing or colour into a protected person. Do not merge adjacent bodies, exchange faces, duplicate the target, or use a protected person's mouth or head as the replacement destination. When target and protected boxes overlap, follow the selected performer's original body contour inside the selected target box; preserve the person outside that contour. A later character-swap pass may already have replaced a protected person, so preserve the current input pixels rather than restoring the original V1 actor.
+
+
+
+SILENT LISTENER — SUMMARY: the selected replacement performer is not the audible speaker in this Shot and its lips stay closed for the whole Shot; the authoritative contract at the end of this prompt decides mouth behaviour.
+<Video 1> supplies the selected performer's position, scale, body pose, gestures, head turns, gaze, blinking, expression outside the mouth, and complete action clock. It must not supply mouth articulation or speaking ownership for the selected performer.
+<Video 1>: preserve composition, camera, body motion, silent facial reaction, action timing, duration and soundtrack; replace only the selected identity and keep the selected mouth silent.
+
+
+FULL DESIGN-SHEET INTERPRETATION — MANDATORY:
+Treat the complete Picture 1 person as a character design sheet, never as a crop, decal, face patch or ready-made foreground layer: rebuild one coherent head, neck, torso and wardrobe on the selected Video 1 body geometry, whose head size, perspective, frame-edge truncation and camera distance decide the result.
+ FINAL MEDIUM PRIORITY: whenever another instruction says preserve the Picture exactly, preserve its own visual medium as well — an illustrated, cartoon, anime or comic reference stays in that same illustrated style with its line work, colour blocking and shading intact; a photographic reference stays photographic. Only <Video 1> supplies action, composition, camera movement, lighting direction, scene geometry and timing.
+
+PICTURE 1 IS ONE IDENTITY SHEET — AUTHORITATIVE:
+<Picture 1> is a multi-panel identity sheet of a single character, not a photograph of a room and not several people. Every panel is the same character at a different zoom, cut from the same artwork, so the visual medium is identical in all of them. The enlarged head panel is the sole authority for facial structure, eyes, eyebrows, nose, mouth, moustache or beard design, skin tone, hairstyle, hair colour and apparent age; the body and outfit panels are the sole authority for body proportions, the complete wardrobe, its colours, footwear and held props. Read those panels as one person: never turn two panels into two people, never put one panel's head on another panel's body, and never average the panels with the Video 1 actor. The sheet's presentation is packaging, not scene content: do not reproduce its split-panel layout, borders, gutters, plain mat or cut-out silhouette edges. Render exactly one instance of that character inside <Video 1>'s pose, framing, lighting, background and camera distance: the scene must not gain a second, smaller or partial copy of Picture 1.
+
+APPARENT AGE LOCK — MANDATORY:
+Picture 1 fixes the replaced character's apparent age exactly. Keep Picture 1's age category, face fullness, skin texture, jaw shape, hairline and build: a young or middle-aged design must not drift into an older person, and an older design must not be de-aged. Do not add wrinkle lines, sagging cheeks, hollow eyes, greying or thinning hair or a heavier frame Picture 1 does not already show, and never borrow the source actor's age from <Video 1>.
+
+NO INVENTED TEXTURE OR PATTERN — MANDATORY:
+Do not invent repeating decorative detail anywhere in this Shot: no lattice, wallpaper motif, honeycomb, dotted or grid texture, medallion, embroidery or ornamental pattern not already visible in <Video 1> at that position. Where Video 1 shows a plain wall, fabric, robe or surface, keep it exactly as plain; preserve the plate's real background geometry, lighting and depth of field.
+
+MEDIUM-SHOT SILENT MOUTH REINFORCEMENT — SHOT-SCALE REMINDER:
+In this Shot the selected performer is a Silent Listener whose face and mouth are clearly visible, which is why <Video 1>'s audible speech keeps parting the lips. Keep the replaced lips visibly closed for the whole Shot and the mouth line a single relaxed closed curve; the authoritative SILENT LISTENER contract below is the deciding word. Picture 1's own open smiling mouth is one static expression to copy, never a licence to move the lips from frame to frame.
+
+SILENT LISTENER PERFORMANCE — AUTHORITATIVE: The selected replacement performer is not the audible speaker in this Shot. Keep the lips naturally together and the jaw still; allow only blinking, breathing, head turns and gaze shifts. Every silent listening reaction must keep the lips closed — no open-mouth smile, laugh or jaw drop. Never copy, infer or animate mouth articulation from Video 1 audio. Every audible voice in this Shot — another on-screen character, an off-screen speaker, or the replaced performer's own original Video 1 voice — is background sound that must never drive the replaced mouth. Picture 1 supplies identity but never supplies an open-mouth pose, smile, visible teeth, tongue or speaking expression. Even if Picture 1 is smiling or has an open mouth, reconstruct that same identity with relaxed closed lips for the whole Shot. Authored mouth direction: lips naturally together; jaw still; blink and breathe only; never follow the V1 voice

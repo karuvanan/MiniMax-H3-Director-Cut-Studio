@@ -104,18 +104,51 @@ def load_design_settings(path: str | Path) -> DesignAISettings:
     return settings
 
 
+def _advanced_design_env_lines(destination: Path) -> list[str]:
+    """Assignment lines in ``destination`` that ``KEYS`` does not describe.
+
+    File order is kept and a repeated key keeps its last value, so hand-editing
+    a knob stays predictable.  Comments are not round-tripped: the page owns the
+    header, and preserving comments would accumulate one stale note per save.
+    """
+
+    try:
+        text = destination.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return []
+    preserved: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.partition("=")[0].strip()
+        if not key or key in KEYS:
+            continue
+        preserved[key] = stripped
+    return list(preserved.values())
+
+
 def save_design_settings(path: str | Path, settings: DesignAISettings) -> None:
     destination = Path(path)
-    destination.write_text(
-        "\n".join(
-            [
-                "# AI Design connection settings (API keys are never stored here)",
-                *[
-                    f"{key}={json.dumps(getattr(settings, field), ensure_ascii=False)}"
-                    for key, field in KEYS.items()
-                ],
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    advanced = _advanced_design_env_lines(destination)
+    lines = [
+        "# AI Design connection settings (API keys are never stored here)",
+        *[
+            f"{key}={json.dumps(getattr(settings, field), ensure_ascii=False)}"
+            for key, field in KEYS.items()
+        ],
+    ]
+    if advanced:
+        # Keys outside ``KEYS`` are not editable from the AI Design page, and
+        # rebuilding the file from scratch used to delete them the moment any
+        # settings dialog saved.  That silently disabled expert render knobs
+        # such as ``H3_IDENTITY_SHEET_MEDIUM_FRAMING_MIN_HEIGHT``, so a take
+        # that was supposed to A/B one layout ran with the other one.  Keep
+        # them verbatim instead; the page still owns every key it knows.
+        lines.append("")
+        lines.append(
+            "# Advanced keys (preserved as written; edit by hand, not from the page)"
+        )
+        lines.extend(advanced)
+    lines.append("")
+    destination.write_text("\n".join(lines), encoding="utf-8")

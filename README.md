@@ -1,6 +1,6 @@
 # MiniMax H3 Director Cut Studio
 
-> v0.3.8-alpha.2：多角色Character Swap改用SAM3.1双轮廓联合合成。Studio分别追踪V1原人物与H3换角后人物，使用`V1 Mask ∪ Generated Mask`完整覆盖旧身体和新身体，减少原演员残影、边缘穿帮及双角色Layer互相遮盖；旧合成缓存会自动标记Dirty。
+> v0.3.8-alpha.3：Unlock All Characters 新增 Shot 级角色清理与合格规格矩形。Ctrl+右键人物框只删除该 Shot 内的 clip / Shot 覆盖（identity/bbox override）/ binding scene 索引，全局 all-appearance 绑定与其他 Shot 不受影响；Ctrl+左键点选已有人物框自动收缩为合格规格矩形（面积 <0.82，不再同时满足宽≥94%、高≥82%，与 Relay 引擎拒绝条件一致）；打开编辑器时大脸近景证据框自动写入合格框，避免 "no reliable box"。本版另新增 Design 页 **Identity Sheet 页面**（小头全身卡通参考图本地合成多面板身份表，见「Director Cut 工作区」），Motion Preview 分辨率由 `0.2 MP` 提升为 `0.5 MP`，Smart Render Policy 升到 **47**（旧 Segment 缓存全部失效，会重新生成）。
 
 一个以 Adobe Premiere Pro 剪辑逻辑为参考的本地 PySide6 导演工作台。它可以管理图片、视频和音频素材，在多轨 Timeline 上规划 Shot、Dialogue、Marker、Ending Hold 与 Prompt，生成 MiniMax H3 Ref2VA 提示词，并把当前有效素材及参数提交到 ComfyUI。
 
@@ -73,7 +73,7 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 
 | 节点 ID | 节点类型 | 准确文件名 | 建议放置目录 | 用途 | 必需 |
 |---:|---|---|---|---|:---:|
-| 127 | `UNETLoader` | `minimax_h3_ref2va_int8_convrot.safetensors` | `ComfyUI/models/diffusion_models/` | H3 Ref2VA 主扩散模型 | 是 |
+| 127 | `UNETLoader` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `ComfyUI/models/diffusion_models/` | H3 Ref2VA Pruned 主扩散模型 | 是 |
 | 128 | `CLIPLoader` | `qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors` | `ComfyUI/models/text_encoders/` | H3/Qwen3-VL 多模态文字与参考素材编码器 | 是 |
 | 119 | `VAELoader` | `minimax_h3_video_vae_fp16.safetensors` | `ComfyUI/models/vae/` | H3 视频 VAE | 是 |
 | 120 | `VAELoader` | `minimax_h3_audio_vae_fp32.safetensors` | `ComfyUI/models/vae/` | H3 原生音频 VAE | 是 |
@@ -92,7 +92,7 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 
 ### 1A. MiniMax-H3 Character-Swap LoRA／H3 Relay
 
-`Source Video Cast Remake H3`使用项目根目录的`akatz-labs-character-swap-turbo8-adaptive-window-api.json`。它与普通H3主工作流是两条独立执行路径；只有选择该Special Skill才会加载Character-Swap LoRA及H3 Relay。
+`Source Video Cast Remake H3`使用项目根目录的`H3-Character-Swap-Relay-V2-api.json`。V2取代旧`akatz-labs-character-swap-turbo8-adaptive-window-api.json`，把Relay拆成原生`PrepareSource → WindowPlan → Native Loop → FinishWindows`图；它与普通H3主工作流是两条独立执行路径。旧API只保留给已保存任务的读取兼容，新任务统一编译V2。
 
 | 类型 | 准确名称／版本 | 建议位置 | 必需 |
 |---|---|---|:---:|
@@ -100,7 +100,7 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 | Custom node | 当前`akatz-ai/h3-relay`主分支 | `ComfyUI/custom_nodes/h3-relay/` | 是 |
 | Server status API + Tray | 本项目`comfyui_director_h3_cache_status` | `ComfyUI/custom_nodes/comfyui_director_h3_cache_status/` | 建议；用于Studio及Windows Tray显示Cache、VRAM、DRAM、GPU与CPU |
 | Character-Swap LoRA | `h3_character_swap_v1.5.safetensors` | `ComfyUI/models/loras/` | 是 |
-| Turbo LoRA | `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | `ComfyUI/models/loras/` | 是 |
+| Turbo LoRA | `minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` | `ComfyUI/models/loras/` | 是 |
 | H3 UNet | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `ComfyUI/models/diffusion_models/` | 是 |
 | Qwen encoder | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `ComfyUI/models/text_encoders/` | 是 |
 | Video VAE | `minimax_h3_video_vae_fp16.safetensors` | `ComfyUI/models/vae/` | 是 |
@@ -112,8 +112,8 @@ Z-Image_Text2Image_for_webui_t2i_api.json
 
 1. 关闭ComfyUI，把当前`h3-relay`安装到`ComfyUI/custom_nodes/h3-relay`。如果曾安装独立旧版`labs-video-prep`，先移除重复副本，避免同名节点冲突。
 2. 按上表放置全部模型；文件名必须与API JSON完全一致。
-3. 确认项目根目录保留`akatz-labs-character-swap-turbo8-adaptive-window-api.json`，不需要把它复制到ComfyUI模型目录。
-4. 重新启动ComfyUI；确认没有`IMPORT FAILED`，并能找到`LabsH3PrepareVideo`、`H3RelayWindowedEdit`、`SAM3_VideoTrack`与`SAM3_TrackToMask`。
+3. 确认项目根目录保留`H3-Character-Swap-Relay-V2-api.json`，不需要把它复制到ComfyUI模型目录。旧`akatz-labs-character-swap-turbo8-adaptive-window-api.json`不再是Studio新任务的默认workflow。
+4. 重新启动ComfyUI；确认没有`IMPORT FAILED`，并能找到`H3RelayPrepareSource`、`H3RelayWindowPlan`、`H3RelayWindowInputs`、`H3RelayApplyHistory`、`H3RelayAppendWindow`、`H3RelayFinishWindows`、`H3RelayTextMemory`、`H3RelaySamplingMemory`、`StartLoop`、`EndLoop`、`SAM3_VideoTrack`与`SAM3_TrackToMask`。
 5. 如需工具栏与Windows Tray实时资源显示，在ComfyUI主机执行`install_h3_cache_status_server.bat`；默认安装到`C:\ai program\Data\Packages\ComfyUI-GPU-1`并连接`http://127.0.0.1:8189`。其他位置可把ComfyUI根目录作为第一个参数、API地址作为第二个参数传入，例如`install_h3_cache_status_server.bat "D:\ComfyUI" "http://192.168.0.185:8189"`。安装程序会复制只读API、启动隐藏Tray并建立Windows登录自启动。重启ComfyUI后，Studio在`ESTIMATE`右侧及Tray都会显示Cache、VRAM、DRAM、GPU、CPU；无法读取的指标明确显示`N/A`。API不返回进程清单、文件名，也不提供删除操作。
 6. 在Studio选择`Source Video Cast Remake H3`，顶部会推荐`LoRA Preserve V1`；选择器保持可编辑，可改用`Create H3 Remake`或`LoRA + Reshape Environment`。切换为None或其他Skill时会推荐`Create H3 Remake`，但不会锁定选择。
 
@@ -192,6 +192,23 @@ mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf
 Studio 每次 Design／AI Enrich 前都会校验保存的 Model ID。若原 GGUF 已删除、改量化版本或被 LM Studio 改成短 alias，会自动选择同系列可用模型并保存修复后的 ID。生成结束时只卸载 `/api/v1/models` 明确列在 `loaded_instances` 的实际实例；未加载／已删除模型直接视为已释放，不会重复产生 `model_not_found`，也不会误卸载其他模型。
 
 主页顶部的 `UNLOAD ALL` 会一次释放 Studio runtime cache、ComfyUI、LM Studio，以及当前 Server／Client API 所连接的 ACE-Step 1.5 DiT、VAE、文字编码器和 LM；如果 SoulX Server 提供卸载 endpoint，也会一并请求释放 SoulX 模型。ACE-Step API 进程会继续运行；下一次分析或生成时自动重新载入所需模型。若音乐任务仍在排队或生成，服务器会拒绝卸载，避免破坏进行中的成品。
+
+### Staged Model Driver · Qwen3.8与ComfyUI串行化
+
+H3任务运行时，GPU必须由ComfyUI或LM Studio的Qwen3.8独占其一，两者不能同时加载（共驻会死锁）。`staged_model_driver.py`按阶段驱动：先卸载Qwen、等ComfyUI就绪再开工，测完执行`/free`：
+
+```powershell
+.\ai_libraries_common\python_env\python.exe staged_model_driver.py status
+.\ai_libraries_common\python_env\python.exe staged_model_driver.py unload-qwen
+# ... 运行H3 worker／ComfyUI任务 ...
+.\ai_libraries_common\python_env\python.exe staged_model_driver.py free
+```
+
+也可以一条命令跑完整管线：`run JOB.json`（unload-qwen → wait-comfy → worker → /free → report）。每次测完记得`/free`。
+
+agent侧还可以显式自载Qwen（`load-qwen`）：未加载时发一次最小chat探针触发LM Studio自动载入，并轮询目录直到验证成功；这修复了旧版“unload后load不了”的问题（聊天页自动重载竞态＋显存共驻死锁）。模型名取自`H3_STAGE_QWEN_LOAD_MODEL`或`design_ai.env`。
+
+Tray（`h3_status_tray.ps1`）是中央仲裁者：同时监控Qwen与ComfyUI，tooltip显示“QWEN loaded (agent owns GPU)”／“GPU free for H3”；菜单可手动Unload Qwen／Load Qwen／Free ComfyUI (/free)。LM Studio与ComfyUI不在同一台机器时，请在设置中填写`lm_studio_url`（留空默认按ComfyUI主机＋端口1234推导）。
 
 ### Audio Separator · Kim_Vocal_2 CUDA 自动模式
 
@@ -279,7 +296,7 @@ SoulX Server现在采用明确的空载生命周期：API启动完成后先释�
 ComfyUI/
 └─ models/
    ├─ diffusion_models/
-   │  ├─ minimax_h3_ref2va_int8_convrot.safetensors
+   │  ├─ minimax_h3_ref2va_pruned_int8_convrot.safetensors
    │  └─ z_image_turbo_bf16.safetensors
    ├─ text_encoders/
    │  ├─ qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors
@@ -302,7 +319,7 @@ ComfyUI/
 |---|---|---|---|
 | `MiniMaxH3ReferenceToVideo` | `comfy_extras.nodes_minimax_h3` | 更新 ComfyUI；H3 原生节点 | 使用上方 H3 UNET、CLIP、双 VAE |
 | `MiniMaxH3TurboLoRA` | `custom_nodes.comfyui_fearnworksnodes` | 安装当前服务器使用的 FearNWorks 节点包 | H3 Turbo LoRA |
-| `MiniMaxH3MemoryEfficientSolAttentionPatch` | `custom_nodes.comfyui_fearnworksnodes` | 同上 | 无 |
+| `SolAttnMiniMaxH3Patcher` | `custom_nodes.ComfyUI_sol-attn_Blackwell-main` | 安装／更新当前Sol-Attn Blackwell节点；RTX SM120原生Triton加速 | 无 |
 | `VRAM_Debug` | `custom_nodes.comfyui_fearnworksnodes` | 同上 | 无 |
 | `RTXVideoSuperResolution` | `custom_nodes.comfyui_nvidia_rtx_nodes` | 安装 `Nvidia_RTX_Nodes_ComfyUI`；仅支持 NVIDIA RTX GPU | 无独立 `.safetensors` checkpoint |
 | `RAMCleanup` | `custom_nodes.comfyui_memory_cleanup` | 安装当前服务器使用的 Memory Cleanup 节点包 | 无 |
@@ -330,7 +347,7 @@ ComfyUI/
 H3 workflow:
 BasicGuider, BasicScheduler, ComfyMathExpression, CreateVideo,
 GetVideoComponents, KSamplerSelect, LoadAudio, LoadImage, LoadVideo,
-MiniMaxH3MemoryEfficientSolAttentionPatch, MiniMaxH3ReferenceToVideo,
+MiniMaxH3ReferenceToVideo, SolAttnMiniMaxH3Patcher,
 ModelAttentionBackend, PrimitiveFloat, PrimitiveStringMultiline,
 RAMCleanup, RandomNoise, ResolutionSelector, RTXVideoSuperResolution,
 SamplerCustomAdvanced, SaveVideo, VAEDecode, VAEDecodeAudio,
@@ -702,7 +719,7 @@ H3_WORKSPACE_FREE_DISK_RESERVE_GB=50.0
 
 请把 URL 改成自己的 ComfyUI 地址。`H3_CONNECTION_RECOVERY_TIMEOUT` 默认是 `3600` 秒；ComfyUI 接受任务并返回 `prompt_id` 后，如果远端网络暂时中断，Studio 会保留该 ID、显示橙色 Reconnecting 状态并持续查询同一个 Server Job，不会因为客户端失联而重复排队。网络恢复后会接回真实进度、下载原任务的输出，再继续其余 Segment 与 Master 拼接；输出下载使用 `.part` 临时文件并在完整取得后才发布。可以在 Settings 的 `Connection recovery window` 调整等待时间。
 
-这项恢复适用于“客户端／局域网断线，但远端 ComfyUI 进程和 Queue 仍然存在”的情况。如果 ComfyUI 本身重启并清空 `/history`，旧 `prompt_id` 无法在客户端凭空重建模型计算，必须重新生成该 Segment。`H3_DIALOGUE_TTS_ENGINE` 可设为 `h3_native`、`voxcpm2_local`、`qwen3_tts_local` 或 `edge_tts`；默认 `h3_native` 直接让 MiniMax H3 根据最新 Timeline Text Layer 生成对白，不建立 WAV。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.2 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
+这项恢复适用于“客户端／局域网断线，但远端 ComfyUI 进程和 Queue 仍然存在”的情况。如果 ComfyUI 本身重启并清空 `/history`，旧 `prompt_id` 无法在客户端凭空重建模型计算，必须重新生成该 Segment。`H3_DIALOGUE_TTS_ENGINE` 可设为 `h3_native`、`voxcpm2_local`、`qwen3_tts_local` 或 `edge_tts`；默认 `h3_native` 直接让 MiniMax H3 根据最新 Timeline Text Layer 生成对白，不建立 WAV。`H3_BLIP_DEVICE` 可设为 `auto`、`cuda` 或 `cpu`；主页 Settings 也提供相同选择。默认 `auto` 会先在 CPU 安全载入 BLIP，执行真实 CUDA 探测后才把模型移到 GPU，任何启动或推理错误都会保留原任务并自动切回 CPU。Pre-run Preview 使用 `0.5 MP` 且跳过 RTX upscaling；Accept 会在正式 `1.0 MP` 生成中复用 seed，Reject 会用新 seed 重新生成低分辨率预览。
 
 ### Design AI 设置
 
@@ -775,6 +792,13 @@ H3_DESIGN_IMAGE_CFG=1.0
 - 对大于 1080p、高码率或超过 100MB 的成片，Studio 会在后台建立缓存用的 720p Monitor Proxy，避免 Windows 播放器停在第一帧；Export 与项目归档仍使用未经修改的原始 Master。
 - 生成过程中仍显示进度遮罩；完成后成片保持在右侧，直到点击 New Project，并提供 Export link。
 - 每次 Preview / Run 完成后，Studio 会更新当前 `example` Workspace 根目录中的唯一 `generated_preview.mp4` 或 `generated_output.mp4`，并自动保存 `project/director_project.h3director.json`。不会再为同一份完整 Master 建立额外的 render Take；`segments/SEGMENT_ID/takes/` 每段最多保留 Preview 与 Final 各一份，Shot 只保存引用。使用 Open Project 打开这份项目时，会同时恢复成片、左右分割比例、对应 Timeline 起点及 Preview/Final Segment 状态。
+
+### Identity Sheet 页面（小头参考图）
+
+- Source Cast 的 P 图如果是全身卡通，在同一个 Shot 的 V1 帧里可能只贡献约十分之一帧高的头部，H3 Relay 会保住配色却自己发明年龄、脸型与服装。Design 页的 `IDENTITY SHEET` 组（开关 + layout preset）把这个判定交给引擎：Studio 以该 Shot V1 clip 的实际分辨率量出 P 图头部覆盖率，低于阈值 `0.22` 时自动改用本地合成的多面板 Identity Sheet；达到阈值或任何量测／合成失败都原图透传，Media Pool 素材永远不被修改。
+- `OPEN IDENTITY SHEET PAGE…` 打开独立页面：cast 列表带缩略图与覆盖率读数（低于阈值的角色会被标出需要合成）、layout preset 下拉与各面板用途说明、预览，以及 `Measure` / `Compose` / `Compose all that need it` / `Export…` / `Open folder`。合成只在本机用 PIL 完成，**不占 GPU、不连 ComfyUI**，可以在设计阶段随时跑，不会和 Qwen3.8 抢显存。
+- 使用 Sheet 时 H3 Prompt 会追加 `PICTURE 1 IS ONE IDENTITY SHEET — AUTHORITATIVE`：放大头部面板是五官／胡须／肤色／发型／表观年龄的唯一权威，身体与服装面板是比例、整套服装、配色与道具的唯一权威；不得把面板读成多人、不得 A 头 B 身、不得把面板边框与底板当成场景内容。卡通项目另附 `APPARENT AGE LOCK — MANDATORY`，锁死年龄（禁止加皱纹、白发、秃顶，或借用 V1 演员的年龄）。
+- QC 会对着**原始 P 图**而不是 Sheet 打分；相似度低于硬门槛 `0.30` 直接判失败并换 fresh seed 重试；落在门槛上方 `0.06` 警告带内则照常拼装，但会标记出来提醒目视确认。
 
 ## Smart Long Render（突破 15 秒）
 
@@ -1006,12 +1030,12 @@ findstr /s /i /m "dghs-imgutils" custom_nodes\*.txt custom_nodes\*.toml custom_n
 
 #### 为什么 Open Project 后点击 `REJECT` 没有反应？
 
-`REJECT` 只有在本次运行已经完成一个 `PREVIEW 0.2M` 后才会启用。重新 Open Project 时通常没有处于待验收状态的当前 Preview，因此按钮会保持禁用；它不是“开始重算”或“令 Segment 变 dirty”的按钮。
+`REJECT` 只有在本次运行已经完成一个 `PREVIEW 0.5M` 后才会启用。重新 Open Project 时通常没有处于待验收状态的当前 Preview，因此按钮会保持禁用；它不是“开始重算”或“令 Segment 变 dirty”的按钮。
 
 正确顺序是：
 
 1. 把 Generation Work Area 设为最后 Segment 的实际范围，例如 `42.5s → 50.0s`。
-2. 点击 `PREVIEW 0.2M`，等待局部预览完成。
+2. 点击 `PREVIEW 0.5M`，等待局部预览完成。
 3. Preview 完成后，`REJECT` 才会亮起。不满意时点击它，Studio 会丢弃当前 Preview seed，并以新 seed 重新生成同一范围；满意时不要点击 `REJECT`。
 
 这个结果只是最后 Segment 的局部预览，不是完整 Master。
@@ -1025,7 +1049,7 @@ findstr /s /i /m "dghs-imgutils" custom_nodes\*.txt custom_nodes\*.toml custom_n
 3. 点击 `RUN+QUEUE`。长片生产会复用未改变的已完成 Segment，只生成被自动标记为 dirty 的结尾 Segment，然后重新拼接完整 `generated_output.mp4`。
 4. 完成后播放结尾，检查对白是否说完、Final Combat Resolve／Final Hold 是否稳定，以及跨 Segment 的人物位置、环境余波与声音是否连续，再保存 Project。
 
-如果旧 Segment Take、生产 Manifest 或缓存文件已经被删除，Studio 无法凭空复用它们，对应范围会自动重新生成。不要在只选择最后几秒的情况下把局部 `ACCEPT 1.0M` 误当作完整 Master；严格使用 Preview seed 的正式验收流程，应先恢复完整工作区间，再执行 `PREVIEW 0.2M → ACCEPT 1.0M`。
+如果旧 Segment Take、生产 Manifest 或缓存文件已经被删除，Studio 无法凭空复用它们，对应范围会自动重新生成。不要在只选择最后几秒的情况下把局部 `ACCEPT 1.0M` 误当作完整 Master；严格使用 Preview seed 的正式验收流程，应先恢复完整工作区间，再执行 `PREVIEW 0.5M → ACCEPT 1.0M`。
 
 ### 删除或更换 LM Studio 模型后出现 `model_not_found`／无法 unload
 
@@ -1179,10 +1203,22 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 
 ## 测试
 
+测试文件现集中于 `testing`（50 个 test_*.py，顶部自带 sys.path bootstrap；studio 源码无路径引用改动）。
+整套 50 个模块共 **972 项**测试。跑测试前先设 `QT_QPA_PLATFORM=offscreen`，否则 Qt 测试会在真实桌面建窗口，`test_standard_pipeline_regressions` 会以 `0xC0000409` 原生 fail-fast 终止整个进程，后面所有模块被吞掉。
+
+推荐的日常整轮跑法（跳过 2 小时级的慢模块，6.5 分钟跑完 49 个模块）：
+
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\ai_libraries_common\python_env\python.exe working\run_testing_suite_watchdog.py --stall 240 --skip test_director_timeline
+```
+
+看门狗会给每个测试重置计时，单项超过 `--stall` 秒就 dump 全部线程栈并点名卡住的模块／测试，而不是让整轮静默挂死。需要单独验慢模块时改用 `--only test_director_timeline`（238 项，每项都会拉起一个 `design_ai_service.py` 子进程，本机 2 小时以上）。`testing\test_staged_model_driver.py`（16 项）会对真实 LM Studio／ComfyUI 端点发 unload 与 `/free` 控制请求，跑它时状态托盘会弹「Qwen loaded／unloaded」气球并触发 auto-resume 通知；它不提交生成任务，托盘跳动不代表做过实机渲染。
+
 高风险流程的标准 Release Gate：
 
 ```powershell
-.\ai_libraries_common\python_env\python.exe -m unittest -v test_standard_pipeline_regressions.py
+.\ai_libraries_common\python_env\python.exe -m unittest discover -v -s testing -p "test_standard_pipeline_regressions.py"
 ```
 
 这十一项标准测试固定检查：
@@ -1199,13 +1235,16 @@ The same black-clad assassin holding exactly two short blades inside the real Ta
 10. 对白延长后的 Shot Coverage：自然语速预算把影片延长越过原结束时间时，最终 Shot 必须同步延长，Text Layer 必须绑定有效 Shot，所有 Render Segment 的 `shot_ids` 均不得为空；旧 Project 的同类损坏必须可自动修复并使旧 Take 失效。
 11. Long Production Recovery／Storage：中断 Job 或 standalone Worker Manifest 引用的恢复缓存不得被 Safe Cleanup 删除；存在未持久化任务时 Archive 必须拒绝；完成持久化后 Archive 必须通过 Hash 验证，OOM 错误也必须进入明确分类。
 
-当前完整验证结果：**411 tests passed**；十一项 Standard Pipeline Release Gate、十项 Timeline Mapping Matrix，以及三项 Storyboard／Smart Cut／Project-scoped Job 隔离模拟全部通过。v0.3.2-alpha.1 修改后另行执行的 **41 项** Workflow／Segment／Storyboard 全局 Mapping 回归也全部通过。
+当前完整验证结果（2026-10-25 本机分模块实测）：**49 个模块 734 项通过，failures=0、errors=0、skipped=10**。跳过项都是环境条件：2 项需要本机不存在的 example 用户项目素材、7 项需要未安装的可选运行时、1 项既有跳过。`test_director_timeline.py` 另计 238 项（耗时 2 小时以上，语义不受本轮改动影响）。十一项 Standard Pipeline Release Gate、十项 Timeline Mapping Matrix，以及 Storyboard／Smart Cut／Project-scoped Job 隔离模拟全部通过。
 
 ```powershell
-.\ai_libraries_common\python_env\python.exe -m unittest discover -v
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\ai_libraries_common\python_env\python.exe working\run_testing_suite_watchdog.py --stall 240 --skip test_director_timeline
 ```
 
 ```text
-Ran 411 tests
-OK
+Ran 734 tests in 382.849s
+RAN 734 tests: failures=0 errors=0 skipped=10
 ```
+
+「源码已修复＋单元测试全绿」与「新视频已实机验证成功」是两件不同的事：本节只证明前者。Identity Sheet、0.5MP preview、Age Lock／Scene／Wardrobe Lock、0.200 背景纹理门槛、target-similarity 硬门槛与 Smart Render Policy 47 仍待 ComfyUI 实机验证。

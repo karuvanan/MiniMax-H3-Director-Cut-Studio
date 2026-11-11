@@ -8768,6 +8768,8 @@ def build_design_system_prompt(context: dict) -> str:
     return (
         "You are the AI Design Planner inside a MiniMax H3 Director Cut application. "
         "Convert the user's concept into one production-ready JSON object that exactly matches the supplied schema. "
+        "Write every schema key exactly once at its own level and never repeat a key: the host discards the whole "
+        "answer when one field such as overall_soundscape appears twice, which loses the entire design. "
         + skill_direction
         + duration_contract
         + language_contract

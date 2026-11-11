@@ -42,6 +42,19 @@ class QualityProfile:
     default_bytes_per_output_second: int
 
 
+# Single source of truth for the Motion Preview budget.  Studio labels, quality
+# profiles and every "_start_generation("preview", ...)" call site must derive
+# from this constant so the visible button text can never drift from the value
+# actually submitted to H3.
+PREVIEW_MEGAPIXELS = 0.5
+PREVIEW_LABEL = f"Motion Preview · {PREVIEW_MEGAPIXELS:g}MP"
+# 0.5MP is 2.5x the pixel count of the previous 0.2MP budget.  Both estimates are
+# advisory only: `update_resource_calibration` replaces them with measured values
+# once real Segment takes exist.
+PREVIEW_GPU_SECONDS_PER_OUTPUT_SECOND = 45.0
+PREVIEW_BYTES_PER_OUTPUT_SECOND = 5 * 1024**2
+
+
 QUALITY_PROFILES = {
     "storyboard": QualityProfile(
         "storyboard",
@@ -55,13 +68,13 @@ QUALITY_PROFILES = {
     ),
     "motion_preview": QualityProfile(
         "motion_preview",
-        "Motion Preview · 0.2MP / 448×448",
-        0.2,
+        PREVIEW_LABEL,
+        PREVIEW_MEGAPIXELS,
         False,
         True,
         False,
-        20.0,
-        2 * 1024**2,
+        PREVIEW_GPU_SECONDS_PER_OUTPUT_SECOND,
+        PREVIEW_BYTES_PER_OUTPUT_SECOND,
     ),
     "approved_final": QualityProfile(
         "approved_final",

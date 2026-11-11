@@ -15,11 +15,13 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import wave
 from urllib.parse import urlparse
 
 from PySide6.QtCore import (
@@ -27,7 +29,12 @@ from PySide6.QtCore import (
     QTimer, QUrl, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPixmapCache, QPolygon, QUndoCommand, QUndoStack, qAlpha
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+from PySide6.QtMultimedia import (
+    QAudioOutput,
+    QMediaDevices,
+    QMediaPlayer,
+    QVideoSink,
+)
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -105,6 +112,7 @@ from media_engine import (
     SOURCE_VIDEO_ROLE_DISCOVERY_MAX_FRAMES,
     SOURCE_VIDEO_ROLE_DISCOVERY_MAX_SHEETS,
     SOURCE_VIDEO_ROLE_DISCOVERY_PROFILE,
+    clamp_seek_to_decode_span,
     create_labeled_contact_sheet,
     create_video_thumbnail,
     media_type_for_path,
@@ -186,7 +194,15 @@ from source_video_analysis import (
 )
 from character_swap_engine import (
     CHARACTER_SWAP_WORKFLOW_NAME,
+    CHARACTER_SWAP_MINIMUM_WARDROBE_SHIFT,
     KEEP_V1_TARGET,
+    FULL_DESIGN_FRAMING,
+    IDENTITY_SHEET_FRAMING,
+    IDENTITY_SHEET_MIN_HEAD_COVERAGE,
+    IDENTITY_SHEET_MIN_SOURCE_CANVAS_HEAD_COVERAGE,
+    IDENTITY_SHEET_MIN_SOURCE_SUBJECT_FILL,
+    SILENT_REINFORCEMENT_MIN_BOX_AREA,
+    SILENT_REINFORCEMENT_MIN_BOX_HEIGHT,
     SOURCE_REMAKE_MODE_CHARACTER_SWAP,
     SOURCE_REMAKE_MODE_CREATIVE_H3,
     SOURCE_REMAKE_MODE_DIRECTED_SWAP,
@@ -194,9 +210,31 @@ from character_swap_engine import (
     automatic_remake_engine_for_skill,
     build_character_swap_prompt,
     character_swap_relay_window_count,
+    character_swap_nonhuman_nouns,
     character_swap_passes_for_window,
+    CHARACTER_SWAP_ROUTE_LEGACY,
+    CHARACTER_SWAP_ROUTE_MANUAL,
+    character_swap_route,
+    CHARACTER_SWAP_OUTPUT_UPSCALE_CONTRACT_KEYS,
     compile_character_swap_pass,
+    character_swap_sam_mask_recipe,
     load_character_swap_workflow,
+    character_swap_workflow_path,
+    mouth_band_registration,
+)
+from character_identity_sheet import (
+    DEFAULT_SHEET_PRESET,
+    SHEET_PRESETS,
+    VIEW_REAR,
+    VIEW_SIDE,
+    collect_view_sources,
+    compose_wardrobe_signature,
+    is_alpha_cutout,
+    measure_reference_head_metrics,
+    measure_head_coverage,
+    measure_source_figure_reveal,
+    resolve_identity_sheet,
+    sheet_preset_labels,
 )
 from design_engine import (
     BEAT_SYNCED_ENTRANCE_SPECIAL_SKILL,
@@ -298,6 +336,8 @@ from prompt_preset_store import (
 )
 from project_workspace import (
     QUALITY_PROFILES,
+    PREVIEW_LABEL,
+    PREVIEW_MEGAPIXELS,
     WORKSPACE_LAYOUT_VERSION,
     allocate_workspace_root,
     ensure_workspace_layout,
@@ -365,6 +405,7 @@ from segment_engine import (
     align_segments_to_dialogue_turns,
     content_fingerprint,
     derive_named_segment_seed,
+    merge_segments_for_relay_window,
     normalize_speech_overlap_policy,
     plan_render_segments,
     plan_speech_track_lanes,
@@ -397,6 +438,300 @@ DESIGN_SETTINGS_ENV = PROJECT_ROOT / "design_ai.env"
 DESIGN_EXAMPLE_ROOT = PROJECT_ROOT / "example"
 Z_IMAGE_WORKFLOW = PROJECT_ROOT / "Z-Image_Text2Image_for_webui_t2i_api.json"
 PROMPT_PRESET_ENV_ROOT = PROJECT_ROOT / "preset_env"
+# Render-behaviour knobs below are read at import time, so historically they had
+# to be exported by whatever launched the Studio.  The Identity Sheet and plate
+# experiments are driven from the GUI - the director presses Preview - and a
+# launcher environment variable is easy to lose across restarts, so the same
+# names are also honoured from ``design_ai.env``.  A real environment variable
+# still wins, unknown keys are ignored, and the allowlist keeps an ordinary
+# design setting from silently changing render behaviour.
+DESIGN_ENV_RENDER_KNOBS = frozenset({
+    "H3_CHARACTER_SWAP_WARDROBE_BAND_MODE",
+    "H3_CHARACTER_SWAP_WARDROBE_BAND",
+    "H3_CHARACTER_SWAP_IDENTITY_MASK_MODE",
+    # Round 34 grades the crown split from the GUI as well: the director presses
+    # Preview, so the mode has to survive a Studio restart the same way the
+    # wardrobe and mask knobs do.  A launcher variable still wins.
+    "H3_CHARACTER_SWAP_HAIR_BAND_MODE",
+    "H3_IDENTITY_SHEET_OUTFIT_VIEW",
+    "H3_IDENTITY_SHEET_CLOSEUP_PRESET",
+    "H3_IDENTITY_SHEET_MEDIUM_FRAMING_MIN_HEIGHT",
+    # Round 49 manual-ComfyUI parity switches.  The director presses Preview, so
+    # all three have to survive a Studio restart the same way the wardrobe and
+    # mask knobs do.  A launcher variable still wins.
+    "H3_CHARACTER_SWAP_PLATE_SUPPRESSION",
+    "H3_CHARACTER_SWAP_SILENT_AUDIO_STRIP",
+    "H3_CHARACTER_SWAP_RELAY_WINDOW_SPLIT",
+    "H3_CHARACTER_SWAP_LORA_MAX_STRENGTH",
+    # Round 122（2026-11-11）：导演把角色替换推倒重来，两个新旋钮都是 Preview 当场要生效的，
+    # 所以进这份名单（worker 每次启动按 design_ai.env 刷新，不必重开 Studio）：
+    # H3_CHARACTER_SWAP_PROMPT_APPENDIX 决定要不要往他模板里的提示词后面加条款（默认不加），
+    # H3_CHARACTER_SWAP_IDENTITY_QC 决定身份 QC 是拦（gate）还是只记录（record）。
+    "H3_CHARACTER_SWAP_PROMPT_APPENDIX",
+    "H3_CHARACTER_SWAP_IDENTITY_QC",
+    "H3_CHARACTER_SWAP_PROMPT_SOURCE",
+    # Round 50 relaxations, same reasoning: the director presses Preview and has
+    # to be able to retune the silent hard-gate tolerance, the wardrobe floor
+    # policy and the reference upscale multiplier from ``design_ai.env`` without
+    # re-exporting a Job.  A launcher variable still wins.
+    "H3_CHARACTER_SWAP_SILENT_HARD_GATE_TOLERANCE",
+    "H3_CHARACTER_SWAP_WARDROBE_FLOOR_POLICY",
+    "H3_CHARACTER_SWAP_WARDROBE_RELATIVE_GAIN",
+    "H3_CHARACTER_SWAP_WARDROBE_SANITY_FLOOR",
+    "H3_CHARACTER_SWAP_REF_UPSCALE_SCALE",
+    # Round 59: what the reference enhancer is allowed to invent.  Same reasoning
+    # as the multiplier: the director presses Preview, and the A/B that decides
+    # whether RTX ULTRA was drawing the wrinkles has to be settable in
+    # ``design_ai.env`` rather than by re-exporting a Job.
+    "H3_CHARACTER_SWAP_REF_UPSCALE_QUALITY",
+    "H3_CHARACTER_SWAP_REF_UPSCALE_STRENGTH",
+    # Round 51: the Preview resolution floor.  The director presses Preview, so
+    # the floor that decides whether the age lock is even on a bucket that obeys
+    # it has to be retunable from ``design_ai.env`` (``=0`` restores the
+    # 576x864 Preview) without re-exporting a Job.  A launcher variable wins.
+    "H3_CHARACTER_SWAP_MIN_MEGAPIXELS",
+    # Round 52: which prompt regime a Job is compiled under.  The shipped
+    # default is route1 (the precise prune); ``=legacy`` is the documented
+    # escape hatch back to the pre-round-52 prompt, and ``=manual`` is the
+    # hand-built ComfyUI floor without the Design checkbox.
+    "H3_CHARACTER_SWAP_ROUTE",
+    # Round 96: the band under the blurred head, and how far it may reach.  This
+    # defect was graded across five Previews and every attempt had to be launched
+    # with an exported variable just to be testable, which is exactly what round
+    # 34's note above promised to stop doing.  A launcher variable still wins.
+    # ``H3_CHARACTER_SWAP_FIGURE_BOTTOM`` is allowed even though the 2026-11-07
+    # measurement showed it cannot thin the band below its own baseline: it can
+    # still lengthen it, and a director has to be able to test that from the file.
+    "H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE",
+    "H3_CHARACTER_SWAP_FIGURE_WIDTH_SHARE",
+    "H3_CHARACTER_SWAP_FIGURE_BOTTOM",
+    "H3_CHARACTER_SWAP_FIGURE_EXTENT",
+    # Round 97: how far the silent listener's identity window reaches.  Round 96
+    # proved the only other way to reach the pixels under the head was the wardrobe
+    # band, and that band cost identity; this knob is the narrow route, and it has to
+    # be settable from ``design_ai.env`` for the same reason round 34 gave.
+    "H3_CHARACTER_SWAP_MEDIUM_SILENT_HEAD_BAND_SHARE",
+    # Round 101: the hair halo's own geometry.  Round 100 found the hat by measuring
+    # the band this code grows, and the only way to test a different reach was to
+    # export a launcher variable -- the same trap round 34 and round 96 wrote notes
+    # about.  All five shipped names plus round 101's contour cap are allowed now, and
+    # so is the ``H3_CHARACTER_SWAP_HAIR_HALO`` kill switch, because the honest rollback
+    # for a halo defect is to turn the halo off, not to guess at a share.  A launcher
+    # variable still wins, and the default of every one of these is the shipped value,
+    # so a file that does not mention them compiles the plate it always did.
+    "H3_CHARACTER_SWAP_HAIR_HALO",
+    "H3_CHARACTER_SWAP_HAIR_HALO_UP_SHARE",
+    "H3_CHARACTER_SWAP_HAIR_HALO_UP_MAX",
+    "H3_CHARACTER_SWAP_HAIR_HALO_UP_MAX_MASKED",
+    "H3_CHARACTER_SWAP_HAIR_HALO_WIDTH_SHARE",
+    "H3_CHARACTER_SWAP_HAIR_HALO_WIDTH_MAX",
+    "H3_CHARACTER_SWAP_HAIR_HALO_MAX_BOX_WIDTH",
+    # Round 102: the SAM3.1 association gate now answers before the first take is
+    # generated, and both of its dials are settable from here.  The floor was a source
+    # constant under round 69, so the director's only escape from a ``R1 0.52`` verdict
+    # on a 14-second clip was re-drawing a box against a ruler he could not see; and the
+    # pre-flight is itself one ComfyUI tracking pass, so it needs a kill switch for the
+    # Project that would rather learn the score at composite time, exactly as before.
+    "H3_CHARACTER_SWAP_SAM31_MIN_MATCH_SCORE",
+    "H3_CHARACTER_SWAP_SAM31_ASSOCIATION_PREFLIGHT",
+    # Round 103: the two neca_6 failures of 2026-11-08 (R1 0.48 at 23:37, R2 0.40 at
+    # 00:11) both landed after both independent takes were already paid for, and the
+    # mask geometry those runs left behind shows the generated take stopped tracking the
+    # replaced performer after 3.75 s of a 13.975 s clip.  So the repair ladder, its width
+    # cap -- which is also what keeps the hair halo armed -- and the choice between
+    # "keep compositing" and "fail the Segment" all have to be reachable from here; the
+    # director is the one paying 20 minutes per attempt, and he should not have to guess
+    # which of the three knobs he needs.
+    "H3_CHARACTER_SWAP_SAM31_AUTO_BOX",
+    "H3_CHARACTER_SWAP_SAM31_AUTO_BOX_MAX_WIDTH",
+    "H3_CHARACTER_SWAP_SAM31_WEAK_ASSOCIATION",
+    # Round 104: neca_6's ``R2 0.40`` was not a bad box -- it was two defects in what
+    # SAM3.1 is asked to look for.  The tracking phrase was the word ``person`` written
+    # into the graph, so the Godzilla replacement in the right half of the frame produced
+    # no instance of its own (only the other performer had a matte: white share 0.210),
+    # while one slot that held the *frame* rather than a matte (mid-gray share 0.440
+    # against 0.000-0.007) entered scoring as a body covering 0.91 of the picture and beat
+    # the only real body 0.4517 to 0.4033.  Both halves are reachable from here: the
+    # phrase, and the confidence the detector must reach (0.35 as always) if a director
+    # wants to test how far loosening it goes before the scene-wide slabs start.
+    "H3_CHARACTER_SWAP_SAM31_TEXT_PROMPT",
+    "H3_CHARACTER_SWAP_SAM31_DETECTION_THRESHOLD",
+    # Round 106: neca_6's shipped 07:58 Preview had association scores of 0.89 and 0.73 and
+    # still showed the source performers for most of the clip, because SAM3.1 answers one body
+    # with several object slots whenever that body's appearance changes mid-clip and the
+    # association kept exactly one slot per Role.  Reading the mask files back out of ComfyUI
+    # measured it precisely: R1's winning slot is an empty shell from 6.25 s to 11 s (its bbox
+    # still covers 0.95 of the Role box, its filled pixels 0.0035), and the missing seconds are
+    # sitting in the slot that was thrown away.  Both dials live here: whether a Role may own
+    # several slots, and how much of the clip a matte must cover before the Manifest stops
+    # calling it adequate.
+    "H3_CHARACTER_SWAP_SAM31_MASK_FRAGMENTS",
+    "H3_CHARACTER_SWAP_SAM31_MASK_COVERAGE_FLOOR",
+    # Round 107: the 11:50 run replaced both performers and still came back with edge
+    # complaints, so the two complaints were separated on that run's own files.  The matte is
+    # registered (median best correction dx +/-2 px, dy 0, dt 0 frames), and what the rim-band
+    # crops show is the edge treatment: dilation twice plus a feather over the *grown* edge
+    # leaves a 1-3 px halo of the plate tracing the silhouette, and the hard 96-threshold
+    # silhouette loses thin limbs so the plate shows through the body.  EDGE_MODE picks the
+    # edge (classic = the old chain, soft, soft_fill = feather plus a guarded re-add of the
+    # take's own silhouette) and DIFF_FLOOR is the luma difference that counts as painted.
+    "H3_CHARACTER_SWAP_SAM31_EDGE_MODE",
+    "H3_CHARACTER_SWAP_SAM31_DIFF_FLOOR",
+    # Round 105: neca_6's 02:08 run shipped two ``head_layer_only`` takes on a Godzilla and
+    # a Gundam because the plate erased only the head (suppressed_frame_area 0.235, wardrobe
+    # shift -0.0376 / -0.0140 against the 0.12 floor) and the cast lock asked the model to
+    # keep the source's wardrobe; the same verdict recorded ``action: retry_fresh_seed`` with
+    # ``attempts_used: 1``.  NONHUMAN_TARGET is the kill switch for the non-human plate /
+    # prompt / retry behaviour (on unless turned off), NONHUMAN_MAX_ATTEMPTS how many takes a
+    # blocking verdict may buy for such a role (default 2, clamped 1-3).
+    "H3_CHARACTER_SWAP_NONHUMAN_TARGET",
+    "H3_CHARACTER_SWAP_NONHUMAN_MAX_ATTEMPTS",
+    # Round 108: the 14:24 run is the second take on the same plate with byte-identical
+    # instructions (only the seed differs) and the director rejected it, while the auditor had
+    # scored it *above* the take he accepted -- 0.4675 against 0.4229 on target_reference_similarity.
+    # Measuring the take's own SAM matte against the target P Picture cutout, second by second,
+    # does order the two runs the way he did, but only on the worst role and its worst seconds
+    # (accepted worst role: median 0.6378 / p10 0.4232 / 17.9 % of seconds weak; rejected: 0.5718 /
+    # 0.3690 / 30.9 %).  TARGET_SHAPE records that series per pass (record, block, off);
+    # SHAPE_IOU_FLOOR and SHAPE_WEAK_SHARE are the two dials inside it.
+    # Round 110 moved that series inside the retry loop for non-human shots.  neca_6's 18:51 run
+    # kept R2's first roll on a likeness score of 0.6292 against 0.3577, and the same ruler, run on
+    # both rolls' own mattes, measured that roll at p10 0.3143 / 43.1 % of seconds off-model against
+    # the discarded roll's 0.5775 / 5.2 %; the frames agree with the ruler, not the score -- the kept
+    # roll loses Godzilla between 8.5 s and 10.5 s while the discarded one carries it to the end, and
+    # target_reference_similarity was a tie inside round 108's own noise (0.429023 / 0.429596).
+    # NONHUMAN_RANKING is therefore shape now (default): every roll a non-human pass generated gets
+    # its own SAM tracking and the roll whose silhouette resembles the target Picture is kept, at
+    # ~90 s of the director's GPU per extra roll and only once the pass really re-rolled.  first
+    # (round 108) and audit (the human ranking) remain, and any roll that cannot be measured leaves
+    # the choice with the first roll.
+    "H3_CHARACTER_SWAP_SAM31_TARGET_SHAPE",
+    "H3_CHARACTER_SWAP_SAM31_SHAPE_IOU_FLOOR",
+    "H3_CHARACTER_SWAP_SAM31_SHAPE_WEAK_SHARE",
+    "H3_CHARACTER_SWAP_NONHUMAN_RANKING",
+    # Round 109: neca_6's 16:52 run refused its own SAM path and shipped a double-exposed
+    # difference-matte composite.  The refusal was arithmetic, not judgement: the paired
+    # Godzilla slot measured 0.7021 wide (0.7188 at 4 fps), so with the person's 0.60 auto-box
+    # cap the repair ladder had no legal candidate at all -- not even the body's own envelope --
+    # the association stayed at 0.69 against the 0.70 floor, and the Shot fell back.  A creature
+    # has no hair halo to protect, so the non-human cap is its own dial; 0.85 equals the area
+    # ceiling, which keeps every other guard (same body, 0.05 margin, 0.70 floor, 0.60 anchor
+    # containment) in charge.
+    "H3_CHARACTER_SWAP_SAM31_AUTO_BOX_MAX_WIDTH_NONHUMAN",
+    # Round 111: the face window on neca_6's plate leaves 25.83 % of the performer's own silhouette
+    # byte-for-byte untouched (36.01 % across 3.75-6.25 s, the seconds where the take repaints the
+    # original girl), and 78.2 % of those survivors are already inside a declared band -- the erase
+    # strength, not the band layout, is what is left.  HEAD_BLUR_RADIUS / HEAD_EXTRA_SIGMA are the
+    # two dials, shipped at exactly the values that were hard-coded before (18, 0) so a run that does
+    # not name them builds the same plate as ever.
+    "H3_CHARACTER_SWAP_HEAD_BLUR_RADIUS",
+    "H3_CHARACTER_SWAP_HEAD_EXTRA_SIGMA",
+    # Round 112: the swap template itself and the in-graph SAM 3 mask parameters are
+    # render knobs too - they decide which graph and which edit mask go up the wire,
+    # so a worker that outlived an edit must be able to catch up on them.
+    "H3_CHARACTER_SWAP_WORKFLOW_NAME",
+    "H3_CHARACTER_SWAP_SAM_MASK_SUBJECT",
+    "H3_CHARACTER_SWAP_SAM_MASK_DETECT_THRESHOLD",
+    "H3_CHARACTER_SWAP_SAM_MASK_TRACK_THRESHOLD",
+    "H3_CHARACTER_SWAP_SAM_MASK_EXPANSION_PX",
+    # Round 113: the GPU claim is only honoured by the status tray while it is being renewed
+    # (120-second liveness grace, h3_status_tray.ps1 Test-ComfyClaimActive), so the renewal rate is a
+    # render knob like any other: a worker that outlived an edit must be able to catch up on it, and
+    # ``0`` puts the old write-the-claim-once behaviour back verbatim.
+    "H3_COMFY_CLAIM_HEARTBEAT_SECONDS",
+    # Round 114: which words the in-graph mask detector is conditioned on and which object it follows
+    # are decided per Shot from the Project's own nouns and role boxes; this switch is the one-line
+    # revert to the always-"person", always-largest graph, so a worker must re-read it like the rest.
+    "H3_CHARACTER_SWAP_SAM_MASK_AUTOSELECT",
+    # Round 116: the plate is erased along the in-graph SAM mask instead of trusting a rectangle whose
+    # shape disagrees with the mask (three passes of the same Shot, measured in
+    # testing/_sheet/115/round115_r1_four_way.png: no erase keeps the source person, a head-sized erase
+    # paints only a head layer, a rectangle wider than the mask leaves a grey blur nobody paints into).
+    # ``=off`` hands the plate back to the Studio's bands byte-for-byte, so a worker must re-read it.
+    "H3_CHARACTER_SWAP_IN_GRAPH_PLATE",
+    "H3_CHARACTER_SWAP_IN_GRAPH_PLATE_BLUR_RADIUS",
+    "H3_CHARACTER_SWAP_IN_GRAPH_PLATE_SIGMA",
+    # Round 117: 导演说「按照原本 h3 的提示词跑，别搞自己的实验」。模型卡与 examples/README 也明写
+    # "both LoRA strengths at 1"。默认交官方 examples/H3-Character-Swap-Relay-V2.api.json 那一句与
+    # 强度 1.0；``=off`` 回到 Studio 自造那段话，``H3_CHARACTER_SWAP_LORA_STRENGTH=template`` 回到图里的 1.5。
+    "H3_CHARACTER_SWAP_PROMPT_RECIPE",
+    "H3_CHARACTER_SWAP_LORA_STRENGTH",
+})
+
+
+def _design_ai_env_fingerprint(path: Path) -> str:
+    """sha256 of the knob file's bytes, or ``""`` when it cannot be read at all."""
+
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def apply_design_ai_env_render_knobs(
+    path: Path = DESIGN_SETTINGS_ENV,
+) -> dict[str, str]:
+    """Copy allowlisted render knobs from ``design_ai.env`` into ``os.environ``.
+
+    Returns only the pairs it actually installed: a name already present in the
+    process environment is left exactly as the launcher set it.
+    """
+
+    installed: dict[str, str] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return installed
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        name = name.strip()
+        if name not in DESIGN_ENV_RENDER_KNOBS:
+            continue
+        value = value.strip().strip('"').strip("'")
+        if name in os.environ:
+            continue
+        os.environ[name] = value
+        installed[name] = value
+    return installed
+
+
+# Round 111: the fingerprint of the knob file this process read, plus exactly the pairs it installed.
+# neca_6's 20:33 take is the evidence that the old one-time copy was a trap: ``design_ai.env`` said
+# ``H3_CHARACTER_SWAP_NONHUMAN_RANKING=shape``, the worker ran policy 106, and still no roll was ever
+# tracked -- the Studio had been opened before that edit, so its own ``os.environ`` still said
+# ``first``, and the worker was spawned with ``env={**os.environ, ...}`` (line 3305), inheriting the
+# stale value while running new code.  Editing the file and re-pressing Render looked identical.
+# A job now carries this snapshot; the worker compares the file's *current* fingerprint and refreshes
+# only the names the Studio itself installed, so a launcher override still wins and a running Studio
+# picks the new value up on the very next take.
+DESIGN_ENV_RENDER_KNOB_STATE: dict[str, object] = {
+    "path": str(DESIGN_SETTINGS_ENV),
+    "fingerprint": "",
+    "installed": {},
+}
+DESIGN_ENV_RENDER_KNOB_STATE["fingerprint"] = _design_ai_env_fingerprint(DESIGN_SETTINGS_ENV)
+DESIGN_ENV_RENDER_KNOB_STATE["installed"] = dict(apply_design_ai_env_render_knobs())
+
+
+def render_knob_provenance() -> dict:
+    """A copy of what this Studio process believes its render knobs are."""
+
+    return {
+        "path": str(DESIGN_ENV_RENDER_KNOB_STATE.get("path") or ""),
+        "fingerprint": str(DESIGN_ENV_RENDER_KNOB_STATE.get("fingerprint") or ""),
+        "installed": dict(DESIGN_ENV_RENDER_KNOB_STATE.get("installed") or {}),
+    }
+
+
+def stamp_render_knob_provenance(job: dict) -> dict:
+    """Attach the Studio's knob snapshot to a job so the worker can detect a stale environment."""
+
+    job["design_env_knobs"] = render_knob_provenance()
+    return job
+
 MIME_SLOT = "application/x-h3-media-slot"
 MEDIA_POOL_COLUMNS = 3
 MEDIA_CARD_MIN_WIDTH = 80
@@ -425,6 +760,197 @@ def _looks_like_illustrated_cast(value: object) -> bool:
         )
     evidence = " ".join(str(field or "") for field in fields).casefold()
     return any(term.casefold() in evidence for term in _ILLUSTRATED_CAST_TERMS)
+
+
+SAM31_TARGET_RECOGNITION_MAX_CHARS = 4000
+
+
+def _sam31_target_recognition_text(value: object) -> str:
+    """What this Project already knows the cast picture looks like, for SAM3.1's phrase.
+
+    The tracking graph had the word ``person`` written into it for every reference, which
+    is why neca_6's Godzilla pass came back with no instance for the replacement at all:
+    the only human-shaped matte in that pass was the other performer.  The BLIP caption of
+    that same picture reads "godzilla action figure by neca" (P2's reads "a gundam ..."),
+    so the word needed by SAM3.1 is already in the Project -- round 104 hands it to the
+    worker on the pass row and the phrase becomes ``person, godzilla``.
+    """
+
+    if isinstance(value, dict):
+        fields = (
+            value.get("recognition"), value.get("semantic_enrichment"),
+            value.get("caption"),
+        )
+    else:
+        fields = (
+            getattr(value, "recognition", ""),
+            getattr(value, "semantic_enrichment", ""),
+            getattr(value, "caption", ""),
+        )
+    text = " ".join(str(field or "") for field in fields).strip()
+    return text[:SAM31_TARGET_RECOGNITION_MAX_CHARS]
+
+
+# Round 105 -- a Picture that is not a person must not be swapped like a person.
+# neca_6's 02:08 run shipped with no Popup and one attempt, and the product's own audit
+# said why the picture is wrong: both passes came back ``head_layer_only`` (R1 -> P2
+# wardrobe shift -0.0140, R2 -> P1 shift -0.0376, both against the 0.12 floor, P1's
+# target_likeness_score 0.019 with retention_score 0.754 -- the source performer stayed
+# on screen).  Reading the plate and the prompt explains it.  The plate erased only the
+# hair crown and the head (``suppressed_frame_area`` 0.235) because ``medium_silent`` is
+# not a wardrobe gate while ``H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE=off``,
+# so QC was grading a body the plate was configured never to touch; and the beat-scoped
+# cast lock that ``design_engine`` authors says, of a Godzilla figure, "Preserve @P1's
+# exact recognizable face, apparent age, hair, skin tone, body proportions, complete
+# wardrobe, footwear and accessories" -- the model obeyed and repainted a head.  The same
+# run also shows the blocking verdict is decorative today: ``action: retry_fresh_seed``,
+# ``blocking: true``, ``attempts_used: 1``, because the lean route pins the audit spec to
+# ``maximum_attempts: 1`` and the shipped blocking lift is 1 as well.
+NONHUMAN_TARGET_ENV = "H3_CHARACTER_SWAP_NONHUMAN_TARGET"
+NONHUMAN_MAX_ATTEMPTS_ENV = "H3_CHARACTER_SWAP_NONHUMAN_MAX_ATTEMPTS"
+NONHUMAN_MAX_ATTEMPTS_DEFAULT = 2
+NONHUMAN_MAX_ATTEMPTS_CEILING = 3
+# A kaiju or a mech is not a head sitting on a human torso: the identity window is pulled
+# back to the close-up gate's own erase depth so the body band has somewhere to live
+# (at the silent share of 0.85 the head band ended at y 0.7951 and left a 0.1156 tall
+# strip barely over MIN_WARDROBE_BAND_HEIGHT 0.10, which is how round 96's own knob
+# silently deletes the torso band), and the figure band is allowed to grow wider and
+# larger because a four-legged figure is wider than the head that seeds it.
+NONHUMAN_PLATE_HEAD_BAND_SHARE = 0.62
+NONHUMAN_FIGURE_WIDTH_SHARE = 1.35
+NONHUMAN_FIGURE_MAX_AREA = 0.62
+
+
+def _nonhuman_swap_target_enabled(environ: object = None) -> bool:
+    """Whether a non-human cast picture may change the plate, prompt and retries.
+
+    The kill switch exists because this behaviour is decided by a word in a caption; a
+    director who disagrees can turn the whole round off without touching anything else.
+    """
+
+    source = os.environ if environ is None else environ
+    flag = str(source.get(NONHUMAN_TARGET_ENV, "") or "").strip().lower()
+    return flag not in {"0", "off", "false", "no"}
+
+
+def _nonhuman_swap_max_attempts(environ: object = None) -> int:
+    """How many takes a blocking identity verdict may buy when the role is not human."""
+
+    source = os.environ if environ is None else environ
+    try:
+        value = int(float(source.get(NONHUMAN_MAX_ATTEMPTS_ENV, NONHUMAN_MAX_ATTEMPTS_DEFAULT)))
+    except (TypeError, ValueError):
+        value = int(NONHUMAN_MAX_ATTEMPTS_DEFAULT)
+    return max(1, min(NONHUMAN_MAX_ATTEMPTS_CEILING, value))
+
+
+# ---------------------------------------------------------------------------
+# Round 91: the caption-only rule above is why the Black Shirt Project renders
+# and the Pink Dress Project does not.  Both Projects feed Relay a cast picture
+# that is far too small for its head to bind, and both Projects own the same
+# Identity Sheet code; the only difference the pipeline ever saw is that one
+# BLIP caption happens to begin "a cartoon ..." and the other reads
+# ``a woman in a pink dress and polka dots``.  The Pink Dress Picture 1 is
+# line-art cel-shaded artwork (graded from the picture itself), so the text scan
+# returned False, ``preserve_full_design`` stayed False, the sheet branch never
+# ran, and a 310x703 picture whose own-canvas head share is 0.1492 went to Relay
+# at native size.  The Project's Identity Sheet setting was on the whole time.
+#
+# The picture itself carries the answer.  ``design_media_service`` only writes a
+# ``*_nobg.png`` when it can remove a *solid* backdrop, which is how the Design
+# pipeline stores its generated cast art; photographic imports and scene plates
+# keep their opaque original file.  Every Character Swap cast picture this
+# workspace has ever graded is therefore a transparent cut-out (46-68 % of its
+# canvas) and every photographic asset measures 0.0 % -- while flat-colour
+# statistics cannot separate them at all (the cartoon's top-3 colour share 0.2388
+# sits inside the photographic range 0.135-0.76).  Alpha is the image-side
+# evidence; the caption stays the fast path.
+#
+# ``H3_ILLUSTRATED_CAST_IMAGE_EVIDENCE=0`` falls back to caption-only behaviour.
+# Reading it here is deliberate: ``apply_design_ai_env_render_knobs()`` has
+# already installed ``design_ai.env`` by this point in the module.
+_ILLUSTRATED_CAST_CUTOUT_CACHE: dict[str, tuple[int, bool]] = {}
+_ILLUSTRATED_CAST_CUTOUT_CACHE_MAX = 512
+
+
+def _illustrated_cast_image_evidence_enabled(environ=None) -> bool:
+    """Parse ``H3_ILLUSTRATED_CAST_IMAGE_EVIDENCE`` out of a mapping.
+
+    Same explicit-mapping pattern as the Identity Sheet knobs, so a Project can
+    be replayed with the pre-Round-91 caption-only rule without touching code.
+    Anything unparseable stays on, because on is the stock behaviour.
+    """
+
+    source = os.environ if environ is None else environ
+    try:
+        raw = source.get("H3_ILLUSTRATED_CAST_IMAGE_EVIDENCE", "1")
+    except (AttributeError, TypeError):
+        return True
+    return str(raw or "").strip().casefold() not in {
+        "0", "off", "false", "no", "disabled",
+    }
+
+
+ILLUSTRATED_CAST_IMAGE_EVIDENCE = _illustrated_cast_image_evidence_enabled()
+
+
+def _character_swap_design_reference_evidence(
+    asset: object,
+    picture_path: object = None,
+    *,
+    image_evidence: object = None,
+) -> bool:
+    """Is this Picture cast artwork whose full design must be preserved?
+
+    ``_looks_like_illustrated_cast`` answers the *medium* question from prose,
+    which is the question the live-action adaptation switch needs answered and
+    stays untouched for that switch.  This predicate answers the narrower
+    question the reference-framing branch needs: is the picture generated cast
+    art (drawn or rendered as a cut-out) rather than a photograph of a person?
+    Cast art is the case where cropping the picture down to a face throws away
+    the wardrobe and the head is too small to bind, so it is the case the
+    Identity Sheet exists for.
+
+    A caption hit short-circuits without touching the filesystem; otherwise the
+    picture is probed for a solid-backdrop cut-out.  Results are memoised per
+    (path, mtime) because Job compilation asks this once per pass.  A picture
+    that cannot be probed is *no evidence*, not evidence of a photograph.
+    """
+
+    if _looks_like_illustrated_cast(asset):
+        return True
+    if not ILLUSTRATED_CAST_IMAGE_EVIDENCE:
+        return False
+    measure = is_alpha_cutout if image_evidence is None else image_evidence
+    try:
+        path = Path(
+            str(
+                picture_path
+                if picture_path is not None
+                else getattr(asset, "local_path", "")
+                or ""
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+    if not path.is_file():
+        return False
+    key = str(path)
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    cached = _ILLUSTRATED_CAST_CUTOUT_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        verdict = bool(measure(path))
+    except Exception:  # noqa: BLE001 - a probe must never break Job compilation
+        verdict = False
+    if len(_ILLUSTRATED_CAST_CUTOUT_CACHE) >= _ILLUSTRATED_CAST_CUTOUT_CACHE_MAX:
+        _ILLUSTRATED_CAST_CUTOUT_CACHE.clear()
+    _ILLUSTRATED_CAST_CUTOUT_CACHE[key] = (stamp, verdict)
+    return verdict
 
 
 def _canonical_special_skill_key(value: object) -> str:
@@ -456,8 +982,1866 @@ TIMELINE_SNAP_SECONDS = 0.5
 # millisecond slider integer range while covering the planned 90-minute mode.
 MAX_MANUAL_TIMELINE_SECONDS = 6.0 * 60.0 * 60.0
 MIN_PRODUCTION_BATCH_SECONDS = 5.0
-SMART_RENDER_POLICY_VERSION = 42
+# Smart Render Policy 50: the compiled Character Swap prompt is now deduplicated
+# (the authoritative SILENT LISTENER contract was emitted twice in every silent
+# Shot, ~1 230 characters) and guarded by
+# ``character_swap_engine.CHARACTER_SWAP_PROMPT_CHAR_BUDGET``.  Because the
+# prompt is part of what a Smart Render Job identity describes, every stale
+# policy-49 candidate must recompile rather than reuse an already-built Job.
+# Smart Render Policy 51: Identity Sheet engine v4 hands the head panel a skull
+# instead of a bust, so the sheet every Character Swap Shot actually submits has
+# different bytes and a different face magnification.  A policy-50 Job still
+# points at the v3 sheet, so it must recompile against v4.
+# Smart Render Policy 52: the Character Swap engine now collapses two automatic
+# role tracks that describe the same body (S10/S11/S7 sent a two-performer
+# subject definition for one man, which doubled every clause and pushed the
+# prompt past its budget so the silent-mouth and plate-texture contracts were
+# deleted), rejects a background column masquerading as a person box (S5
+# audited brown background pixels), and moves the Silent Listener mouth band
+# onto the lower face when the selection fills the frame (S3/S10 failed on
+# blinking and hat texture).  Policy 53 removes the two positive lip-sync
+# sentences that every ``silent_listener`` pass was still carrying — the official
+# author prompt's "and visible mouth movements" and Studio's own "Preserve Video 1
+# visible mouth timing" — after round-10 seeds 97000444 (S10) and 97000454 (S3)
+# both lip-synced against the authoritative Silent Listener contract.  The
+# Policy 54 freezes CLOSE-UP MEDIUM REINFORCEMENT and NO INVENTED TEXTURE OR
+# PATTERN out of the tail-drop pool: reading back the prompts ComfyUI actually
+# received for the graded full film (seeds 97000374-97000544) shows the takes
+# graded ok or 80 % are exactly the ones that kept both clauses, while every
+# take graded 20 %-60 % had lost them.  The two overlapping sheet clauses
+# (design-sheet interpretation under sheet framing, multi-person subject
+# definitions) are compressed instead, which brings S3/S6/S10 back under the
+# budget without sacrificing a load-bearing clause.  Policy 55 recalibrates that
+# budget from 11 400 to 11 900 (the 11 400 number was calibrated while the length
+# guard could still delete the two clauses policy 54 froze out) and folds the
+# voice-ownership rule into the never-droppable authoritative SILENT LISTENER
+# contract, so the two shot-scale mouth reinforcements shrink from 720 to ~380
+# characters each.  Policy 56 makes the plate clauses honest: the Studio reports
+# the identity-suppression bands it really drew, and Relay now states what an
+# unreadable head-and-chest band means instead of leaving H3 to guess (round-13
+# seeds 97000554/97000564/97000574 blurred 62 % of the frame with no plate clause
+# at all, and invented a grey-haired old man plus a fantasy robe out of the
+# smudge).  It also raises the char budget to 12 400 now that seed 97000584 proved
+# 12 326 submittable end to end, and tells the identity-sheet grammar to render
+# exactly one instance of the reference character, because replica counts in the
+# background tracked panel counts exactly.  The compiled prompt text changes
+# again, so every policy-55 candidate must recompile.
+# Policy 57 compresses the redundant tail clauses so the frozen contracts fit
+# the raised budget.  Smart Render Policy 58 changes geometry, not wording: the
+# identity-suppression plate composites its blurred regions through a rounded,
+# gaussian-feathered alpha mask instead of a hard-edged crop-boxblur-overlay
+# (round-14 S6 blurred 44 % of the frame, most of it wall, and H3 re-drew the
+# smear as honeycomb), and a close-up or medium-silent Shot routes its Identity
+# Sheet to the single-face layout 8 whenever the chosen layout carries two faces
+# (round-14 S2 cloned the character: one oversized face plus one correctly
+# dressed small figure).  Both change submitted bytes — the plate video and
+# Picture 1 — so every policy-57 candidate must recompile.
+# Policy 59 changes sheet geometry again, not wording.  A close-up or
+# medium-silent Shot now crops its wardrobe panel at the framing line of the
+# Shot instead of pasting the whole body: round-15 S2 took the sheet's legs and
+# shoes as a second standing P1 inside a frame that only ever had room for one.
+# The panel orientation vote also stops trading face pixels for outfit pixels
+# (0.2 -> 0.05 for the non-primary panels), which had pushed P1 into a
+# side-by-side layout where its head covered 15 % of Picture 1 while P3/P5/P6
+# stacked at 27 %-29 %; H3 filled the missing face detail with grey hair and
+# wrinkles (round-15 S3/S10).  Picture 1 changes, so every policy-58 candidate
+# must recompile.
+# Policy 60 keeps policy 59's cropping machinery and only moves the line a
+# close-up crops at, from the chest to the hip.  Round 17 ran the first clean
+# single-variable test of that line (seeds 97000804 and 97000824, same Shot,
+# same plate, same suppression geometry, same 12132-character prompt, same
+# policy, same sheet engine 5): the chest crop returned no glasses, a flat-
+# banded hat and the source actor's golden medallion robe, while the hip crop
+# returned Picture 1's round wire glasses, its black hat with gold band and
+# red-top plaque, and the dark chest panel carrying Picture 1's three white
+# dots.  No take in that round grew a second character, so the hip-height panel
+# is safe for close-ups.  Picture 1 changes, so every policy-59 candidate must
+# recompile.
+# Policy 61 pairs two changes that both alter what Relay is actually shown.
+# Identity Sheet engine 6 paints burned-in white captions, show titles and
+# social-UI chrome out of an opaque Picture's outer bands before any panel is
+# cropped: round-19 S1 proved that a screen-grab cast picture teaches the sheet
+# the title text and the like/comment column as character design, and the take
+# was graded "wrong person" because the painted face matched the screenshot.
+# The Character Swap prompt also gains the close-up sheet crop lock, which
+# demotes a sheet's out-of-frame panels to identity facts after round 18/19 S7
+# and S9 showed Relay widening <Video 1>'s shot to draw the sheet's own hands,
+# cuffs and hem.  Picture 1 and the prompt both change, so every policy-60
+# candidate must recompile.
+# Policy 62 is the black-shirt single-character grading pass, and it changes both
+# what Relay is shown and how a take is judged.  On the prompt side an intact
+# source plate never carried a wardrobe clause before, so the erased actor's robe
+# kept voting on the replacement (S4/S6/S8 "the clothes look nothing like the
+# reference") and every small-head take aged the cartoon design (S3/S7/S10/S11 at
+# 20 %-60 % likeness); the compiled pass therefore gains source costume ownership
+# and an apparent-age lock, and the never-droppable tail was compressed 301
+# characters so the S8/S9 silent sheet close-up fits the proven 12 326-character
+# submittable ceiling while keeping the crop lock.  On the judgement side the
+# silent-mouth verdict now comes from the median across the sample timestamps
+# against an upper-face relative floor — the mean alone passed the black-shirt S2
+# take whose R1 mouth coverage measured 0.090 against a 0.030 bystander strip —
+# and a take whose only "V1 retained" evidence is an unchanged background strip is
+# flagged for review instead of burning five fresh-seed renders on wallpaper.
+# Prompt and QC both change, so every policy-61 candidate must recompile.
+# Policy 63 rebuilds the Identity Sheet face panel: the head is now measured as
+# the opaque run attached to the skull axis (engine v7), so a cast that waves an
+# arm beside its own head no longer gets its face panel cut at the eyes, and the
+# panel then grows into real artwork until it fills its cell with the face
+# centred.  Both panels H3 conditions on change, so policy-62 sheets, manifests
+# and candidates are stale.
+# Policy 64 lets a medium-framed Shot choose the single-face Identity Sheet
+# layout from the plate box itself rather than only from a suppression gate, and
+# honours the allowlisted render knobs in ``design_ai.env`` so a GUI Preview
+# still sees them after a Studio restart.  With the knob on, the reference image
+# H3 conditions on changes, so a policy-63 manifest built from the
+# head-plus-whole-body sheet must not be reused.
+#
+# Policy 65: the Identity Sheet layout, outfit crop, gate rows and framing
+# threshold are now serialized into every Character Swap pass, so they enter the
+# content fingerprint.  Rounds 22 and 23 both rendered the stock two-face sheet
+# while the director believed the single-face layout was live, and nothing in the
+# Job could prove it afterwards.  A manifest stamped 65 that does not name
+# ``identity_sheet_preset`` is not a valid A/B.
+#
+# Policy 66 aligns the medium-shot Silent Listener plate suppression with the
+# prompt clause that already fires for it.  Round 23 proved the mismatch: the
+# engine reinforced the closed mouth (tiers 0.050 / 0.25) while the Studio's
+# older 0.12 / 0.35 gate left the plate untouched, so H3 was told the source
+# face had been weakened and saw it in full detail.  A pass that used to render
+# the raw V1 plate now renders a blurred head band, so policy-65 manifests are
+# stale.
+# Policy 67 extends that same gate downwards: the Silent Listener pass now also
+# gets the wardrobe band under its blurred head, softening garment edges while
+# keeping chroma (``CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE``).  Seed
+# 923000227 graded policy 66 and showed why: the head went to Picture 1 in 8 of
+# 12 frames, and the one segment whose head band lined up cleanly adopted
+# Picture 1's whole outfit, while the two segments whose plate still carried a
+# coloured cosplay torso kept reproducing it.  The garment was the last region
+# still voting for V1 on this gate.  Passes that previously rendered the raw
+# plate below the head now render a softened garment band, so policy-66
+# manifests are stale.
+#
+# Policy 68 puts the whole figure under reference authority and stops letting the
+# source actor's hair survive the swap.  Round 29 graded the black-shirt take
+# "头部效果完美" while the user's standing complaint stayed "衣服完全不像参考图":
+# the sheet's wardrobe panel was cut at the hip, which on this cast stops *above*
+# the yellow checked trousers, so those rows had no Picture 1 authority at all and
+# H3 re-drew them from the plate; and the head band sat under the cosplayer's pink
+# twin-tail wig (x 0.15-0.85, y 0.03-0.75), so the face went to Picture 1 and the
+# hair was never asked about.  Three things change together: the Identity Sheet
+# outfit view becomes ``full`` (whole neck-down figure) for a medium-shot silent
+# listener or a Shot whose framing reaches the hips (sheet engine 8, so every
+# composed Picture 1 changes); a hair halo grows the suppression band upward and
+# sideways over the hair while keeping its bottom edge, so pose conditioning and
+# every prompt clause stay put (seed 923000227 proved that an aligned band already
+# makes this cosplayer's wig and cat ears vanish); and the prompt adds the
+# wig/earpiece erasure sentence plus the one-body reminder, funded by making two
+# MULTI-PERSON isolation sentences conditional on evidence that is now stamped per
+# pass.  Plate, sheet and prompt all move, so policy-67 manifests are stale.
+#
+# Policy 69 grows the garment band under that head to the actor's whole visible
+# body.  Seed 923001027 graded policy 68 and named the residue exactly: the head
+# stayed Picture 1's cartoon in all three segments, while the cosplayer's black
+# cat-ear crown, gem-studded headband and pink/black striped sleeves stayed sharp
+# and re-seeded themselves in every frame.  Both bands are derived from
+# ``source_bbox_normalized``, which on this Shot is the AI role census' thumbnail
+# box (0.30 x 0.30), while the actor spans x 0.10-0.90 / y 0.03-1.0: 18 % of the
+# frame was suppressed and roughly 60 % of it kept voting for V1.  The band now
+# grows downward and sideways by head proportions, with protected bystanders cut
+# out of the rectangle instead of clamping its growth, and the growth is bounded
+# by a total-suppression area cap because round 13 measured what an unreadable
+# body costs — an invented age and an invented costume.  The merged silent clause
+# says crown to feet when the band really does reach the bottom of the frame.
+# Every suppressed plate changes, so policy-68 manifests are stale.
+# Policy 70 changes which asset goes up as Picture 1 and what the QC ruler is:
+# a full-body artwork whose head already dominates its own canvas is passed
+# through instead of re-sheeted (the composed sheet's border and headless lower
+# panel were being rendered inside the scene), and every pass now carries a
+# garment-only QC reference plus the body rectangle it must be measured on.
+# Both change the submitted input and the acceptance decision, so policy-69
+# manifests are stale.
+# Policy 71 says one more fact on a suppressed plate: the hair clause used to
+# hand the crown region to Picture 1 without saying what belongs there, and
+# round 35e seed 923009999 kept the source actor's cat-ear wig and headband in
+# 13 of 16 sampled frames.  The clause now states the crown positively — bare
+# scalp where Picture 1 is bald, headwear only where Picture 1 draws it — which
+# changes the submitted prompt, so policy-70 manifests are stale.
+# Policy 72 tightens the acceptance ruler the Job's QC reference is judged by:
+# the whole-body wardrobe gate now asks the upper half and the lower half of the
+# audited garment rectangle to each move away from the source wardrobe, because
+# seed 923010107 cleared the single median three times (0.121 / 0.155 / 0.124)
+# with Picture 1's legwear below the waist and the cosplayer's vest and sleeves
+# above it.  The decision changes, so policy-71 manifests are stale.
+# Policy 73 re-describes the mouth a Silent Listener must hold: the suppression
+# clause now asks the pass to copy Picture 1's relaxed closed mouth and allows
+# blinking, brow and eye expression only, instead of promising one static
+# expression with visible mouth movements.  The submitted prompt changes, so
+# policy-72 manifests are stale.
+# Policy 74 rewrites the affirmative half of the same contract.  The official
+# template still says the performance "comes from the person being replaced",
+# asks for a "complete visible performance", holds identity "through every
+# expression" and retains the source clip's sound; seeds 923010107, 923010207 and
+# 923010307 all lip-synced with those sentences present, so the pass now says
+# body performance, drops "expression", moves the clothing clause to body motion
+# and states that the speech is off screen.  The submitted prompt changes, so
+# policy-73 manifests are stale.
+# Policy 75 changes the pixels Relay is conditioned on, not the words.  On a
+# Silent Listener close-up the identity-suppressed plate now time-freezes every
+# registered mouth band (``tmix=frames=7``, always the last stage so it averages
+# the already-blurred plate), which is the one lever three policy-74 seeds left
+# untried: the prompt said 23 times not to articulate while the plate kept
+# handing the model a moving mouth.  The audit reference moves too -- the pass
+# now submits ``plate_video_path`` so the silent gate measures the clip Relay was
+# actually shown instead of raw V1.  The submitted plate and the ruler both
+# change, so policy-74 manifests are stale.
+# Policy 76 takes the words back rather than the pixels.  The prompt the endpoint
+# received for seed 923010507 used speech / speaker / audible / voice / audio five
+# times and every occurrence was affirmative -- "the speech is off screen",
+# "which is why <Video 1>'s audible speech keeps pulling the lips open", "not the
+# audible speaker", "Every audible voice in this Shot ... is background sound" --
+# so the sentences written to suppress the mouth were simultaneously the only
+# evidence in the caption that the Shot has audible speech.  Nothing in that take
+# was lip-syncing V1: the submitted plate has no audio track, the take's own audio
+# is digital silence (-91 dB) because the workflow muxes the plate, and the mouth
+# energy sits at 2.5-8 Hz with negative cross-correlation against V1's speech
+# envelope.  The silent clauses now declare an empty human vocal channel the way
+# this project's verified speech-free audio passes do.  The submitted prompt
+# changes, so policy-75 manifests are stale.
+# Policy 77 stops the retry ranking from paying for an open mouth.  The p75/p76
+# A/B on seed 923010507 re-ran the same three pass seeds under both wordings and
+# the de-voiced caption did not quiet the mouth -- seg0 articulation excess went
+# 0.0477 -> 0.0591 and seg2 0.0589 -> 0.0675 -- so policy 76 is a measured null
+# result and the decision still being made wrongly lives in the selector.  Picture
+# 1 grins with its teeth showing and retry likeness reads a colour histogram, so
+# the take whose mouth is open widest looks most like the reference: seg2 chose
+# between takes 0.004 apart on similarity whose mouth articulation differed 2x.
+# The selection likeness now also subtracts the articulation excess the silent
+# mouth audit already recorded for that take, capped and weighted so a real
+# likeness gap still wins while a hairline gap cannot out-vote a moving mouth.
+# Only Silent Listener and no-human-voice takes carry that audit, so speaker Shots
+# rank as before.  Selection changes and the submitted prompt does not, so
+# policy-76 manifests are stale.
+# Policy 78 = the reference image itself changes.  A single big-figure Picture 1
+# used to skip the Identity Sheet on layout grounds alone, which sent the black-shirt
+# Project's 252x370 (0.093 MP) artwork raw into a workflow that upscales conditioning
+# images 4.6x: the head survived, the wardrobe did not, and QC had no pixels to grade
+# either.  The passthrough now needs 0.35 MP of its own to be worth it, and anything
+# below goes up as the one-face + whole-figure sheet (800x1216 = 0.973 MP) that the
+# director graded as a real gain.  ``reference_framing`` flips to
+# illustrated_identity_sheet for those Shots, so the compiled prompt changes too and
+# policy-77 manifests are stale.
+# Smart Render policy 79: the Silent Listener merged plate paragraph gives up its
+# drop rank (it is the only sentence that tells Relay the blurred plate's surviving
+# garment colours belong to the erased actor, and seed 923010907 dropped it in 3/3
+# windows while inventing a different costume per window).  The shot-scale mouth
+# reminder yields instead.  A compiled Silent Listener pass changes, so policy-78
+# manifests are stale.  Paired with SMART_RENDER_POLICY_VERSION in
+# smart_render_worker.py.
+# Smart Render policy 80: the retry winner is decided from two wardrobe sampling
+# windows instead of one.  The wardrobe cue that gates QC and the wardrobe bonus
+# that ranks retries both came from samples at 0.22 / 0.50 / 0.78 of the window, and
+# seed 923010907 showed the cost: the director's only accepted take had already put
+# on Picture 1's costume by 88 %, while the take the worker kept wore it for a
+# moment and lost it.  The audit now records the same cue over 0.78 / 0.86 / 0.94 as
+# ``wardrobe_shift_late`` and the ranking may use whichever window measured more
+# movement.  QC and the retry trigger still read the median, so a tail-only costume
+# still fails and still retries.  The compiled prompt is unchanged, but the recorded
+# winner in a policy-79 manifest is no longer authoritative, so those manifests are
+# stale.  Paired with SMART_RENDER_POLICY_VERSION in smart_render_worker.py.
+# Smart Render policy 81: the medium-shot Silent Listener plate stops suppressing
+# the garment and goes back to a head band.  Seed 923010907 (policy 80, band
+# ``blur``) had the wardrobe band running from y 0.285 to the bottom of the frame,
+# which crushed 50.13 % of the picture and merged the head with the whole torso
+# into one colour blob - H3 kept the pose and painted the costume itself out of
+# the leftover palette of the source cosplayer, which is where the red-gold
+# imperial robe, the odd motifs, the honeycomb and "only the head got swapped"
+# came from.  Seed 923011007 changed nothing but the band mode and became the
+# first Studio take to wear Picture 1's outfit end to end: 5/6 rows passed the
+# wardrobe rule against 1/6, mean wardrobe shift +0.0972 -> +0.1658, mean target
+# similarity 0.5359 -> 0.5876, and the hands turned cartoon.  The blurred band
+# also cost 660 prompt characters, and the clause the 12 320-character budget
+# deleted to pay for it was the Silent Listener mouth clause.  ``off`` is now the
+# shipped default (H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE=blur
+# restores the old plate); the strategy string loses its
+# ``_wardrobe_blur_suppressed`` suffix and the plate clause reverts to SOURCE
+# PLATE FACE BLURRED, so a policy-80 compiled Silent Listener prompt and its
+# cached plate are stale.  Paired with SMART_RENDER_POLICY_VERSION in
+# smart_render_worker.py.
+#
+# Policy 82 is Round 49's manual-ComfyUI parity flip.  Seeds 923011007 and
+# 923011008 (job preview_923011007_1793291943180178000, read back from the
+# ComfyUI /history endpoint) prove Studio and the user's hand-built graph
+# submitted the same template but not the same render: Studio fed Relay a
+# box-blurred, audio-stripped plate, cut the single authored 12.864 s Shot into
+# three cold 4.288 s segments, and escalated the Character-Swap LoRA to 1.75 and
+# 2.0 on retries while the official ceiling is 1.5.  The plate change alone
+# rewrites the compiled prompt for every pass, so all cached plates, prompts and
+# takes under 81 are stale.
+# Policy 83 is Round 50, kept in step with smart_render_worker.py: the silent
+# mouth gate tolerates a small overrun of its own motion limit instead of
+# hard-failing it, the wardrobe gate accepts a relative gain over the source
+# region as well as one absolute shift, the age / invented-detail / silhouette
+# prompt clauses grew, and the RTX reference upscale multiplier became an
+# explicit environment override.  Verdicts and compiled prompts under 82 are
+# stale, so every cached pass is recompiled.
+#
+# Policy 84 is Round 51, kept in step with smart_render_worker.py.  The close-up
+# sheet crop lock is now triggered by a measurement of the plate instead of by the
+# selected box: when <Video 1> cuts the figure at its bottom edge the clause goes
+# up even though the UI's qualified rectangle shrank the box to 0.30x0.30, because
+# otherwise the ``full`` outfit sheet widens a half-body Shot until Picture 1's
+# shoes appear.  The prepare bucket also stopped following the director's request
+# alone — the shipped floor is 1.0 MP, so Preview renders 800x1216 (the bucket the
+# accepted takes used, and the only one where the APPARENT AGE LOCK is obeyed)
+# rather than 576x864.  Compiled prompts and take sizes under 83 are stale.  Both
+# switches are reversible from ``design_ai.env``:
+# ``H3_CHARACTER_SWAP_MIN_MEGAPIXELS=0`` restores the 480 bucket, and an
+# unmeasurable plate simply means no crop lock, which is the policy-83 behaviour.
+# Policy 85 is Round 54, kept in step with smart_render_worker.py.  路線 1 sends
+# Relay the clean V1 plate, so ``suppressed_plate`` is false and every ownership
+# sentence the engine wrote for a blurred head — LEAN_HAIR and the policy-68/71
+# source-hair clause — never fires.  The director's grade on seed
+# 2246500964096521702 (project ``..._black_shirt_and_yellow_pants_4``, policy 84,
+# 768 bucket, identity audit clean) names the hole that leaves open: V1's red
+# twin-tail wig and cat ears still on Picture 1's bald crown, pink cosplay straps
+# and ribbons still on the body, and Picture 1's round glasses dropped.  The new
+# SOURCE LOOK BELONGS TO THE ERASED ACTOR clause says the fact out loud on a clean
+# plate only, and it measures 525 characters inside a 4 200-character appendix
+# budget, so no clause had to be traded.  Compiled 路線 1 prompts under 84 are
+# stale; the clause is silent on a suppressed plate, where the old sentences
+# already own this ground.
+#
+# Round 57 says the same for policy 86.  The 85 take of the same shot (master
+# seed 8178175072880861825) is the one that proved the ownership clause works —
+# wig, ears and pink cosplay harness gone, Picture 1's own wardrobe back — and
+# its sampled frames show the two residuals left behind: Picture 1's round
+# spectacles absent in 5 of 5 frames, one temple floating free on a cheek, and a
+# face older than the sheet once the wig stopped covering the crown.  The new
+# DRAWN EYEWEAR STAYS WORN clause plus the rewritten APPARENT AGE LOCK cost 905
+# characters against a 3 764-character appendix inside a 4 200-character budget.
+# Policy 87 is Round 62/63, kept in step with smart_render_worker.py, and the
+# evidence this time is text rather than frames.  The prompt ComfyUI received on
+# the policy-84 take the director graded 「效果很好，唯一问题＝老人化」 is 8 204
+# characters: 3 398 of author template carrying 0 aging nouns and 0 texture
+# nouns, then 4 806 characters of Studio appendix carrying 7 of each.  The same
+# live graph run by hand in ComfyUI produced neither the aged face nor the
+# invented background, so the appendix wording — not the graph, the seed or the
+# LoRA strength — owns the defect.  Round 62 rewrote the eight clauses that
+# enumerated forbidden marks into positive-only sentences at a cost of 127
+# characters, pushing this shape's appendix from 4 560 to 4 661 and forcing the
+# legacy length guard to sacrifice a third load-bearing clause
+# (``source_costume_leaves_plate``) on the silent sheet close-up.  Round 63
+# trims the duplicated restatements out of those six clauses: 2 962 characters
+# across the eight clause sites, 133 below the pre-round-62 wording, so the
+# graded shape compiles at 4 545 appendix characters again and the sheet close-up
+# pays with rank 1 and rank 2 only.  Compiled Character Swap prompts under 86
+# are stale; H3-Character-Swap-Relay-V2-api.json is untouched either way.
+#
+# Round 65 keeps this cache key in step with smart_render_worker.py at 88.  The
+# take that decided it is the one the director graded 「这一次最完美」: project
+# ``a_cartoon_character_with_a_black_shirt_and_yellow_pants_4``, master seed
+# 6401000000000000001, policy 87, 0.5 MP asked and 1.0 MP effective under the
+# apparent-age floor, pass seed 6759948290807294904, one attempt.  Identity,
+# wardrobe, background, plate continuity and crop all read as Picture 1 and the
+# aging drift is gone; the single residual is eyewear.  Picture 1 draws small
+# rimless ovals, and the take wears nothing at all for 2.5 s, then the erased
+# performer's thick black rectangular frames from about 3 s, with one lens slid
+# down onto a jaw at 9 s — the mandate Round 57 wrote could only be honoured by
+# taking the glasses from ``<Video 1>``, and the instruction is
+# 「不要在画面强制放入眼镜」.  Eyewear is therefore a three-way policy now
+# (``H3_CHARACTER_SWAP_EYEWEAR``: ``uncovered`` by default, ``worn`` restores
+# Round 57, ``neutral`` says nothing), and the default compiles THE FACE STAYS
+# UNCOVERED with the ownership sentence and the detail keep-list reading the same
+# value.  Cost is negative: this shape's appendix goes 4 545 -> 4 532 characters
+# with nothing dropped.  Prompts compiled under 87 are stale; the graph json
+# remains untouched, as the director required.
+#
+# Round 69 is the manual-ComfyUI parity round, and it changes four things a cache
+# key has to notice: the styling appendix is capped and drops clauses instead of
+# only recording its own overflow; the appendix stops naming the objects it
+# forbids; segments below one relay window merge and one V1 shares one relay seed;
+# and a head-layer-only rebuild below the target-reference floor blocks instead of
+# passing as advisory.  A SAM3.1 match below ``SAM31_MIN_MATCH_SCORE`` now refuses
+# to guess, references with alpha are flattened on white, the preview canvas is
+# quantized to a multiple of 16, and the RTX Video Super Resolution node is off
+# unless ``H3_CHARACTER_SWAP_PREVIEW_VSR`` opts in.  Everything compiled under 88
+# is stale.  The graph json remains untouched, as the director required.
+#
+# Round 91 is the cut-out evidence fix.  The reference-framing branch used to ask
+# one question — does the BLIP caption contain a cartoon word — and the Pink
+# Dress Project's Picture 1 is line-art cel-shaded artwork whose caption reads
+# ``a woman in a pink dress and polka dots``.  That single False kept
+# ``preserve_full_design`` off, so the Identity Sheet never ran, the picture
+# reached Relay at 310x703 with 0.1492 of its own canvas given to the head, and
+# every take lost the face.  A caption hit still wins; when it misses, a picture
+# whose solid backdrop was removed (the way ``design_media_service`` stores
+# generated cast art: 46-68 % transparent across every graded cast reference in
+# this workspace, against 0.0 % for every photograph) now counts as cast artwork
+# for framing only.  ``H3_ILLUSTRATED_CAST_IMAGE_EVIDENCE=0`` restores caption
+# only.  The live-action adaptation switch and the close-up plate gates keep
+# reading the caption predicate, so the medium question and the framing question
+# cannot drift into each other again.  ``reference_design_evidence`` records
+# which of the two answered.  A Shot whose framing flips recompiles its prompt,
+# so policy-89 manifests are stale.  The graph json remains untouched, as the
+# director required.
+#
+# Round 92 is the head-layer veto's blind spot.  The Hallway Approach Project
+# shipped a take whose replacement collapses back to the V1 performer between 3.5 s
+# and 8 s while the audit called it a pass-with-advisory: the three target-P
+# samples scored 0.636 / 0.485 / 0.573 and the veto read the median, so it sat
+# above the 0.5 floor and let the wardrobe witness be waived.  Replaying the take
+# through the worker's own decoder reproduced that median to 0.000000, which puts
+# the fault on the arithmetic.  The veto now also binds the floor on the worst
+# sample, records ``minimum_similarity`` / ``worst_timestamp_seconds`` / the
+# per-sample table and names its witness in ``blocking_cause``, and a
+# ``target_reference_temporal_collapse`` verdict lifts a lean single-take spec by
+# one fresh seed (``H3_CHARACTER_SWAP_BLOCKING_MAX_ATTEMPTS`` still rules both
+# ways; the structural head-layer miss keeps the round-86 no-lift answer).  Only
+# QC verdicts move, so policy-90 manifests are stale; the graph json remains
+# untouched, as the director required.
+#
+# Round 93 answers one question the manifest had been leaving to filename
+# archaeology: was Relay handed the untouched V1, or a weakened source head?  Two
+# Hallway takes were graded on that guess.  The identity audit spec published
+# ``plate_video_path`` but never said which suppression produced it, so a run whose
+# path read ``v1_relay_..._0.000-8.500.mp4`` with no ``_identity_suppressed_`` in it
+# had to be reverse-engineered to learn that ``source_identity_strategy`` was
+# ``"original"`` -- meaning the crown blur, the hair halo and the round-35e
+# hair-ownership clause (the sentence written after seed 923009999 kept V1's cat-ear
+# wig in 13 of 16 frames although the halo already covered the crown) had never
+# fired, not once.  The spec now carries ``identity_suppression_strategy`` plus the
+# ``identity_suppression_geometry`` object the prompt compiler already reads: the band
+# rectangles that drove the ffmpeg crop, ``head_band_bottom``,
+# ``suppressed_frame_area`` and the crown and halo reports.  Nothing that reaches
+# Relay moves, so policy-91 takes stay valid; a new Preview simply records what the
+# plate really was, in the same place the director already reads the QC verdicts.
+#
+# Round 94 disarms a silent dependency.  The close-up plate gates asked the caption
+# predicate whether the reference is illustrated, and this host's BLIP service is
+# dead: the Hallway Project's Picture 1 row stores ``caption = ''`` next to a
+# ``recognition`` reading ``BLIP ERROR · BLIP service stopped unexpectedly (exit 1)``,
+# so the answer was False for every cast picture and
+# ``H3_CHARACTER_SWAP_PLATE_SUPPRESSION=1`` bought three renders of an untouched
+# plate, each one recorded as ``source_identity_strategy = "original"``.  The same
+# ``recognition`` reports ``AUTO BACKGROUND REMOVAL: uniform edge-connected
+# background removed (52 % transparent)`` -- the cut-out evidence round 91 already
+# trusts for framing, where every graded cast picture in this workspace measures
+# 46-68 % transparent and every photograph 0.0 %.  A blurred source head is a decision
+# about what Relay's Picture 1 *is*, so ``character_swap_plate_suppression_gate`` now
+# lets that gate read caption OR cut-out exactly as framing does, while the
+# live-action medium question keeps the caption predicate alone.  The manifest
+# publishes the reason in ``identity_suppression_gate`` (``off`` / ``caption`` /
+# ``cutout`` / ``none``), and ``H3_ILLUSTRATED_CAST_IMAGE_EVIDENCE=0`` returns every
+# image-side rule to caption-only.  A photographic reference compiles exactly as
+# before; a drawn reference now gets a different plate, which is the point.
+#
+# Round 95 widens the vanilla hair sentence to the hair that hangs.  The first
+# honest suppressed-plate Preview (policy 93, seed 3608049340227527602, 18:20:49)
+# proves the gate, the plate and the geometry all fired --
+# ``identity_suppression_gate.evidence = "cutout"`` on both units,
+# ``identity_suppression_strategy = "medium_silent_listener_identity_suppressed"``,
+# bands at x 0.141171-0.558136 / y 0.029259-0.5193 on unit 1 and x 0.0999-0.45 /
+# y 0.12-0.5025 on unit 2 -- and the identity landed: Picture 1's bald scalp, his
+# nose and his black-and-white vest are in every sampled frame, unit 1's 4.229 s
+# sample climbed 0.428631 -> 0.538907 (over the 0.5 floor for the first time), and
+# the kept character was not painted over.  What survives is hair the window never
+# owned: length down the sides at 4.23 s, a mass behind the head at 6.60 s, a
+# spiked mane plus a plait and its tie at 11.21 s (the second unit's worst sample,
+# 0.382527).  Both units' own ``wardrobe_audit`` says it in numbers -- "the V1
+# wardrobe still fills the upper half of the body region", shift 0.029945 and
+# 0.008174 against a required 0.047239 and 0.048380 -- while ``wardrobe_mode``
+# stays ``off``, so the plate stops at y 0.5193 / y 0.5025.  Picture 1 is a bald
+# man with three stray filaments and no hair below them, so all of it is fault.
+# The wider plate was measured before it was refused: rebuilding both of this
+# run's clips from the same manifest under
+# ``H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE=blur`` (18:36) draws a
+# wardrobe band at x 0.049758-0.689648 / y 0.519259-1.0 and x 0.0-0.70035 /
+# y 0.5025-1.0, but it smears 0.2043 -> 0.5316 and 0.1339 -> 0.5015 of the frame
+# and every ``figure_extent_applied`` row reports ``protected_boxes: []``, so the
+# kept character's own body blurs with it -- the regime policy 81 already refused
+# at 50.13 % against 11.4 %.  So the words carry this round:
+# ``LEAN_VANILLA_SOURCE_HAIR`` in character_swap_engine.py grows 167 -> 442
+# characters and claims the nape, shoulders and back as geometry, never as an
+# object to remove (``crown`` and ``forehead`` are on round 69's price list), and
+# the vanilla appendix stays inside its 1200-character budget, 769 -> 1044.
+#
+# Round 96 arms the band under the blurred head, and lets the director set it from
+# the file.  The 19:22 take (policy 94, seed 1689239479428983434) proved the words
+# landed: the spiked mane, the plait and its tie are gone, segment 1 is no longer a
+# blocking take (worst sample 0.459285 -> 0.513452 at 6.597 s, median 0.52792) and
+# the kept character is intact.  What is left sits one step below the window -- a
+# pale lock beside the jaw at 4.23 s and 6.60 s, black tufts at the temples and nape
+# at 11.21 s (0.473436) -- and both units' ``wardrobe_audit`` had been naming that
+# region all along: "the V1 wardrobe still fills the upper half of the body region",
+# shift 0.037728 and -0.039443 against a required 0.047239 and 0.048380, with
+# ``wardrobe_mode`` still ``off``.  Measured before being armed: the default growth
+# smears 0.2043 -> 0.5316 and reaches x 0.6896, past the protected role's near edge
+# at 0.558136, while ``H3_CHARACTER_SWAP_FIGURE_WIDTH_SHARE=1.0`` holds the band
+# inside the authored box -- x 0.141171-0.598136 / y 0.519259-0.898148 at 0.3971 and
+# x 0.0999-0.5 / y 0.12-0.75 at 0.2521 -- inside the engine's own 0.56 cap, with the
+# kept character's eyes, glasses and mouth outside the blur.  ``H3_CHARACTER_SWAP_
+# FIGURE_BOTTOM=0.66`` was tried and cannot thin it: the band's baseline is as tall
+# as the head band, so it already reaches y 0.898148, and the growth code only
+# extends.  The two knobs that decide all of this had to be added to
+# ``DESIGN_ENV_RENDER_KNOBS`` first -- five Previews were spent on the defect and not
+# one of them could be configured from ``design_ai.env``.  The band flips the plate
+# clause and the strategy suffix, so 94's prompts and takes are stale; the shipped
+# default remains ``off`` and the shipped width share remains 1.75.
+#
+# Round 97 rolls that band back and reaches the same pixels through the identity
+# window instead.  The director rendered 95 twice (19:56 seed 5474034667317928853,
+# 20:14 seed 8564544838065224999) and called it worse than the 19:22 take, and the
+# numbers agreed: unit 2's median similarity fell 0.486057 -> 0.325397 (worst sample
+# 0.287048 at 2.708 s) and unit 1's 0.52792 -> 0.509834 (the other seed 0.42589), both
+# blocking, and the frames show why -- blurring y 0.519259-1.0 leaves no neck and no
+# collar, so H3 rebuilt the erased actor's hair over the mush: long black hair to the
+# shoulders at 4.23 s and a full fringe over Picture 1's bald scalp at 11.21 s.  So
+# ``H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE`` is back to ``off`` and the new
+# knob ``H3_CHARACTER_SWAP_MEDIUM_SILENT_HEAD_BAND_SHARE`` walks the silent listener's
+# own band down: on this Project 0.65 puts the bottom at y 0.657037 (the jaw locks at
+# 4.23 s and 6.60 s) and y 0.5925 (the temple and nape tufts at 11.21 s) with the
+# suppressed area at 0.2617 and 0.1654 on the clipped column -- inside the 0.56 ceiling
+# either way.  It is the narrow route for two reasons the wardrobe band is not: the
+# column is already clipped at the protected character's near edge (x 0.558136), and
+# nothing in the prompt changes, so the 19:22 wording that removed the mane, the plait
+# and the tie is reused verbatim.  The shipped default stays 0.45, the policy-67 plate.
+# Round 101 makes the hair halo's reach testable from ``design_ai.env`` and gives the
+# auto contour a cap of its own.  Shot 3 of the Hallway Project grew a black cap with a
+# red band and a white pentagram badge from 8.5 s to 12.1 s, and the measurement
+# explains it without naming any object (naming is what paints -- round 69's price
+# list): the window top is ``box_top - min(0.5 x box_height, up_max 0.18)``, and a box
+# top at 0.264815 over a crown measured at y 0.25 parked 0.165 of featureless
+# background above the head, which H3 filled downward from the band's own top edge --
+# the cap's top was flush with it, and its brim ended at the crown.  The same geometry
+# never misfired on segment_001, whose boxes the director authored about 0.18 under the
+# crown, which is exactly what the halo assumes.  Reaching that number used to mean
+# exporting a launcher variable, the trap rounds 34, 96 and 97 each wrote a note about,
+# so all five shipped halo names, the kill switch and the new
+# ``H3_CHARACTER_SWAP_HAIR_HALO_UP_MAX_MASKED`` are allowlisted now.  The engine also
+# marks which rectangles the Shot Visual Editor authored (``source_bbox_provenance``): a
+# contour box, which by construction ends at the hair, may take the shorter reach, while
+# a hand box keeps the reach it was graded against.  The masked cap ships at 0.18 -- the
+# hand value -- is clamped to it, and a missing provenance key reads as a hand box, so a
+# Project that arms nothing compiles the plate it always did.
+# Round 102 moves a measurement the worker already makes, instead of adding one.  Two
+# Godzilla Projects of 2026-11-08 each paid for a full generation and then lost it to the
+# round-69 association floor: neca_5 at 19:00 and 19:29 (``R3 0.36``, then ``R3 0.31`` --
+# three tracker slivers of 0.0184 frame area judged against a full-body reference, with
+# the 3.1667 s box sitting 0.10 right of where the performer actually stands) and neca_6
+# at 21:17 (``R1 0.52``, one static Design box of 0.0800 against a performer measured at
+# 0.106 / 0.436 / 0.220 across the three framing regimes of the same clip, which is why
+# the ComfyUI log shows 334 generated frames and 345/345 tracked frames before the popup).
+# The V1 association already ran through the same ``match_sam31_masks_to_passes``; it just
+# ran after every independent take.  The worker now runs it first, aborts with the same
+# sentinel plus a note that no take was spent, and hands the bundle to the composite stage
+# instead of re-queueing it -- one upload and one tracking pass cheaper, and the gate on
+# the generated take still runs afterwards because the replacement silhouette is bigger
+# than the source one, never smaller.  Studio's job is to make both dials armable from
+# ``design_ai.env``: the floor (default 0.70, clamped to [0.05, 1.0]) and the pre-flight
+# itself (``on`` / ``advisory`` / ``off``).  Nothing is compiled differently here, so
+# prompts, plates and QC verdicts stamped 97 stay valid.
+# Round 103 is the other half of the same lesson, learned twice more in the same night:
+# neca_6 came back at 23:37 with ``R1 0.48`` -- on a box whose V1 association had measured
+# 0.7726 with a 0.3514 margin over the runner-up, i.e. the right person -- and at 00:11 with
+# ``R2 0.40``, both times with every independent take already generated and both takes
+# written to disk (4,177,894 B and 6,541,283 B).  The mask videos those runs left behind are
+# the diagnosis: the generated take tracked the replaced performer for 16 of 56 sampled
+# frames (0 to 3.75 s of a 13.975 s clip) and spent the rest of the clip inside a single
+# instance whose median bbox was 0.9111 of the frame, so the runner-up for that role was that
+# full-frame blob at 0.4244 -- 0.0551 behind -- and no character box could have reached 0.70.
+# A measurement that stopped following a person must not veto a composite, so the worker now
+# repairs the box from the silhouette it actually measured (0.4795 re-scored 0.7397 on
+# neca_6's own geometry, same winning instance, margin 0.1038, width 0.5458 so the halo
+# survives) and, when the repair is refused, composites through the delta-mask path instead
+# of failing the Segment.  Three dials reach that behaviour from ``design_ai.env``:
+# ``H3_CHARACTER_SWAP_SAM31_AUTO_BOX`` (``on`` / ``advisory`` / ``off``), its width cap
+# ``H3_CHARACTER_SWAP_SAM31_AUTO_BOX_MAX_WIDTH`` (default 0.60, the number that also decides
+# whether the hair halo stays armed) and ``H3_CHARACTER_SWAP_SAM31_WEAK_ASSOCIATION``
+# (``continue`` / ``abort``).  The pre-flight of round 102 now defaults to ``advisory``: it
+# measures and records, and no longer blocks a take on its own.
+#
+# Round 104 read the same mask videos further and found that the gate was not the problem.
+# The tracking graph had the word ``person`` written into its conditioning (P1's own caption
+# in this Project says "godzilla action figure by neca", P2's "a gundam ..."), so the
+# Godzilla in the right half of the Godzilla pass had **no instance of its own**: the only
+# human-shaped matte was the other performer (white share 0.210, union x 0.02-0.69) and the
+# other slots were a bottom sliver, one stray top frame and one empty slot.  Meanwhile one
+# slot's saved video was the frame itself -- mid-gray share 0.440-0.558 against 0.000-0.007
+# for a real matte -- and because the mask decoder reads any luma >= 96 as filled, it scored
+# as a body whose bbox covers 0.91 of the picture in all 56 samples and *won* the Godzilla
+# role from the only real body, 0.4517 against 0.4033, margin 0.0484.  That is the number
+# that appeared as ``R2 0.40``, and compositing on it would have smeared the whole frame.
+# So Studio now hands the Project's own words for each Picture to the worker on the pass row
+# (``sam31_target_recognition``), the worker widens the phrase to ``person, godzilla``, and
+# a slot whose video is not a matte is refused before scoring -- with the reason recorded in
+# the Manifest.  ``H3_CHARACTER_SWAP_SAM31_TEXT_PROMPT`` overrides the phrase and
+# ``H3_CHARACTER_SWAP_SAM31_DETECTION_THRESHOLD`` (default 0.35) is the detector's
+# confidence.  The stamp moves to 100: Segments cached under 99 are re-validated once, and a
+# re-captioned Picture now correctly counts as a change, because it changes what the tracker
+# is asked to hunt for.  Prompts, plates and QC verdicts themselves are untouched.
+#
+# Round 105 read the *next* run of the same Segment (02:08, policy 100) and the Popup era is
+# clearly over: pre-flight ``verdict: trusted`` (R1 0.9221 / R2 0.8065), take side R1 0.9189
+# and R2 0.7228 -- the Godzilla finally has its own instance -- ``fallback_reason`` empty,
+# one attempt, no Popup.  What failed now is the swap itself, and the Manifest says so:
+# ``character_swap_identity_failed: true`` with ``head_layer_only`` on both passes, P1's
+# ``target_likeness_score`` 0.019 and ``retention_score`` 0.754 (the source performer stayed
+# on screen), wardrobe shifts -0.0140 and -0.0376 against the 0.12 floor.  Frames agree: the
+# Gundam appears in the wide shots, the right-hand role never becomes Godzilla, and both
+# roles fall back to the source characters through the close-up stretch.  Two authored
+# decisions caused it.  The plate erased only the hair crown and the head
+# (``suppressed_frame_area`` 0.235) because the silent-listener gate is not a wardrobe gate
+# while ``H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE`` is ``off`` -- so QC graded a
+# body the plate was configured never to touch -- and the beat-scoped cast lock authored by
+# design_engine tells the model, of a Godzilla figure, to preserve its "exact recognizable
+# face, apparent age, hair, skin tone, body proportions, complete wardrobe, footwear and
+# accessories", a sentence the stored copy even truncates mid-word ("duplicate, r.").  A
+# third finding is structural: ``lean_audit`` pins the audit spec to ``maximum_attempts: 1``
+# on every non-legacy route while the shipped blocking lift is also 1, so a blocking
+# ``retry_fresh_seed`` verdict buys nothing and ``attempts_used: 1`` shipped beside it.
+# A Picture whose own words name a non-human body is therefore no longer swapped like a
+# person: the plate erases the body too, the cast lock becomes a rebuild-the-figure clause,
+# and one fresh seed is paid for.  The stamp moves to 101, which re-validates cached
+# Segments once; the new per-pass ``nonhuman_target_nouns`` also changes a Segment's content
+# fingerprint, correctly, because it changes what the render was told to build.
+# Round 111 -- the Studio copies design_ai.env's allowlisted render knobs into its own environment once,
+# at import, so a file edited afterwards silently kept rendering under the old values: neca_6's 20:33
+# take proves it (the file said NONHUMAN_RANKING=shape, the Manifest said policy 106, no roll was ever
+# tracked).  The process now remembers the fingerprint of the file it read and the pairs it installed,
+# and stamps that snapshot on every job so the worker can notice the file moved and refresh only the
+# Studio's own pairs.  Also gradeable for the first time: the face window's blur, which was hard-coded
+# at ``boxblur=18:2`` while the crown and garment bands already had knobs -- neca_6's 20:33 plate leaves
+# 25.83 % of the performer's own silhouette byte-identical (36.01 % across the seconds where the take
+# repaints the original girl) and 78.2 % of that sits inside a declared band, so strength, not band
+# layout, is what is left.  Both dials ship at the previously hard-coded values and are unarmed.
+SMART_RENDER_POLICY_VERSION = 108
 PROGRAM_MONITOR_FPS = 24.0
+
+# Close-up plates blur the selected V1 face so H3 stops over-conditioning on it.
+# Whether the torso band under that face is *also* suppressed is measured, not
+# assumed.  Four S4 takes (R2 -> P6, same v3 sheet, fresh seeds) each traded one
+# wardrobe fault for another: 97000314 head band only reproduced Picture 6's
+# plaid shirt and collar but kept one diagonal sash; 97000324 torso boxblur=40
+# plus desaturation erased the checked weave and Relay invented an ornate
+# medallion kimono with a wide belt; 97000334 torso boxblur=6 plus desaturation
+# kept the weave but Relay painted the plate's own grey tunic as an extra
+# sleeveless vest over Picture 6's shirt (torso-vs-P6 histogram correlation
+# +0.690 / +0.778 / +0.364 and weave gradient 15.30 / 14.17 / 15.62).  Seed
+# 97000344 repeated the head-band-only plate under policy 49 and scored +0.768
+# with weave 16.17 - the best garment palette of the series - while still
+# keeping the source actor's cross-collar sash.  The desaturated variants are
+# the only takes whose torso saturation collapsed (160 -> 103 mean chroma), so
+# the grey wash, not the blur, is what handed Relay a grey garment to paint.
+# Band strength is therefore a three-way knob instead of a boolean:
+#   off          head band only - shipped default (seed 97000344 evidence)
+#   blur         torso blur, chroma preserved: softens the source garment's
+#                collar/sash/layer edges without handing Relay a grey template
+#   blur_desat   torso blur plus hue=s= desaturation - the 97000324/97000334
+#                experiments, kept reproducible
+# Set H3_CHARACTER_SWAP_WARDROBE_BAND_MODE=blur|blur_desat, or the legacy
+# H3_CHARACTER_SWAP_WARDROBE_BAND=1 for blur_desat, to re-enable a band.
+CHARACTER_SWAP_WARDROBE_BAND_MODE = (
+    os.environ.get("H3_CHARACTER_SWAP_WARDROBE_BAND_MODE", "").strip().lower()
+)
+if CHARACTER_SWAP_WARDROBE_BAND_MODE not in {"off", "blur", "blur_desat"}:
+    CHARACTER_SWAP_WARDROBE_BAND_MODE = (
+        "blur_desat"
+        if os.environ.get("H3_CHARACTER_SWAP_WARDROBE_BAND", "").strip().lower()
+        not in {"", "0", "false", "no", "off"}
+        else "off"
+    )
+CHARACTER_SWAP_WARDROBE_BAND_ENABLED = (
+    CHARACTER_SWAP_WARDROBE_BAND_MODE != "off"
+)
+
+# ---------------------------------------------------------------------------
+# Round 49: manual-ComfyUI parity switches.
+#
+# The user grades the hand-built ComfyUI graph above everything Studio produced
+# for the same Picture 1, so the graph was read back node by node rather than
+# re-guessed.  Three Studio behaviours have no counterpart in that graph, and
+# each one is now opt-in instead of an unconditional step:
+#
+#   plate suppression   Studio blurred the V1 face (and sometimes the torso)
+#                       before Relay; the manual graph feeds the untouched V1.
+#                       Rounds 44-47 measured the blur as useful for extreme
+#                       close-ups, and Round 46 already measured it as harmful
+#                       for the torso ("a blurred torso is what makes H3 invent
+#                       a costume").  Off reproduces the manual plate;
+#                       H3_CHARACTER_SWAP_PLATE_SUPPRESSION=1 restores the
+#                       close-up gates exactly as they shipped in policy 81.
+#   silent audio strip  Studio muted the plate's own AAC track on Silent
+#                       Listener passes; the manual graph keeps the original
+#                       audio and still renders a closed mouth.  Off is the
+#                       manual behaviour; =1 restores the stripped plate.
+#   relay window split  Studio split an over-124-frame Shot into balanced
+#                       cold-start jobs so each piece began from frame one with
+#                       no previous window to inherit.  The manual graph submits
+#                       the Shot once and lets the native Relay loop chain its
+#                       windows through the 18-frame history, which is where the
+#                       "identity perfect in the second half, V1 in the first
+#                       half" complaint came from.  Off is the manual behaviour;
+#                       =1 restores the split.
+# Every switch reads affirmative values only, so an unset or empty name is off.
+# ---------------------------------------------------------------------------
+
+
+def _character_swap_parity_flag(name: str) -> bool:
+    """Return True only for an affirmative value of one parity switch."""
+
+    return (
+        os.environ.get(name, "").strip().lower()
+        not in {"", "0", "false", "no", "off"}
+    )
+
+
+CHARACTER_SWAP_PLATE_SUPPRESSION = _character_swap_parity_flag(
+    "H3_CHARACTER_SWAP_PLATE_SUPPRESSION"
+)
+
+
+def character_swap_plate_suppression_gate(
+    caption_illustrated: bool,
+    design_artwork_evidence: bool,
+    suppression_enabled: bool = False,
+) -> tuple[bool, str]:
+    """Whether the close-up plate gates may treat the reference as drawn artwork.
+
+    Round 94.  The gate used to ask the caption predicate only, and on this host
+    that predicate is quietly False for *every* cast picture: the Hallway Project's
+    Picture 1 row carries ``caption = ''`` and a
+    ``recognition`` that reads ``BLIP ERROR · BLIP service stopped unexpectedly
+    (exit 1)``, so nothing ever matched ``_ILLUSTRATED_CAST_TERMS`` and
+    ``H3_CHARACTER_SWAP_PLATE_SUPPRESSION=1`` bought nothing across three renders.
+    The same ``recognition`` says ``AUTO BACKGROUND REMOVAL: uniform edge-connected
+    background removed (52 % transparent)`` -- the cut-out evidence round 91 already
+    trusts for framing, where every graded cast picture in this workspace measures
+    46-68 % transparent and every photograph measures 0.0 %.
+
+    So the plate gate follows the same two-question rule round 91 established: the
+    *medium* question (is the source live-action?) keeps reading the caption, while
+    "is Relay's Picture 1 drawn art whose design has to survive?" is answered by
+    caption **or** cut-out.  A photograph cannot be re-labelled by accident, because
+    an opaque import never returns cut-out evidence; and
+    ``H3_ILLUSTRATED_CAST_IMAGE_EVIDENCE=0`` puts the whole image side back under
+    the caption-only rule, which is also the rollback for this gate.
+
+    Returns ``(may_suppress, evidence)`` with evidence in
+    ``{"off", "caption", "cutout", "none"}`` so the manifest can say which of the
+    three reasons a plate stayed untouched.
+    """
+
+    if not suppression_enabled:
+        return False, "off"
+    if caption_illustrated:
+        return True, "caption"
+    if design_artwork_evidence:
+        return True, "cutout"
+    return False, "none"
+CHARACTER_SWAP_SILENT_AUDIO_STRIP = _character_swap_parity_flag(
+    "H3_CHARACTER_SWAP_SILENT_AUDIO_STRIP"
+)
+CHARACTER_SWAP_RELAY_WINDOW_SPLIT = _character_swap_parity_flag(
+    "H3_CHARACTER_SWAP_RELAY_WINDOW_SPLIT"
+)
+
+# How the identity-suppression blur meets the unblurred plate.  Round-14 S2/S4/S6
+# evidence: the plate was built with a hard-edged ``crop -> boxblur -> overlay``,
+# so a person box that nearly fills the frame also smeared the wall behind the
+# actor (S6 box 0.1102,0,0.7408,0.5958 blurred 44 % of the frame, most of it
+# background).  H3 then re-drew the smeared wall as honeycomb/lattice texture and
+# the visible rectangle read as scene content.  ``feather`` composites the same
+# blurred regions through a rounded, gaussian-feathered alpha mask, which is the
+# recipe that survived the offline A/B in ``testing/_dsh_verify_9/round14/mask_ab``: the
+# wall outside the performer keeps its own geometry and there is no tool
+# rectangle.  Set ``H3_CHARACTER_SWAP_IDENTITY_MASK_MODE=rect`` to roll the plate
+# back to the hard-edged recipe.
+CHARACTER_SWAP_IDENTITY_MASK_MODE = (
+    os.environ.get("H3_CHARACTER_SWAP_IDENTITY_MASK_MODE", "feather")
+    .strip()
+    .lower()
+)
+if CHARACTER_SWAP_IDENTITY_MASK_MODE not in {"feather", "rect"}:
+    CHARACTER_SWAP_IDENTITY_MASK_MODE = "feather"
+
+# Floor for the medium-shot Silent Listener plate suppression.  Round 23 (black
+# shirt, seed 923000127, policy 65) graded the first valid Identity Sheet take:
+# the second small chibi is gone in 12/12 frames, but the pink twin-tail wig and
+# the source cosplayer's striped costume are still there in 12/12.  The worker
+# log holds zero suppression rows, because R1's plate box
+# ``[0.35, 0.15, 0.65, 0.45]`` (height 0.30, area 0.09) clears *no* blur gate,
+# so Relay received a pristine V1 plate.  The prompt side was not the problem:
+# character_swap_engine loosened its medium-shot silent clause to area >= 0.050
+# and height >= 0.25 (SILENT_REINFORCEMENT_MIN_BOX_*), so that take really did
+# carry MEDIUM-SHOT SILENT MOUTH REINFORCEMENT while the picture beside it kept
+# the source face in full detail.  A clause that says "the plate weakened its
+# face" next to an untouched plate is worse than no clause, so the Studio gate
+# now reads the engine's numbers instead of the older 0.12 / 0.35 pair.  Set
+# H3_CHARACTER_SWAP_MEDIUM_SILENT_MIN_AREA=0.12 and
+# H3_CHARACTER_SWAP_MEDIUM_SILENT_MIN_HEIGHT=0.35 to roll the plate back.
+
+
+def _medium_silent_blur_min_framing(environ=None) -> tuple[float, float]:
+    """(area, height) floor for the medium-shot silent blur, from a mapping.
+
+    Same reasoning as ``_identity_sheet_framing_medium_min_height``: the knobs
+    are merged into ``os.environ`` at import, so the stock answer is only
+    provable through an explicit mapping.  Missing or unusable values fall back
+    to the engine's silent-reinforcement tiers, which is the whole point of the
+    helper - prompt and plate must not disagree.
+    """
+
+    source = os.environ if environ is None else environ
+    pairs = (
+        ("H3_CHARACTER_SWAP_MEDIUM_SILENT_MIN_AREA",
+         SILENT_REINFORCEMENT_MIN_BOX_AREA),
+        ("H3_CHARACTER_SWAP_MEDIUM_SILENT_MIN_HEIGHT",
+         SILENT_REINFORCEMENT_MIN_BOX_HEIGHT),
+    )
+    values: list[float] = []
+    for name, fallback in pairs:
+        try:
+            value = float(source.get(name, fallback))
+        except (TypeError, ValueError):
+            value = float(fallback)
+        values.append(value if 0.0 <= value <= 1.0 else float(fallback))
+    return values[0], values[1]
+
+
+CHARACTER_SWAP_MEDIUM_SILENT_BLUR_MIN_AREA, \
+    CHARACTER_SWAP_MEDIUM_SILENT_BLUR_MIN_HEIGHT = (
+        _medium_silent_blur_min_framing()
+    )
+
+# How far down the silent listener's identity window reaches, as a share of the
+# authored box.  45 % was policy 66's answer to a different question -- keep torso,
+# hands and desk geometry so the replacement performance still has pose cues -- and
+# round 96 tried to reach further by arming the wardrobe band underneath instead.  It
+# was refused on the app's own numbers: the 19:56 and 20:14 takes (seed
+# 5474034667317928853 / 8564544838065224999) blurred y 0.519259-1.0 at 40.48 % of the
+# picture and unit 2's median similarity fell 0.486057 -> 0.325397 (worst sample
+# 0.287048), while the 4.23 s frame came back with long black hair down to the
+# shoulders and the 11.21 s frame with a full fringe over Picture 1's bald scalp.
+# With no neck and no collar left in the plate, H3 had nothing to anchor the neckline
+# on and rebuilt the erased actor's hair out of the blur -- the exact mechanism the
+# round-46 note below warns about, one region higher.
+# The residual defect of the *good* 19:22 take sits one step under the head band: a
+# pale lock beside the jaw at 4.23 s and 6.60 s and dark tufts at the temples and
+# nape at 11.21 s, all inside y 0.50-0.66.  Growing the identity window itself reaches
+# that band of pixels without touching the chest, and its column is already clipped at
+# the protected character's near edge (x 0.558136 here), so the kept character stays
+# sharp and -- unlike the wardrobe band -- no prompt clause flips.  0.65 is the
+# measured value: bottoms at y 0.657037 and y 0.5925, suppressed area 0.2043 -> 0.2617
+# and 0.1339 -> 0.1654, inside the engine's own 0.56 ceiling.  The shipped default
+# remains 0.45, which is the policy-67 plate every graded run before this one used.
+def _medium_silent_head_band_share(
+    environ: dict[str, str] | None = None,
+) -> float:
+    """Read how far down the silent listener's identity window reaches."""
+
+    source = os.environ if environ is None else environ
+    try:
+        value = float(
+            source.get(
+                "H3_CHARACTER_SWAP_MEDIUM_SILENT_HEAD_BAND_SHARE",
+                0.45,
+            )
+        )
+    except (TypeError, ValueError):
+        value = 0.45
+    return value if 0.05 <= value <= 1.0 else 0.45
+
+
+CHARACTER_SWAP_MEDIUM_SILENT_HEAD_BAND_SHARE = (
+    _medium_silent_head_band_share()
+)
+
+# Which band the medium-shot silent listener gets *under* its head band.  Round
+# 24 aligned the two gates (policy 66) and seed 923000227 graded the result: the
+# blurred head band really did hand the head to Picture 1 — the source cosplayer's
+# pink twin-tail wig and cat ears disappeared in 8 of 12 graded frames, and the
+# one segment whose plate head band lined up cleanly (seg2) adopted Picture 1's
+# whole outfit, black vest with white trim, blue tunic, yellow checkered socks and
+# black sneakers.  The other two segments kept the source cosplay on the torso in
+# 4/4 frames each, because for this gate the band below the head was still `off`:
+# a blurred-but-coloured garment is what re-seeds the original costume.  The
+# close-up gates have had a wardrobe band for a while; the silent-listener gate
+# never did, so the torso stayed the only region still voting for V1.
+#   off          head band only — the policy-66 plate, and the shipped default
+#                again after seed 923011007 (see the measurement below)
+#   blur         soften garment edges, keep chroma (policy 69-80 default, now
+#                the rollback arm)
+#   blur_desat   blur plus hue desaturation — the grey-template recipe measured on
+#                S4 seeds 97000324/97000334, kept one env away
+# Round 46 re-decided this knob on the same timeline, the same full-figure
+# identity sheet and one seed, graded on the wardrobe ruler alone (probes
+# ``working\_r45_band_ab.py`` for the plate and
+# ``working\_r41_wardrobe_replay.py`` for the takes).  The blurred wardrobe band
+# starts at y 0.285 and runs to the bottom of the frame, so it crushes 50.13 %
+# of the picture and merges the head and the whole torso into one colour blob:
+# H3 keeps the pose but paints the garment itself out of whatever palette the
+# source cosplayer left behind, which is where the red-gold imperial robe, the
+# odd motifs and the honeycomb came from.  With the band off the plate suppresses
+# 11.4 % (head band only) and the torso keeps its structure.  Seed 923011007
+# became the first Studio take to wear Picture 1's outfit end to end - black
+# top, blue hem, yellow checkered socks, black sneakers on white - with cartoon
+# hands instead of photoreal ones: the wardrobe rule passed 5/6 rows against 1/6
+# on the blurred arm (seed 923010907), mean ``wardrobe_shift`` went +0.0972 ->
+# +0.1658 and mean ``target_reference_similarity`` 0.5359 -> 0.5876.  That pairing
+# is directional rather than strict — seed 923010907 ran policy 78 with three
+# attempts per window, seed 923011007 ran policy 80 with one — and the strict
+# control (same seed, same windows, ``blur``) is still queued as an unrun Job.
+# Prompt length is not the argument either: the two pending policy-80 ``blur``
+# Job JSONs compile to 11935 characters, *fewer* than the 12208 that ``off``
+# actually submitted (budget 12320, ``dropped_tail_clauses`` empty), even though
+# the older policy-78 ``blur`` manifest did have the budget drop
+# ``plate_wardrobe_silent_clause``.  The argument is the plate itself: 50.13 % of
+# the frame smeared into one colour blob against 11.4 %.  Set
+# H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE=blur to bring
+# the policy-69..80 head-plus-wardrobe band back, or =blur_desat for the
+# grey-template recipe.  Note this is a regime flip, not one variable: ``off``
+# also drops the ``_wardrobe_blur_suppressed`` strategy suffix and swaps the
+# plate clause back to ``SOURCE PLATE FACE BLURRED``.
+
+
+def _medium_silent_wardrobe_band_mode(environ=None) -> str:
+    """Wardrobe-band mode for the medium-shot silent gate, from a mapping.
+
+    Same convention as the other plate knobs: stock values are only provable
+    through an explicit mapping because the real module constants are merged from
+    ``os.environ`` at import.  Anything unusable falls back to the shipped
+    default, and the close-up gates' independent
+    ``H3_CHARACTER_SWAP_WARDROBE_BAND_MODE`` is deliberately not consulted here.
+    """
+
+    source = os.environ if environ is None else environ
+    mode = str(source.get(
+        "H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE", ""
+    )).strip().lower()
+    return mode if mode in {"off", "blur", "blur_desat"} else "off"
+
+
+CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE = (
+    _medium_silent_wardrobe_band_mode()
+)
+
+# How the silent plate treats the strip of face the QC audits.  Round 37i
+# measured the three policy-74 segments of the black-shirt Project on the same
+# ruler: the generated take's registered mouth band moves 0.184-0.270, the
+# suppressed plate it was conditioned on 0.056-0.073, and the raw V1 clip 0.108-
+# 0.121.  So the plate already carries less mouth motion than the take — the
+# performer is talking in V1, and a blurred mouth still teaches "this person
+# articulates".  Five positive rewrite sentences (policy 74) did not stop it,
+# which is why the plate side is the next lever: temporally averaging the
+# registered band with ``tmix`` turns the source's residual lip-sync into a
+# smeared still, so the one region that can seed speech stops moving.
+#   on    freeze the registered mouth band (shipped default)
+#   off   roll the plate back to the policy-74 recipe
+# ``H3_CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE_FRAMES`` sets the averaging
+# window; 7 frames is ~0.29 s at the plate's own frame rate, enough to erase a
+# syllable-sized lip movement without freezing the head's gross motion.
+# Silent passes only: a speaking Shot needs its source mouth, and freezing it
+# would contradict the dialogue contract.
+
+
+def _silent_plate_mouth_freeze_settings(environ=None) -> tuple[str, int]:
+    """``(mode, tmix window)`` for the silent plate's mouth-band freeze.
+
+    Same convention as the other plate knobs: the values are only provable
+    through an explicit mapping, because the module constants are merged from
+    ``os.environ`` at import.  Anything unusable falls back to the shipped
+    default, and the freeze can never be applied to a non-silent pass.
+    """
+
+    source = os.environ if environ is None else environ
+    mode = str(source.get(
+        "H3_CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE", "on"
+    )).strip().lower()
+    if mode in {"0", "false", "no"}:
+        mode = "off"
+    if mode not in {"on", "off"}:
+        mode = "on"
+    try:
+        frames = int(
+            str(source.get(
+                "H3_CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE_FRAMES", "7"
+            )).strip() or "7"
+        )
+    except (TypeError, ValueError):
+        frames = 7
+    return mode, min(max(frames, 2), 60)
+
+
+(
+    CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE_MODE,
+    CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE_FRAMES,
+) = _silent_plate_mouth_freeze_settings()
+
+
+# How far the identity-suppression head band reaches around the selected face.
+# Round 24 aligned the medium-silent plate gates (policy 66) and seed 923000227
+# graded the result: with the head band aligned, the source cosplayer's pink
+# twin-tail wig and cat ears vanished in 8 of 12 frames, and the segment whose
+# band lined up cleanly also adopted Picture 1's whole outfit.  Round 28 re-ran
+# the same gate on the same footage with a band that lined up on the *face* only
+# (seed 3395346299780713753, head band 0.3620,0.1500,0.2760x0.1350): the head
+# came out as Picture 1 again — graded 完美 — while the wig stayed in every
+# frame, because the saved R1 box ``[0.35, 0.15, 0.65, 0.45]`` sits under the
+# hair.  On this plate the wig spans x 0.15-0.85 and y 0.03-0.75, so the box top
+# at 0.15 already excludes the crown and the box sides exclude the twin-tails.
+# The face was handed to Picture 1 and the hair was never asked about.  The halo
+# below grows the band over exactly that hair region and no further:
+#   up_share       extra band height above the box top, share of box height
+#   up_max         absolute cap, share of frame height
+#   up_max_masked  the same cap for a box that came from the auto contour rather
+#                  than from the director's hand (round 101).  A contour box ends
+#                  *at* the hair, so the shipped 0.18 pushes the band 0.165 into
+#                  empty background and H3 fills it -- round 100's cap.  The
+#                  default equals ``up_max``, so nothing moves until a director
+#                  asks for contour-trusting plates; it is clamped to ``up_max``
+#                  so it can only ever shorten the reach, never lengthen it.
+#   width_share    head-band width multiplier about the box centre
+#   width_max      cap on the *added* width, share of frame width
+#   max_box_width  halo only for boxes at most this wide — a face that already
+#                  fills its box needs no halo, and round 14 measured what a
+#                  44 %-of-frame band does to the wall behind the actor (S6
+#                  honeycomb background).  This is also what keeps the
+#                  multi-role all-dominant plates (boxes 0.92 / 0.896 wide)
+#                  byte-identical to policy 67.
+# A protected non-target gets its own box back: when its centre lies to one side
+# of the target's centre *and* it overlaps the band vertically, the band stops at
+# that person's near edge on that side, so the halo can never smear a face the
+# prompt just promised to keep stable (R1/R2 on this plate: R2 x 15-30 %,
+# y 25-45 %).  The band never shrinks below the pre-halo box, which is the
+# shipped behaviour, so clipping can only ever restore, never reduce, coverage.
+# Set ``H3_CHARACTER_SWAP_HAIR_HALO=0`` to roll the plate back to the exact box.
+
+
+def _hair_halo_parameters(environ=None) -> dict[str, float]:
+    """Hair-halo band parameters, read from an explicit mapping.
+
+    Same convention as every other plate knob in this module: the module
+    constants are merged from ``os.environ`` at import, so the stock answer is
+    only provable through a mapping.  Unusable values fall back to the shipped
+    default rather than to zero, because a silently-zeroed halo would change a
+    graded plate without reporting it.
+    """
+
+    source = os.environ if environ is None else environ
+    spec = (
+        ("up_share", 0.5, 4.0, "H3_CHARACTER_SWAP_HAIR_HALO_UP_SHARE"),
+        ("up_max", 0.18, 1.0, "H3_CHARACTER_SWAP_HAIR_HALO_UP_MAX"),
+        # Round 101: the auto contour's own cap.  Shipped at the ``up_max`` value so
+        # the arm is off by default and every plate graded before policy 97 stays
+        # byte-identical; a director arms it from ``design_ai.env`` when the shot's
+        # boxes are contour-derived and the crown is already inside the box.
+        (
+            "up_max_masked",
+            0.18,
+            1.0,
+            "H3_CHARACTER_SWAP_HAIR_HALO_UP_MAX_MASKED",
+        ),
+        ("width_share", 1.45, 4.0, "H3_CHARACTER_SWAP_HAIR_HALO_WIDTH_SHARE"),
+        ("width_max", 0.25, 1.0, "H3_CHARACTER_SWAP_HAIR_HALO_WIDTH_MAX"),
+        (
+            "max_box_width",
+            0.60,
+            1.0,
+            "H3_CHARACTER_SWAP_HAIR_HALO_MAX_BOX_WIDTH",
+        ),
+    )
+    values: dict[str, float] = {}
+    for name, default, upper, env_name in spec:
+        try:
+            value = float(source.get(env_name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        values[name] = value if 0.0 <= value <= upper else float(default)
+    # The contour arm may only ever shorten the reach.  A mis-typed 1.0 in the file
+    # must not hand a plate a band taller than the shipped one, because the reach is
+    # the one number round 100 proved H3 reads as "how much canvas may I fill".
+    values["up_max_masked"] = min(
+        float(values.get("up_max_masked", 0.0)),
+        float(values.get("up_max", 0.0)),
+    )
+    flag = str(source.get("H3_CHARACTER_SWAP_HAIR_HALO", "")).strip().lower()
+    values["enabled"] = (
+        0.0 if flag in {"0", "off", "false", "no"} else 1.0
+    )
+    return values
+
+
+CHARACTER_SWAP_HAIR_HALO_PARAMETERS = _hair_halo_parameters()
+
+
+def _hair_halo_parameters_for_provenance(
+    halo: dict[str, float],
+    provenance: object,
+) -> dict[str, float]:
+    """The halo parameters a box of this provenance should be grown with.
+
+    Round 100 graded the same actor twice: with the director's hand box the crown
+    landed inside the identity window, and with an auto contour of the same person
+    it did not -- a contour ends *at* the hair, so the shipped upward reach parked a
+    band of featureless background over the head and H3 filled it with a cap whose
+    top edge was flush with the band.  The engine now marks which rectangles the Shot
+    Visual Editor authored (``source_bbox_provenance``), and only that marker takes
+    the shorter reach.  Anything else -- an older ledger, a merged role row, an
+    offline probe -- keeps the shipped numbers, so this arm can never fire on a pass
+    that was not compiled knowing the difference.
+    """
+
+    if not halo or not halo.get("enabled"):
+        return halo
+    if str(provenance or "").strip().casefold() != "auto_contour":
+        return halo
+    masked = float(halo.get("up_max_masked", 0.0))
+    if masked >= float(halo.get("up_max", 0.0)):
+        # Armed at the shipped value, which is the default: hand and contour boxes
+        # compile the same band, and the plate stays byte-identical.
+        return halo
+    return {**halo, "up_max": masked}
+
+# How much of the selected performer's *figure* the plate suppresses below the
+# head band.  Seed 923001027 (policy 68) graded the split exactly: the head came
+# out as Picture 1's cartoon in all three segments, and the body kept voting for
+# V1 — the cosplayer's black cat-ear crown, gem-studded headband, pink/black
+# striped sleeves and skirt stayed sharp from x 0.10-0.90 / y 0.03-1.0, about 60 %
+# of the frame, while the plate blurred 18 %.  Both bands were derived from the
+# same source: ``source_bbox_normalized`` is the AI role census' *thumbnail* box
+# (0.30 x 0.30 here), not a hand-drawn full-figure box, so a band built from it
+# stops under the actor's chest and everything outside it is copied verbatim.
+# Policy 69 grows the garment band down and sideways to the visible body — a
+# head is one head wide, shoulders are roughly two — and keeps the head band's
+# bottom edge, so the wording the engine already spends on a soft crown-to-hip
+# window describes the plate honestly instead of claiming more than it covers.
+# Protected roles are cut out of the grown rectangle rather than merely pushed
+# sideways, because the box that used to clamp the halo's growth is a bystander's
+# *whole* body: her face only needs her own rectangle.
+# The growth is bounded by an area cap, since round 13 measured what happens when
+# the plate keeps no readable body at all: H3 reconstructs an age and an outfit
+# from the colour distribution.  The shipped cap of 0.56 of the frame is the
+# widest candidate that still keeps a standing actor's sleeves and legs inside the
+# soft window on this cast (measured offline on seed 923001027: 0.40 of the frame
+# at the policy-68 width, 0.50 once the bystander is cut back out, and the older
+# 62 % take had no clause at all).  Set ``H3_CHARACTER_SWAP_FIGURE_EXTENT=0`` to
+# roll the plate back to the exact policy-68 box.
+
+
+def _figure_extent_parameters(environ=None) -> dict[str, float]:
+    """Figure-extent band parameters, read from an explicit mapping.
+
+    Same convention as every other plate knob in this module: the module
+    constants are merged from ``os.environ`` at import, so the stock answer is
+    only provable through a mapping, and an unusable value falls back to the
+    shipped default instead of silently zeroing a graded plate.
+    """
+
+    source = os.environ if environ is None else environ
+    spec = (
+        ("width_share", 1.75, 4.0, "H3_CHARACTER_SWAP_FIGURE_WIDTH_SHARE"),
+        ("max_width", 0.80, 1.0, "H3_CHARACTER_SWAP_FIGURE_MAX_WIDTH"),
+        ("bottom", 1.0, 1.0, "H3_CHARACTER_SWAP_FIGURE_BOTTOM"),
+        ("max_area", 0.56, 1.0, "H3_CHARACTER_SWAP_FIGURE_MAX_AREA"),
+        (
+            "min_piece_width",
+            0.06,
+            1.0,
+            "H3_CHARACTER_SWAP_FIGURE_MIN_PIECE_WIDTH",
+        ),
+        (
+            "min_piece_height",
+            0.06,
+            1.0,
+            "H3_CHARACTER_SWAP_FIGURE_MIN_PIECE_HEIGHT",
+        ),
+    )
+    values: dict[str, float] = {}
+    for name, default, upper, env_name in spec:
+        try:
+            value = float(source.get(env_name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        values[name] = value if 0.0 <= value <= upper else float(default)
+    if values["bottom"] <= 0.0:
+        values["bottom"] = 1.0
+    flag = str(source.get("H3_CHARACTER_SWAP_FIGURE_EXTENT", "")).strip().lower()
+    values["enabled"] = (
+        0.0 if flag in {"0", "off", "false", "no"} else 1.0
+    )
+    return values
+
+
+CHARACTER_SWAP_FIGURE_EXTENT_PARAMETERS = _figure_extent_parameters()
+
+
+# Whether the crown of the head band is filtered harder than the face under it.
+# Seed 923001027 graded three plates under three policies and the crown is the one
+# region that never came out as Picture 1.  The shipped chroma-preserving head
+# band kept the cosplayer's black cat-ear crown, gem-studded headband and long
+# wig, and round 33's whole-window desaturation made it worse: draining the
+# garment's chroma left the crown coloured while V1 stayed sharp below the window,
+# so the model rebuilt the original cosplay out of the grey silhouette (identity
+# similarity 0.5753 against 0.5873 for the shipped blur, and the crown survived in
+# every graded frame of both arms).  The window therefore has to stop treating hair
+# like a face.  A face needs spatial blur only, because its chroma is replaced
+# along with the head; a crown — where a wig, cat ears and a headband live — needs
+# the same blur plus a saturation drain, or its own colour keeps re-seeding itself
+# under Picture 1's hair.
+# The split costs nothing the prompt has to pay for.  The crown piece and the face
+# piece below it tile the same rectangle, the face band keeps the shipped bottom
+# edge (which is the one number character_swap_engine reads), and the sentence
+# about who owns the hair already ships as ``source_hair_ownership_clause``.
+#   off          one head band, chroma preserved — shipped default
+#   blur_desat   crown slice blurred plus desaturated, face band as shipped
+# Set H3_CHARACTER_SWAP_HAIR_BAND_MODE=blur_desat to try the split.
+
+
+def _hair_band_mode(environ=None) -> str:
+    """Crown-band mode for the identity-suppression head band, from a mapping.
+
+    Same convention as every other plate knob: the module constants are merged
+    from ``os.environ`` at import, so the stock answer is only provable through an
+    explicit mapping.  Anything unusable falls back to ``off``, because a plate
+    that silently started desaturating crowns would change a graded take without
+    reporting it.
+    """
+
+    source = os.environ if environ is None else environ
+    mode = str(source.get("H3_CHARACTER_SWAP_HAIR_BAND_MODE", "")).strip().lower()
+    return mode if mode in {"off", "blur_desat"} else "off"
+
+
+def _hair_band_parameters(environ=None) -> dict[str, float]:
+    """Crown-band parameters, read from an explicit mapping.
+
+    ``vertical_share`` is the top slice of the head band — the part of the window
+    a wig or a pair of cat ears occupies — and ``min_band_height`` is the floor
+    both the crown and the face band left under it have to clear, since a band
+    thinner than that is a tool mark rather than a suppression window.
+    ``saturation`` of 1.0 means "blur the crown, leave its colour alone", which is
+    how the crown-only half of the experiment stays measurable.  ``extra_sigma``
+    is the second lever, kept at zero until the blur radius alone is graded:
+    ``boxblur`` cannot reach the low frequencies a long wig hides in and ``gblur``
+    can.  Unusable values fall back to the shipped default instead of silently
+    zeroing a graded plate.
+    """
+
+    source = os.environ if environ is None else environ
+    spec = (
+        ("vertical_share", 0.42, 1.0, "H3_CHARACTER_SWAP_HAIR_BAND_SHARE"),
+        ("saturation", 0.25, 1.0, "H3_CHARACTER_SWAP_HAIR_SATURATION"),
+        ("blur_radius", 18.0, 64.0, "H3_CHARACTER_SWAP_HAIR_BLUR_RADIUS"),
+        ("extra_sigma", 0.0, 32.0, "H3_CHARACTER_SWAP_HAIR_EXTRA_SIGMA"),
+        (
+            "min_band_height",
+            0.05,
+            1.0,
+            "H3_CHARACTER_SWAP_HAIR_BAND_MIN_HEIGHT",
+        ),
+    )
+    values: dict[str, float] = {}
+    for name, default, upper, env_name in spec:
+        try:
+            value = float(source.get(env_name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        values[name] = value if 0.0 <= value <= upper else float(default)
+    values["enabled"] = 0.0 if _hair_band_mode(source) == "off" else 1.0
+    return values
+
+
+CHARACTER_SWAP_HAIR_BAND_MODE = _hair_band_mode()
+CHARACTER_SWAP_HAIR_BAND_PARAMETERS = _hair_band_parameters()
+
+
+def _head_band_parameters(environ: dict[str, str] | None = None) -> dict[str, float]:
+    """How hard the face window itself is blurred on the identity-suppressed plate.
+
+    Round 111: the crown answers to ``H3_CHARACTER_SWAP_HAIR_BLUR_RADIUS`` and the garment band to
+    ``WARDROBE_BLUR_RADIUS``, but the face -- the region whose pixels actually carry identity -- was
+    pinned at ``boxblur=18:2`` with no way to grade it.  neca_6's 20:33 plate measures 25.83 % of the
+    performer's own silhouette left byte-for-byte untouched, 36.01 % across 3.75-6.25 s, which are the
+    exact seconds where the take repaints the original girl over the Gundam; 78.2 % of those survivors
+    already sit *inside* a declared band, and widening the bands to what the tracker reports would cost
+    0.6629 of the frame against the 0.62 cap while reaching only 20.9 % more of them.  Strength, not
+    area, is the remaining lever: replaying the shipped rectangles on the raw V1 plate under the same
+    metric leaves 0.1250 at boxblur 18, 0.0985 at 30, 0.0681 at 45, and 0.0524 when every rectangle is
+    filled with flat grey -- the ceiling is set by silhouette the rectangles never cover, not by the
+    blur, which is why this ships at today's values and stays unarmed until the director grades it.
+    """
+
+    source = os.environ if environ is None else environ
+    spec = (
+        ("blur_radius", 18.0, 128.0, "H3_CHARACTER_SWAP_HEAD_BLUR_RADIUS"),
+        ("extra_sigma", 0.0, 32.0, "H3_CHARACTER_SWAP_HEAD_EXTRA_SIGMA"),
+    )
+    values: dict[str, float] = {}
+    for name, default, upper, env_name in spec:
+        try:
+            value = float(source.get(env_name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        values[name] = value if 0.0 <= value <= upper else float(default)
+    return values
+
+
+CHARACTER_SWAP_HEAD_BAND_PARAMETERS = _head_band_parameters()
+
+
+def _subtract_protected_boxes(
+    rects: tuple | list,
+    protected_boxes: tuple | list = (),
+) -> list[tuple[float, float, float, float]]:
+    """Exact rectangle subtraction: ``rects`` minus every protected box.
+
+    Each surviving piece stays an axis-aligned rectangle, which is what the
+    ffmpeg ROI graph and the feathered plate mask can both draw, and the pieces
+    never overlap, so the reported suppressed area is the real suppressed area.
+    """
+
+    pieces = [tuple(float(value) for value in rect) for rect in rects or ()]
+    for protected in protected_boxes or ():
+        try:
+            x1, y1, x2, y2 = (float(value) for value in protected)
+        except (TypeError, ValueError):
+            continue
+        if not all(0.0 <= value <= 1.0 for value in (x1, y1, x2, y2)):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        kept: list[tuple[float, float, float, float]] = []
+        for left, top, width, height in pieces:
+            right, bottom = left + width, top + height
+            if x2 <= left or x1 >= right or y2 <= top or y1 >= bottom:
+                kept.append((left, top, width, height))
+                continue
+            overlap_left = max(left, x1)
+            overlap_right = min(right, x2)
+            if overlap_right <= overlap_left:
+                kept.append((left, top, width, height))
+                continue
+            if x1 > left:
+                kept.append((left, top, x1 - left, height))
+            if x2 < right:
+                kept.append((x2, top, right - x2, height))
+            if y1 > top:
+                kept.append(
+                    (overlap_left, top, overlap_right - overlap_left, y1 - top)
+                )
+            if y2 < bottom:
+                kept.append(
+                    (
+                        overlap_left,
+                        y2,
+                        overlap_right - overlap_left,
+                        bottom - y2,
+                    )
+                )
+        pieces = [p for p in kept if p[2] > 0.0 and p[3] > 0.0]
+    return pieces
+
+
+def _hair_accessory_band_boxes(
+    head_band: tuple,
+    parameters: dict | None = None,
+    protected_boxes: tuple | list = (),
+) -> tuple[list[tuple[float, float, float, float]], tuple[float, float, float, float]]:
+    """Split a head band into (crown pieces, face band) for hair suppression.
+
+    ``head_band`` is the band that is about to be blurred, as
+    ``(left, top, width, height)``.  The crown is the top ``vertical_share`` of
+    it — the part of the window a wig, a pair of animal ears or a headband
+    occupies — and the face band is what remains below it, which keeps the
+    shipped bottom edge.  The two tile the original rectangle, so the suppressed
+    area, the engine's ``head_band_bottom`` and every clause that depends on that
+    number do not move.  Protected bystanders are cut back out of the crown the
+    same way ``_figure_extent_band_boxes`` cuts them out of a grown garment band:
+    the prompt just promised to keep those people stable, and a sliver of a
+    bystander's hairline is not worth a tool mark, so a piece smaller than
+    ``min_band_height`` in either axis is dropped rather than blurred.
+
+    Returns ``([], head_band)`` when the knob is off, when the crown would be
+    thinner than ``min_band_height``, when the bystanders ate the crown, or when
+    the face band left under it would be — that last one because
+    character_swap_engine reads the bottom edge of the band whose kind is
+    ``head``, so a head band that stopped existing would silently reselect its
+    wording.  That is also what keeps the shipped plate byte-identical while the
+    mode is off.
+    """
+
+    try:
+        left, top, width, height = (float(value) for value in head_band)
+    except (TypeError, ValueError):
+        return [], (0.0, 0.0, 0.0, 0.0)
+    face_band = (
+        round(left, 6),
+        round(top, 6),
+        round(width, 6),
+        round(height, 6),
+    )
+    params = parameters or {}
+    if not params.get("enabled"):
+        return [], face_band
+    if width <= 0.0 or height <= 0.0:
+        return [], face_band
+    try:
+        share = float(params.get("vertical_share", 0.0))
+        min_band_height = float(params.get("min_band_height", 0.0))
+    except (TypeError, ValueError):
+        return [], face_band
+    crown_height = height * min(max(share, 0.0), 1.0)
+    bottom = top + height
+    if (
+        crown_height < min_band_height
+        # The remnant is a *height*, so it has to be measured against the band's
+        # height and not against its bottom coordinate: comparing ``bottom`` to
+        # ``crown_height`` let a share of 1.0 keep splitting and hand back a face
+        # band of zero height, which the engine would still read as a head band.
+        or height - min(crown_height, height) < min_band_height
+    ):
+        return [], face_band
+    crown_bottom = top + crown_height
+    pieces = [
+        piece
+        for piece in _subtract_protected_boxes(
+            [(left, top, width, round(crown_height, 6))], protected_boxes
+        )
+        if piece[2] >= min_band_height and piece[3] >= min_band_height
+    ]
+    if not pieces:
+        return [], face_band
+    return (
+        [
+            tuple(round(value, 6) for value in piece) for piece in pieces
+        ],
+        (
+            round(left, 6),
+            round(crown_bottom, 6),
+            round(width, 6),
+            round(max(0.0, bottom - crown_bottom), 6),
+        ),
+    )
+
+
+def _figure_extent_band_boxes(
+    centre: float,
+    band_top: float,
+    baseline: tuple,
+    head_width: float,
+    head_area: float,
+    protected_boxes: tuple | list = (),
+    parameters: dict | None = None,
+) -> list[tuple[float, float, float, float]]:
+    """Rectangle(s) for the visible body under the head band, or the baseline.
+
+    ``baseline`` is the policy-68 garment band ``(left, top, width, height)`` and
+    is what this returns when the knob is off, when no grown box passes the area
+    cap, or when the grown box would leave nothing worth blurring.  Candidates
+    shrink in width only, because depth is the whole point: the actor's legs and
+    the lower half of her costume live below the census box.  ``head_area`` is
+    charged against ``max_area`` so the cap means the total suppressed frame, not
+    just the new band.
+    """
+
+    base_left, base_top, base_width, base_height = (
+        float(value) for value in baseline
+    )
+    baseline_rects = [
+        (
+            round(base_left, 6),
+            round(base_top, 6),
+            round(base_width, 6),
+            round(base_height, 6),
+        )
+    ]
+    params = parameters or {}
+    if not params.get("enabled"):
+        return list(baseline_rects)
+    max_width = float(params.get("max_width", 1.0))
+    grown_width = max(
+        min(
+            max(head_width * float(params.get("width_share", 1.0)), base_width),
+            max_width,
+        ),
+        base_width,
+    )
+    band_bottom = min(1.0, max(base_top + base_height, float(params.get("bottom", 1.0))))
+    min_piece_width = float(params.get("min_piece_width", 0.06))
+    min_piece_height = float(params.get("min_piece_height", 0.06))
+    max_area = float(params.get("max_area", 1.0))
+    band_height = band_bottom - band_top
+    if band_height > 0.0:
+        for width in (grown_width, grown_width * 0.8, base_width):
+            if width <= 0.0 or width > 1.0:
+                continue
+            left = min(max(0.0, float(centre) - (width / 2.0)), 1.0 - width)
+            pieces = _subtract_protected_boxes(
+                [(left, band_top, width, band_height)], protected_boxes
+            )
+            pieces = [
+                piece
+                for piece in pieces
+                if piece[2] >= min_piece_width and piece[3] >= min_piece_height
+            ]
+            if not pieces:
+                continue
+            if float(head_area) + sum(
+                piece[2] * piece[3] for piece in pieces
+            ) > max_area:
+                continue
+            return [
+                tuple(round(value, 6) for value in piece) for piece in pieces
+            ]
+    return list(baseline_rects)
+
+
+def _hair_halo_band_box(
+    box_left: float,
+    box_top: float,
+    box_width: float,
+    box_height: float,
+    baseline_left: float,
+    baseline_top: float,
+    baseline_width: float,
+    halo: dict[str, float],
+    protected_boxes: tuple | list = (),
+) -> tuple[float, float, float]:
+    """(left, top, width) of a head band grown over the source actor's hair.
+
+    The band keeps its baseline bottom edge — that is where pose and torso
+    information is still being supplied to Relay — and only grows upward and
+    sideways, which is where the hair lives.  ``protected_boxes`` are normalized
+    ``(x1, y1, x2, y2)`` boxes of people this pass must not modify; each one
+    takes back the side of the band its own centre falls on.
+    """
+
+    left, top, width = baseline_left, baseline_top, baseline_width
+    if not halo or not halo.get("enabled"):
+        return (
+            round(max(0.0, min(left, 1.0)), 6),
+            round(max(0.0, min(top, 1.0)), 6),
+            round(max(0.0, min(width, 1.0)), 6),
+        )
+    if box_width > float(halo.get("max_box_width", 0.0)):
+        # A face that already fills its box has no hair outside it to reach.
+        return (
+            round(max(0.0, min(left, 1.0)), 6),
+            round(max(0.0, min(top, 1.0)), 6),
+            round(max(0.0, min(width, 1.0)), 6),
+        )
+    centre = box_left + (box_width / 2.0)
+    grown = min(
+        width * float(halo.get("width_share", 1.0)),
+        width + float(halo.get("width_max", 0.0)),
+    )
+    grown = max(grown, width)
+    new_left = centre - (grown / 2.0)
+    new_right = centre + (grown / 2.0)
+    band_bottom = max(baseline_top, box_top + box_height)
+    for protected in protected_boxes or ():
+        try:
+            x1, y1, x2, y2 = (float(value) for value in protected)
+        except (TypeError, ValueError):
+            continue
+        if not all(0.0 <= value <= 1.0 for value in (x1, y1, x2, y2)):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        if y2 < top or y1 > band_bottom:
+            # Nobody standing in that column of the band.
+            continue
+        if (x1 + x2) / 2.0 < centre:
+            new_left = max(new_left, x2)
+        else:
+            new_right = min(new_right, x1)
+    # Clipping may cut into the halo but never into the shipped band.
+    new_left = min(new_left, left)
+    new_right = max(new_right, left + width)
+    new_left = max(0.0, new_left)
+    new_right = min(1.0, new_right)
+    up = min(
+        box_height * float(halo.get("up_share", 0.0)),
+        float(halo.get("up_max", 0.0)),
+    )
+    new_top = max(0.0, min(baseline_top, baseline_top - max(0.0, up)))
+    return (
+        round(new_left, 6),
+        round(new_top, 6),
+        round(max(0.0, new_right - new_left), 6),
+    )
+
+
+# Which line the Identity Sheet's wardrobe panel is cut at.  Both gated Shot
+# classes now cut at the hip (``uhip``).  Round 17 settled it with the first
+# single-variable comparison: seeds 97000804 (S3, chest crop, head coverage
+# 0.4473) and 97000824 (S3, hip crop, head coverage 0.3421) share policy 59,
+# sheet engine 5, the same plate, the same suppression geometry and the same
+# 12132-character prompt - only the crop line differs.  The chest crop produced
+# no glasses, a flat-banded hat and the source actor's golden medallion robe;
+# the hip crop produced Picture 1's round wire glasses, its black hat with the
+# gold band and red-top plaque, and the dark chest panel carrying Picture 1's
+# three white dots.  Seed 97000814 (S2, hip crop) and 97000834 (S10, hip crop)
+# reproduce the same effect, and no take in that round gained a second
+# character, so the round-15 clone fear does not apply to a hip-height panel
+# (only to the uncut neck-down figure).  The crop stays selectable per Project:
+#   close_up  cut every gated Shot's wardrobe panel at the chest
+#   medium    cut it at the hip (whole yellow robe and trousers stay in frame)
+#   full      keep the whole neck-down figure (hem, trousers, shoes) and still
+#             trade canvas to the face panels (round 28: the hip cut stops
+#             *above* the yellow checked trousers, so those rows had no
+#             reference at all and the user graded "衣服完全不像参考图")
+#   none      pass no view at all, so the panel keeps the entire neck-down figure
+#             without the face-vs-wardrobe re-weighting
+# Empty (default) keeps the automatic per-Shot choice, which is now ``full`` for
+# a medium-shot silent listener or a Shot whose framing reaches the hips, and
+# ``medium`` for a verified close-up (round 17: the chest crop hides the rows
+# that make Picture 1 recognisable); ``close_up`` remains reachable through this
+# override.
+IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE = (
+    os.environ.get("H3_IDENTITY_SHEET_OUTFIT_VIEW", "").strip().lower()
+)
+if IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE not in {
+    "", "close_up", "medium", "full", "none"
+}:
+    IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE = ""
+
+# Single-figure passthrough kill-switch.  When Picture 1 is already a big-figure
+# full-body design, the composed sheet costs head pixels and hands H3 a layout it
+# keeps reproducing inside the scene (the black-shirt Project rendered the sheet's
+# border and its headless lower panel at every Relay window start).  ``0`` /
+# ``off`` / ``false`` / ``no`` restores the previous "always sheet it when the
+# frame head share is under 0.22" behaviour without touching any other rule.
+IDENTITY_SHEET_SINGLE_FIGURE_PASSTHROUGH = (
+    os.environ.get("H3_IDENTITY_SHEET_SINGLE_FIGURE_PASSTHROUGH", "")
+    .strip()
+    .lower()
+    not in {"0", "off", "false", "no"}
+)
+# Resolution floor for the same rule.  The passthrough above only ever weighed
+# the *layout* cost, so it also fired for a 252x370 WhatsApp cut-out (0.093 MP):
+# the black-shirt Project's Picture 1 went up the wire untouched, Relay's
+# ImageScaleToTotalPixels node upscaled it 4.6x before conditioning, and every
+# take kept the palette while inventing the face, the age and the wardrobe.  The
+# composed Identity Sheet is native ~1.0 MP (this Project's measures 800x1216 =
+# 0.973 MP), so an artwork below this floor now goes up as the sheet instead, at
+# the one-face + whole-figure layout.  An artwork already big enough to fill the
+# Relay reference budget is still passed through with no layout to reproduce.
+# ``H3_IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS=0`` restores the pre-floor behaviour.
+
+
+def _identity_sheet_min_source_megapixels(environ=None) -> float:
+    """Parse ``H3_IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS`` out of a mapping.
+
+    Same explicit-mapping pattern as the framing knob above, so the stock
+    default stays provable on a checkout that ships the knob in
+    ``design_ai.env``.  Anything unusable means the 0.35 MP stock floor; 0 or a
+    negative value turns the floor off (always pass a big figure through).
+    """
+
+    source = os.environ if environ is None else environ
+    try:
+        value = float(
+            source.get("H3_IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS", "0.35")
+        )
+    except (TypeError, ValueError):
+        return 0.35
+    if value <= 0.0:
+        return 0.0
+    return min(value, 4.0)
+
+
+IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS = _identity_sheet_min_source_megapixels()
+# Whole-body QC strength.  ``on`` (default) fails a take whose body region never
+# moved towards Picture 1's wardrobe; ``advisory`` records the measurement without
+# spending a fresh seed on it; ``off`` skips the sampling entirely.  The floor and
+# the calibration frames are in character_swap_engine so the offline probes and the
+# worker read the same number.
+CHARACTER_SWAP_WARDROBE_AUDIT_MODE = (
+    os.environ.get("H3_CHARACTER_SWAP_WARDROBE_AUDIT", "on").strip().lower()
+)
+if CHARACTER_SWAP_WARDROBE_AUDIT_MODE not in {"on", "advisory", "off"}:
+    CHARACTER_SWAP_WARDROBE_AUDIT_MODE = "on"
+
+
+# Round 122（2026-11-11，导演选"删掉第 13 步：身份 QC 只记录不拦"）。
+#
+# h3_project_333 那一枪其实渲染完成（``segment.status = "complete"``、
+# ``generated_preview.mp4`` 也在），判它"失败"的是身份 QC：``target_reference_similarity
+# = 0.319801``、``quality_risk_score = 1.059735``、``attempts_used = 1``，而
+# ``character_swap_identity_failed`` 会被 8 处审批/取用门引用（:39939 / :40011 / :40097 /
+# :42086 / :42100 / :42231 / :42288 / :42353），于是这段片子在 Studio 里既不算干净 Segment
+# 也进不了后续复用。导演现在要先看画面再判好坏，所以 ``record`` 模式把判决降级：
+# audit、尝试表、``character_swap_identity_failed`` 全都照样落盘，只是不再拦。
+# 默认仍是 ``gate``（旧行为）；写坏了也回默认，不会因为一个错字把 QC 悄悄关掉。
+# 这个名字读的是调用时的环境，改完不必重开 Studio。
+def _character_swap_identity_qc_mode(environ=None) -> str:
+    """Parse ``H3_CHARACTER_SWAP_IDENTITY_QC``（``gate`` 默认 / ``record``）."""
+
+    source = os.environ if environ is None else environ
+    mode = str(source.get("H3_CHARACTER_SWAP_IDENTITY_QC", "gate")).strip().lower()
+    return mode if mode in {"gate", "record"} else "gate"
+
+
+CHARACTER_SWAP_IDENTITY_QC_MODE = _character_swap_identity_qc_mode()
+
+# Identity Sheet layouts the Project may select.  Kept as a module-level set so
+# opening an older or hand-edited Project JSON cannot install an unknown preset.
+SHEET_PRESET_KEYS = frozenset(SHEET_PRESETS)
+# Panels that can show a face.  The ``outfit`` slot is cropped from the neck
+# down, so it carries wardrobe authority without a second face.
+IDENTITY_SHEET_FACE_PANEL_SLOTS = frozenset({"head", "body", "full"})
+# Layout a close-up / medium-silent Shot must use whatever the user picked.
+# Round-14 S2 evidence: a close-up V1 frame has room for one face, and a sheet
+# with two face-bearing panels (head + full figure) was read as two people, so
+# Relay cloned the character.  Preset 8 pairs the head with the neck-down
+# outfit panel.  ``H3_IDENTITY_SHEET_CLOSEUP_PRESET=-1`` keeps the user's pick
+# for every Shot.
+try:
+    IDENTITY_SHEET_CLOSEUP_PRESET = int(
+        os.environ.get("H3_IDENTITY_SHEET_CLOSEUP_PRESET", "8")
+    )
+except (TypeError, ValueError):
+    IDENTITY_SHEET_CLOSEUP_PRESET = 8
+if IDENTITY_SHEET_CLOSEUP_PRESET not in SHEET_PRESET_KEYS and (
+    IDENTITY_SHEET_CLOSEUP_PRESET != -1
+):
+    IDENTITY_SHEET_CLOSEUP_PRESET = 8
+# Framing-based fallback for the same layout rule.  Both gates that force it are
+# keyed to plate suppression (a verified close-up box, or a Silent Listener box at
+# height >= 0.35 with tracked mouth samples), so a Shot whose performer sits at
+# height 0.30 with an untouched plate - exactly the round-22 black-shirt take -
+# reaches Relay with the two-face head-plus-whole-body layout and gets a second,
+# smaller standing copy of Picture 1 in 4 of 12 sampled frames.  The layout should
+# follow the framing, because the room for a second face is decided by the Shot,
+# not by whether a blur band was applied.  A box at least this tall therefore gets
+# the single-face layout and the hip-height wardrobe panel too.  0.0 (default)
+# keeps the gates as the only trigger, so this stays an opt-in experiment until a
+# take confirms it.
+
+
+def _identity_sheet_framing_medium_min_height(environ=None) -> float:
+    """Parse ``H3_IDENTITY_SHEET_MEDIUM_FRAMING_MIN_HEIGHT`` out of a mapping.
+
+    Reading it as a function of an explicit mapping keeps the stock default
+    provable even when a Project ships the knob in ``design_ai.env``: the knob
+    is merged into ``os.environ`` at import, so an ambient assertion would only
+    hold on an unconfigured checkout.  Anything unusable means 0.0 = off.
+    """
+
+    source = os.environ if environ is None else environ
+    try:
+        value = float(
+            source.get("H3_IDENTITY_SHEET_MEDIUM_FRAMING_MIN_HEIGHT", "0.0")
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    return value if 0.0 <= value <= 1.0 else 0.0
+
+
+IDENTITY_SHEET_FRAMING_MEDIUM_MIN_HEIGHT = (
+    _identity_sheet_framing_medium_min_height()
+)
+# Floor for the same gate: a box this short in area is a background extra or a
+# stray detection, and handing it the wardrobe panel is what produced the second
+# small copy in the first place, so it keeps the ordinary layout.
+IDENTITY_SHEET_FRAMING_MEDIUM_MIN_AREA = 0.04
+# Height used by the same gate when the single-face layout was chosen by hand on
+# the Identity Sheet page.  The dropdown is the opt-in there, so the gate only
+# has to rule out wide Shots (where the shoes are on screen and belong in the
+# wardrobe reference) and stray slivers.  0.0 restores "env knob or nothing".
+IDENTITY_SHEET_FRAMING_MEDIUM_MIN_HEIGHT_WHEN_CHOSEN = 0.18
+# Round 69 item 7 (Studio side): real rear / side artwork for a turnaround sheet.
+# Layout 9 tags its body panels with the view each panel must show, and the engine
+# has always accepted a ``view_sources`` mapping for them.  What was missing is
+# that nothing in the App ever built one, so a director who drew the back of the
+# head and put it next to Picture 1 still received a mirrored front - the exact
+# "the back of the head was invented" failure the layout exists to fix.  The Media
+# Pool is a flat folder of ``<asset id>_<hash>_<original name>`` files, so the
+# drawings are one folder listing away, and the asset-id prefix is what stops
+# Picture 2's rear drawing from being read as Picture 1's.  Only layouts that tag
+# a view ever scan the folder, so presets 0-8 - including the close-up layout the
+# gates force - compose exactly as they did before.  Setting
+# ``H3_IDENTITY_SHEET_VIEW_SOURCES`` to 0 / off / false / no turns the scan off and
+# restores "front artwork only, everything else invented".
+IDENTITY_SHEET_VIEW_SOURCES_ENABLED = (
+    os.environ.get("H3_IDENTITY_SHEET_VIEW_SOURCES", "")
+    .strip()
+    .lower()
+    not in {"0", "off", "false", "no"}
+)
+# Pictures the App is willing to read as view artwork.  Same set the Media Pool
+# import dialog offers, so a drawing the Project can import is a drawing the
+# turnaround can use.
+IDENTITY_SHEET_VIEW_SOURCE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+)
+# Filename tokens that name a view.  Matched as whole words against the file's
+# name split on separators, so ``background`` and ``playback`` never claim a rear
+# panel - only a name that actually says the view does.
+IDENTITY_SHEET_VIEW_SOURCE_TOKENS: dict[str, tuple[str, ...]] = {
+    VIEW_REAR: ("rear", "back", "behind"),
+    VIEW_SIDE: ("side", "profile"),
+}
+# Guard against a Media Pool folder that has been used for months: the scan is
+# alphabetical, so the first drawings a director imports are always read and the
+# listing stays bounded either way.
+IDENTITY_SHEET_VIEW_SOURCE_SCAN_LIMIT = 4000
+# Every field that says which Identity Sheet actually went up the wire.  The
+# Job serialiser used to hand-pick two coverage numbers, so a take could never
+# be graded on layout (round 22 and the 02:27 round-23 take both ran layout 0
+# and nothing in the manifest proved it).  The list is the contract: adding a
+# decision field here is enough to get it into the Job and the manifest.
+IDENTITY_SHEET_DECISION_KEYS: tuple[str, ...] = (
+    "identity_sheet_head_coverage",
+    "identity_sheet_source_head_coverage",
+    "identity_sheet_preset",
+    "identity_sheet_preset_requested",
+    "identity_sheet_preset_forced",
+    "identity_sheet_outfit_view",
+    "identity_sheet_outfit_view_override",
+    "identity_sheet_closeup_gate_rows",
+    "identity_sheet_medium_silent_rows",
+    "identity_sheet_framing_medium_rows",
+    "identity_sheet_framing_threshold",
+    "identity_sheet_reason",
+    # Which layout was *declined* is just as gradeable as which one was built:
+    # the black-shirt card bleed is only diagnosable after the fact if the
+    # manifest proves the raw artwork went up the wire and what its own canvas
+    # measured.
+    "identity_sheet_single_figure_passthrough",
+    "identity_sheet_reference_head_coverage",
+    "identity_sheet_reference_subject_fill",
+    # Round 38b: which side of the resolution floor the artwork fell on, and the
+    # layout the fall-through chose.  Without these two rows a manifest cannot
+    # say whether Picture 1 went up at 0.093 MP raw or as the 0.973 MP sheet.
+    "identity_sheet_source_reference_megapixels",
+    "identity_sheet_single_figure_fullfig",
+    # Round 59: the megapixels of *real* face behind the head panel.  Layout can
+    # already be at 0.53 head coverage and still be grown from a 0.02 MP crop, and
+    # until this row existed "the layout lever is exhausted" was an argument rather
+    # than a manifest reading.
+    "identity_sheet_source_head_crop_megapixels",
+    # Round 51: what the plate probe said about the source figure's bottom edge.
+    # The crop lock now depends on this flag instead of face size, so a take that
+    # widened a half-body Shot into Picture 1's whole figure is only diagnosable
+    # if the manifest proves the plate was measured and what it measured.  The
+    # name stays unprefixed because the engine gate reads that exact key.
+    "source_figure_reaches_frame_bottom",
+    "source_figure_bottom_normalized",
+    "source_figure_reveal_status",
+    "source_figure_reveal_sample_count",
+    # Round 69 item 7: whether the layout that ran had any view-tagged panel, and
+    # which real rear / side drawing (if any) was read for it.  A turnaround sheet
+    # that silently fell back to a mirrored front looks identical in the manifest
+    # to one that used the director's actual back-of-head drawing, and the grade
+    # "the back of the head was invented" is only answerable once these rows exist.
+    # Absence means the layout tags no view at all, which is true of presets 0-8.
+    "identity_sheet_view_panels_tagged",
+    "identity_sheet_view_source_state",
+    "identity_sheet_view_source_candidate_count",
+    "identity_sheet_view_sources",
+)
 H3_DURATION_FRAME_MODULUS = 17
 H3_DURATION_FRAME_REMAINDER = 5
 
@@ -476,6 +2860,23 @@ _QUOTED_VISIBLE_WORD_RE = re.compile(
     r"[^'\"‘’“”「」『』《》]{1,120}"
     r"(?:['\"’”」』》])"
 )
+
+
+def sheet_preset_face_panel_count(preset: int) -> int:
+    """How many panels in one Identity Sheet layout can show a face.
+
+    Layouts 0/2/3/6/7 all put a complete figure next to the enlarged head, so
+    the sheet carries two faces.  That is fine in a wide Shot and is exactly
+    what produced the cloned extra character in round-14's close-up S2, which is
+    why those Shots are routed to the single-face layout instead.
+    """
+
+    layout = SHEET_PRESETS.get(int(preset)) or SHEET_PRESETS[DEFAULT_SHEET_PRESET]
+    return sum(
+        1
+        for panel in layout.panels
+        if str(panel.slot or "").strip().lower() in IDENTITY_SHEET_FACE_PANEL_SLOTS
+    )
 
 
 def strip_untracked_visible_text_directions(value: object) -> str:
@@ -1496,6 +3897,10 @@ class DirectorCue:
     # Coordinates are normalized to the displayed V1 frame and take
     # precedence over uncertain Qwen track boxes during Character Swap.
     source_role_bbox_overrides: dict[str, list[float]] = field(default_factory=dict)
+    # Monotonic Shot-local cache generation. CLEAN SHOT CACHE increments this
+    # value so a file that Windows could not remove can never become a valid
+    # authoring-fingerprint hit on the next Smart Render.
+    render_cache_revision: int = 0
 
     def __post_init__(self) -> None:
         if self.cue_type not in DIRECTOR_LANE_TYPES and self.cue_type != "cut":
@@ -1579,6 +3984,10 @@ class DirectorCue:
                     continue
                 normalized_boxes[role] = [left, top, right, bottom]
             self.source_role_bbox_overrides = normalized_boxes
+        try:
+            self.render_cache_revision = max(0, int(self.render_cache_revision))
+        except (TypeError, ValueError, OverflowError):
+            self.render_cache_revision = 0
         if not isinstance(self.semantic_reference_directions, dict):
             self.semantic_reference_directions = {}
         else:
@@ -6235,11 +8644,102 @@ class ShotStripCard(QFrame):
         super().mousePressEvent(event)
 
 
+def qualified_spec_person_bbox(value: object) -> list[float] | None:
+    """Return a person box that passes the Relay engine's person spec.
+
+    ``_normalized_person_bbox`` in character_swap_engine rejects automatic boxes
+    whose area reaches 0.82 or which are at least 94% wide and 82% tall; a
+    nearly full-frame rectangle usually means localization failed. A big face
+    filling the shot is a real close-up, so instead of discarding it we shrink
+    the box around its center to a qualified size (target area 0.72). Boxes
+    that already pass the spec are returned unchanged.
+    """
+    try:
+        left, top, right, bottom = [float(item) for item in value][:4]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    left, top = max(0.0, left), max(0.0, top)
+    right, bottom = min(1.0, right), min(1.0, bottom)
+    if right <= left or bottom <= top:
+        return None
+    width, height = right - left, bottom - top
+    area = width * height
+    full_frame_sentinel = (
+        left <= 0.001 and top <= 0.001 and right >= 0.999 and bottom >= 0.999
+    )
+    if not (
+        full_frame_sentinel
+        or area >= 0.82
+        or (width >= 0.94 and height >= 0.82)
+    ):
+        return [round(left, 6), round(top, 6), round(right, 6), round(bottom, 6)]
+    center_x = (left + right) / 2.0
+    center_y = (top + bottom) / 2.0
+    target_area = 0.72
+    scale = math.sqrt(target_area / area) if area > 1e-9 else 1.0
+    new_width = min(width * scale, 1.0)
+    new_height = min(height * scale, 1.0)
+    if new_width >= 0.94 and new_height >= 0.82:
+        # Wide box: capping the width below the engine threshold is enough
+        # because the scaled area already stays under 0.82.
+        new_width = 0.93
+    left2 = min(max(0.0, center_x - new_width / 2.0), max(0.0, 1.0 - new_width))
+    top2 = min(max(0.0, center_y - new_height / 2.0), max(0.0, 1.0 - new_height))
+    return [
+        round(left2, 6), round(top2, 6),
+        round(left2 + new_width, 6), round(top2 + new_height, 6),
+    ]
+
+
+def source_figure_probe_box(pass_spec: object) -> list[float] | None:
+    """Pick the box the plate's figure-reveal probe should measure through.
+
+    ``measure_source_figure_reveal`` only needs the box horizontally: it decodes
+    the whole frame and reports the lowest row inside the box's central band that
+    carries the performer's motion.  That makes the probe immune to the shrink the
+    qualified-rectangle rule applies to a big face (``qualified_spec_person_bbox``
+    targets 0.72 area and the UI auto-box measures 0.30x0.30), because a narrow
+    column down the middle of the performer answers the same question.  The
+    selected target's own box wins; the largest role box is the fallback, which is
+    how the identity-audit band already chooses its subject.  ``None`` degrades to
+    the pre-round-51 behaviour: no probe, no crop lock unless the face dominates.
+    """
+
+    spec = pass_spec if isinstance(pass_spec, dict) else {}
+
+    def usable(bbox: object) -> tuple[float, list[float]] | None:
+        try:
+            left, top, right, bottom = [float(item) for item in bbox][:4]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        left, top = max(0.0, left), max(0.0, top)
+        right, bottom = min(1.0, right), min(1.0, bottom)
+        if right - left < 0.03 or bottom - top < 0.15:
+            return None
+        return (
+            (right - left) * (bottom - top),
+            [round(left, 6), round(top, 6), round(right, 6), round(bottom, 6)],
+        )
+
+    chosen = usable(spec.get("source_bbox_normalized"))
+    if chosen:
+        return chosen[1]
+    largest: tuple[float, list[float]] | None = None
+    for row in spec.get("source_roles") or []:
+        if not isinstance(row, dict):
+            continue
+        candidate = usable(row.get("source_bbox_normalized"))
+        if candidate and (largest is None or candidate[0] > largest[0]):
+            largest = candidate
+    return largest[1] if largest else None
+
+
 class V1PersonPickerWidget(QWidget):
     """Clickable V1 frame overlay used to select exact source R roles."""
 
     role_selected = Signal(str, bool)
     role_bbox_edited = Signal(str, object)
+    role_shot_delete_requested = Signal(str)
 
     def __init__(
         self,
@@ -6271,11 +8771,13 @@ class V1PersonPickerWidget(QWidget):
         self.setCursor(Qt.ArrowCursor)
         self.setMouseTracking(True)
         self.setToolTip(
-            "Click a boxed V1 person to replace only that R role. "
-            "Ctrl+click adds or removes another person. Repeated clicks cycle "
-            "through roles whose boxes overlap. Drag a box to move it; drag an "
-            "edge or corner to resize it. Focus a Current Role, then Ctrl+click "
-            "or Ctrl+drag empty image space to add its missing box."
+            "Click a boxed V1 person to select it. Ctrl+click a box auto-fits that role "
+            "to a qualified-spec rectangle; already-qualified boxes keep add/remove "
+            "selection. Ctrl+right-click a box deletes that role's clip, Shot override and "
+            "binding in this shot only. Repeated clicks cycle through roles whose boxes "
+            "overlap. Drag a box to move it; drag an edge or corner to resize it. Focus a "
+            "Current Role, then Ctrl+click or Ctrl+drag empty image space to add its "
+            "missing box."
         )
 
     def set_frame_content(
@@ -6543,6 +9045,19 @@ class V1PersonPickerWidget(QWidget):
         )
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if (
+            event.button() == Qt.RightButton
+            and bool(event.modifiers() & Qt.ControlModifier)
+        ):
+            role_ids = self._hit_roles(event.position())
+            if role_ids:
+                # Ctrl+right-click deletes this role's Shot-scoped clip, override
+                # and binding entries; a plain right-click stays inert.
+                self.role_shot_delete_requested.emit(
+                    self._role_for_press(role_ids)
+                )
+                event.accept()
+                return
         if event.button() != Qt.LeftButton:
             super().mousePressEvent(event)
             return
@@ -6636,6 +9151,26 @@ class V1PersonPickerWidget(QWidget):
             if bbox is not None:
                 self._selected_roles.add(role_id)
                 self.role_bbox_edited.emit(role_id, list(bbox))
+        elif additive:
+            # Ctrl+click on an existing box auto-fits that role to a
+            # qualified-spec rectangle. A big face filling the shot would
+            # otherwise be rejected by the Relay engine as "no reliable box";
+            # if the box already passes the spec, keep the legacy add/remove
+            # selection behavior instead.
+            bbox = self._normalized_bbox(self._roles.get(role_id, {}))
+            qualified = qualified_spec_person_bbox(bbox)
+            changed = (
+                bbox is not None
+                and qualified is not None
+                and [round(float(value), 6) for value in qualified]
+                != [round(float(value), 6) for value in list(bbox)]
+            )
+            if changed:
+                self._set_role_bbox(role_id, qualified)
+                self._selected_roles.add(role_id)
+                self.role_bbox_edited.emit(role_id, list(qualified))
+            else:
+                self.role_selected.emit(role_id, True)
         else:
             self.role_selected.emit(role_id, additive)
         self._edit_role = ""
@@ -6690,6 +9225,9 @@ class ShotVisualEditorDialog(QDialog):
         self._source_role_bbox_overrides = deepcopy(
             cue.source_role_bbox_overrides
         )
+        self._shot_deleted_roles: set[str] = set()
+        self._shot_deleted_clip_targets: list[str] = []
+        self._shot_binding_scene_deletions: dict[str, set[int]] = {}
         self._source_remake_editor = bool(
             str(getattr(getattr(parent, "special_combo", None), "currentData", lambda: "")() or "")
             .strip().casefold() == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
@@ -6704,6 +9242,7 @@ class ShotVisualEditorDialog(QDialog):
             picker_resolver = getattr(parent, "_source_role_picker_for_shot", None)
             if callable(picker_resolver):
                 self._source_role_picker_payload = dict(picker_resolver(cue))
+                self._auto_qualify_big_face_boxes()
         self.pending_qwen_request: tuple[str, str] | None = None
         self.pending_navigation_cue_id = ""
         self._history: list[dict] = []
@@ -6822,6 +9361,14 @@ class ShotVisualEditorDialog(QDialog):
         heading.addWidget(subtitle)
         header_layout.addLayout(heading)
         header_layout.addStretch(1)
+        self.clean_cache_button = QPushButton("CLEAN SHOT CACHE")
+        self.clean_cache_button.setObjectName("shotEditorCleanCache")
+        self.clean_cache_button.setToolTip(
+            "Invalidate and remove only this Shot's reusable Preview / 1.0 Segment Takes. "
+            "The V1 source, P Pictures and assembled master video are preserved."
+        )
+        self.clean_cache_button.clicked.connect(self._request_clean_shot_cache)
+        header_layout.addWidget(self.clean_cache_button)
         self.undo_button = QPushButton("Undo")
         self.undo_button.setObjectName("shotEditorUndo")
         self.undo_button.clicked.connect(self._undo_local)
@@ -7737,10 +10284,12 @@ class ShotVisualEditorDialog(QDialog):
             picker.set_selected_roles(selected_roles)
             picker_layout.addWidget(picker)
             picker_hint = QLabel(
-                "Click = replace only this boxed person · Ctrl+click = add/remove another "
-                "person · drag a box to move it · drag an edge/corner to resize · focus a "
-                "Current Role then Ctrl+click or Ctrl+drag empty space to add its box · "
-                "repeated clicks cycle overlapping R roles."
+                "Click = select this boxed person · Ctrl+click an existing box = auto-fit it "
+                "to a qualified-spec rectangle (already-qualified boxes keep add/remove "
+                "selection) · Ctrl+right-click a box = delete that role's clip, Shot override "
+                "and binding in this shot only · drag a box to move it · drag an edge/corner "
+                "to resize · focus a Current Role then Ctrl+click or Ctrl+drag empty space to "
+                "add its box · repeated clicks cycle overlapping R roles."
             )
             picker_hint.setWordWrap(True)
             picker_hint.setStyleSheet("color:#69dce8; padding:3px;")
@@ -8117,9 +10666,70 @@ class ShotVisualEditorDialog(QDialog):
             )
             if isinstance(_widget, V1CurrentRoleWidget):
                 _widget.role_clicked.connect(focus_source_role)
+        def stage_shot_role_deletion(role_id: str) -> None:
+            """Ctrl+right-click: delete this role's clip/override/binding in this shot."""
+
+            role_id = str(role_id or "").strip().upper()
+            if not role_id or role_id in self._shot_deleted_roles:
+                return
+            scene_index = 0
+            parent_window = self.parentWidget()
+            scene_resolver = getattr(parent_window, "_source_scene_for_shot", None)
+            if callable(scene_resolver):
+                try:
+                    scene_row = scene_resolver(self.cue) or {}
+                    scene_index = int(scene_row.get("scene_index", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    scene_index = 0
+            target_reference = normalize_picture_reference(
+                dict(self.cue.source_role_identity_overrides or {}).get(role_id)
+            )
+            if not target_reference:
+                bindings = getattr(parent_window, "source_video_role_bindings", None) or []
+                for row in bindings:
+                    if str(row.get("source_role_id", "")).strip().upper() != role_id:
+                        continue
+                    explicit_indexes = [
+                        int(index) for index in (row.get("scene_indexes") or [])
+                    ]
+                    if not explicit_indexes or scene_index in explicit_indexes:
+                        target_reference = normalize_picture_reference(
+                            row.get("target_media_id")
+                        )
+                        break
+            self._shot_deleted_roles.add(role_id)
+            self._source_role_bbox_overrides.pop(role_id, None)
+            if target_reference:
+                self._shot_deleted_clip_targets.append(target_reference)
+                lip_target = normalize_picture_reference(
+                    str(self.lip_sync_target_combo.currentData() or "")
+                )
+                if lip_target == target_reference:
+                    auto_index = self.lip_sync_mode_combo.findData("auto")
+                    if auto_index >= 0:
+                        self.lip_sync_mode_combo.setCurrentIndex(auto_index)
+                    self.lip_sync_target_combo.setCurrentIndex(0)
+            if scene_index > 0:
+                self._shot_binding_scene_deletions.setdefault(role_id, set()).add(scene_index)
+            _widget, combo, checkbox = source_role_widgets.get(role_id, (None, None, None))
+            keep_v1 = bool(
+                combo is not None
+                and str(combo.currentData() or "").upper() == KEEP_V1_TARGET
+            )
+            if checkbox is not None:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(keep_v1)
+                checkbox.blockSignals(False)
+            if combo is not None:
+                combo.setEnabled(keep_v1)
+            selected_roles.discard(role_id)
+            if picker is not None:
+                picker.set_selected_roles(selected_roles)
+
         if picker is not None:
             picker.role_selected.connect(sync_role_controls)
             picker.role_bbox_edited.connect(stage_role_bbox)
+            picker.role_shot_delete_requested.connect(stage_shot_role_deletion)
         role_scroll.setWidget(role_scroll_content)
         layout.addWidget(role_scroll, 1)
 
@@ -8408,6 +11018,9 @@ class ShotVisualEditorDialog(QDialog):
             QPushButton:hover { border-color:#17bdd4; background:#132a36; }
             QPushButton#shotEditorSave { background:#0bd2e8; color:#031017; font-weight:750;
                 border-color:#2cecff; padding:10px 22px; }
+            QPushButton#shotEditorCleanCache { background:#2a1c10; color:#ffd39a;
+                border-color:#9b6733; font-weight:700; }
+            QPushButton#shotEditorCleanCache:hover { background:#3a2511; border-color:#e29a50; }
             QPushButton#shotGenerateSuggestion { background:#6c39e8; border-color:#8b64ff;
                 color:white; font-weight:700; }
             QPushButton#speechModeButton:checked { background:#0c3b45; border:2px solid #18d9ed;
@@ -8425,6 +11038,38 @@ class ShotVisualEditorDialog(QDialog):
         # A checkable group box disables children when collapsed; limit its
         # height too so visual controls remain the primary editing surface.
         self.advanced_group.setMaximumHeight(280 if checked else 28)
+
+    def _request_clean_shot_cache(self) -> None:
+        cleaner = getattr(self.parentWidget(), "_clean_shot_render_cache", None)
+        if not callable(cleaner):
+            QMessageBox.information(
+                self,
+                "Clean Shot Cache",
+                "This Shot is not attached to an active Studio project.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clean Shot Cache",
+            (
+                f"Remove reusable Preview and 1.0 Segment cache for {self.cue.cue_id}?\n\n"
+                "The source V1, P Pictures, Shot settings and assembled master video are kept. "
+                "This Shot will become dirty and must be generated again."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        result = cleaner(self.cue)
+        if not isinstance(result, dict):
+            return
+        removed = int(result.get("removed_paths", 0) or 0)
+        segments = int(result.get("segment_count", 0) or 0)
+        self.saved_badge.setText("Cache cleaned · dirty")
+        self.clean_cache_button.setToolTip(
+            f"{segments} Segment cache record(s) invalidated; {removed} cached path(s) removed."
+        )
 
     def _request_qwen(self) -> None:
         request = self.ask_edit.toPlainText().strip()
@@ -8451,6 +11096,72 @@ class ShotVisualEditorDialog(QDialog):
         # Commit the visible field controls first. The assistant then receives
         # the newly authored Shot state instead of the stale pre-dialog state.
         self.accept()
+
+    def _auto_qualify_big_face_boxes(self) -> None:
+        """Auto-qualify near-fullscreen evidence boxes so close-ups keep a box."""
+
+        payload_roles = self._source_role_picker_payload.get("roles") or {}
+        candidate_rows: dict[str, list[float]] = {}
+        for raw_role, row in payload_roles.items():
+            role_id = str(raw_role or "").strip().upper()
+            if not role_id or not isinstance(row, dict):
+                continue
+            raw_box = row.get("bbox_normalized")
+            try:
+                box = [float(value) for value in list(raw_box)[:4]]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if len(box) == 4 and all(0.0 <= value <= 1.0 for value in box):
+                candidate_rows[role_id] = box
+        role_views = self._source_role_picker_payload.get("role_views") or {}
+        for view in role_views.values():
+            if not isinstance(view, dict):
+                continue
+            for raw_role, row in (view.get("roles") or {}).items():
+                role_id = str(raw_role or "").strip().upper()
+                if not role_id or not isinstance(row, dict) or role_id in candidate_rows:
+                    continue
+                raw_box = row.get("bbox_normalized")
+                try:
+                    box = [float(value) for value in list(raw_box)[:4]]
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if len(box) == 4 and all(0.0 <= value <= 1.0 for value in box):
+                    candidate_rows[role_id] = box
+        for role_id, raw_box in candidate_rows.items():
+            # A saved manual box is always accepted by the Relay engine; only
+            # tracked evidence boxes need qualification here.
+            if role_id in self._source_role_bbox_overrides:
+                continue
+            qualified = qualified_spec_person_bbox(raw_box)
+            if not qualified:
+                continue
+            if [round(float(value), 6) for value in qualified] == [
+                round(float(value), 6) for value in raw_box
+            ]:
+                continue
+            self._source_role_bbox_overrides[role_id] = list(qualified)
+            payload_row = payload_roles.get(role_id)
+            if isinstance(payload_row, dict):
+                payload_row["bbox_normalized"] = list(qualified)
+            for view in role_views.values():
+                if not isinstance(view, dict):
+                    continue
+                view_role = (view.get("roles") or {}).get(role_id)
+                if isinstance(view_role, dict):
+                    view_role["bbox_normalized"] = list(qualified)
+
+    def shot_deleted_roles(self) -> list[str]:
+        return sorted(self._shot_deleted_roles)
+
+    def shot_deleted_clip_targets(self) -> list[str]:
+        return list(dict.fromkeys(self._shot_deleted_clip_targets))
+
+    def shot_binding_scene_deletions(self) -> dict[str, set[int]]:
+        return {
+            role: set(indexes)
+            for role, indexes in self._shot_binding_scene_deletions.items()
+        }
 
     def state(self) -> dict:
         action = self.action_edit.toPlainText().strip()
@@ -9685,7 +12396,7 @@ class DesignPageDialog(QDialog):
         self.source_live_action_cast_check.setChecked(bool(
             self.context.get(
                 "source_cast_live_action_adaptation",
-                illustrated_cast_detected,
+                False,
             )
         ))
         self.source_live_action_cast_check.setToolTip(
@@ -9702,6 +12413,118 @@ class DesignPageDialog(QDialog):
             lambda _checked: self._invalidate_json()
         )
         concept_layout.addWidget(self.source_live_action_cast_check)
+
+        # Round 52 · 路線 2「手動對齊模式」.  The director rebuilt the same swap
+        # by hand in ComfyUI and graded it better than Studio, so the escape
+        # hatch has to be a Design control and not an environment variable.
+        # Off means 路線 1: the official author template plus the verified lean
+        # clause set, with no silent clause dropping and no QC-driven re-roll.
+        self.character_swap_manual_align_check = QCheckBox(
+            "MANUAL-ALIGNED SWAP · HAND-BUILT COMFYUI FLOOR"
+        )
+        self.character_swap_manual_align_check.setObjectName(
+            "sourceRemakeManualAlignPrompt"
+        )
+        self.character_swap_manual_align_check.setChecked(bool(
+            self.context.get("character_swap_manual_align", False)
+        ))
+        self.character_swap_manual_align_check.setToolTip(
+            "Route 3 · vanilla (off, default since round 69): the official Character Swap "
+            "author prompt and nothing else, so the submitted text is byte-identical to the "
+            "accepted manual ComfyUI run. A silent Shot is the one exception and keeps the "
+            "silent-listener mouth contract. Use it when the manual ComfyUI prompt is the "
+            "reference result.\n\n"
+            "Route 2 (on): the hand-built graph's floor. Only the in-place and whole-body "
+            "erasure guards, the medium sentence that stops a cartoon going photographic, one "
+            "identity-sheet line when a sheet is on the wire, and the silent-listener tail stay. "
+            "Nothing is ever dropped to fit a character budget, resolution is not forced up, the "
+            "source plate is never blurred or muted, and a QC verdict can never spend a second "
+            "or third generation on the same Segment.\n\n"
+            "Route 1 (H3_CHARACTER_SWAP_ROUTE=route1): the author template plus every verified "
+            "pruned Studio clause, including the apparent-age lock that vanilla does not carry.\n\n"
+            "Legacy (H3_CHARACTER_SWAP_ROUTE=legacy): the pre-round-52 prompt with all "
+            "reinforcement clauses, budget clipping and QC-driven retries."
+        )
+        self.character_swap_manual_align_check.setVisible(
+            _bound_special_skill_key(self.context)
+            == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        self.character_swap_manual_align_check.toggled.connect(
+            lambda _checked: self._invalidate_json()
+        )
+        concept_layout.addWidget(self.character_swap_manual_align_check)
+
+        self.identity_sheet_group = QGroupBox(
+            "IDENTITY SHEET · GIVE RELAY A FACE IT CAN READ"
+        )
+        self.identity_sheet_group.setObjectName("sourceIdentitySheetControls")
+        identity_sheet_layout = QHBoxLayout(self.identity_sheet_group)
+        identity_sheet_layout.setContentsMargins(8, 4, 8, 4)
+        self.identity_sheet_check = QCheckBox(
+            "AUTO-COMPOSE WHEN PICTURE 1'S FACE IS TOO SMALL"
+        )
+        self.identity_sheet_check.setObjectName("sourceIdentitySheetEnabled")
+        self.identity_sheet_check.setChecked(
+            bool(self.context.get("identity_sheet_enabled", True))
+        )
+        self.identity_sheet_check.setToolTip(
+            "Relay redraws the character from Picture 1.  When that picture's own head would cover "
+            "less than about 22 % of the selected V1 frame, H3 keeps the palette but invents the face, "
+            "age and wardrobe - the 'became an old man' and 'the clothes are nothing like the reference' "
+            "results.  Studio then composes an Identity Sheet from the same artwork: one large head panel "
+            "plus body and outfit panels, no re-painting, no photorealism, and the Media Pool picture is "
+            "never modified.  Turn this off to always send the original picture."
+        )
+        self.identity_sheet_check.toggled.connect(
+            self._identity_sheet_controls_changed
+        )
+        identity_sheet_layout.addWidget(self.identity_sheet_check)
+        identity_sheet_layout.addWidget(QLabel("Layout"))
+        self.identity_sheet_preset_combo = QComboBox()
+        self.identity_sheet_preset_combo.setObjectName("sourceIdentitySheetPreset")
+        for preset_value, preset_label in sheet_preset_labels():
+            self.identity_sheet_preset_combo.addItem(preset_label, int(preset_value))
+        saved_sheet_preset = int(
+            self.context.get("identity_sheet_preset", DEFAULT_SHEET_PRESET)
+            if isinstance(self.context.get("identity_sheet_preset"), int)
+            and int(self.context.get("identity_sheet_preset", -1)) in SHEET_PRESET_KEYS
+            else DEFAULT_SHEET_PRESET
+        )
+        preset_index = self.identity_sheet_preset_combo.findData(saved_sheet_preset)
+        if preset_index >= 0:
+            self.identity_sheet_preset_combo.setCurrentIndex(preset_index)
+        self.identity_sheet_preset_combo.setToolTip(
+            "Which panels the sheet shows and how large the head panel is.  Layout 0 (head band over a "
+            "full-body panel) is the verified default; other layouts trade head size for extra outfit and "
+            "profile coverage.  Changing the layout re-composes from the same picture.  Layout 9 is the "
+            "turnaround: import a real rear or side drawing of the same character into the same Media Pool "
+            "folder with the same asset id and the view in its file name (rear / back / behind, side / "
+            "profile), and that panel is cut from the real drawing instead of a mirrored front.  The sheet's "
+            "sidecar and the render manifest both name which panels used real artwork and which stayed invented."
+        )
+        self.identity_sheet_preset_combo.currentIndexChanged.connect(
+            self._identity_sheet_controls_changed
+        )
+        identity_sheet_layout.addWidget(self.identity_sheet_preset_combo)
+        self.identity_sheet_open_button = QPushButton(
+            "Measure / Review Sheets…"
+        )
+        self.identity_sheet_open_button.setObjectName("sourceIdentitySheetPage")
+        self.identity_sheet_open_button.setToolTip(
+            "Open the Identity Sheet page: measure every cast picture's face size against the selected V1 "
+            "frame, compose a sheet on demand, inspect its panels and export it.  Nothing here touches the "
+            "Media Pool or starts ComfyUI."
+        )
+        self.identity_sheet_open_button.clicked.connect(
+            self._open_identity_sheet_page
+        )
+        identity_sheet_layout.addWidget(self.identity_sheet_open_button)
+        identity_sheet_layout.addStretch(1)
+        self.identity_sheet_group.setVisible(
+            _bound_special_skill_key(self.context)
+            == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
+        )
+        concept_layout.addWidget(self.identity_sheet_group)
 
         self.source_role_binding_group = QGroupBox(
             "V1 PRINCIPAL ROLE BINDINGS · QWEN3.8 → P PICTURES"
@@ -10263,6 +13086,27 @@ class DesignPageDialog(QDialog):
             setter(bindings)
         self._invalidate_json()
 
+    def _identity_sheet_controls_changed(self, _value: int = 0) -> None:
+        """Push the Identity Sheet switches from the Design page onto the Studio."""
+        enabled = bool(self.identity_sheet_check.isChecked())
+        raw_preset = self.identity_sheet_preset_combo.currentData()
+        preset = (
+            int(raw_preset)
+            if isinstance(raw_preset, int) and int(raw_preset) in SHEET_PRESET_KEYS
+            else int(DEFAULT_SHEET_PRESET)
+        )
+        owner = self.parentWidget()
+        setter = getattr(owner, "set_identity_sheet_settings", None)
+        if callable(setter):
+            setter(enabled, preset)
+        self._invalidate_json()
+
+    def _open_identity_sheet_page(self) -> None:
+        owner = self.parentWidget()
+        opener = getattr(owner, "open_identity_sheet_page", None)
+        if callable(opener):
+            opener()
+
     def _refresh_source_role_binding_table(self) -> None:
         if not hasattr(self, "source_role_binding_table"):
             return
@@ -10271,6 +13115,9 @@ class DesignPageDialog(QDialog):
             == SOURCE_VIDEO_CAST_REMAKE_SPECIAL_SKILL
         )
         self.source_role_binding_group.setVisible(active)
+        if hasattr(self, "identity_sheet_group"):
+            self.identity_sheet_group.setVisible(active)
+            self.identity_sheet_group.setEnabled(active)
         if not active:
             return
         ledger = self._source_video_analysis_ledger()
@@ -10559,6 +13406,19 @@ class DesignPageDialog(QDialog):
             )
             context["source_cast_live_action_adaptation"] = bool(
                 self.source_live_action_cast_check.isChecked()
+            )
+            context["character_swap_manual_align"] = bool(
+                self.character_swap_manual_align_check.isChecked()
+            )
+            context["identity_sheet_enabled"] = bool(
+                self.identity_sheet_check.isChecked()
+            )
+            context["identity_sheet_preset"] = (
+                int(self.identity_sheet_preset_combo.currentData())
+                if isinstance(self.identity_sheet_preset_combo.currentData(), int)
+                and int(self.identity_sheet_preset_combo.currentData())
+                in SHEET_PRESET_KEYS
+                else int(DEFAULT_SHEET_PRESET)
             )
         if _bound_special_skill_key(context) == AI_MOVIE_MAKING_OF_4DX_SKILL:
             context["fourdx_preferences"] = deepcopy(self.fourdx_preferences)
@@ -12366,6 +15226,18 @@ class DesignPageDialog(QDialog):
             models = payload.get("models") or []
             current = self.model_combo.currentText().strip()
             resolved = str(payload.get("resolved_model", "")).strip()
+            if not models and current:
+                # Strata (and a paused LM Studio server) list only models that
+                # are actually loaded, so an empty catalogue means "nothing is
+                # loaded" — not that the saved Model ID is wrong.  Clearing the
+                # list here used to blank the field and turn the next Create
+                # Director Design into an unrelated "Model is required" failure.
+                self.status_label.setText(
+                    f"Connected · no model is loaded at this endpoint, so "
+                    f"{current!r} is kept. Load it in Strata/LM Studio and run "
+                    "Test Connection again."
+                )
+                return
             self.model_combo.clear()
             self.model_combo.addItems(models)
             if current in models:
@@ -12434,7 +15306,15 @@ class DesignPageDialog(QDialog):
             self.validated_plan = plan
             self._show_summary(plan)
             self.apply_button.setEnabled(True)
-            self.status_label.setText("Director Design JSON ready · review or Apply")
+            accepted_as = str(payload.get("structured_mode") or "json_schema")
+            relaxed_note = (
+                ""
+                if accepted_as == "json_schema"
+                else f" · accepted as {accepted_as} after a rejected strict-JSON answer"
+            )
+            self.status_label.setText(
+                f"Director Design JSON ready · review or Apply{relaxed_note}"
+            )
 
             if self.provider_combo.currentData() == "lm_studio" and self.runner.is_running():
                 self.runner.write_json({
@@ -12786,6 +15666,9 @@ class DesignPageDialog(QDialog):
         plan["_source_cast_live_action_adaptation"] = bool(
             self.source_live_action_cast_check.isChecked()
         )
+        plan["_character_swap_manual_align"] = bool(
+            self.character_swap_manual_align_check.isChecked()
+        )
         plan["_required_text_layers"] = authored_text_layers_with_plan_assignments(
             requirement,
             plan,
@@ -12859,7 +15742,15 @@ class DirectorCutStudio(QMainWindow):
         self.source_role_scan_progress: QProgressDialog | None = None
         self.source_video_role_bindings: list[dict] = []
         self.source_remake_render_mode = automatic_remake_engine_for_skill("")
-        self.source_cast_live_action_adaptation = True
+        self.source_cast_live_action_adaptation = False
+        # Round 52: route 1「精準拆」is the shipped default, so the manual
+        # alignment switch starts off.  Identity Sheet composition stays on.
+        self.character_swap_manual_align = False
+        # Identity Sheet composition is on by default: it only changes the
+        # picture Relay receives, never the Media Pool asset or its medium.
+        self.identity_sheet_enabled = True
+        self.identity_sheet_preset = int(DEFAULT_SHEET_PRESET)
+        self.identity_sheet_page = None
         self.original_design_requirement = ""
         self.latest_design_requirement = ""
         self.native_audio_qc_jobs: dict[str, dict] = {}
@@ -12993,7 +15884,13 @@ class DirectorCutStudio(QMainWindow):
         # separately so REGENERATE DIRTY is not offered again for the exact
         # same edit while that Preview is waiting for approval.
         self.render_dirty_previewed_segment_ids: set[str] = set()
+        # CLEAN SHOT CACHE is an explicit, Shot-local repair request.  Keep its
+        # exact Segment IDs separate from the general dirty ledger so the job
+        # builder cannot expand one clicked Shot into every older
+        # identity-failed/fingerprint-stale Segment on the Timeline.
+        self.render_targeted_repair_segment_ids: set[str] = set()
         self.active_dirty_regeneration_ids: set[str] = set()
+        self.active_generation_targeted_repair_ids: set[str] = set()
         self.render_runtime_status: dict[str, str] = {}
         self.generated_output_path: Path | None = None
         self.generated_playback_path: Path | None = None
@@ -13341,7 +16238,8 @@ class DirectorCutStudio(QMainWindow):
             self.quality_profile_combo.findData(self.quality_profile)
         )
         self.quality_profile_combo.setToolTip(
-            "Storyboard uses no H3; Motion Preview uses 0.2MP; Approved Final reuses the accepted seed at 1.0MP"
+            f"Storyboard uses no H3; Motion Preview uses {PREVIEW_MEGAPIXELS:g}MP; "
+            "Approved Final reuses the accepted seed at 1.0MP"
         )
         self.quality_profile_combo.currentIndexChanged.connect(
             self._quality_profile_changed
@@ -13426,10 +16324,10 @@ class DirectorCutStudio(QMainWindow):
         self.smart_cut_aggressive_action.triggered.connect(lambda: self.open_smart_cut("aggressive"))
         self.manual_ripple_action.toggled.connect(self._toggle_storyboard_trim_mode)
         generation_bar.addWidget(self.storyboard_trim_button)
-        self.preview_button = QPushButton("PREVIEW 0.2M")
+        self.preview_button = QPushButton(f"PREVIEW {PREVIEW_MEGAPIXELS:g}M")
         self.preview_button.setFixedWidth(115)
         self.preview_button.setToolTip(
-            "Motion Preview 0.2MP / 448×448 - generate a low-resolution motion test "
+            f"{PREVIEW_LABEL} - generate a low-resolution motion test "
             "without RTX upscaling"
         )
         self.preview_button.clicked.connect(self.generate_pre_run_preview)
@@ -13445,8 +16343,8 @@ class DirectorCutStudio(QMainWindow):
         self.reject_preview_button = QPushButton("REJECT")
         self.reject_preview_button.setFixedWidth(70)
         self.reject_preview_button.setToolTip(
-            "Reject Preview - discard the current preview seed and generate a new "
-            "0.2MP / 448×448 motion test"
+            f"Reject Preview - discard the current preview seed and generate a new "
+            f"{PREVIEW_MEGAPIXELS:g}MP motion test"
         )
         self.reject_preview_button.setEnabled(False)
         self.reject_preview_button.clicked.connect(self.reject_pre_run_preview)
@@ -13528,7 +16426,8 @@ class DirectorCutStudio(QMainWindow):
             (
                 self.next_batch_button,
                 "Preview Next Incremental Batch",
-                "Moves Work Area to the next unapproved range and starts its 0.2MP motion Preview.",
+                f"Moves Work Area to the next unapproved range and starts its "
+                f"{PREVIEW_MEGAPIXELS:g}MP motion Preview.",
             ),
             (
                 self.production_progress_label,
@@ -13572,7 +16471,7 @@ class DirectorCutStudio(QMainWindow):
             ),
             (
                 self.preview_button,
-                "Motion Preview 0.2MP / 448×448",
+                PREVIEW_LABEL,
                 "Generates a low-cost motion test without RTX upscaling and records its seed.",
             ),
             (
@@ -13588,7 +16487,7 @@ class DirectorCutStudio(QMainWindow):
             (
                 self.regenerate_dirty_button,
                 "Regenerate Dirty Segment",
-                "Appears only after a Shot, Text Layer, media mapping or Qwen Patch invalidates an existing Segment. One click selects a safe full-Timeline Smart Render and starts the 0.2MP Preview; clean Segments are reused.",
+                f"Appears only after a Shot, Text Layer, media mapping or Qwen Patch invalidates an existing Segment. One click selects a safe full-Timeline Smart Render and starts the {PREVIEW_MEGAPIXELS:g}MP Preview; clean Segments are reused.",
             ),
             (
                 self.resource_estimate_button,
@@ -13815,17 +16714,17 @@ class DirectorCutStudio(QMainWindow):
     def _special_skill_production_strategy_changed(self, *_args) -> None:
         """Long-form Special selects safe batching; every other Skill stays one-shot."""
         if hasattr(self, "preview_button"):
-            self.preview_button.setText("PREVIEW 0.2M")
+            self.preview_button.setText(f"PREVIEW {PREVIEW_MEGAPIXELS:g}M")
             self.preview_button.setToolTip(
-                "Motion Preview 0.2MP / 448×448 - generate a low-resolution motion test "
+                f"{PREVIEW_LABEL} - generate a low-resolution motion test "
                 "without RTX upscaling"
             )
             self.accept_preview_button.setToolTip(
                 "Approved Final 1.0MP - render with exactly the accepted Motion Preview seed"
             )
             self.reject_preview_button.setToolTip(
-                "Reject Preview - discard the current preview seed and generate a new "
-                "0.2MP / 448×448 motion test"
+                f"Reject Preview - discard the current preview seed and generate a new "
+                f"{PREVIEW_MEGAPIXELS:g}MP motion test"
             )
         desired = (
             "incremental"
@@ -14524,6 +17423,83 @@ class DirectorCutStudio(QMainWindow):
         self.generated_player.positionChanged.connect(
             self._generated_position_changed
         )
+        # Program Monitor audio.  Qt binds a QAudioOutput to the endpoint that
+        # was default when the object was created, and it reports no error when
+        # that endpoint disappears (a Bluetooth headset powering off is the
+        # common case here), so playback keeps advancing but stays silent.
+        # Mute state is therefore derived from the branch that is actually
+        # playing, the output device is resolved again on every play, and
+        # volume/mute/device plus a calibration tone are exposed on the
+        # transport row so a routing failure is visible instead of invisible.
+        self.player.errorOccurred.connect(
+            lambda error, message: self._monitor_media_error(
+                "TIMELINE SOURCE", error, message
+            )
+        )
+        self.generated_player.errorOccurred.connect(
+            lambda error, message: self._monitor_media_error(
+                "GENERATED OUTPUT", error, message
+            )
+        )
+        self.player.playbackStateChanged.connect(self._apply_monitor_audio_routing)
+        self.generated_player.playbackStateChanged.connect(
+            self._apply_monitor_audio_routing
+        )
+        self.monitor_test_audio_output = QAudioOutput(self)
+        self.monitor_test_player = QMediaPlayer(self)
+        self.monitor_test_player.setAudioOutput(self.monitor_test_audio_output)
+        self.monitor_test_player.mediaStatusChanged.connect(
+            self._monitor_test_status_changed
+        )
+        prefs = self._load_monitor_audio_prefs()
+        self.monitor_muted = bool(prefs.get("muted", False))
+        try:
+            self.monitor_volume = max(0.0, min(1.0, float(prefs.get("volume", 1.0))))
+        except (TypeError, ValueError):
+            self.monitor_volume = 1.0
+        stored_device = prefs.get("device_id")
+        self.monitor_audio_device_id = str(stored_device) if stored_device else ""
+        self.monitor_mute_button = QPushButton("🔊")
+        self.monitor_mute_button.setFixedSize(34, 24)
+        self.monitor_mute_button.setCheckable(True)
+        self.monitor_mute_button.setToolTip("Mute or unmute Program Monitor playback")
+        self.monitor_mute_button.toggled.connect(self._set_monitor_muted)
+        self.monitor_volume_slider = QSlider(Qt.Horizontal)
+        self.monitor_volume_slider.setRange(0, 100)
+        self.monitor_volume_slider.setValue(int(round(self.monitor_volume * 100)))
+        self.monitor_volume_slider.setFixedWidth(92)
+        self.monitor_volume_slider.setToolTip("Program Monitor playback volume")
+        self.monitor_volume_slider.valueChanged.connect(self._set_monitor_volume)
+        self.monitor_volume_label = QLabel(f"{self.monitor_volume_slider.value()}%")
+        self.monitor_volume_label.setMinimumWidth(34)
+        self.monitor_audio_device = QComboBox()
+        self.monitor_audio_device.setMinimumWidth(176)
+        self.monitor_audio_device.setToolTip(
+            "Output device used by Program Monitor playback and the calibration tone"
+        )
+        self.monitor_audio_device.currentIndexChanged.connect(
+            self._monitor_audio_device_changed
+        )
+        self.monitor_audio_test_button = QPushButton("AUDIO TEST")
+        self.monitor_audio_test_button.setToolTip(
+            "Play a three-beep calibration tone through the selected output device; "
+            "the monitor mute switch is ignored during the test"
+        )
+        self.monitor_audio_test_button.clicked.connect(self._play_monitor_audio_test)
+        for audio_widget in (
+            self.monitor_mute_button,
+            self.monitor_volume_slider,
+            self.monitor_volume_label,
+            self.monitor_audio_device,
+            self.monitor_audio_test_button,
+        ):
+            controls.addWidget(audio_widget)
+        try:
+            QMediaDevices.audioOutputsChanged.connect(self._refresh_monitor_audio_devices)
+        except (RuntimeError, TypeError, AttributeError):
+            pass
+        self.monitor_mute_button.setChecked(self.monitor_muted)
+        self._refresh_monitor_audio_devices()
         upper.addWidget(monitor)
 
         right = QSplitter(Qt.Vertical)
@@ -15149,6 +18125,11 @@ class DirectorCutStudio(QMainWindow):
             "source_cast_live_action_adaptation": (
                 self.source_cast_live_action_adaptation
             ),
+            "character_swap_manual_align": (
+                self.character_swap_manual_align
+            ),
+            "identity_sheet_enabled": bool(self.identity_sheet_enabled),
+            "identity_sheet_preset": int(self.identity_sheet_preset),
             "source_rebuild_environment": (
                 self.source_remake_render_mode == SOURCE_REMAKE_MODE_DIRECTED_SWAP
             ),
@@ -15480,6 +18461,11 @@ class DirectorCutStudio(QMainWindow):
             "source_cast_live_action_adaptation": (
                 self.source_cast_live_action_adaptation
             ),
+            "character_swap_manual_align": (
+                self.character_swap_manual_align
+            ),
+            "identity_sheet_enabled": bool(self.identity_sheet_enabled),
+            "identity_sheet_preset": int(self.identity_sheet_preset),
             "original_design_requirement": self.original_design_requirement,
             "latest_design_requirement": self.latest_design_requirement,
             "fourdx_reference_role_ledger": deepcopy(self.fourdx_reference_role_ledger),
@@ -15525,6 +18511,9 @@ class DirectorCutStudio(QMainWindow):
             "render_dirty_previewed_segment_ids": sorted(
                 self.render_dirty_previewed_segment_ids
             ),
+            "render_targeted_repair_segment_ids": sorted(
+                self.render_targeted_repair_segment_ids
+            ),
         }
 
     def _restore_design_workspace_state(self, state: dict) -> None:
@@ -15568,6 +18557,22 @@ class DirectorCutStudio(QMainWindow):
                 "source_cast_live_action_adaptation",
                 self.source_cast_live_action_adaptation,
             )
+        )
+        self.character_swap_manual_align = bool(
+            state.get(
+                "character_swap_manual_align",
+                self.character_swap_manual_align,
+            )
+        )
+        self.identity_sheet_enabled = bool(
+            state.get("identity_sheet_enabled", self.identity_sheet_enabled)
+        )
+        saved_workspace_preset = state.get("identity_sheet_preset")
+        self.identity_sheet_preset = (
+            int(saved_workspace_preset)
+            if isinstance(saved_workspace_preset, int)
+            and int(saved_workspace_preset) in SHEET_PRESET_KEYS
+            else int(self.identity_sheet_preset)
         )
         remake_index = self.source_remake_mode_combo.findData(
             self.source_remake_render_mode
@@ -15744,8 +18749,14 @@ class DirectorCutStudio(QMainWindow):
             for value in state.get("render_dirty_previewed_segment_ids", [])
             if str(value).strip()
         } & self.render_dirty_segment_ids
+        self.render_targeted_repair_segment_ids = {
+            str(value)
+            for value in state.get("render_targeted_repair_segment_ids", [])
+            if str(value).strip()
+        } & self.render_dirty_segment_ids
         self._mark_legacy_character_swap_composites_dirty()
         self.active_dirty_regeneration_ids.clear()
+        self.active_generation_targeted_repair_ids.clear()
         self.render_runtime_status.clear()
         self._refresh_render_status_bar()
 
@@ -15852,6 +18863,12 @@ class DirectorCutStudio(QMainWindow):
                 plan.get(
                     "_source_cast_live_action_adaptation",
                     self.source_cast_live_action_adaptation,
+                )
+            )
+            self.character_swap_manual_align = bool(
+                plan.get(
+                    "_character_swap_manual_align",
+                    self.character_swap_manual_align,
                 )
             )
         if str(self.special_combo.currentData() or "") == AI_MOVIE_MAKING_OF_4DX_SKILL:
@@ -17100,6 +20117,12 @@ class DirectorCutStudio(QMainWindow):
                     self.source_cast_live_action_adaptation,
                 )
             )
+            character_swap_manual_align = bool(
+                plan.get(
+                    "_character_swap_manual_align",
+                    self.character_swap_manual_align,
+                )
+            )
             subtitles_enabled = bool(plan.get("_subtitles_enabled", False))
             dialogue_language = str(plan.get("_dialogue_language", "") or "")
             required_text_layers = deepcopy(
@@ -17133,6 +20156,9 @@ class DirectorCutStudio(QMainWindow):
             plan["_source_remake_render_mode"] = source_remake_render_mode
             plan["_source_cast_live_action_adaptation"] = (
                 source_cast_live_action_adaptation
+            )
+            plan["_character_swap_manual_align"] = (
+                character_swap_manual_align
             )
             plan = enforce_design_music_mode(plan, selected_music_mode)
             plan = protect_explicit_timed_text_layers(
@@ -17489,6 +20515,7 @@ class DirectorCutStudio(QMainWindow):
         job["local_gc_collected"] = int(local_collected)
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         job_path = CACHE_ROOT / f"design_cleanup_{time.time_ns()}.json"
+        stamp_render_knob_provenance(job)
         job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         self.design_cleanup_job_path = job_path
         runner = JsonLineProcess(self, "design-model-cleanup")
@@ -17515,6 +20542,17 @@ class DirectorCutStudio(QMainWindow):
             self.statusBar().showMessage(
                 "AI Design applied · clearing RAM and unloading ComfyUI VRAM/cache…"
             )
+        if operation == "pre_generation":
+            # Claim protocol: the H3 phase is about to start. Write the claim
+            # file so the status tray pauses its Qwen auto-load until this job's
+            # final /free clears it (smart_render_worker) or the runner exits
+            # (_generation_finished safety net).
+            try:
+                import staged_model_driver as _h3_claim_driver
+
+                _h3_claim_driver.write_comfy_claim(note="studio-pre-generation")
+            except Exception:
+                pass  # claim is a coordination hint; never block generation on it
         if not runner.start(
             str(self.runtime.python),
             [str(PROJECT_ROOT / "design_cleanup_service.py"), str(job_path)],
@@ -17772,7 +20810,17 @@ class DirectorCutStudio(QMainWindow):
         self.source_remake_render_mode = automatic_remake_engine_for_skill(
             self.special_combo.currentData()
         )
-        self.source_cast_live_action_adaptation = True
+        self.source_cast_live_action_adaptation = False
+        self.character_swap_manual_align = False
+        self.identity_sheet_enabled = True
+        self.identity_sheet_preset = int(DEFAULT_SHEET_PRESET)
+        stale_sheet_page = self.identity_sheet_page
+        self.identity_sheet_page = None
+        if stale_sheet_page is not None:
+            try:
+                stale_sheet_page.close()
+            except Exception:
+                pass
         self.original_design_requirement = ""
         self.latest_design_requirement = ""
         remake_index = self.source_remake_mode_combo.findData(
@@ -17862,7 +20910,9 @@ class DirectorCutStudio(QMainWindow):
             self.render_dirty_segment_ids.clear()
             self.render_isolated_shot_ids.clear()
             self.render_dirty_previewed_segment_ids.clear()
+            self.render_targeted_repair_segment_ids.clear()
             self.active_dirty_regeneration_ids.clear()
+            self.active_generation_targeted_repair_ids.clear()
         self.render_runtime_status.clear()
         self.submit_request_kind = "final"
         self._refresh_render_status_bar()
@@ -17873,7 +20923,7 @@ class DirectorCutStudio(QMainWindow):
             self.generated_video_widget.clear()
         self.player.stop()
         self.player.setSource(QUrl())
-        self.audio_output.setMuted(False)
+        self._apply_monitor_audio_routing()
         if hasattr(self, "generation_overlay"):
             self.generation_overlay.stop()
         if hasattr(self, "generated_output_label"):
@@ -19398,6 +22448,296 @@ class DirectorCutStudio(QMainWindow):
         shutil.rmtree(cache_root)
         return True
 
+    def _clean_shot_render_cache(self, cue: DirectorCue) -> dict | None:
+        """Invalidate one Shot's reusable render lineage and remove its Takes.
+
+        The assembled master is deliberately retained as a visual reference.
+        Character Swap relay source preparation is also retained because it is
+        shared input evidence, not a rendered Shot result.  Exact Segment Take
+        folders and generated-output download folders are the only directories
+        this method is allowed to remove.
+        """
+
+        if not self.scan or cue.cue_type != "shot":
+            return None
+        if self.submit_runner and self.submit_runner.is_running():
+            QMessageBox.warning(
+                self,
+                "Clean Shot Cache",
+                "Generation is running. Wait for the current Job to finish before cleaning a Shot cache.",
+            )
+            return None
+
+        was_isolated = cue.cue_id in self.render_isolated_shot_ids
+        self.render_isolated_shot_ids.add(cue.cue_id)
+        timeline_end = max(
+            float(cue.end_seconds), float(self._timeline_duration_seconds())
+        )
+        planned = self._planned_render_segments(
+            start_seconds=0.0,
+            end_seconds=timeline_end,
+        )
+        boundary_tolerance = max(1e-6, 1.0 / PROGRAM_MONITOR_FPS)
+
+        def row_range(value: object) -> tuple[float, float]:
+            if not isinstance(value, dict):
+                return (-1.0, -1.0)
+            try:
+                row_start = float(
+                    value.get("core_start_seconds")
+                    if value.get("core_start_seconds") is not None
+                    else value.get("start_seconds", 0.0)
+                )
+                row_end = float(
+                    value.get("core_end_seconds")
+                    if value.get("core_end_seconds") is not None
+                    else value.get("end_seconds", row_start)
+                )
+            except (TypeError, ValueError, OverflowError):
+                return (-1.0, -1.0)
+            return row_start, row_end
+
+        def wholly_inside_shot(row_start: float, row_end: float) -> bool:
+            return bool(
+                row_end > row_start
+                and row_start >= float(cue.start_seconds) - boundary_tolerance
+                and row_end <= float(cue.end_seconds) + boundary_tolerance
+            )
+
+        target_segment_ids = {
+            str(segment.segment_id)
+            for segment in planned
+            if cue.cue_id in [str(value) for value in segment.shot_ids or []]
+            and wholly_inside_shot(
+                float(
+                    segment.core_start_seconds
+                    if segment.core_start_seconds is not None
+                    else segment.start_seconds
+                ),
+                float(
+                    segment.core_end_seconds
+                    if segment.core_end_seconds is not None
+                    else segment.end_seconds
+                ),
+            )
+        }
+
+        planned_shot_ids = {
+            str(shot_id)
+            for segment in planned
+            for shot_id in segment.shot_ids or []
+            if str(shot_id).strip()
+        }
+        planned_segment_ids = {str(segment.segment_id) for segment in planned}
+        if (
+            len(planned_shot_ids) > 1
+            and target_segment_ids
+            and target_segment_ids == planned_segment_ids
+        ):
+            if not was_isolated:
+                self.render_isolated_shot_ids.discard(cue.cue_id)
+            QMessageBox.critical(
+                self,
+                "Clean Shot Cache stopped",
+                (
+                    f"Studio refused to clean {cue.cue_id}: the calculated cache scope covered "
+                    "the whole Timeline. No cache or dirty state was changed."
+                ),
+            )
+            return None
+
+        manifests: list[dict] = []
+        seen_manifests: set[int] = set()
+        for candidate in [
+            *self.smart_render_manifests.values(),
+            self.smart_render_manifest,
+        ]:
+            if not isinstance(candidate, dict) or id(candidate) in seen_manifests:
+                continue
+            seen_manifests.add(id(candidate))
+            manifests.append(candidate)
+
+        # Older projects may have been planned before Shot-isolated repair and
+        # therefore use a different Segment ID. A legacy row is accepted only
+        # when its complete core interval is inside this Shot. ``shot_ids`` is
+        # supporting evidence, never a broad OR condition: some old manifests
+        # accidentally copied every Shot ID into every Segment row.
+        for manifest in manifests:
+            for row in manifest.get("segments") or []:
+                if not isinstance(row, dict):
+                    continue
+                segment_id = str(row.get("segment_id") or "").strip()
+                row_start, row_end = row_range(row)
+                row_shot_ids = {
+                    str(value) for value in row.get("shot_ids") or []
+                    if str(value).strip()
+                }
+                if (
+                    wholly_inside_shot(row_start, row_end)
+                    and (not row_shot_ids or cue.cue_id in row_shot_ids)
+                ) and segment_id:
+                    target_segment_ids.add(segment_id)
+
+        self._sync_shot_take_states()
+        for segment_id, state in self.segment_take_states.items():
+            if not isinstance(state, dict):
+                continue
+            state_start, state_end = row_range(state)
+            state_shot_ids = {
+                str(value) for value in state.get("shot_ids") or []
+                if str(value).strip()
+            }
+            if (
+                wholly_inside_shot(state_start, state_end)
+                and (not state_shot_ids or cue.cue_id in state_shot_ids)
+            ):
+                target_segment_ids.add(str(segment_id))
+
+        if not target_segment_ids:
+            if not was_isolated:
+                self.render_isolated_shot_ids.discard(cue.cue_id)
+            QMessageBox.warning(
+                self,
+                "Clean Shot Cache stopped",
+                f"Studio could not resolve an exact Segment wholly inside {cue.cue_id}. Nothing was deleted.",
+            )
+            return None
+
+        # Remove every durable lookup before touching the files. The monotonic
+        # revision remains authoritative if OneDrive/Windows has a file open.
+        now = utc_now_text()
+        for manifest in manifests:
+            manifest["segments"] = [
+                row for row in manifest.get("segments") or []
+                if not isinstance(row, dict)
+                or str(row.get("segment_id") or "") not in target_segment_ids
+            ]
+            manifest["updated_at"] = now
+        for segment_id in target_segment_ids:
+            self.segment_take_states.pop(segment_id, None)
+
+        affected_shot_ids = {cue.cue_id}
+        ref_fields = (
+            "segment_refs", "preview_segment_refs", "approved_segment_refs"
+        )
+        for shot_id, state in self.shot_take_states.items():
+            # A Shot-local cache command must never reset a neighbor's approval
+            # state, even if an old shared Segment reference is malformed.
+            if str(shot_id) != cue.cue_id:
+                continue
+            removed_ref = False
+            for field_name in ref_fields:
+                refs = [
+                    ref for ref in state.get(field_name) or []
+                    if isinstance(ref, dict)
+                ]
+                retained = [
+                    ref for ref in refs
+                    if str(ref.get("segment_id") or "") not in target_segment_ids
+                ]
+                if len(retained) != len(refs):
+                    removed_ref = True
+                state[field_name] = retained
+            if (
+                str(state.get("segment_id") or "") in target_segment_ids
+                or str(shot_id) == cue.cue_id
+                or removed_ref
+            ):
+                affected_shot_ids.add(str(shot_id))
+                state.update({
+                    "status": "dirty",
+                    "render_profile": "storyboard",
+                    "seed": None,
+                    "take_count": 0,
+                    "latest_take": "",
+                    "latest_output_path": "",
+                    "latest_output_relative_path": "",
+                    "approved_take": "",
+                    "approved_output_path": "",
+                    "approved_output_relative_path": "",
+                    "segment_id": "",
+                    "updated_at": now,
+                })
+
+        cue.render_cache_revision = max(
+            0, int(getattr(cue, "render_cache_revision", 0) or 0)
+        ) + 1
+        self.render_dirty_segment_ids.update(target_segment_ids)
+        self.render_dirty_previewed_segment_ids.difference_update(target_segment_ids)
+        # This button means exactly this Shot.  Replacing (rather than
+        # extending) the target set also lets the user recover from an older
+        # build that incorrectly polluted the general dirty ledger with every
+        # R1/R2 appearance on the Timeline.
+        self.render_targeted_repair_segment_ids = set(target_segment_ids)
+        self.active_dirty_regeneration_ids.difference_update(target_segment_ids)
+        for segment_id in target_segment_ids:
+            self.render_runtime_status.pop(segment_id, None)
+
+        workspace = self._ensure_project_workspace().resolve()
+        segment_root = (workspace / "segments").resolve()
+        generated_roots = [
+            (workspace / "cache" / "generated_outputs").resolve(),
+            (CACHE_ROOT / "generated_outputs").resolve(),
+        ]
+        removed_paths = 0
+        failed_paths: list[str] = []
+
+        def remove_exact_directory(candidate: Path, allowed_root: Path) -> None:
+            nonlocal removed_paths
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(allowed_root)
+            except (OSError, ValueError):
+                return
+            if not resolved.is_dir():
+                return
+            try:
+                shutil.rmtree(resolved)
+                removed_paths += 1
+            except OSError as exc:
+                failed_paths.append(f"{resolved}: {exc}")
+
+        for segment_id in sorted(target_segment_ids):
+            slug = slugify_project_name(segment_id, "segment")
+            # Only one exact direct child below segments/ may be removed.
+            segment_directory = segment_root / slug
+            if segment_directory.parent == segment_root:
+                remove_exact_directory(segment_directory, segment_root)
+            # generated_outputs/<preview|final>/<seed>/<segment-id>/
+            for generated_root in generated_roots:
+                if not generated_root.is_dir():
+                    continue
+                for candidate in generated_root.glob(f"*/*/{slug}"):
+                    if candidate.name == slug:
+                        remove_exact_directory(candidate, generated_root)
+
+        self._write_shot_state_manifests()
+        self._mark_dirty()
+        self._refresh_render_status_bar()
+        self.statusBar().showMessage(
+            f"{cue.cue_id} cache cleaned · {len(target_segment_ids)} Segment(s) dirty · "
+            f"{removed_paths} cached path(s) removed",
+            10000,
+        )
+        if failed_paths:
+            QMessageBox.warning(
+                self,
+                "Shot cache partly locked",
+                (
+                    "The Shot was logically invalidated and will not reuse the old result, "
+                    "but Windows could not remove some open cache paths:\n\n"
+                    + "\n".join(failed_paths[:5])
+                ),
+            )
+        return {
+            "shot_id": cue.cue_id,
+            "segment_count": len(target_segment_ids),
+            "removed_paths": removed_paths,
+            "failed_paths": failed_paths,
+            "affected_shot_ids": sorted(affected_shot_ids),
+            "cache_revision": cue.render_cache_revision,
+        }
+
     def _archive_generated_outputs(
         self,
         outputs: list[dict],
@@ -19951,12 +23291,21 @@ class DirectorCutStudio(QMainWindow):
         # Match Action can still request the lighter text-only state contract.
         return "motion_reference"
 
-    def _planned_render_segments(self):
+    def _planned_render_segments(
+        self,
+        *,
+        start_seconds: float | None = None,
+        end_seconds: float | None = None,
+    ):
         """Return the hidden render windows represented by the current work area."""
         if not self.scan:
             return []
-        start = float(self.clip_start.value())
-        end = float(self.clip_end.value())
+        start = float(
+            self.clip_start.value() if start_seconds is None else start_seconds
+        )
+        end = float(
+            self.clip_end.value() if end_seconds is None else end_seconds
+        )
         if self._source_remake_uses_character_swap_relay():
             # CompactSecondsSpinBox intentionally displays two decimals. A V1
             # ending at e.g. 39.466042s is therefore shown/restored as 39.47s.
@@ -20027,8 +23376,19 @@ class DirectorCutStudio(QMainWindow):
                 # cutting at the 124-frame Relay ceiling.
                 cue_start = max(start, float(cue.start_seconds))
                 cue_end = min(end, float(cue.end_seconds))
-                relay_parts = character_swap_relay_window_count(
-                    cue_end - cue_start
+                # Round 49 inverts the default.  Splitting is what produced the
+                # three cold-starting 4.288 s jobs for the single authored
+                # 12.864 s Shot in job preview_923011007_1793291943180178000:
+                # each piece re-entered H3 with no previous window, and the user
+                # graded exactly that as "front half still V1, back half
+                # correct".  The manual graph submits the Shot once and the
+                # native loop chains windows through the 18-frame history, so
+                # the split is now opt-in through
+                # H3_CHARACTER_SWAP_RELAY_WINDOW_SPLIT.
+                relay_parts = (
+                    character_swap_relay_window_count(cue_end - cue_start)
+                    if CHARACTER_SWAP_RELAY_WINDOW_SPLIT
+                    else 1
                 )
                 if cue_end > cue_start and relay_parts > 1:
                     for part_index in range(1, relay_parts):
@@ -20049,6 +23409,25 @@ class DirectorCutStudio(QMainWindow):
             if start + 1e-6 < cue.start_seconds < end - 1e-6:
                 mandatory_story_boundaries.add(float(cue.start_seconds))
         mandatory_story_boundary_active = len(mandatory_story_boundaries) > 2
+        # Round 49 follow-up.  With native Relay chaining the whole authored
+        # Shot is handed to one H3 run, so its exact endpoints are the
+        # generation contract.  Nothing downstream re-derives them, and the
+        # ordinary 0.5 s edit grid silently rewrote the single-Shot 5.200 s
+        # work area to 5.000 s (dropping 4.8 frames of performance).  On the
+        # focus Project the same rounding goes the other way: a 12.86 s work
+        # area becomes 13.000 s, which is past the 12.864042 s V1 EOF that the
+        # clamp above deliberately enforced, so FFmpeg again seeks at EOF.
+        # This never surfaced before the split became opt-in because the split
+        # boundaries already pushed the planner onto the millisecond grid.
+        native_relay_exact_endpoints = bool(
+            self._source_remake_uses_character_swap_relay()
+            and not CHARACTER_SWAP_RELAY_WINDOW_SPLIT
+        )
+        native_relay_grid_seconds = (
+            0.001
+            if native_relay_exact_endpoints
+            else TIMELINE_SNAP_SECONDS
+        )
         if keyframe_chain_active or mandatory_story_boundary_active:
             # A later Picture must never be present in the same native H3
             # request as an earlier scene anchor. Render each ownership range
@@ -20077,7 +23456,7 @@ class DirectorCutStudio(QMainWindow):
                             or relay_shot_boundaries
                             or relay_window_split_boundaries
                         )
-                        else TIMELINE_SNAP_SECONDS
+                        else native_relay_grid_seconds
                     ),
                 ))
         elif end - start > MAX_NATIVE_SECONDS + 1e-6:
@@ -20122,7 +23501,11 @@ class DirectorCutStudio(QMainWindow):
                     min_segment_seconds=(5.0 if source_remake else MAX_NATIVE_SECONDS),
                     max_segment_seconds=MAX_NATIVE_SECONDS,
                     overlap_seconds=0.0,
-                    grid_seconds=(1.0 / 24.0 if source_remake else TIMELINE_SNAP_SECONDS),
+                    grid_seconds=(
+                        0.001
+                        if native_relay_exact_endpoints
+                        else (1.0 / 24.0 if source_remake else TIMELINE_SNAP_SECONDS)
+                    ),
                 )
             else:
                 planned = plan_render_segments(
@@ -20137,6 +23520,7 @@ class DirectorCutStudio(QMainWindow):
                 end,
                 max_segment_seconds=MAX_NATIVE_SECONDS,
                 overlap_seconds=0.0,
+                grid_seconds=native_relay_grid_seconds,
             )
         for index, segment in enumerate(planned):
             if index == 0:
@@ -20247,6 +23631,17 @@ class DirectorCutStudio(QMainWindow):
                     cue.start_seconds, cue.end_seconds, unit_start, unit_end
                 )
             ] or segment.shot_ids
+        if self._source_remake_uses_character_swap_relay():
+            # Round 69 item 2: Relay needs a whole window to chain through.  The
+            # authored Shot lane is the generation contract on this route, so a
+            # sub-window Shot (the pink-dress project had 1.589 s and 0.559 s
+            # pieces around an 11.420 s one) cold-started its own H3 request with
+            # its own seed and its 18-frame history handle ate visible frames of
+            # its own duration.  Fusing those fragments is what makes Studio submit
+            # the clip the way the accepted manual ComfyUI graph did: one chained
+            # run per continuous range, never a sub-second phantom tail that makes
+            # FFmpeg seek past the end of V1.
+            planned = merge_segments_for_relay_window(planned, grid_seconds=0.001)
         return planned
 
     def _render_status_rows(self) -> list[dict]:
@@ -20337,7 +23732,7 @@ class DirectorCutStudio(QMainWindow):
         if button is None:
             return
         # Dirty Segments remain dirty until their accepted 1.0MP render is
-        # complete.  A successful 0.2MP repair Preview is nevertheless enough
+        # complete.  A successful low-MP repair Preview is nevertheless enough
         # to suppress the repair button while the user decides ACCEPT/REJECT.
         # Without this distinction the same REGENERATE DIRTY action reappears
         # immediately after every successful repair Preview.
@@ -20358,18 +23753,28 @@ class DirectorCutStudio(QMainWindow):
                 f"REGENERATE DIRTY ({count})" if count > 1 else "REGENERATE DIRTY"
             )
         if count:
-            button.setToolTip(
-                f"{count} dirty Segment(s). Click once to select the complete Timeline and start "
-                "a 0.2MP Smart Render Preview. Clean approved Segments remain cached and are "
-                "not regenerated."
-            )
+            if self.render_targeted_repair_segment_ids:
+                button.setToolTip(
+                    f"{count} targeted dirty Segment(s) from CLEAN SHOT CACHE. "
+                    f"Only the selected Shot repair will run at {PREVIEW_MEGAPIXELS:g}MP; every other "
+                    "Timeline Segment and role remains cache-reused."
+                )
+            else:
+                button.setToolTip(
+                    f"{count} dirty Segment(s). Click once to select the complete Timeline and start "
+                    f"a {PREVIEW_MEGAPIXELS:g}MP Smart Render Preview. Clean approved Segments remain cached and are "
+                    "not regenerated."
+                )
         if visibility_changed and hasattr(self, "generation_overflow_toolbar"):
             QTimer.singleShot(0, self._reflow_generation_toolbar)
 
     def _pending_dirty_segment_ids(self) -> set[str]:
         """Return stale Segments that do not yet have a reviewable repair Preview."""
 
-        return set(self.render_dirty_segment_ids).difference(
+        dirty = set(self.render_dirty_segment_ids)
+        if self.render_targeted_repair_segment_ids:
+            dirty.intersection_update(self.render_targeted_repair_segment_ids)
+        return dirty.difference(
             self.render_dirty_previewed_segment_ids
         )
 
@@ -20444,9 +23849,10 @@ class DirectorCutStudio(QMainWindow):
             )
             return
 
-        dirty_ranges = self._dirty_segment_ranges()
+        requested_ids = self._pending_dirty_segment_ids()
+        dirty_ranges = self._dirty_segment_ranges(requested_ids)
         previewed_ranges = self._dirty_segment_ranges(
-            self.render_dirty_previewed_segment_ids
+            self.render_dirty_previewed_segment_ids & requested_ids
         )
         duration = self._timeline_duration_seconds()
         self.clip_start.setValue(0.0)
@@ -20482,12 +23888,20 @@ class DirectorCutStudio(QMainWindow):
                     for start, end in previewed_ranges
                 ):
                     remapped_previewed.add(segment.segment_id)
-            self.render_dirty_segment_ids = remapped_dirty
-            self.render_dirty_previewed_segment_ids = (
+            # Remap only the requested Shot-local repair.  Unrelated dirty
+            # entries stay recorded but are never pulled into this Job.
+            self.render_dirty_segment_ids.difference_update(requested_ids)
+            self.render_dirty_segment_ids.update(remapped_dirty)
+            self.render_dirty_previewed_segment_ids.difference_update(
+                requested_ids
+            )
+            self.render_dirty_previewed_segment_ids.update(
                 remapped_previewed & remapped_dirty
             )
+            if self.render_targeted_repair_segment_ids:
+                self.render_targeted_repair_segment_ids = set(remapped_dirty)
         else:
-            self.render_dirty_segment_ids.intersection_update(full_ids)
+            scoped_ids = requested_ids & full_ids
             self.render_dirty_previewed_segment_ids.intersection_update(
                 self.render_dirty_segment_ids
             )
@@ -20496,19 +23910,32 @@ class DirectorCutStudio(QMainWindow):
             )
             if target is not None:
                 self._mark_render_range_dirty(target.start_seconds, target.end_seconds)
+                scoped_ids = self._pending_dirty_segment_ids()
             else:
                 # An old project can contain dirty IDs without a surviving
                 # manifest range. Regenerate conservatively instead of hiding
                 # the repair button or silently reusing stale output.
-                self.render_dirty_segment_ids.update(full_ids)
+                scoped_ids = set(full_ids)
+                self.render_dirty_segment_ids.update(scoped_ids)
 
-        pending_ids = self._pending_dirty_segment_ids()
+        pending_ids = (
+            self._pending_dirty_segment_ids()
+            if dirty_ranges else scoped_ids.difference(
+                self.render_dirty_previewed_segment_ids
+            )
+        )
         count = len(pending_ids)
         self.active_dirty_regeneration_ids = set(pending_ids)
         self._mark_dirty()
         self._refresh_render_status_bar()
         self.statusBar().showMessage(
-            f"Regenerate Dirty · {count} Segment(s) selected · clean Segments will be reused",
+            (
+                f"Regenerate Dirty · targeted Shot repair · {count} Segment(s) selected · "
+                "all other Timeline roles remain cached"
+                if self.render_targeted_repair_segment_ids
+                else
+                f"Regenerate Dirty · {count} Segment(s) selected · clean Segments will be reused"
+            ),
             8000,
         )
         self.generate_pre_run_preview(reuse_clean_segments=True)
@@ -20518,7 +23945,29 @@ class DirectorCutStudio(QMainWindow):
             return
         start = min(float(start_seconds), float(end_seconds))
         end = max(float(start_seconds), float(end_seconds))
-        for segment in self._planned_render_segments():
+        # A duration-shrinking Apply (Smart Cut, Storyboard Apply) still hands
+        # over the *pre-cut* extents of the Shots it remapped. After the
+        # Timeline got shorter that stale tail sits past the last Shot, and
+        # planning a render window into the empty tail raised
+        # "Shot-less render Segment 43.00-45.00s" even though the real edit is
+        # inside the remaining Timeline. Clamp the requested range to the
+        # Timeline before deciding what is dirty.
+        timeline_duration = max(0.0, float(self._timeline_duration_seconds()))
+        if timeline_duration > 0.0:
+            end = min(end, timeline_duration)
+            start = min(start, timeline_duration)
+        if end <= start:
+            return
+        # Shot Visual Editor edits are Timeline-authoring changes, not Work
+        # Area changes.  Planning only the currently displayed Work Area made
+        # an identity edit outside that range add no dirty Segment at all.  A
+        # later Regenerate Dirty then reused the old Character Swap take even
+        # though the Shot-local override had been saved correctly.
+        timeline_end = max(end, timeline_duration)
+        for segment in self._planned_render_segments(
+            start_seconds=0.0,
+            end_seconds=timeline_end,
+        ):
             unit_start = (
                 segment.core_start_seconds
                 if segment.core_start_seconds is not None
@@ -20621,6 +24070,11 @@ class DirectorCutStudio(QMainWindow):
             "source_cast_live_action_adaptation": (
                 self.source_cast_live_action_adaptation
             ),
+            "character_swap_manual_align": (
+                self.character_swap_manual_align
+            ),
+            "identity_sheet_enabled": bool(self.identity_sheet_enabled),
+            "identity_sheet_preset": int(self.identity_sheet_preset),
             "original_design_requirement": self.original_design_requirement,
             "latest_design_requirement": self.latest_design_requirement,
             "smart_cut_last_plan": deepcopy(self.smart_cut_last_plan),
@@ -20670,6 +24124,9 @@ class DirectorCutStudio(QMainWindow):
             "render_isolated_shot_ids": sorted(self.render_isolated_shot_ids),
             "render_dirty_previewed_segment_ids": sorted(
                 self.render_dirty_previewed_segment_ids
+            ),
+            "render_targeted_repair_segment_ids": sorted(
+                self.render_targeted_repair_segment_ids
             ),
             "workspace_layout_version": WORKSPACE_LAYOUT_VERSION,
             "workspace_id": self.project_workspace_id,
@@ -20990,8 +24447,30 @@ class DirectorCutStudio(QMainWindow):
                 else automatic_remake_engine_for_skill(special)
             )
             self.source_cast_live_action_adaptation = bool(
-                payload.get("source_cast_live_action_adaptation", True)
+                payload.get("source_cast_live_action_adaptation", False)
             )
+            self.character_swap_manual_align = bool(
+                payload.get("character_swap_manual_align", False)
+            )
+            self.identity_sheet_enabled = bool(
+                payload.get("identity_sheet_enabled", True)
+            )
+            saved_sheet_preset = payload.get("identity_sheet_preset")
+            self.identity_sheet_preset = (
+                int(saved_sheet_preset)
+                if isinstance(saved_sheet_preset, int)
+                and int(saved_sheet_preset) in SHEET_PRESET_KEYS
+                else int(DEFAULT_SHEET_PRESET)
+            )
+            # A page built for the previous Project still points at its cast
+            # pictures and cache folder, so it must not survive the switch.
+            stale_sheet_page = self.identity_sheet_page
+            self.identity_sheet_page = None
+            if stale_sheet_page is not None:
+                try:
+                    stale_sheet_page.close()
+                except Exception:
+                    pass
             self._refresh_skill_binding_display()
             # _refresh_skill_binding_display loads the Skill recommendation.
             # Restore the Project's explicit choice afterwards so opening a
@@ -21150,6 +24629,11 @@ class DirectorCutStudio(QMainWindow):
                 str(value)
                 for value in payload.get("render_dirty_previewed_segment_ids", [])
             } & self.render_dirty_segment_ids
+            self.render_targeted_repair_segment_ids = {
+                str(value)
+                for value in payload.get("render_targeted_repair_segment_ids", [])
+                if str(value).strip()
+            } & self.render_dirty_segment_ids
             migrated_composites = self._mark_legacy_character_swap_composites_dirty()
             if migrated_composites:
                 integrity_repairs.append(
@@ -21161,6 +24645,7 @@ class DirectorCutStudio(QMainWindow):
             if not self.preview_ready:
                 self.render_dirty_previewed_segment_ids.clear()
             self.active_dirty_regeneration_ids.clear()
+            self.active_generation_targeted_repair_ids.clear()
             self.render_runtime_status.clear()
             lip_route_repairs = self._normalize_source_remake_lip_sync_routes()
             if lip_route_repairs:
@@ -21390,7 +24875,9 @@ class DirectorCutStudio(QMainWindow):
         self.render_dirty_segment_ids.clear()
         self.render_isolated_shot_ids.clear()
         self.render_dirty_previewed_segment_ids.clear()
+        self.render_targeted_repair_segment_ids.clear()
         self.active_dirty_regeneration_ids.clear()
+        self.active_generation_targeted_repair_ids.clear()
         self.render_runtime_status.clear()
         self.tracks = default_timeline_tracks()
         self.text_layers = []
@@ -22472,6 +25959,147 @@ class DirectorCutStudio(QMainWindow):
         self.source_video_role_bindings = normalized
         self._normalize_source_remake_lip_sync_routes()
         self._mark_dirty()
+
+    def set_identity_sheet_settings(self, enabled: bool, preset: int) -> None:
+        """Store the Identity Sheet switches pushed by the Design page."""
+
+        try:
+            preset_value = int(preset)
+        except (TypeError, ValueError):
+            preset_value = int(DEFAULT_SHEET_PRESET)
+        if preset_value not in SHEET_PRESET_KEYS:
+            preset_value = int(DEFAULT_SHEET_PRESET)
+        enabled_flag = bool(enabled)
+        if (
+            enabled_flag == bool(self.identity_sheet_enabled)
+            and preset_value == int(self.identity_sheet_preset)
+        ):
+            return
+        self.identity_sheet_enabled = enabled_flag
+        self.identity_sheet_preset = preset_value
+        page = self.identity_sheet_page
+        apply_settings = getattr(page, "set_settings", None)
+        if page is not None and callable(apply_settings):
+            try:
+                apply_settings(enabled_flag, preset_value)
+            except Exception:
+                pass
+        self._mark_dirty()
+
+    def _identity_sheet_cast_rows(self) -> list[dict]:
+        """Every readable P Picture in the Media Pool, in Media Pool order."""
+
+        rows: list[dict] = []
+        seen: set[str] = set()
+        if not self.scan:
+            return rows
+        for asset in self.scan.assets:
+            shortcut = str(media_shortcut(asset) or "").strip().upper()
+            if not re.fullmatch(r"P[1-9][0-9]*", shortcut) or shortcut in seen:
+                continue
+            path = Path(str(getattr(asset, "local_path", "") or ""))
+            if not path.is_file():
+                continue
+            seen.add(shortcut)
+            rows.append(
+                {
+                    "media_id": shortcut,
+                    "filename": Path(
+                        str(getattr(asset, "filename", "") or path.name)
+                    ).name,
+                    "path": path,
+                }
+            )
+        return rows
+
+    def _identity_sheet_frame_size(self) -> tuple[int, int]:
+        """Pixel geometry of the selected V1 plate, or (0, 0) when unknown."""
+
+        v1 = self._reference_asset("V1")
+        source = str(getattr(v1, "local_path", "") or "") if v1 else ""
+        if not source or not Path(source).is_file():
+            return (0, 0)
+        try:
+            info = probe_media(source, self.runtime)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.SubprocessError,
+        ):
+            return (0, 0)
+        for stream in info.get("streams") or []:
+            if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+                continue
+            try:
+                width = int(stream.get("width", 0) or 0)
+                height = int(stream.get("height", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if width > 0 and height > 0:
+                return (width, height)
+        return (0, 0)
+
+    def open_identity_sheet_page(self) -> QDialog | None:
+        """Open the Identity Sheet review page; it never touches ComfyUI."""
+
+        page = self.identity_sheet_page
+        if page is not None:
+            try:
+                if bool(getattr(page, "isVisible", lambda: False)()):
+                    page.refresh()
+            except Exception:
+                pass
+            page.show()
+            page.raise_()
+            page.activateWindow()
+            return page
+        try:
+            from identity_sheet_page import IdentitySheetPage
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "IDENTITY SHEET PAGE",
+                "The Identity Sheet page could not be loaded:\n" + str(error),
+            )
+            return None
+        width, height = self._identity_sheet_frame_size()
+        try:
+            page = IdentitySheetPage(
+                self,
+                cast_rows=self._identity_sheet_cast_rows(),
+                cast_provider=self._identity_sheet_cast_rows,
+                frame_size=(width, height),
+                output_dir=self._ensure_project_workspace() / "cache" / "identity_sheets",
+                enabled=bool(self.identity_sheet_enabled),
+                preset=int(self.identity_sheet_preset),
+                on_settings_changed=self.set_identity_sheet_settings,
+                view_sources_provider=lambda picture_path, sheet_preset: (
+                    self._character_swap_identity_sheet_view_sources(
+                        Path(str(picture_path)), int(sheet_preset)
+                    )[0]
+                ),
+            )
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "IDENTITY SHEET PAGE",
+                "The Identity Sheet page could not be built:\n" + str(error),
+            )
+            return None
+        self.identity_sheet_page = page
+        page.show()
+        page.raise_()
+        page.activateWindow()
+        return page
+
+    def note_identity_sheet_page_closed(self, page=None) -> None:
+        """Drop the cached Identity Sheet page so the next open rebuilds it."""
+
+        if page is None or page is self.identity_sheet_page:
+            self.identity_sheet_page = None
 
     def _source_scene_for_shot(self, cue: DirectorCue) -> dict:
         """Return the V1 analysis scene with the greatest overlap with one Shot."""
@@ -26419,6 +30047,24 @@ class DirectorCutStudio(QMainWindow):
             scope = dialog.repair_scope()
             identity_changes = dialog.identity_changes()
             pending_qwen_request = dialog.pending_qwen_request
+            shot_deleted_roles = [
+                str(role or "").strip().upper()
+                for role in dialog.shot_deleted_roles()
+                if str(role or "").strip()
+            ]
+            binding_scene_deletions = {
+                str(role or "").strip().upper(): {int(index) for index in (indexes or [])}
+                for role, indexes in dialog.shot_binding_scene_deletions().items()
+                if str(role or "").strip()
+            }
+            deleted_clip_targets = list(dict.fromkeys(
+                normalize_picture_reference(ref)
+                for ref in dialog.shot_deleted_clip_targets()
+                if normalize_picture_reference(ref)
+            ))
+            shot_deletion_pending = bool(
+                shot_deleted_roles or binding_scene_deletions or deleted_clip_targets
+            )
             pending_navigation_cue_id = dialog.pending_navigation_cue_id
             dialog.deleteLater()
             navigation_target = next(
@@ -26436,7 +30082,7 @@ class DirectorCutStudio(QMainWindow):
                 after = self._apply_identity_overrides_to_state(
                     after, state_identity_changes
                 )
-            if before == after and not identity_changes:
+            if before == after and not identity_changes and not shot_deletion_pending:
                 if pending_qwen_request:
                     request, requested_scope = pending_qwen_request
                     QTimer.singleShot(
@@ -26645,6 +30291,52 @@ class DirectorCutStudio(QMainWindow):
                     target_reference,
                     list(target_rows.values()),
                 ))
+            if shot_deleted_roles:
+                remaining_overrides = {
+                    role: target
+                    for role, target in (after.get("source_role_identity_overrides") or {}).items()
+                    if str(role).strip().upper() not in shot_deleted_roles
+                }
+                after["source_role_identity_overrides"] = remaining_overrides
+            if binding_scene_deletions:
+                kept_bindings = []
+                for row in updated_bindings:
+                    role = str(row.get("source_role_id", "")).strip().upper()
+                    removed_indexes = {
+                        int(index)
+                        for index in (binding_scene_deletions.get(role) or set())
+                    }
+                    if not removed_indexes:
+                        kept_bindings.append(row)
+                        continue
+                    explicit_indexes = [
+                        int(index) for index in (row.get("scene_indexes") or [])
+                    ]
+                    if not explicit_indexes:
+                        # Global all-appearance binding rows survive a Shot-scoped
+                        # delete; only their own scene indexes are removed.
+                        kept_bindings.append(row)
+                        continue
+                    remaining_indexes = sorted(set(explicit_indexes) - removed_indexes)
+                    if remaining_indexes:
+                        row["scene_indexes"] = remaining_indexes
+                        kept_bindings.append(row)
+                updated_bindings[:] = kept_bindings
+            bindings_diff_exists = any(
+                isinstance(after_state, dict)
+                and "source_video_role_bindings" in after_state
+                for _target, _before_state, after_state in changes
+            )
+            if (
+                binding_scene_deletions
+                and updated_bindings != self.source_video_role_bindings
+                and not bindings_diff_exists
+            ):
+                changes.append((
+                    self,
+                    {"source_video_role_bindings": deepcopy(self.source_video_role_bindings)},
+                    {"source_video_role_bindings": deepcopy(updated_bindings)},
+                ))
             self.undo_stack.beginMacro("Edit Shot visually")
             try:
                 self.undo_stack.push(TimelineStructuredPatchCommand(
@@ -26658,11 +30350,39 @@ class DirectorCutStudio(QMainWindow):
                         clip,
                         self._refresh_after_timeline_clip_list,
                     ))
+                if deleted_clip_targets and self.scan is not None:
+                    removed_clip_ids = set()
+                    for target_reference in dict.fromkeys(deleted_clip_targets):
+                        source_asset = self._reference_asset(target_reference)
+                        if source_asset is None or source_asset.media_type != "image":
+                            continue
+                        for item in self._timeline_assets():
+                            if id(item) in removed_clip_ids:
+                                continue
+                            if not getattr(item, "timeline_placed", False):
+                                continue
+                            if self._source_asset_for(item) is not source_asset:
+                                continue
+                            if not ranges_intersect(
+                                cue.start_seconds,
+                                cue.end_seconds,
+                                item.start_seconds,
+                                item.end_seconds,
+                            ):
+                                continue
+                            removed_clip_ids.add(id(item))
+                            self.undo_stack.push(RemoveTimelineClipCommand(
+                                self.scan.timeline_clips,
+                                item,
+                                self._refresh_after_timeline_clip_list,
+                            ))
             finally:
                 self.undo_stack.endMacro()
             self._mark_shot_visual_editor_changes_dirty(
                 cue, scope, changes, identity_clips
             )
+            if shot_deletion_pending:
+                self._mark_render_range_dirty(cue.start_seconds, cue.end_seconds)
             for _identity_change, identity_targets in identity_target_rows:
                 for target in identity_targets:
                     self._mark_render_range_dirty(
@@ -27617,6 +31337,7 @@ class DirectorCutStudio(QMainWindow):
                 for player in self.timeline_audio_players.values():
                     player.pause()
                 self.play_button.setText("▶")
+                self._apply_monitor_audio_routing()
             else:
                 if (
                     self.generated_player.duration() > 0
@@ -27624,6 +31345,9 @@ class DirectorCutStudio(QMainWindow):
                 ):
                     self.seek_timeline(self.generated_output_timeline_start)
                 self.timeline_playing = True
+                # Qt cannot retarget a running QAudioOutput, so device binding
+                # and audibility are asserted before the clip starts.
+                self._apply_monitor_audio_routing()
                 self.render_timeline_at(self.playhead_seconds, force_seek=True)
                 self._sync_generated_player(self.playhead_seconds, force=True)
                 self.generated_player.play()
@@ -27639,6 +31363,7 @@ class DirectorCutStudio(QMainWindow):
             for player in self.timeline_audio_players.values():
                 player.pause()
             self.play_button.setText("▶")
+            self._apply_monitor_audio_routing()
             self.render_timeline_at(self.playhead_seconds, force_seek=True)
             return
         if not self.scan:
@@ -27649,6 +31374,7 @@ class DirectorCutStudio(QMainWindow):
         self.playback_anchor_seconds = self.playhead_seconds
         self.playback_anchor_time = time.monotonic()
         self.play_button.setText("Ⅱ")
+        self._apply_monitor_audio_routing()
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
         self._sync_generated_player(self.playhead_seconds, force=True)
         self.timeline_timer.start()
@@ -28170,10 +31896,24 @@ class DirectorCutStudio(QMainWindow):
                 )
                 self.timeline_audio_outputs[clip_key] = output
                 self.timeline_audio_players[clip_key] = player
+                # A freshly created output must inherit the monitor's device and
+                # mute state, otherwise it plays on the endpoint Qt bound at
+                # creation time, which is exactly the silent-playback failure.
+                self._apply_monitor_audio_routing()
             output = self.timeline_audio_outputs[clip_key]
             track = self._track_for_asset(asset)
             track_volume = track.volume if track and track.kind == "audio" else 1.0
-            output.setVolume(max(0.0, min(1.0, track_volume * self._clip_envelope(asset, seconds))))
+            output.setVolume(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        track_volume
+                        * self._clip_envelope(asset, seconds)
+                        * self._monitor_gain(),
+                    ),
+                )
+            )
             desired_ms = self._source_position_ms(asset, seconds)
             self.pending_audio_positions[clip_key] = desired_ms
             player.setPlaybackRate(asset.playback_speed)
@@ -28207,6 +31947,7 @@ class DirectorCutStudio(QMainWindow):
             if self.generated_player.duration() > 0:
                 self._generated_position_changed(self.generated_player.duration())
             self.play_button.setText("▶")
+            self._apply_monitor_audio_routing()
             return
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
             # Setting the same position on every Loaded/Buffered transition
@@ -28224,6 +31965,7 @@ class DirectorCutStudio(QMainWindow):
                 self._syncing_generated_position = False
             if self.timeline_playing:
                 self.generated_player.play()
+            self._ensure_generated_audio_track()
 
     def _audio_media_status_changed(self, clip_key: str, status) -> None:
         if status not in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
@@ -28234,6 +31976,386 @@ class DirectorCutStudio(QMainWindow):
         player.setPosition(self.pending_audio_positions.get(clip_key, 0))
         if self.timeline_playing and self.pending_audio_positions.get(clip_key, 0) < player.duration() - 20:
             player.play()
+
+    # ---- Program Monitor audio routing -------------------------------------
+    # Two Qt behaviours make Program Monitor playback silently fail on Windows.
+    # A QAudioOutput keeps writing to the endpoint it bound when it was created,
+    # so when Windows changes the default device (a Bluetooth speaker
+    # disconnecting is the recurring case on this machine) playback advances
+    # normally while producing no sound, with no error signal at all.  And the
+    # timeline SOURCE output used to stay muted until ``_clear_generated_output``
+    # ran, which left every timeline-branch playback -- Storyboard preview,
+    # image output, a Shot unit shown during Smart Render -- silent.
+    # ``_apply_monitor_audio_routing`` is the single authority for both: it
+    # derives audibility from the branch that is really playing, re-resolves the
+    # output device, and applies the monitor's master gain.
+
+    def _monitor_audio_pref_path(self) -> Path:
+        return CACHE_ROOT / "monitor_audio_prefs.json"
+
+    def _load_monitor_audio_prefs(self) -> dict:
+        """Machine-local monitor audio state; device ids are not project data."""
+        try:
+            payload = json.loads(
+                self._monitor_audio_pref_path().read_text(encoding="utf-8")
+            )
+            if isinstance(payload, dict):
+                return payload
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
+    def _save_monitor_audio_prefs(self) -> None:
+        try:
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            self._monitor_audio_pref_path().write_text(
+                json.dumps(
+                    {
+                        "volume": float(self.monitor_volume),
+                        "muted": bool(self.monitor_muted),
+                        "device_id": str(self.monitor_audio_device_id or ""),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+
+    def _monitor_gain(self) -> float:
+        try:
+            return max(0.0, min(1.0, float(self.monitor_volume)))
+        except (TypeError, ValueError, AttributeError):
+            return 1.0
+
+    def _monitor_audio_devices(self) -> list:
+        try:
+            return [
+                device
+                for device in QMediaDevices.audioOutputs()
+                if device is not None and not device.isNull()
+            ]
+        except (RuntimeError, TypeError, AttributeError):
+            return []
+
+    def _resolve_monitor_audio_device(self):
+        """Return the chosen endpoint, falling back to the current default."""
+        devices = self._monitor_audio_devices()
+        if not devices:
+            return None
+        wanted = str(self.monitor_audio_device_id or "")
+        if wanted:
+            for device in devices:
+                try:
+                    if str(device.id()) == wanted:
+                        return device
+                except (RuntimeError, TypeError):
+                    continue
+        try:
+            default = QMediaDevices.defaultAudioOutput()
+            if default is not None and not default.isNull():
+                return default
+        except (RuntimeError, TypeError, AttributeError):
+            pass
+        return devices[0]
+
+    def _monitor_playback_branch(self) -> str:
+        """Which pane is the audible source right now: ``generated``/``timeline``."""
+        generated_source = bool(
+            self.generated_output_locked
+            and not self.storyboard_preview_active
+            and self.generated_output_path
+            and media_type_for_path(self.generated_output_path) == "video"
+        )
+        if self.timeline_playing:
+            return "generated" if generated_source else "timeline"
+        # A Shot unit shown during Smart Render plays through the generated
+        # player without touching ``timeline_playing``, so player state is the
+        # next authority before falling back to the timeline.
+        try:
+            if self.generated_player.playbackState() == QMediaPlayer.PlayingState:
+                return "generated"
+        except RuntimeError:
+            pass
+        return "timeline"
+
+    def _apply_monitor_audio_routing(self, *_ignored) -> None:
+        if not hasattr(self, "audio_output") or not hasattr(self, "generated_audio_output"):
+            return
+        branch = self._monitor_playback_branch()
+        device = self._resolve_monitor_audio_device()
+        gain = self._monitor_gain()
+        master_muted = bool(self.monitor_muted)
+        generated_live = branch == "generated"
+        # Master gain lives on the monitor itself.  Per-clip envelope gain is
+        # applied by ``_sync_timeline_audio`` on top of ``_monitor_gain()``, so
+        # the clip outputs only receive mute/device state here.
+        for output in (self.audio_output, self.generated_audio_output):
+            try:
+                output.setVolume(gain)
+            except RuntimeError:
+                continue
+        routed = (
+            (self.audio_output, generated_live),
+            (self.generated_audio_output, not generated_live),
+        ) + tuple(
+            (output, generated_live)
+            for output in self.timeline_audio_outputs.values()
+        )
+        for output, branch_muted in routed:
+            try:
+                output.setMuted(bool(master_muted or branch_muted))
+            except RuntimeError:
+                continue
+            try:
+                current = output.device()
+                stale = current is None or current.isNull()
+                if not stale and device is not None:
+                    stale = str(current.id()) != str(device.id())
+                if device is not None and stale:
+                    output.setDevice(device)
+            except (RuntimeError, TypeError, AttributeError):
+                continue
+
+    def _refresh_monitor_audio_devices(self, *_ignored) -> None:
+        combo = getattr(self, "monitor_audio_device", None)
+        if combo is None:
+            return
+        wanted = str(self.monitor_audio_device_id or "")
+        devices = self._monitor_audio_devices()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("System default", "")
+        for device in devices:
+            try:
+                label = str(device.description() or "audio output")
+                device_id = str(device.id())
+            except (RuntimeError, TypeError):
+                continue
+            try:
+                if device.isDefault():
+                    label = f"{label} · default"
+            except RuntimeError:
+                pass
+            combo.addItem(label, device_id)
+        index = max(0, combo.findData(wanted))
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        known = set()
+        for device in devices:
+            try:
+                known.add(str(device.id()))
+            except (RuntimeError, TypeError):
+                continue
+        if wanted and wanted not in known:
+            # An endpoint that vanished (the usual cause of silent playback)
+            # must not keep the monitor bound to a device Windows no longer has.
+            self.monitor_audio_device_id = ""
+            self._save_monitor_audio_prefs()
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData("")))
+            combo.blockSignals(False)
+            self.statusBar().showMessage(
+                "Saved audio output device is gone; following the Windows default instead",
+                9000,
+            )
+        self._apply_monitor_audio_routing()
+
+    def _monitor_audio_device_changed(self, index: int) -> None:
+        combo = getattr(self, "monitor_audio_device", None)
+        if combo is None or not isinstance(index, int) or index < 0:
+            return
+        self.monitor_audio_device_id = str(combo.itemData(index) or "")
+        self._save_monitor_audio_prefs()
+        self._monitor_audio_rebind_playback()
+        label = str(combo.currentText() or "System default")
+        self.statusBar().showMessage(
+            f"Program Monitor audio output → {label} · press AUDIO TEST to confirm",
+            9000,
+        )
+
+    def _set_monitor_muted(self, checked: bool) -> None:
+        self.monitor_muted = bool(checked)
+        try:
+            self.monitor_mute_button.setText("🔇" if self.monitor_muted else "🔊")
+        except (RuntimeError, AttributeError):
+            pass
+        self._save_monitor_audio_prefs()
+        self._apply_monitor_audio_routing()
+
+    def _set_monitor_volume(self, value: int) -> None:
+        try:
+            self.monitor_volume = max(0.0, min(1.0, int(value) / 100.0))
+        except (TypeError, ValueError):
+            self.monitor_volume = 1.0
+        try:
+            self.monitor_volume_label.setText(
+                f"{int(round(self._monitor_gain() * 100))}%"
+            )
+        except (RuntimeError, AttributeError):
+            pass
+        self._save_monitor_audio_prefs()
+        # Clip outputs keep their own envelope gain: ``_sync_timeline_audio``
+        # multiplies it by ``_monitor_gain()`` on every render, so pushing the
+        # master gain here would only flatten the envelope.
+        self._apply_monitor_audio_routing()
+
+    def _monitor_audio_rebind_playback(self) -> None:
+        """Restart the audible branch so a new device takes effect immediately."""
+        branch = self._monitor_playback_branch()
+        try:
+            if branch == "generated":
+                was_playing = (
+                    self.generated_player.playbackState() == QMediaPlayer.PlayingState
+                )
+                self._apply_monitor_audio_routing()
+                if was_playing:
+                    self.generated_player.pause()
+                    self.generated_player.play()
+                return
+            audio_players = list(self.timeline_audio_players.values())
+            was_playing = (
+                self.player.playbackState() == QMediaPlayer.PlayingState
+                or any(
+                    player.playbackState() == QMediaPlayer.PlayingState
+                    for player in audio_players
+                )
+            )
+            self._apply_monitor_audio_routing()
+            if was_playing and self.scan:
+                self.player.pause()
+                for player in audio_players:
+                    player.pause()
+                self.player.play()
+                self.render_timeline_at(self.playhead_seconds, force_seek=True)
+        except RuntimeError:
+            pass
+
+    def _monitor_calibration_tone_path(self) -> Path:
+        """Three short sine beeps so silence can be attributed to routing."""
+        folder = CACHE_ROOT / "audio_test"
+        folder.mkdir(parents=True, exist_ok=True)
+        tone = folder / "monitor_calibration_tone_v1.wav"
+        if tone.is_file() and tone.stat().st_size > 2048:
+            return tone
+        rate = 48_000
+        plan = ((660.0, 0.32), (0.0, 0.14), (880.0, 0.32), (0.0, 0.14), (1320.0, 0.42))
+        frames = bytearray()
+        for frequency, seconds in plan:
+            samples = max(1, int(rate * seconds))
+            for index in range(samples):
+                amplitude = 0.0
+                if frequency > 0.0:
+                    attack = min(1.0, index / 300.0)
+                    release = min(1.0, (samples - index) / 600.0)
+                    amplitude = (
+                        0.32
+                        * math.sin(2.0 * math.pi * frequency * index / rate)
+                        * attack
+                        * release
+                    )
+                value = int(round(max(-1.0, min(1.0, amplitude)) * 32767.0))
+                frames += struct.pack("<hh", value, value)
+        temporary = tone.with_name(f"{tone.stem}.{os.getpid()}.tmp")
+        with temporary.open("wb") as raw:
+            with wave.open(raw, "wb") as handle:
+                handle.setnchannels(2)
+                handle.setsampwidth(2)
+                handle.setframerate(rate)
+                handle.writeframes(bytes(frames))
+        temporary.replace(tone)
+        return tone
+
+    def _play_monitor_audio_test(self) -> None:
+        try:
+            tone = self._monitor_calibration_tone_path()
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.statusBar().showMessage(f"Calibration tone failed · {exc}", 12000)
+            return
+        device = self._resolve_monitor_audio_device()
+        output = self.monitor_test_audio_output
+        player = self.monitor_test_player
+        player.stop()
+        try:
+            if device is not None and not device.isNull():
+                output.setDevice(device)
+            output.setVolume(self._monitor_gain())
+            output.setMuted(False)
+            player.setSource(QUrl.fromLocalFile(str(tone)))
+            player.play()
+        except (RuntimeError, TypeError, AttributeError) as exc:
+            self.statusBar().showMessage(f"Calibration tone failed · {exc}", 12000)
+            return
+        label = "System default"
+        if device is not None:
+            try:
+                label = str(device.description() or "System default")
+            except RuntimeError:
+                pass
+        backend = os.environ.get("QT_MEDIA_BACKEND", "").strip() or "default"
+        self.statusBar().showMessage(
+            f"Calibration tone → {label} · {len(self._monitor_audio_devices())} Qt "
+            f"device(s) · media backend {backend} · three beeps expected; if silent, "
+            "select another OUTPUT DEVICE and press AUDIO TEST again",
+            18000,
+        )
+
+    def _monitor_test_status_changed(self, status) -> None:
+        if status == QMediaPlayer.EndOfMedia:
+            try:
+                self.monitor_test_player.stop()
+            except RuntimeError:
+                pass
+
+    def _monitor_media_error(self, pane: str, error, message: str) -> None:
+        try:
+            if not int(error):
+                return
+        except (TypeError, ValueError):
+            pass
+        text = str(message or "").strip() or "unspecified media backend error"
+        backend = os.environ.get("QT_MEDIA_BACKEND", "").strip() or "default"
+        self.statusBar().showMessage(
+            f"{pane} playback error · {error} · {text} · backend {backend}", 15000
+        )
+
+    def _ensure_generated_audio_track(self) -> None:
+        """Select the generated clip's audio stream when Qt leaves it unset."""
+        try:
+            tracks = list(self.generated_player.audioTracks() or [])
+        except (RuntimeError, TypeError, AttributeError):
+            return
+        if not tracks:
+            notice_key = str(self.generated_playback_path or "")
+            if (
+                not self.monitor_muted
+                and getattr(self, "_generated_audio_notice_key", "") != notice_key
+            ):
+                self._generated_audio_notice_key = notice_key
+                self.statusBar().showMessage(
+                    "GENERATED OUTPUT exposes no audio track in Qt's playback graph",
+                    10000,
+                )
+            return
+        try:
+            active = int(self.generated_player.activeAudioTrack())
+        except (RuntimeError, TypeError, ValueError):
+            active = -1
+        if active >= 0:
+            return
+        try:
+            # PySide6 6.11 hands back track metadata objects instead of a track
+            # class carrying a unique id, so the integer index overload is the
+            # one that actually works on this runtime.
+            try:
+                self.generated_player.setActiveAudioTrack(0)
+            except (RuntimeError, TypeError, ValueError):
+                self.generated_player.setActiveAudioTrack(int(tracks[0].uniqueId()))
+        except (RuntimeError, TypeError, ValueError, AttributeError):
+            return
+        self.statusBar().showMessage(
+            "GENERATED OUTPUT re-selected its audio track for playback", 9000
+        )
 
     def _stop_all_timeline_media(self) -> None:
         self.timeline_playing = False
@@ -28248,6 +32370,7 @@ class DirectorCutStudio(QMainWindow):
         self.composite_visuals = []
         if hasattr(self, "play_button"):
             self.play_button.setText("▶")
+        self._apply_monitor_audio_routing()
 
     def _release_all_media_sources(self) -> None:
         """Release Windows/FFmpeg file handles without changing project state."""
@@ -31761,6 +35884,40 @@ class DirectorCutStudio(QMainWindow):
             )
         return rows
 
+    @staticmethod
+    def _character_swap_identity_failed(row: dict | None) -> bool:
+        """Return True when Relay completed but no retry replaced the actor.
+
+        Character Swap QC is intentionally non-blocking, so the worker may
+        return the least-bad take after its retry budget.  Such a take is
+        still useful for review, but it must never be promoted to a clean,
+        reusable Segment or the same unchanged V1 actor becomes permanently
+        cached behind a newly saved Unlock Identity choice.
+        """
+
+        if not isinstance(row, dict):
+            return False
+        if _character_swap_identity_qc_mode() == "record":
+            # Round 122（导演的选择）：``H3_CHARACTER_SWAP_IDENTITY_QC=record`` 时判决
+            # 只落盘不拦路 —— audit、尝试表、``character_swap_identity_failed`` 全都还在
+            # manifest 里，但这段取不再被当成坏片拒绝。默认 ``gate`` 保持旧行为。
+            return False
+        if bool(row.get("character_swap_identity_failed", False)):
+            return True
+        for audit in row.get("character_swap_identity_audits") or []:
+            if not isinstance(audit, dict):
+                continue
+            if bool(audit.get("advisory_only")):
+                # Round 52: an advisory verdict is evidence for the next
+                # diagnosis, not a reason to refuse a Segment.  A pre-round-52
+                # manifest has no such flag and keeps failing exactly as before.
+                continue
+            if bool(audit.get("available", False)) and not bool(
+                audit.get("passed", True)
+            ):
+                return True
+        return False
+
     def _compiled_window_job(
         self,
         start: float,
@@ -32077,9 +36234,18 @@ class DirectorCutStudio(QMainWindow):
             )
         except (OSError, RuntimeError, ValueError, TypeError):
             has_audio = True
+        # A phone or WhatsApp plate publishes a duration that runs past its last
+        # seekable picture.  An input seek into that tail decodes nothing and
+        # FFmpeg then fails inside its encoder, so an isolated repair near the
+        # end of such a plate used to be dropped for no reason.  Climb back into
+        # the span that can actually be decoded; the slice keeps its length and
+        # simply starts at the nearest reachable frame.
+        seek = clamp_seek_to_decode_span(
+            source, max(0.0, source_offset), runtime=self.runtime
+        )
         command = [
             str(self.runtime.ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", f"{max(0.0, source_offset):.6f}", "-i", str(source),
+            "-ss", f"{seek:.6f}", "-i", str(source),
             "-t", f"{duration:.6f}", "-map", "0:v:0",
         ]
         if has_audio:
@@ -32219,12 +36385,667 @@ class DirectorCutStudio(QMainWindow):
             return preview_path
         return destination.resolve()
 
+    @staticmethod
+    def _identity_sheet_head_coverage(
+        source: Path,
+        video_width: int,
+        video_height: int,
+    ) -> float | None:
+        """Estimate how much of one V1 frame Picture 1's own head can fill.
+
+        The picture is fit inside the source frame the same way Relay sees it, so
+        the number is the head area a take can actually inherit.  Every rejected
+        Shot in the current Project ("became an old man", "the clothes are
+        nothing like the reference") had a head below 0.18 of the frame, while
+        the two Shots the director called perfect sat above that band.  Returns
+        None when the artwork cannot be segmented.
+        """
+
+        return measure_head_coverage(source, video_width, video_height)
+
+    @staticmethod
+    def _identity_sheet_tagged_views(preset: int) -> tuple[str, ...]:
+        """Return the body views the chosen layout asks a panel to show.
+
+        Presets 0-8 tag nothing, which is the honest signal for "this layout
+        invents its angles": offering it real rear artwork would change a layout
+        the director already graded.  Layout 9 tags front / rear / side.
+        """
+
+        try:
+            layout = SHEET_PRESETS[int(preset)]
+        except (KeyError, TypeError, ValueError):
+            layout = SHEET_PRESETS[DEFAULT_SHEET_PRESET]
+        tagged = {
+            str(getattr(panel, "view", "") or "").strip().lower()
+            for panel in layout.panels
+        } - {""}
+        return tuple(sorted(tagged))
+
+    @staticmethod
+    def _identity_sheet_view_family(stem: str) -> str:
+        """Return the Media Pool asset family one picture belongs to.
+
+        Imported assets are ``<asset id>_<hash>_<original name>``, where the id is
+        ``P1``-style, or ``image_137``-style for a picture that arrived without
+        one.  The family is that id, and it is what stops Picture 2's rear drawing
+        from being read as Picture 1's rear.  A name with no id falls back to its
+        first token, which still only matches siblings that start the same way.
+        """
+
+        tokens = [
+            token for token in re.split(r"[^0-9A-Za-z]+", str(stem or "")) if token
+        ]
+        if not tokens:
+            return ""
+        first = tokens[0].lower()
+        if re.fullmatch(r"[a-z]{1,8}\d{1,6}", first):
+            return first
+        if len(tokens) >= 2 and re.fullmatch(r"\d{1,6}", tokens[1]):
+            return f"{first}_{tokens[1].lower()}"
+        return first
+
+    @classmethod
+    def _character_swap_identity_sheet_view_sources(
+        cls,
+        source: Path,
+        preset: int,
+    ) -> tuple[dict, dict]:
+        """Find real rear / side drawings for one P Picture's turnaround layout.
+
+        The Media Pool folder is scanned - non-recursively, so the Project's own
+        cache folders can never feed a sheet - and a sibling is only accepted when
+        it shares Picture 1's asset family *and* its name states the view as a
+        whole word.  Both conditions are load-bearing: without the family rule a
+        second character's rear drawing becomes the first character's, and without
+        the whole-word rule ``background_test.png`` claims the rear panel.
+
+        Returns ``(view_sources, metrics)``.  ``view_sources`` is empty whenever
+        the layout tags no view, the scan is switched off, or the Project really
+        only has front artwork - in every one of those cases the sheet composes
+        exactly as it did before, and the metrics say which case it was rather than
+        leaving the manifest silent.
+        """
+
+        metrics: dict = {}
+        tagged = cls._identity_sheet_tagged_views(preset)
+        wanted = tuple(
+            name for name in tagged if name in IDENTITY_SHEET_VIEW_SOURCE_TOKENS
+        )
+        if not wanted:
+            return {}, metrics
+        metrics["identity_sheet_view_panels_tagged"] = list(tagged)
+        if not IDENTITY_SHEET_VIEW_SOURCES_ENABLED:
+            metrics["identity_sheet_view_source_state"] = "environment_disabled"
+            return {}, metrics
+        source = Path(source)
+        folder = source.parent
+        try:
+            siblings = sorted(
+                path.name for path in folder.iterdir() if path.is_file()
+            )
+        except OSError:
+            metrics["identity_sheet_view_source_state"] = "folder_unreadable"
+            return {}, metrics
+        family = cls._identity_sheet_view_family(source.stem)
+        matches: dict[str, list[str]] = {name: [] for name in wanted}
+        for name in siblings[:IDENTITY_SHEET_VIEW_SOURCE_SCAN_LIMIT]:
+            if name == source.name:
+                continue
+            candidate = folder / name
+            if candidate.suffix.lower() not in IDENTITY_SHEET_VIEW_SOURCE_SUFFIXES:
+                continue
+            if family and cls._identity_sheet_view_family(candidate.stem) != family:
+                continue
+            tokens = {
+                token.lower()
+                for token in re.split(r"[^0-9A-Za-z]+", candidate.stem)
+                if token
+            }
+            for view_name, view_tokens in IDENTITY_SHEET_VIEW_SOURCE_TOKENS.items():
+                if view_name in matches and any(
+                    token in tokens for token in view_tokens
+                ):
+                    matches[view_name].append(name)
+        chosen = {
+            view_name: names[0]
+            for view_name, names in sorted(matches.items())
+            if names
+        }
+        metrics["identity_sheet_view_source_candidate_count"] = sum(
+            len(names) for names in matches.values()
+        )
+        if not chosen:
+            metrics["identity_sheet_view_source_state"] = "front_only_artwork"
+            return {}, metrics
+        metrics["identity_sheet_view_source_state"] = "matched"
+        metrics["identity_sheet_view_sources"] = chosen
+        # The engine is the one that decides which views a layout can read, so the
+        # mapping handed to it is filtered through the same gate instead of a
+        # parallel copy of the rule.  Whatever survives is what reaches the sheet.
+        # ``chosen`` holds file *names* and the engine keeps only a view whose
+        # picture it can open, so the folder has to be resolved here.  Handing it
+        # bare names made every real rear / side drawing fail its own ``is_file``
+        # check, which put the mirrored-front fallback back on the wire and made
+        # the whole scan a no-op that still reported a match.
+        usable = collect_view_sources(
+            int(preset),
+            {name: str(folder / chosen[name]) for name in sorted(chosen)},
+        )
+        return (
+            {name: str(usable[name]) for name in sorted(usable)},
+            metrics,
+        )
+
+    def _character_swap_identity_sheet_reference(
+        self,
+        source: Path,
+        source_clip: Path | None,
+        pass_spec: dict | None = None,
+    ) -> tuple[Path, str, dict]:
+        """Return the picture Relay should receive for one Character Swap pass.
+
+        Picture 1 stays the authority for the character's medium and design; the
+        only question is whether its head is large enough for H3 to read the
+        face.  A 209x600 full-body cartoon fit into a 460x642 source frame puts
+        roughly one tenth of that frame into the head, which is the regime where
+        Relay kept the palette but invented a new age, face and wardrobe (S3,
+        S5, S7, S9, S10, S11).  Below the threshold the engine composes a local
+        Identity Sheet - same artwork, one head panel plus body/outfit panels -
+        so the identity arrives with enough pixels to copy.  Above it the Media
+        Pool picture is passed through untouched, and any failure to measure or
+        compose degrades to that same untouched picture.
+
+        A second rule sits in front of the sheet for artwork that is already a
+        big-figure full-body design.  There, the sheet's extra head pixels are
+        small (the black-shirt Picture 1 measured 0.2144 of the frame raw versus
+        0.5259 sheeted) while the price is certain: H3 reproduced the sheet's own
+        border, gutters and headless lower panel as scene content at the start of
+        every Relay window, which is exactly what the director reported as "the
+        character sheet's lower half appears at the 4th second".  When the
+        artwork's head already dominates its own canvas and the subject fills
+        almost all of it, the raw Media Pool picture goes up the wire instead.
+        The age-drift risk of the smaller head is handled by the apparent-age
+        lock and by the plate head-band blur, and the whole rule is reversible
+        through ``H3_IDENTITY_SHEET_SINGLE_FIGURE_PASSTHROUGH=0``.
+
+        That rule now carries a resolution floor, because the layout argument only
+        holds for artwork the model can actually read.  The black-shirt Picture 1
+        is 252x370 = 0.093 MP on its own canvas, Relay's conditioning node upscale
+        inflated it 4.6x, and the graded result was "the head is right, the clothes
+        are nothing like the reference" - the pixels for the wardrobe simply were
+        not there.  A big figure at or above
+        ``IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS`` (0.35 MP stock) still goes up
+        untouched; below it the sheet goes up instead, forced to the one-face
+        whole-figure layout (``identitysheet08_fullfig``) that the director
+        measured as a real gain.  ``H3_IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS=0``
+        restores the unconditional passthrough.
+        """
+
+        source = Path(source).resolve()
+        metrics: dict = {}
+        if not self.identity_sheet_enabled or not source.is_file():
+            return source, FULL_DESIGN_FRAMING, metrics
+        if source_clip is None or not Path(source_clip).is_file():
+            return source, FULL_DESIGN_FRAMING, metrics
+        try:
+            info = probe_media(str(source_clip), self.runtime)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            return source, FULL_DESIGN_FRAMING, metrics
+        video_width = video_height = 0
+        for stream in info.get("streams") or []:
+            if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+                continue
+            video_width = int(stream.get("width", 0) or 0)
+            video_height = int(stream.get("height", 0) or 0)
+            break
+        if video_width <= 0 or video_height <= 0:
+            return source, FULL_DESIGN_FRAMING, metrics
+        coverage = self._identity_sheet_head_coverage(
+            source, video_width, video_height
+        )
+        if coverage is None:
+            return source, FULL_DESIGN_FRAMING, metrics
+        metrics["identity_sheet_source_head_coverage"] = round(coverage, 6)
+        if coverage >= IDENTITY_SHEET_MIN_HEAD_COVERAGE:
+            return source, FULL_DESIGN_FRAMING, metrics
+        own = measure_reference_head_metrics(source)
+        if own:
+            metrics["identity_sheet_reference_head_coverage"] = round(
+                float(own["head_canvas_coverage"]), 6
+            )
+            metrics["identity_sheet_reference_subject_fill"] = round(
+                float(own["subject_fill_share"]), 6
+            )
+        own_megapixels = 0.0
+        if own:
+            own_canvas = own.get("canvas") or [0, 0]
+            own_megapixels = (
+                float(own_canvas[0] or 0) * float(own_canvas[1] or 0)
+            ) / 1_000_000.0
+            metrics["identity_sheet_source_reference_megapixels"] = round(
+                own_megapixels, 6
+            )
+        single_figure_design = bool(
+            own is not None
+            and float(own["head_canvas_coverage"])
+            >= IDENTITY_SHEET_MIN_SOURCE_CANVAS_HEAD_COVERAGE
+            and float(own["subject_fill_share"])
+            >= IDENTITY_SHEET_MIN_SOURCE_SUBJECT_FILL
+        )
+        single_figure_fullfig = False
+        if IDENTITY_SHEET_SINGLE_FIGURE_PASSTHROUGH and single_figure_design:
+            if (
+                IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS <= 0.0
+                or own_megapixels >= IDENTITY_SHEET_MIN_SOURCE_MEGAPIXELS
+            ):
+                metrics["identity_sheet_single_figure_passthrough"] = True
+                return source, FULL_DESIGN_FRAMING, metrics
+            # Round 38b: one big figure, but too few pixels to be its own
+            # reference.  The layout price the passthrough was avoiding only
+            # applies to a layout the model can actually read, so this asset gets
+            # the sheet - and it gets the single-face layout with the whole figure
+            # in the wardrobe panel, which is the one the director graded as a
+            # real gain ("identitysheet08_fullfig", 800x1216).
+            single_figure_fullfig = True
+            metrics["identity_sheet_single_figure_fullfig"] = True
+        # Round 51: does <Video 1> itself cut the figure at the bottom edge?  The
+        # clause that stops Relay from widening the shot used to trigger on face
+        # dominance alone, so this Shot — plate head coverage 0.2144, a half-body
+        # crop, and a manual qualified rectangle the UI deliberately shrank to
+        # 0.30x0.30 — never emitted it, and the graded take came back as "V1 is a
+        # half-body, the result is P1's whole body".  The full outfit sheet is the
+        # strongest "this whole figure belongs in frame" cue Relay receives, so
+        # the counter-weight has to be measured evidence about the plate rather
+        # than another guess from box sizes.  Cheap (one 96-wide gray decode of the
+        # window, six sampled frames) and every failure mode degrades to no flag,
+        # which is exactly the pre-round-51 behaviour.
+        probe_box = source_figure_probe_box(pass_spec)
+        if probe_box is not None:
+            reveal = measure_source_figure_reveal(
+                self.runtime.ffmpeg,
+                source_clip,
+                probe_box,
+                frame_width=video_width,
+                frame_height=video_height,
+            )
+            if reveal:
+                metrics["source_figure_reveal_status"] = str(
+                    reveal.get("status", "")
+                )
+                metrics["source_figure_reveal_sample_count"] = int(
+                    reveal.get("sample_count", 0) or 0
+                )
+                bottom = reveal.get("figure_bottom_normalized")
+                if bottom is not None:
+                    metrics["source_figure_bottom_normalized"] = round(
+                        float(bottom), 6
+                    )
+                if str(reveal.get("status", "")) == "measured":
+                    metrics["source_figure_reaches_frame_bottom"] = bool(
+                        reveal.get("reaches_frame_bottom", False)
+                    )
+        requested_preset = int(self.identity_sheet_preset)
+        sheet_preset = requested_preset
+        metrics["identity_sheet_preset_requested"] = requested_preset
+        outfit_view = ""
+        if single_figure_fullfig:
+            # Layout 8 pairs the enlarged head with the neck-down outfit panel, so
+            # the sheet carries exactly one face (the round-14 clone failure) while
+            # ``full`` keeps every wardrobe row - trousers and shoes included - inside
+            # the reference (the round-28 "衣服完全不像参考图" failure).  Both failures
+            # were measured on this Project's own artwork, and this branch is only
+            # reachable for artwork that is already a single big figure.
+            if IDENTITY_SHEET_CLOSEUP_PRESET in SHEET_PRESET_KEYS:
+                sheet_preset = int(IDENTITY_SHEET_CLOSEUP_PRESET)
+                metrics["identity_sheet_preset_forced"] = sheet_preset
+            outfit_view = "full"
+        elif pass_spec is not None and (
+            IDENTITY_SHEET_CLOSEUP_PRESET in SHEET_PRESET_KEYS
+        ):
+            # Close-up and medium-silent Shots only have room for one face, so a
+            # two-face layout clones the character there (round-14 S2).
+            # The same Shots cannot carry a whole-body wardrobe panel either:
+            # round-15 S2 rendered the sheet's legs as a second standing clone.
+            closeup_rows = self._pass_spec_closeup_gate_rows(pass_spec)
+            medium_rows = self._pass_spec_medium_silent_blur_rows(pass_spec)
+            metrics["identity_sheet_closeup_gate_rows"] = len(closeup_rows)
+            metrics["identity_sheet_medium_silent_rows"] = len(medium_rows)
+            framing_rows: list[dict] = []
+            framing_threshold = IDENTITY_SHEET_FRAMING_MEDIUM_MIN_HEIGHT
+            if (
+                framing_threshold <= 0.0
+                and requested_preset == int(IDENTITY_SHEET_CLOSEUP_PRESET)
+            ):
+                # The Identity Sheet page lists this layout by name, so picking
+                # "Head + neck-down figure (single face)" in the GUI is itself
+                # the opt-in.  Requiring ``design_ai.env`` plus a Studio restart
+                # instead meant a take could silently run on the old layout, and
+                # one settings save deleted the knob outright.  A wardrobe panel
+                # cut at the hips is what makes the layout readable on a medium
+                # Shot (rounds 22/23), so the rule applies here.  Setting the
+                # constant below to 0.0 rolls the behaviour back.
+                framing_threshold = float(
+                    IDENTITY_SHEET_FRAMING_MEDIUM_MIN_HEIGHT_WHEN_CHOSEN
+                )
+            metrics["identity_sheet_framing_threshold"] = round(
+                framing_threshold, 6
+            )
+            if (
+                not closeup_rows
+                and not medium_rows
+                and framing_threshold > 0.0
+            ):
+                framing_rows = self._pass_spec_framing_medium_rows(
+                    pass_spec,
+                    framing_threshold,
+                )
+            if medium_rows:
+                # A medium-shot silent listener is framed from the hips up or
+                # lower, so the trousers are inside <Video 1>'s crop.  Round 28
+                # measured the shipped hip cut on this Project's own P1 artwork:
+                # the crop ends at [0,153,250,288], the tunic hem, while the
+                # yellow checked trousers and shoes start at y=296.  Everything
+                # the Shot shows below the hem therefore had zero reference
+                # authority, which is the "衣服完全不像参考图" grade.  ``full``
+                # buys those rows back at the same 0.44 wardrobe-area target, so
+                # the head panel — graded 完美 by the user — does not move.
+                outfit_view = "full"
+            elif closeup_rows:
+                # Round 17 (97000804 vs 97000824, one variable): the chest crop
+                # hides the very wardrobe rows that make Picture 1 recognisable,
+                # so a close-up is given the same hip-height panel as a medium
+                # Shot, not the whole figure: a face-filling Shot has no room for
+                # the legs, and round 15 rendered an uncut figure as a second
+                # standing person there.  ``H3_IDENTITY_SHEET_OUTFIT_VIEW=close_up``
+                # rolls back.
+                outfit_view = "medium"
+            if outfit_view and IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE:
+                # Experiment override only: the automatic choice still decides
+                # *whether* this Shot gets a framed wardrobe panel at all, so an
+                # ungated Shot never inherits a crop it has no box for.
+                outfit_view = (
+                    ""
+                    if IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE == "none"
+                    else IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE
+                )
+                metrics["identity_sheet_outfit_view_override"] = (
+                    IDENTITY_SHEET_OUTFIT_VIEW_OVERRIDE
+                )
+            if framing_rows:
+                outfit_view = "full"
+                metrics["identity_sheet_framing_medium_rows"] = len(framing_rows)
+            if (closeup_rows or medium_rows or framing_rows) and (
+                sheet_preset_face_panel_count(requested_preset) >= 2
+            ):
+                sheet_preset = int(IDENTITY_SHEET_CLOSEUP_PRESET)
+                metrics["identity_sheet_preset_forced"] = sheet_preset
+        metrics["identity_sheet_outfit_view"] = outfit_view
+        # Round 69 item 7: which real views this layout can read is decided by the
+        # layout that survived the gates above, not by the one the user picked --
+        # a close-up Shot forced back to layout 8 has no rear panel, and recording
+        # the rear drawing it ignored would have been a lie.  Layouts 0-8 return
+        # here with nothing to look for, so their sheets are byte-identical.
+        # The helper reads no instance state, so it is reached through the class
+        # rather than ``self``: the Job compiler is sometimes handed a bare
+        # stand-in for the window, and a view search must not be the thing that
+        # fails when it is.
+        view_sources, view_metrics = (
+            DirectorCutStudio._character_swap_identity_sheet_view_sources(
+                source, sheet_preset
+            )
+        )
+        metrics.update(view_metrics)
+        result = resolve_identity_sheet(
+            source,
+            self._ensure_project_workspace() / "cache" / "identity_sheets",
+            preset=sheet_preset,
+            target_aspect=(video_width, video_height),
+            outfit_view=outfit_view or None,
+            view_sources=view_sources or None,
+        )
+        sheet_path = Path(str(result.sheet_path or ""))
+        metrics["identity_sheet_reason"] = str(result.reason or "")
+        if not result.ok or not sheet_path.is_file():
+            return source, FULL_DESIGN_FRAMING, metrics
+        metrics["identity_sheet_head_coverage"] = round(
+            float(result.head_coverage or 0.0), 6
+        )
+        metrics["identity_sheet_source_head_crop_megapixels"] = round(
+            float(getattr(result, "source_head_crop_megapixels", 0.0) or 0.0), 6
+        )
+        metrics["identity_sheet_preset"] = int(result.preset)
+        return sheet_path, IDENTITY_SHEET_FRAMING, metrics
+
+    def _character_swap_wardrobe_signature(
+        self, source: Path
+    ) -> tuple[Path | None, dict]:
+        """Return the garment-only QC reference for one Character Swap pass.
+
+        Relay QC has always judged the face.  That is why "head perfect, clothes
+        still V1" survived thirty rounds of grading: the body region was never
+        measured, and the whole-picture target cue is dominated by head pixels, so
+        keeping the source actor's cosplay barely moves its histogram.  This
+        reference is the artwork below its own head box and nothing else, which is
+        what makes "did the body change?" answerable at all.  ``Path|None`` plus
+        the fields the Job row needs; ``None`` means the picture has no measurable
+        body region (a portrait, an unsegmentable photo) and the Shot simply keeps
+        the face-only QC it had before.
+        """
+
+        try:
+            source = Path(source).resolve()
+        except (OSError, ValueError):
+            return None, {}
+        if not source.is_file():
+            return None, {}
+        signature = compose_wardrobe_signature(
+            source,
+            self._ensure_project_workspace() / "cache" / "wardrobe_signatures",
+        )
+        if not signature:
+            return None, {"identity_wardrobe_signature_state": "unmeasurable"}
+        return (
+            Path(signature["path"]),
+            {
+                "identity_wardrobe_signature": str(signature["path"]),
+                "identity_wardrobe_bbox_normalized": list(
+                    signature["bbox_normalized"]
+                ),
+                "identity_wardrobe_reason": str(signature["reason"]),
+            },
+        )
+
+    @staticmethod
+    def _character_swap_body_audit_box(
+        pass_spec: dict, audit_role_rows: list
+    ) -> list[list[float]]:
+        """Return the one body region the wardrobe audit should measure.
+
+        The suppression geometry is the only place in the Job that already knows
+        where this Shot decided the performer's clothes live: it is the same
+        rectangle ffmpeg blurred, so the audit cannot drift from what the model was
+        shown.  Calibration used exactly the largest wardrobe band (the black-shirt
+        Shot's ``[0.30, 0.285, 0.78012, 1.0]``); a thin arm sliver or a
+        shoulders-only band would measure background instead of a costume, so
+        narrow bands are skipped.  With no suppression geometry — a Shot whose
+        source performer is not illustrated-suppressed — the fallback is the lower
+        half of the largest role box, which is the same region the pre-existing
+        lower-body check reads but reaching the feet instead of a chest sliver.
+        At most one box is returned: three boxes triple the ffmpeg work per stamp
+        and three near-identical medians do not tell the director anything new.
+        """
+
+        geometry = pass_spec.get("identity_suppression_geometry")
+        if isinstance(geometry, dict):
+            candidates = []
+            for band in geometry.get("bands") or []:
+                if not isinstance(band, dict):
+                    continue
+                if str(band.get("kind") or "") != "wardrobe":
+                    continue
+                try:
+                    left = max(0.0, float(band.get("left", 0.0) or 0.0))
+                    top = max(0.0, float(band.get("top", 0.0) or 0.0))
+                    width = max(0.0, float(band.get("width", 0.0) or 0.0))
+                    height = max(0.0, float(band.get("height", 0.0) or 0.0))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if width < 0.12 or height < 0.30:
+                    continue
+                right = min(1.0, left + width)
+                bottom = min(1.0, top + height)
+                if right - left < 0.12 or bottom - top < 0.30:
+                    continue
+                band_box = [
+                    round(left, 6),
+                    round(top, 6),
+                    round(right, 6),
+                    round(bottom, 6),
+                ]
+                # ``list.append`` takes one argument: the candidate is the
+                # (area, box) pair itself, not two arguments.
+                candidates.append(((right - left) * (bottom - top), band_box))
+            if candidates:
+                return [max(candidates, key=lambda row: row[0])[1]]
+
+        largest: tuple[float, list[float]] | None = None
+        for row in audit_role_rows or []:
+            if not isinstance(row, dict):
+                continue
+            bbox = (
+                row.get("identity_audit_bbox_normalized")
+                or row.get("source_bbox_normalized")
+                or []
+            )
+            try:
+                left, top, right, bottom = [float(value) for value in bbox][:4]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            left, top = max(0.0, left), max(0.0, top)
+            right, bottom = min(1.0, right), min(1.0, bottom)
+            if right - left < 0.03 or bottom - top < 0.15:
+                continue
+            area = (right - left) * (bottom - top)
+            box = [
+                round(left, 6),
+                round(top + (bottom - top) * 0.45, 6),
+                round(right, 6),
+                round(max(bottom, 0.999), 6),
+            ]
+            if largest is None or area > largest[0]:
+                largest = (area, box)
+        return [largest[1]] if largest else []
+
+    @staticmethod
+    def _character_swap_opaque_reference(source: Path) -> tuple[Path, bool]:
+        """Return the reference Relay should actually receive, plus whether it was matted.
+
+        The Design pipeline stores its cast as transparent cut-outs (``*_nobg.png``).
+        The manual ComfyUI graph the director grades was built from an ordinary
+        opaque picture - the accepted ``images (8).jfif`` reference in the verified
+        history has no alpha channel at all - and Relay's VAE treats transparent
+        pixels as content it has to explain.  Feeding it the same artwork flattened
+        onto white makes the two wires carry the same information: the cartoon keeps
+        its medium and its colours, and the model stops inventing background detail
+        where the matte used to be, which is the honeycomb lattice the director
+        graded on the black-shirt and pink-dress backgrounds.
+
+        White is the matte because it is what the Identity Sheet already composes
+        onto, so the two reference framings cannot disagree about what "outside the
+        character" looks like.  Anything that cannot be read or written is reported
+        as unflattened and the original path ships: Character Swap must never die on
+        a matting step.
+        """
+
+        try:
+            source = Path(source).resolve()
+        except (OSError, ValueError):
+            return source, False
+        if not source.is_file():
+            return source, False
+        try:
+            picture = QImage(str(source))
+        except Exception:
+            return source, False
+        if picture.isNull() or not picture.hasAlphaChannel():
+            return source, False
+        try:
+            stamp = hashlib.sha256(
+                (
+                    f"character-swap-opaque-reference-v1|{source}|"
+                    f"{source.stat().st_size}|{source.stat().st_mtime_ns}"
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            cache = CACHE_ROOT / "character_swap_reference_opaque"
+            cache.mkdir(parents=True, exist_ok=True)
+            destination = cache / f"{source.stem}_opaque_{stamp}.png"
+        except OSError:
+            return source, False
+        if not destination.is_file() or destination.stat().st_size <= 128:
+            canvas = QImage(picture.size(), QImage.Format_RGB32)
+            canvas.fill(QColor(255, 255, 255))
+            painter = QPainter(canvas)
+            try:
+                painter.drawImage(
+                    0, 0, picture.convertToFormat(QImage.Format_RGBA8888)
+                )
+            finally:
+                painter.end()
+            if canvas.isNull() or not canvas.save(str(destination), "PNG"):
+                return source, False
+        return destination.resolve(), True
+
+    def _character_swap_shot_framing_class(self, pass_specs: list[dict]) -> str:
+        """One reference-framing class for every Character Swap pass in a Shot.
+
+        Round 69 item 4.  Each pass used to grade the Shot's shot-scale from its
+        own Current Role boxes, so a Segment with a large foreground performer and
+        a distant second performer sent Relay two different reference grammars at
+        once — one role rebuilt from a head-and-shoulders identity crop, the other
+        from a full figure.  The pink-dress post-mortem found the same split
+        feeding the misplacement: the pairing that QC could not see, the pairing
+        Relay could not hold.  Measuring the widest box any role in the Shot
+        occupies keeps every pass in the Segment telling the model the same thing
+        about how close the camera is.
+        """
+
+        widths: list[float] = []
+        heights: list[float] = []
+        event_parts: list[str] = []
+        for pass_spec in pass_specs:
+            for row in pass_spec.get("source_roles") or []:
+                if not isinstance(row, dict):
+                    continue
+                bbox = row.get("source_bbox_normalized") or []
+                if len(bbox) != 4:
+                    continue
+                try:
+                    left, top, right, bottom = [float(value) for value in bbox]
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                widths.append(max(0.0, right - left))
+                heights.append(max(0.0, bottom - top))
+            event_parts.extend(
+                str(value or "") for value in pass_spec.get("source_events") or []
+            )
+        event_text = " ".join(event_parts).casefold()
+        if "close-up" in event_text or "close up" in event_text or (
+            widths and heights and max(widths) >= 0.55 and max(heights) >= 0.65
+        ):
+            return "close_up"
+        if widths and heights and max(widths) >= 0.35 and max(heights) >= 0.55:
+            return "medium"
+        return "original"
+
     def _character_swap_framed_reference(
         self,
         source: Path,
         pass_spec: dict,
         *,
         preserve_full_design: bool = False,
+        source_clip: Path | None = None,
+        shot_framing_class: str | None = None,
     ) -> tuple[Path, str]:
         """Match a P-picture's identity scale to the selected V1 performer.
 
@@ -32232,6 +37053,11 @@ class DirectorCutStudio(QMainWindow):
         Relay paste a tiny complete figure over the original actor.  For large
         source performers, give Relay an upper-body/identity crop instead.  The
         original Media Pool asset is never modified.
+
+        ``shot_framing_class`` (round 69 item 4) decides the class once for the
+        whole Shot instead of once per role, so a multi-character Segment cannot
+        send Relay a cropped identity picture for one body and a full figure for
+        the next one.
         """
 
         # Illustrated cast pictures are design sheets, not source pixels to
@@ -32240,7 +37066,27 @@ class DirectorCutStudio(QMainWindow):
         # on the V1 pose.  Cropping these assets was the common factor in the
         # oversized cartoon-face failures seen in close-up Shots.
         if preserve_full_design:
-            return source.resolve(), "illustrated_full_design"
+            sheet_path, framing, metrics = (
+                self._character_swap_identity_sheet_reference(
+                    source, source_clip, pass_spec
+                )
+            )
+            coverage = metrics.get("identity_sheet_source_head_coverage")
+            if coverage is not None:
+                pass_spec["identity_sheet_source_head_coverage"] = coverage
+            if framing == IDENTITY_SHEET_FRAMING:
+                pass_spec["identity_sheet_head_coverage"] = metrics.get(
+                    "identity_sheet_head_coverage"
+                )
+            # Which layout actually went up the wire is the first thing to check
+            # when a take looks wrong, and until now it could only be guessed
+            # from the sheet filename in the upload log.  Record the decision.
+            for decision_key in IDENTITY_SHEET_DECISION_KEYS:
+                decision_value = metrics.get(decision_key)
+                if decision_value is None:
+                    continue
+                pass_spec[decision_key] = decision_value
+            return sheet_path, framing
 
         source_roles = [
             row for row in pass_spec.get("source_roles") or []
@@ -32261,21 +37107,25 @@ class DirectorCutStudio(QMainWindow):
         event_text = " ".join(
             str(value or "") for value in pass_spec.get("source_events") or []
         ).casefold()
-        close_up = bool(
-            "close-up" in event_text
-            or "close up" in event_text
-            or (
-                widths and heights
-                and max(widths) >= 0.55
-                and max(heights) >= 0.65
+        if shot_framing_class is not None:
+            close_up = shot_framing_class == "close_up"
+            medium = shot_framing_class == "medium"
+        else:
+            close_up = bool(
+                "close-up" in event_text
+                or "close up" in event_text
+                or (
+                    widths and heights
+                    and max(widths) >= 0.55
+                    and max(heights) >= 0.65
+                )
             )
-        )
-        medium = bool(
-            not close_up
-            and widths and heights
-            and max(widths) >= 0.35
-            and max(heights) >= 0.55
-        )
+            medium = bool(
+                not close_up
+                and widths and heights
+                and max(widths) >= 0.35
+                and max(heights) >= 0.55
+            )
         if not close_up and not medium:
             return source.resolve(), "original"
         image = QImage(str(source))
@@ -32335,6 +37185,1511 @@ class DirectorCutStudio(QMainWindow):
                 return source.resolve(), "original"
         return destination.resolve(), strategy
 
+    @staticmethod
+    def _closeup_gate_for_bbox(bbox: object) -> str | None:
+        """Classify one normalized person box against the verified close-up gates.
+
+        Returns ``"dominant"`` for a face-filling box (area >= 0.72, width
+        >= 0.80, height >= 0.82), ``"head_dominant"`` for a tall narrow
+        standing person (height >= 0.75, width <= 0.45) whose head sits at the
+        top of the box, or None when neither verified gate applies.  These are
+        the same thresholds used by the identity-suppression blur and the strict
+        temporal coverage gate so all three stay in step with the close-up face
+        anchoring clause compiled into Relay prompts.
+        """
+        try:
+            values = [float(value) for value in bbox]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if len(values) != 4:
+            return None
+        left, top, right, bottom = values
+        left, top = max(0.0, left), max(0.0, top)
+        right, bottom = min(1.0, right), min(1.0, bottom)
+        width, height = right - left, bottom - top
+        if width * height >= 0.72 and width >= 0.80 and height >= 0.82:
+            return "dominant"
+        if height >= 0.75 and width <= 0.45:
+            return "head_dominant"
+        return None
+
+    @classmethod
+    def _pass_spec_closeup_gate_rows(cls, pass_spec: dict) -> list[dict]:
+        """One row per selected role whose box hits a verified close-up gate.
+
+        Each row carries the role id, the gate kind and the clamped normalized
+        box used for blur geometry.  Shared by the identity-suppression source
+        builder and the strict temporal coverage decision so both see exactly
+        the same boxes.
+        """
+        rows: list[dict] = []
+        for row in pass_spec.get("source_roles") or []:
+            if not isinstance(row, dict):
+                continue
+            bbox = (
+                row.get("source_bbox_normalized")
+                or row.get("identity_audit_bbox_normalized")
+                or []
+            )
+            gate = cls._closeup_gate_for_bbox(bbox)
+            if gate is None:
+                continue
+            try:
+                left, top, right, bottom = [float(value) for value in bbox]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            rows.append({
+                "source_role_id": str(row.get("source_role_id", "") or "").strip().upper(),
+                "gate": gate,
+                "left": max(0.0, left),
+                "top": max(0.0, top),
+                "right": min(1.0, right),
+                "bottom": min(1.0, bottom),
+                # Who authored this box, so the halo can reach over the hair of a
+                # hand box and stop at the hair of a contour box (round 101).
+                "bbox_provenance": str(
+                    row.get("source_bbox_provenance") or ""
+                ).strip().casefold(),
+            })
+        return rows
+
+    @classmethod
+    def _pass_spec_medium_silent_blur_rows(cls, pass_spec: dict) -> list[dict]:
+        """One row per silent-listener role whose box is medium-shot visible.
+
+        Extends the identity-suppression blur beyond the verified close-up
+        gates: in a Silent Listener shot where the face and mouth are clearly
+        visible but the box does not fill the frame, H3 still over-conditions
+        on the source plate's live face (S2 evidence: three fresh seeds all
+        animated the replaced mouth against the unblurred plate).  The gate
+        reads the same two numbers character_swap_engine uses for its
+        medium-shot silent clause (default area >= 0.050, height >= 0.25) so
+        the prompt can never claim a weakened plate that the Studio never
+        weakened - round 23's black-shirt take is exactly that mismatch, where
+        the clause fired and the plate stayed pristine.  Boxes that already hit
+        a verified close-up gate are excluded here because the stronger
+        close-up blur covers them.
+        """
+        mode = str(pass_spec.get("performance_mode") or "").strip().casefold()
+        if mode not in {"silent_listener", "no_human_voice"}:
+            return []
+        rows: list[dict] = []
+        for row in pass_spec.get("source_roles") or []:
+            if not isinstance(row, dict):
+                continue
+            bbox = (
+                row.get("source_bbox_normalized")
+                or row.get("identity_audit_bbox_normalized")
+                or []
+            )
+            try:
+                values = [float(value) for value in bbox]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if len(values) != 4:
+                continue
+            left, top, right, bottom = values
+            left, top = max(0.0, left), max(0.0, top)
+            right, bottom = min(1.0, right), min(1.0, bottom)
+            width, height = right - left, bottom - top
+            if not (
+                width * height >= CHARACTER_SWAP_MEDIUM_SILENT_BLUR_MIN_AREA
+                and height >= CHARACTER_SWAP_MEDIUM_SILENT_BLUR_MIN_HEIGHT
+            ):
+                continue
+            if cls._closeup_gate_for_bbox(bbox) is not None:
+                continue
+            rows.append({
+                "source_role_id": str(row.get("source_role_id", "") or "").strip().upper(),
+                "gate": "medium_silent",
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                # Round 101: the silent listener is the shot class where an auto
+                # contour is most likely to be used, and the one whose window top
+                # round 100 measured 0.165 above the crown.
+                "bbox_provenance": str(
+                    row.get("source_bbox_provenance") or ""
+                ).strip().casefold(),
+            })
+        return rows
+
+    @classmethod
+    def _pass_spec_framing_medium_rows(
+        cls,
+        pass_spec: dict,
+        min_height: float,
+    ) -> list[dict]:
+        """One row per role framed like a medium Shot, whatever it performs.
+
+        The medium-silent gate above deliberately asks for a Silent Listener,
+        because there it protects the mouth.  The Identity Sheet layout needs
+        the same framing information for a different reason: round 22 shows a
+        person who occupies only about a third of the frame (height 0.30) being
+        handed the sheet's head-plus-whole-body layout, and the model then drew
+        that body panel as a second small chibi in the scene instead of reading
+        it as wardrobe.  A box this small can never host a full-body wardrobe
+        panel, so it gets the hip-height crop that close-up Shots already use.
+
+        Deliberately *not* gated on ``performance_mode``: framing is framing.
+        The area floor only rejects slivers, and boxes that already hit a
+        verified close-up gate are skipped because that clause is stronger.
+        """
+        try:
+            threshold = float(min_height)
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if not 0.0 < threshold <= 1.0:
+            return []
+        rows: list[dict] = []
+        for row in pass_spec.get("source_roles") or []:
+            if not isinstance(row, dict):
+                continue
+            bbox = (
+                row.get("source_bbox_normalized")
+                or row.get("identity_audit_bbox_normalized")
+                or []
+            )
+            try:
+                values = [float(value) for value in bbox]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if len(values) != 4:
+                continue
+            left, top, right, bottom = values
+            left, top = max(0.0, left), max(0.0, top)
+            right, bottom = min(1.0, right), min(1.0, bottom)
+            width, height = right - left, bottom - top
+            if width <= 0.0 or height <= 0.0:
+                continue
+            if height < threshold:
+                continue
+            if not (width * height >= IDENTITY_SHEET_FRAMING_MEDIUM_MIN_AREA):
+                continue
+            if cls._closeup_gate_for_bbox(bbox) is not None:
+                continue
+            rows.append({
+                "source_role_id": str(row.get("source_role_id", "") or "").strip().upper(),
+                "gate": "framing_medium",
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "height": height,
+            })
+        return rows
+
+
+    # Feathered-plate mask geometry, in shares of the smaller side of one blur
+    # region.  Measured offline against the S6 relay clip and the round-14 band
+    # (``testing/_dsh_verify_9/round14/mask_ab/board_t400.png``): these are the values
+    # that keep the wall beside the actor unredrawn while still erasing the
+    # actor's identity, with no visible tool rectangle.
+    IDENTITY_MASK_CORNER_SHARE = 0.30
+    IDENTITY_MASK_FEATHER_SHARE = 0.055
+    IDENTITY_MASK_FEATHER_MIN_PX = 4
+    IDENTITY_MASK_FEATHER_MAX_PX = 48
+
+    @classmethod
+    def _identity_suppression_plate_mask(
+        cls,
+        regions: list[dict],
+        plate_width: int,
+        plate_height: int,
+        destination: Path,
+        feather_regions: list[dict] | None = None,
+    ) -> int | None:
+        """Draw the blur regions into one union alpha mask in plate pixels.
+
+        Every region becomes a rounded rectangle filled at full opacity, and the
+        whole mask is then gaussian-blurred, so the plate's blurred areas meet
+        the sharp background through a soft window instead of a hard rectangle.
+        Returns the feather radius in pixels, or None when the mask cannot be
+        built - the caller then keeps the legacy hard-edged plate recipe.  The
+        feather follows the *smallest* region so a narrow head band is never
+        eaten alive by the transition width a full-frame box would want.
+
+        Regions whose kind is ``hair`` are drawn into the mask but do not vote on
+        the feather width.  A crown slice is by construction a thin strip on top
+        of the face band, and the feather follows the smallest box, so splitting a
+        head band in two would quietly narrow the transition across the *whole*
+        window as well - a second variable on top of the one the split is meant
+        to test.  The face and garment bands still set it, exactly as before.
+
+        ``feather_regions`` overrides which boxes vote at all.  The caller passes
+        the suppression window as designed, before the crown was carved out of it,
+        so a split plate and the shipped plate measure the same transition width and
+        the A/B stays one variable.  Drawing still comes from ``regions``.
+        """
+
+        try:
+            from PIL import Image, ImageDraw, ImageFilter
+        except ImportError:
+            return None
+        if plate_width < 16 or plate_height < 16:
+            return None
+        def plate_boxes(rows: list[dict]) -> list[tuple[str, tuple[int, int, int, int]]]:
+            """Plate-pixel rectangles for ``rows``, tagged with the region kind."""
+
+            found: list[tuple[str, tuple[int, int, int, int]]] = []
+            for region in rows:
+                try:
+                    left = float(region["left"])
+                    top = float(region["top"])
+                    width = float(region["width"])
+                    height = float(region["height"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                left = max(0.0, left)
+                top = max(0.0, top)
+                right = min(1.0, left + max(0.0, width))
+                bottom = min(1.0, top + max(0.0, height))
+                x0 = int(round(left * plate_width))
+                y0 = int(round(top * plate_height))
+                x1 = int(round(right * plate_width)) - 1
+                y1 = int(round(bottom * plate_height)) - 1
+                x1 = min(plate_width - 1, x1)
+                y1 = min(plate_height - 1, y1)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                found.append((str(region.get("kind") or ""), (x0, y0, x1, y1)))
+            return found
+
+        drawn = plate_boxes(regions)
+        boxes = [box for _kind, box in drawn]
+        # ``feather_regions`` is the suppression window as designed; when the
+        # caller supplies it, the carved-up window below cannot change the answer.
+        voters = drawn if feather_regions is None else plate_boxes(feather_regions)
+        feather_boxes = [box for kind, box in voters if kind != "hair"]
+        if not boxes:
+            return None
+        if not feather_boxes:
+            # Every drawn box was a crown slice: a hair-only plate still has to
+            # meet the background through *some* window, so fall back to the
+            # shipped rule rather than to a hard edge.
+            feather_boxes = boxes
+        feather = min(
+            max(
+                cls.IDENTITY_MASK_FEATHER_MIN_PX,
+                min(
+                    cls.IDENTITY_MASK_FEATHER_MAX_PX,
+                    int(cls.IDENTITY_MASK_FEATHER_SHARE * min(x1 - x0, y1 - y0)),
+                ),
+            )
+            for (x0, y0, x1, y1) in feather_boxes
+        )
+        try:
+            mask = Image.new("L", (plate_width, plate_height), 0)
+            draw = ImageDraw.Draw(mask)
+            for (x0, y0, x1, y1) in boxes:
+                radius = max(
+                    2,
+                    int(cls.IDENTITY_MASK_CORNER_SHARE * min(x1 - x0, y1 - y0)),
+                )
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=255)
+            mask = mask.filter(ImageFilter.GaussianBlur(feather))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            mask.save(str(destination))
+        except (OSError, ValueError):
+            destination.unlink(missing_ok=True)
+            return None
+        if not destination.is_file() or destination.stat().st_size <= 64:
+            destination.unlink(missing_ok=True)
+            return None
+        return feather
+
+
+    def _character_swap_identity_suppressed_source(
+        self,
+        source: Path,
+        pass_spec: dict,
+        *,
+        enabled: bool,
+        wardrobe_band: bool | str | None = None,
+    ) -> tuple[Path, str]:
+        """Blur only dominant V1 close-up identities before Relay.
+
+        MiniMax H3 can over-condition on a source face that occupies nearly the
+        complete vertical frame: it copies Picture 1's clothing but keeps the
+        original face.  The V2 LoRA author's prompt succeeds when that identity
+        texture is weakened while pose, motion, framing and audio remain.  Each
+        selected role of a pass is now evaluated independently against the
+        verified close-up gates; a grouped multi-person pass (several V1 bodies
+        mapped to one P Picture) previously skipped suppression entirely because
+        the old gate required exactly one role, which let H3 over-condition on
+        every unblurred V1 face at once.  Normal and small-box Shots continue
+        to receive the untouched V1 plate.  Both gates stay in step with the
+        close-up face anchoring clause compiled into Relay prompts by
+        character_swap_engine.build_character_swap_prompt.
+
+        Close-up passes also suppress the source wardrobe below the head band
+        (S4 seeds 97000304 and 97000314: the blur erases the face, yet the
+        source actor's maroon robe sash survives because a blurred garment
+        keeps both its diagonal shape and its mean chroma, so H3 repaints it
+        over Picture 1's plaid shirt).  The band under the head region is
+        therefore blurred harder and desaturated: gross motion, pose and
+        lighting survive, while the original outfit's silhouette and colour
+        stop competing with the design sheet.  Silent-listener medium shots
+        used to keep head-only blur; seed 923000227 (policy 66) suggested that
+        was not enough, so the gate got its own band mode - see
+        ``CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE``.  Round 46 reversed
+        that verdict on seed 923011007: the silent gate ships ``off`` again,
+        because a blurred torso is what makes H3 invent a costume.  The close-up
+        gates still follow ``CHARACTER_SWAP_WARDROBE_BAND_MODE`` independently.
+
+        The band's strength is measured, and it is off by default.  Four S4
+        takes with everything else held constant: 97000314 and 97000344 (head
+        band only) reproduced Picture 6's checked shirt and collar - 97000344
+        scored the best torso-vs-P6 correlation of the series, +0.768 against
+        P6's own crop - yet both kept the source actor's diagonal sash; 97000324
+        (torso boxblur=40 + desaturation) destroyed the checked grid, so Relay
+        had no weave to map Picture 6's pattern onto and invented an ornate
+        medallion kimono with a wide maroon belt; 97000334 (torso boxblur=6 +
+        desaturation) kept the weave but Relay read the plate's own grey tunic
+        as a garment and painted an extra sleeveless vest over Picture 6's
+        shirt.  The two grey-washed takes are also the only ones whose torso
+        chroma collapsed (mean saturation 160 -> 103 against P6's 160), which
+        points at the desaturation rather than the blur: a grey template invites
+        a grey garment.  ``wardrobe_band`` therefore selects a *mode*, not a
+        boolean - ``"off"``, ``"blur"`` (soften garment edges, keep chroma) or
+        ``"blur_desat"`` (the 97000324/97000334 recipe) - through
+        ``H3_CHARACTER_SWAP_WARDROBE_BAND_MODE`` unless the argument overrides
+        it.  ``WARDROBE_GATES`` regions are emitted for either non-off mode, and
+        the plate's identity-suppression strategy records which one ran so
+        character_swap_engine writes the clause that matches the plate the model
+        actually sees.  For the close-up gates the head band alone stays the
+        shipped default, and since Round 46 so does the medium-shot silent gate
+        (its knob still accepts ``blur`` and ``blur_desat`` for experiments).
+        """
+
+        WARDROBE_BLUR_RADIUS = 6
+        MIN_WARDROBE_BAND_HEIGHT = 0.10
+        WARDROBE_GATES = {"dominant", "head_dominant"}
+        band_mode = CHARACTER_SWAP_WARDROBE_BAND_MODE
+        if isinstance(wardrobe_band, str):
+            band_mode = wardrobe_band.strip().lower() or "off"
+            if band_mode not in {"off", "blur", "blur_desat"}:
+                raise ValueError(
+                    "wardrobe_band must be 'off', 'blur', 'blur_desat' or a bool"
+                )
+        elif wardrobe_band is not None:
+            # A bool keeps the pre-mode contract: True means the desaturating
+            # band that seeds 97000324/97000334 measured, False means no band.
+            band_mode = "blur_desat" if wardrobe_band else "off"
+        # Chroma is only drained in the explicit desaturating mode.  1.0 means
+        # "leave the plate's own colours alone", so no hue filter is emitted.
+        WARDROBE_SATURATION = 0.25 if band_mode == "blur_desat" else 1.0
+        band_enabled = band_mode != "off"
+        source_roles = [
+            row for row in pass_spec.get("source_roles") or []
+            if isinstance(row, dict)
+        ]
+        if not enabled or not source_roles or not source.is_file():
+            return source.resolve(), "original"
+
+        # Evaluate every selected role against the verified close-up gates and
+        # collect one blur region per qualifying role.  Identical regions from
+        # overlapping duplicate roles are deduplicated so the plate is never
+        # blurred twice in the same area.
+        gate_rows = self._pass_spec_closeup_gate_rows(pass_spec)
+        if not gate_rows:
+            # No verified close-up box in this pass; a medium-shot silent
+            # listener still needs its source face suppressed (S2 evidence).
+            gate_rows = self._pass_spec_medium_silent_blur_rows(pass_spec)
+        if not gate_rows:
+            return source.resolve(), "original"
+
+        # A pass whose only qualifying rows are medium-shot silent listeners is
+        # its own regime: the silent gate gets its own wardrobe band mode so a
+        # close-up experiment (`H3_CHARACTER_SWAP_WARDROBE_BAND_MODE`) can never
+        # silently change a silent plate as well, and vice versa.  An explicit
+        # ``wardrobe_band`` argument still wins, because that is what the offline
+        # A/B probes use to force one mode for a comparison.
+        wardrobe_gates = set(WARDROBE_GATES)
+        # Round 105: a cast picture that names a non-human body (neca_6's P1 is a
+        # "godzilla action figure by neca", P2 "a gundam ...") is not a person wearing
+        # clothes, so erasing only the head leaves the source performer's wardrobe on
+        # screen -- which is what the 02:08 audit measured (shift -0.0376 and -0.0140
+        # against the 0.12 floor, head_layer_only true on both passes).  For those roles
+        # the silent-listener gate earns the body band even when the shipped
+        # ``H3_CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE`` is ``off``, and the
+        # strategy label then picks up its ``_wardrobe_blur_suppressed`` suffix so
+        # character_swap_engine writes the clause that matches the plate Relay sees.
+        nonhuman_cast = bool(pass_spec.get("nonhuman_target")) and bool(
+            pass_spec.get("nonhuman_target_nouns")
+        )
+        silent_only_rows = bool(gate_rows) and all(
+            row["gate"] == "medium_silent" for row in gate_rows
+        )
+        if wardrobe_band is None and silent_only_rows:
+            band_mode = CHARACTER_SWAP_MEDIUM_SILENT_WARDROBE_BAND_MODE
+            band_enabled = band_mode != "off"
+            WARDROBE_SATURATION = 0.25 if band_mode == "blur_desat" else 1.0
+            if band_enabled:
+                wardrobe_gates.add("medium_silent")
+        if nonhuman_cast and silent_only_rows and not band_enabled:
+            band_mode = "blur_desat"
+            band_enabled = True
+            WARDROBE_SATURATION = 0.25
+            wardrobe_gates.add("medium_silent")
+
+        # Multi-role all-dominant (S7/S10/S11 evidence): when every selected
+        # face fills its box, the legacy full-face 62% blur erases the pose and
+        # motion cues H3 needs to anchor the replacement - with both plate faces
+        # gone it renders a loose photorealistic "concept" of Picture 1 instead.
+        # Blur only each head band (top 30%) so shoulders, torso and hands keep
+        # supplying pose; S5's single head_dominant pass is the success baseline.
+        multi_role_all_dominant = (
+            len(gate_rows) > 1
+            and all(row["gate"] == "dominant" for row in gate_rows)
+        )
+
+        # Boxes of the people this pass must not modify, so the hair halo can
+        # stop at their near edge instead of smearing a protected face.  The
+        # engine writes this key for every pass (``character_swap_passes_for_window``);
+        # a pass compiled without it simply runs with the unclipped halo.
+        protected_boxes: list[tuple[float, float, float, float]] = []
+        for protected in pass_spec.get("protected_source_roles") or []:
+            if not isinstance(protected, dict):
+                continue
+            bbox = protected.get("source_bbox_normalized") or []
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            try:
+                protected_boxes.append(
+                    tuple(float(value) for value in bbox)  # type: ignore[misc]
+                )
+            except (TypeError, ValueError):
+                continue
+        halo_parameters = CHARACTER_SWAP_HAIR_HALO_PARAMETERS
+        figure_parameters = CHARACTER_SWAP_FIGURE_EXTENT_PARAMETERS
+        if nonhuman_cast:
+            # Round 105: a kaiju or a mech is wider than the head that seeds its body
+            # band, and neca_6 runs H3_CHARACTER_SWAP_FIGURE_WIDTH_SHARE=1.0 (shipped
+            # default 1.75) against a 0.56 area cap -- which clips the erased region back
+            # to a narrow column and leaves the figure's own shoulders sharp.
+            figure_parameters = {
+                **CHARACTER_SWAP_FIGURE_EXTENT_PARAMETERS,
+                "width_share": max(
+                    float(
+                        CHARACTER_SWAP_FIGURE_EXTENT_PARAMETERS.get("width_share", 0.0)
+                    ),
+                    NONHUMAN_FIGURE_WIDTH_SHARE,
+                ),
+                "max_area": max(
+                    float(CHARACTER_SWAP_FIGURE_EXTENT_PARAMETERS.get("max_area", 0.0)),
+                    NONHUMAN_FIGURE_MAX_AREA,
+                ),
+                "enabled": 1.0,
+            }
+        hair_parameters = CHARACTER_SWAP_HAIR_BAND_PARAMETERS
+        # What the crown split is actually going to do, derived from the numbers
+        # in force rather than from the environment string: a probe that patches
+        # ``CHARACTER_SWAP_HAIR_BAND_PARAMETERS`` directly, and a run that sets the
+        # variable, must report the same plate.  A saturation of 1.0 is the
+        # crown-only arm — same blur as the face, colour left alone — and it is
+        # named ``blur`` so a graded take can never confuse it with the arm that
+        # also drains chroma.
+        hair_blur_radius = float(hair_parameters.get("blur_radius", 18.0))
+        hair_saturation = float(hair_parameters.get("saturation", 1.0))
+        hair_extra_sigma = float(hair_parameters.get("extra_sigma", 0.0))
+        hair_share = float(hair_parameters.get("vertical_share", 0.0))
+        hair_mode = (
+            "off"
+            if not hair_parameters.get("enabled")
+            else ("blur_desat" if hair_saturation != 1.0 else "blur")
+        )
+        halo_applied: list[dict] = []
+        figure_applied: list[dict] = []
+        hair_applied: list[dict] = []
+
+        blur_regions: list[dict] = []
+        variants: list[str] = []
+        region_keys: list[tuple] = []
+        gates_used: list[str] = []
+        # The boxes allowed to set the feather width.  A crown slice is drawn into
+        # the mask but must not vote on it, and neither may the face remnant it was
+        # cut from: the feather follows the smallest box, so a split window would
+        # otherwise narrow the transition across the whole suppression window and
+        # put a second variable on the take.  These entries are the window as
+        # designed, before any split, which is why the shipped plate is unchanged.
+        feather_regions: list[dict] = []
+        for row in gate_rows:
+            left, top = max(0.0, row["left"]), max(0.0, row["top"])
+            right, bottom = min(1.0, row["right"]), min(1.0, row["bottom"])
+            width, height = right - left, bottom - top
+            # Verified extreme close-up gate: a dominant face covering most of
+            # the frame weakens identity texture over head and upper chest; a
+            # tall narrow standing person only loses the head region at the top
+            # of its box so pose cues survive.  A medium-shot silent listener
+            # loses only the head-and-neck band (45% from the top of the box)
+            # so torso, hands and desk geometry keep supplying pose and motion
+            # cues for the replacement performance.
+            vertical_share = {
+                "dominant": 0.30 if multi_role_all_dominant else 0.62,
+                "head_dominant": 0.30,
+                # Round 97: this one share is a knob now, so the silent listener's
+                # identity window can be walked down to the jaw line without arming
+                # the wardrobe band -- the arm round 96 measured as bringing the
+                # erased actor's hair back.  Reading the constant here rather than
+                # the environment keeps a direct patch of it, like the hair and halo
+                # parameters above, the very same knob a run reads.
+                "medium_silent": (
+                    # Round 105: the silent share is a director knob (neca_6 runs 0.85),
+                    # and at 0.85 the head band ends at y 0.7951 -- leaving the body band
+                    # 0.1156 of frame height, a hair over MIN_WARDROBE_BAND_HEIGHT.  A
+                    # non-human role needs the torso erased, so its identity window is
+                    # capped at the close-up gate's own depth and the body gets the rest.
+                    min(
+                        float(CHARACTER_SWAP_MEDIUM_SILENT_HEAD_BAND_SHARE),
+                        NONHUMAN_PLATE_HEAD_BAND_SHARE,
+                    )
+                    if nonhuman_cast
+                    else float(CHARACTER_SWAP_MEDIUM_SILENT_HEAD_BAND_SHARE)
+                ),
+            }[row["gate"]]
+            blur_left = max(0.0, left + width * 0.04)
+            blur_top = max(0.0, top)
+            blur_width = min(1.0 - blur_left, width * 0.92)
+            blur_height = min(1.0 - blur_top, height * vertical_share)
+            # The baseline band is the policy-67 plate: face only, box inset 4 %.
+            # The halo grows it upward and sideways over the source actor's hair
+            # while keeping the same bottom edge, so pose and torso conditioning
+            # do not move and no prompt clause flips.
+            # Round 101: a contour-authored box ends at the hair, so it takes the
+            # shorter reach; a hand box keeps the shipped reach it was drawn against.
+            halo_row_parameters = _hair_halo_parameters_for_provenance(
+                halo_parameters,
+                row.get("bbox_provenance"),
+            )
+            halo_left, halo_top, halo_width = _hair_halo_band_box(
+                left,
+                top,
+                width,
+                height,
+                blur_left,
+                blur_top,
+                blur_width,
+                halo_row_parameters,
+                protected_boxes,
+            )
+            halo_active = bool(
+                halo_parameters.get("enabled")
+                and (
+                    halo_top < round(blur_top, 6)
+                    or halo_width > round(blur_width, 6)
+                )
+            )
+            head_left = halo_left if halo_active else round(blur_left, 6)
+            head_top = halo_top if halo_active else round(blur_top, 6)
+            head_width = halo_width if halo_active else round(blur_width, 6)
+            head_bottom = min(1.0, blur_top + blur_height)
+            if halo_active:
+                halo_applied.append(
+                    {
+                        "gate": row["gate"],
+                        "left": head_left,
+                        "top": head_top,
+                        "width": head_width,
+                        "baseline": [
+                            round(blur_left, 6),
+                            round(blur_top, 6),
+                            round(blur_width, 6),
+                        ],
+                        "box": [
+                            round(left, 6),
+                            round(top, 6),
+                            round(width, 6),
+                            round(height, 6),
+                        ],
+                        # Which reach was actually in force, and who authored the box:
+                        # the pair that says whether a graded take ran under the
+                        # round 101 contour arm or on the shipped hand-box reach.
+                        "bbox_provenance": str(
+                            row.get("bbox_provenance") or ""
+                        ),
+                        "up_max": round(
+                            float(halo_row_parameters.get("up_max", 0.0)), 6
+                        ),
+                        "protected_boxes": [
+                            [round(value, 6) for value in box]
+                            for box in protected_boxes
+                        ],
+                    }
+                )
+            head_height = round(
+                min(1.0 - head_top, head_bottom - head_top), 6
+            )
+            # The crown of the window is where a wig, a pair of animal ears and a
+            # headband live, and on this cast that is the one region the plate has
+            # never managed to hand over to Picture 1.  Splitting the band lets the
+            # crown take a chroma drain that the face below it must not take, while
+            # the two pieces still tile the shipped rectangle: the ``head`` band
+            # keeps its left edge, its width and — the number
+            # character_swap_engine reads — its bottom edge.
+            hair_pieces, face_band = _hair_accessory_band_boxes(
+                (head_left, head_top, head_width, head_height),
+                hair_parameters,
+                protected_boxes,
+            )
+            regions: list[dict] = []
+            if hair_pieces:
+                for piece in hair_pieces:
+                    regions.append(
+                        {
+                            "kind": "hair",
+                            "left": round(float(piece[0]), 6),
+                            "top": round(float(piece[1]), 6),
+                            "width": round(float(piece[2]), 6),
+                            "height": round(float(piece[3]), 6),
+                        }
+                    )
+                hair_applied.append(
+                    {
+                        "gate": row["gate"],
+                        "band": [
+                            round(head_left, 6),
+                            round(head_top, 6),
+                            round(head_width, 6),
+                            head_height,
+                        ],
+                        "pieces": [
+                            [round(value, 6) for value in piece]
+                            for piece in hair_pieces
+                        ],
+                        "face_band": [
+                            round(value, 6) for value in face_band
+                        ],
+                        "protected_boxes": [
+                            [round(value, 6) for value in box]
+                            for box in protected_boxes
+                        ],
+                    }
+                )
+            # ``head_left``/``head_top``/``head_width``/``head_height`` keep
+            # describing the *shipped* head window, because the wardrobe band below
+            # derives the source actor's body from that window's centre and its
+            # aspect.  Rebinding them to the face remnant made the grown body shrink
+            # in the experiment arm, so the two arms suppressed different windows and
+            # the A/B stopped being one variable.  Only the band that reaches the
+            # filter graph is split, and with the knob off ``face_band`` *is* the head
+            # window, so the shipped arm stays byte-identical.
+            regions.append(
+                {
+                    "kind": "head",
+                    "left": round(float(face_band[0]), 6),
+                    "top": round(float(face_band[1]), 6),
+                    "width": round(float(face_band[2]), 6),
+                    "height": round(float(face_band[3]), 6),
+                }
+            )
+            if band_enabled and row["gate"] in wardrobe_gates:
+                # Everything still visible under the head band is the source
+                # actor's wardrobe, so it gets the harder filter.
+                wardrobe_top = head_bottom
+                wardrobe_height = min(1.0 - wardrobe_top, bottom - wardrobe_top)
+                if wardrobe_height >= MIN_WARDROBE_BAND_HEIGHT:
+                    baseline_band = (
+                        round(head_left, 6),
+                        round(wardrobe_top, 6),
+                        round(head_width, 6),
+                        round(wardrobe_height, 6),
+                    )
+                    # The census box stops under the actor's chest, so a band
+                    # built from it leaves her sleeves, skirt and legs sharp and
+                    # Relay copies them.  Grow it to the visible body and cut the
+                    # bystanders back out; ``_figure_extent_band_boxes`` returns
+                    # the baseline band unchanged when the knob is off or when no
+                    # grown box fits the area cap, which keeps the plate honest
+                    # about what it actually covers.
+                    figure_pieces = _figure_extent_band_boxes(
+                        head_left + (head_width / 2.0),
+                        wardrobe_top,
+                        baseline_band,
+                        head_width,
+                        round(head_width * (head_bottom - head_top), 6),
+                        protected_boxes,
+                        figure_parameters,
+                    )
+                    if [list(piece) for piece in figure_pieces] != [
+                        list(piece) for piece in (baseline_band,)
+                    ]:
+                        figure_applied.append(
+                            {
+                                "gate": row["gate"],
+                                "baseline": list(baseline_band),
+                                "pieces": [
+                                    [round(value, 6) for value in piece]
+                                    for piece in figure_pieces
+                                ],
+                                "box": [
+                                    round(left, 6),
+                                    round(top, 6),
+                                    round(width, 6),
+                                    round(height, 6),
+                                ],
+                                "protected_boxes": [
+                                    [round(value, 6) for value in box]
+                                    for box in protected_boxes
+                                ],
+                            }
+                        )
+                    for piece in figure_pieces:
+                        regions.append(
+                            {
+                                "kind": "wardrobe",
+                                "left": round(float(piece[0]), 6),
+                                "top": round(float(piece[1]), 6),
+                                "width": round(float(piece[2]), 6),
+                                "height": round(float(piece[3]), 6),
+                            }
+                        )
+            row_regions: list[dict] = []
+            row_feather_regions: list[dict] = []
+            for region in regions:
+                if region["width"] <= 0.0 or region["height"] <= 0.0:
+                    continue
+                key = (
+                    region["kind"],
+                    region["left"],
+                    region["top"],
+                    region["width"],
+                    region["height"],
+                )
+                if key in region_keys:
+                    continue
+                region_keys.append(key)
+                row_regions.append(region)
+                if region["kind"] == "hair":
+                    continue
+                if region["kind"] == "head" and hair_pieces:
+                    # Vote with the window as designed, not with the remnant left
+                    # under the crown.
+                    row_feather_regions.append(
+                        {
+                            "kind": "head",
+                            "left": round(float(head_left), 6),
+                            "top": round(float(head_top), 6),
+                            "width": round(float(head_width), 6),
+                            "height": round(float(head_height), 6),
+                        }
+                    )
+                else:
+                    row_feather_regions.append(dict(region))
+            if not row_regions:
+                continue
+            blur_regions.extend(row_regions)
+            feather_regions.extend(row_feather_regions)
+            variants.append(row["gate"])
+            gates_used.append(row["gate"])
+        if not blur_regions:
+            return source.resolve(), "original"
+
+        gate_labels = {
+            "dominant": "dominant_closeup",
+            "head_dominant": "head_dominant_closeup",
+            "medium_silent": "medium_silent_listener",
+        }
+        wardrobe_active = any(
+            region["kind"] == "wardrobe" for region in blur_regions
+        )
+        unique_gates = list(dict.fromkeys(gates_used))
+        if multi_role_all_dominant:
+            # Head-band blur keeps pose cues alive; the distinct name marks the
+            # variant so cached plates never mix with full-face ones.
+            strategy = (
+                "multi_role_head_band_dominant_closeup_identity_suppressed"
+            )
+        elif len(unique_gates) == 1:
+            strategy = gate_labels[unique_gates[0]] + "_identity_suppressed"
+        else:
+            strategy = (
+                "multi_role_"
+                + "_".join(gate_labels[gate] for gate in unique_gates)
+                + "_identity_suppressed"
+            )
+        if wardrobe_active:
+            # Distinct name so a wardrobe-suppressed plate never reuses an
+            # older head-only cache entry.
+            # The chroma-preserving blur is a different plate and needs a
+            # different clause: its garment colours stay readable, so the model
+            # may read them as Picture 1's palette rather than as a grey
+            # template.  Encoding the mode in the name keeps both prompt and
+            # cache honest.
+            strategy += (
+                "_wardrobe_blur_suppressed"
+                if band_mode == "blur"
+                else "_wardrobe_suppressed"
+            )
+        # The band parameters only matter while the band exists: folding them in
+        # unconditionally would invalidate every head-only plate whenever an
+        # experiment retunes a radius that is never applied.
+        band_tag = (
+            f"{band_mode}:{WARDROBE_BLUR_RADIUS}:{WARDROBE_SATURATION}|"
+            if band_enabled
+            else ""
+        )
+        # Same rule for the crown: while the split is off the tag is empty, so a
+        # plate cached under the shipped recipe can never be served to a take that
+        # expects desaturated hair, and retuning a crown knob that never fired
+        # costs nothing.
+        hair_tag = (
+            f"hair={hair_mode}:{hair_share}:{hair_blur_radius}:"
+            f"{hair_saturation}:{hair_extra_sigma}|"
+            if hair_applied
+            else ""
+        )
+        # Round 111: the face blur is now a knob, so it has to be part of the plate's own identity.
+        # Without this tag a re-armed radius would be handed the plate cached under boxblur=18 and the
+        # take would come back byte-identical -- the same silent-stale trap this round closed for the
+        # render knobs, one layer down.
+        head_tag = (
+            f"head={int(CHARACTER_SWAP_HEAD_BAND_PARAMETERS.get('blur_radius', 18.0))}:"
+            f"{float(CHARACTER_SWAP_HEAD_BAND_PARAMETERS.get('extra_sigma', 0.0))}|"
+            if "identity_suppressed" in strategy
+            else ""
+        )
+        # Round 37k: temporally freeze the one strip of the plate that the Relay
+        # QC reads as speech.  ``mouth_band_registration`` is that audit's ruler
+        # — it lives in ``character_swap_engine`` so plate and QC cannot drift
+        # apart the way the policy-74 plate and its own audit did: on that take
+        # the hard head blur stopped at y 0.285 while the audited mouth band ran
+        # y 0.306-0.414, i.e. it sat inside the *garment* blur.  Registering the
+        # band from the authored box is therefore the whole point: it names the
+        # pixels the audit measures, whatever the head band happened to cover.
+        # Silent passes only — a speaking Shot needs its source mouth, and a
+        # frozen one would contradict the dialogue contract the prompt asserts.
+        freeze_mode = CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE_MODE
+        freeze_frames = CHARACTER_SWAP_SILENT_PLATE_MOUTH_FREEZE_FRAMES
+        performance_mode = str(
+            pass_spec.get("performance_mode") or ""
+        ).strip().casefold()
+        freeze_bands: list[dict] = []
+        if (
+            freeze_mode != "off"
+            and performance_mode in {"silent_listener", "no_human_voice"}
+        ):
+            frozen_keys: set[tuple] = set()
+            for row in gate_rows:
+                band_box, band_registration = mouth_band_registration(
+                    [row["left"], row["top"], row["right"], row["bottom"]]
+                )
+                if not band_box:
+                    continue
+                band_left, band_top, band_right, band_bottom = band_box
+                band_left, band_top = max(0.0, band_left), max(0.0, band_top)
+                band_right, band_bottom = min(1.0, band_right), min(1.0, band_bottom)
+                band_width = band_right - band_left
+                band_height = band_bottom - band_top
+                if band_width < 0.03 or band_height < 0.03:
+                    continue
+                band_key = (
+                    round(band_left, 4),
+                    round(band_top, 4),
+                    round(band_width, 4),
+                    round(band_height, 4),
+                )
+                if band_key in frozen_keys:
+                    continue
+                frozen_keys.add(band_key)
+                freeze_bands.append({
+                    "left": band_left,
+                    "top": band_top,
+                    "width": band_width,
+                    "height": band_height,
+                    "registration": band_registration,
+                })
+        # A cached plate is a recipe, so the freeze has to be part of its name:
+        # toggling the knob, or a pass that is not silent, must never be served
+        # the other arm's pixels.
+        freeze_tag = ""
+        if freeze_bands:
+            freeze_tag = "mouthfreeze=" + ",".join(
+                "%s:%.6f,%.6f,%.6f,%.6f" % (
+                    band["registration"] or "unknown",
+                    band["left"],
+                    band["top"],
+                    band["width"],
+                    band["height"],
+                )
+                for band in freeze_bands
+            ) + "|frames=%d|" % int(freeze_frames)
+        # Report the plate geometry to the prompt compiler.  character_swap_engine
+        # used to infer "was the torso blurred?" from the strategy name, which is
+        # how the three round-13 dominant-close-up takes (S3/S6/S10) went to Relay
+        # with 62 % of the frame smudged and no clause telling H3 what the smudge
+        # means: it invented an apparent age and a costume out of the colour
+        # distribution.  The bands below are the same numbers that drove the ffmpeg
+        # crop, so prompt and plate cannot drift apart again.
+        pass_spec["identity_suppression_geometry"] = {
+            "strategy": strategy,
+            "bands": [dict(region) for region in blur_regions],
+            "head_band_bottom": round(
+                max(
+                    (
+                        region["top"] + region["height"]
+                        for region in blur_regions
+                        if region["kind"] == "head"
+                    ),
+                    default=0.0,
+                ),
+                4,
+            ),
+            "suppressed_frame_area": round(
+                sum(
+                    region["width"] * region["height"]
+                    for region in blur_regions
+                ),
+                4,
+            ),
+            "wardrobe_mode": band_mode if wardrobe_active else "off",
+            # What the figure extent did.  Like the halo report this is for the
+            # graded take, with one exception: ``wardrobe_reaches_bottom`` is read
+            # by character_swap_engine, whose merged silent clause claims the soft
+            # window runs "crown to hips".  A garment band grown to the bottom of
+            # the frame has to be named crown to feet, or the clause would again
+            # describe a plate the model never saw.
+            "figure_extent": {
+                "parameters": {
+                    key: round(float(value), 4)
+                    for key, value in figure_parameters.items()
+                },
+                "applied": figure_applied,
+            },
+            "wardrobe_reaches_bottom": bool(
+                any(
+                    region["kind"] == "wardrobe"
+                    and region["top"] + region["height"] >= 0.995
+                    for region in blur_regions
+                )
+            ),
+            # What the silent mouth freeze did.  Like the crown split this
+            # changes pixels without changing a single word of the prompt, so the
+            # manifest record is the only place a reader can see whether the
+            # registered band the audit later measures was ever frozen, and
+            # ``registration`` names the ruler that placed it.
+            "silent_mouth_freeze": {
+                "applied": bool(freeze_bands),
+                "mode": freeze_mode,
+                "tmix_frames": int(freeze_frames),
+                "performance_mode": performance_mode,
+                "bands": [dict(band) for band in freeze_bands],
+            },
+            # What the hair halo did, so a graded take can be read without
+            # re-deriving it: the parameters in force, the bands that actually
+            # grew, and the protected boxes that were in scope when they grew.
+            # No prompt clause reads this key; the bands themselves are already
+            # described to the model, and the head band's bottom edge — the one
+            # number the clause compiler looks at — does not move.
+            "hair_halo": {
+                "parameters": {
+                    key: round(float(value), 4)
+                    for key, value in halo_parameters.items()
+                },
+                "applied": halo_applied,
+            },
+            # What the crown split did.  Unlike the halo and the figure extent
+            # this one changes pixels without changing a single word of the prompt,
+            # so the manifest record is the only place a reader can see which of
+            # the two arms a take came from.  ``hair_band_mode`` reports ``off``
+            # when the knob was on but no crown slice survived — too thin, or eaten
+            # by a protected bystander — because the plate the model saw then was
+            # the shipped one.
+            "hair_band_mode": hair_mode if hair_applied else "off",
+            "hair_extent": {
+                "parameters": {
+                    key: round(float(value), 4)
+                    for key, value in hair_parameters.items()
+                },
+                "applied": hair_applied,
+            },
+            # Filled in below once the plate recipe is known.  The prompt
+            # compiler reads these keys to describe the plate it was handed, so
+            # a feathered suppression window must never be described to the
+            # model as a hard rectangle (and vice versa).
+            "mask_mode": "rect",
+            "mask_feather_px": 0,
+        }
+        geometry = pass_spec["identity_suppression_geometry"]
+        base_token = hashlib.sha256(
+            (
+                # v7: the plate recipe (hard-edged vs feathered window) is now
+                # part of a cached plate's identity, so a plate built with the
+                # old v6 hard-edged overlay can never be served where a
+                # feathered window is expected.
+                "character-swap-identity-suppression-v7|"
+                f"band={1 if band_enabled else 0}|"
+                f"{'+'.join(variants)}|"
+                f"{band_tag}"
+                f"{hair_tag}"
+                f"{head_tag}"
+                f"{freeze_tag}"
+                f"{source.resolve()}|"
+                f"{source.stat().st_mtime_ns}|"
+                + "|".join(
+                    f"{region['kind']}:{region['left']:.6f},{region['top']:.6f},"
+                    f"{region['width']:.6f},{region['height']:.6f}"
+                    for region in blur_regions
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        cache = CACHE_ROOT / "character_swap_identity_suppression"
+        cache.mkdir(parents=True, exist_ok=True)
+        # Root cause E.  Round 14 measured that a dominant or medium-silent box
+        # near full frame blurred real background along with the actor (S6 band
+        # 0.1102,0,0.7408,0.5958 = 44 % of the frame, most of it wall), and H3
+        # re-drew the smeared wall as honeycomb texture while treating the tool
+        # rectangle as scene geometry.  Compositing the same blurred regions
+        # through a rounded, feathered alpha window is the recipe that survived
+        # the offline A/B.  The mask is drawn in plate pixels, so the plate has
+        # to be measurable: any probe or drawing failure keeps the legacy
+        # hard-edged graph instead of failing the pass.
+        wants_mask = CHARACTER_SWAP_IDENTITY_MASK_MODE == "feather"
+        mask_feather = 0
+        mask_destination: Path | None = None
+        plate_width = plate_height = 0
+        # ``boxblur`` rejects a radius that is not below half of the smallest plane
+        # it is given, and in yuv420 the chroma plane is half the crop's height.  A
+        # crown slice is far thinner than the head band it was cut from, so the hair
+        # arm has to know the plate dimensions even when the feathered mask is off —
+        # otherwise the shipped radius 18 would fail the encode on a narrow band
+        # instead of blurring it, and the pass would fall back to a raw V1 plate.
+        if wants_mask or hair_applied:
+            try:
+                plate_info = probe_media(str(source), self.runtime)
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+                subprocess.SubprocessError,
+            ):
+                plate_info = {}
+            for plate_stream in plate_info.get("streams") or []:
+                if (
+                    not isinstance(plate_stream, dict)
+                    or plate_stream.get("codec_type") != "video"
+                ):
+                    continue
+                plate_width = int(plate_stream.get("width", 0) or 0)
+                plate_height = int(plate_stream.get("height", 0) or 0)
+                break
+        if wants_mask:
+            plate_mask = (
+                cache / f"{source.stem}_identity_mask_{base_token}.png"
+            )
+            mask_feather_built = self._identity_suppression_plate_mask(
+                blur_regions,
+                plate_width,
+                plate_height,
+                plate_mask,
+                feather_regions=feather_regions,
+            )
+            if mask_feather_built is None:
+                wants_mask = False
+            else:
+                mask_feather = int(mask_feather_built)
+                mask_destination = plate_mask
+                geometry["mask_mode"] = "feather"
+                geometry["mask_feather_px"] = mask_feather
+                geometry["mask_plate_size"] = [plate_width, plate_height]
+        token = hashlib.sha256(
+            (
+                f"{base_token}|mask={'feather' if wants_mask else 'rect'}|"
+                f"{plate_width}x{plate_height}|feather={mask_feather}"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        destination = cache / f"{source.stem}_identity_suppressed_{token}.mp4"
+        if destination.is_file() and destination.stat().st_size > 1024:
+            return destination.resolve(), strategy
+        # One sequential split/crop/blur/overlay stage per qualifying role.  The
+        # single-role case produces the same graph as the original filter; extra
+        # roles chain onto the accumulated output so every face region is blurred
+        # on one shared plate without re-encoding in between.
+        filter_parts: list[str] = []
+        for index, region in enumerate(blur_regions):
+            region_left = region["left"]
+            region_top = region["top"]
+            region_width = region["width"]
+            region_height = region["height"]
+            # A face needs spatial blur only: its chroma is replaced along with
+            # the head.  A garment needs chroma removed too, because its average
+            # colour keeps re-seeding the source robe under Picture 1's wardrobe
+            # -- but only its chroma: the weave and seam geometry are the map
+            # Relay uses to place Picture 1's own pattern, and erasing them
+            # makes it invent an outfit instead (S4 seed 97000324).
+            if region["kind"] == "hair":
+                # The crown takes the face's blur strength -- one variable, not
+                # two -- and then the chroma drain the face must not take.  The
+                # radius has to shrink on a thin slice: boxblur's limit is half of
+                # the smallest plane, and the chroma plane is half the crop's
+                # height, so radius 18 is only legal on a crown at least 73 px
+                # tall at full resolution.  Shrinking the radius keeps the plate
+                # suppressing; failing the graph would cost the pass its whole
+                # identity suppression.
+                crown_limit = 0
+                if plate_width > 0 and plate_height > 0:
+                    crown_limit = (
+                        int(
+                            min(
+                                region_width * plate_width,
+                                region_height * plate_height / 2.0,
+                            )
+                            // 2
+                        )
+                        - 1
+                    )
+                crown_radius = int(hair_blur_radius)
+                if crown_limit >= 1:
+                    crown_radius = min(crown_radius, crown_limit)
+                roi_filter = (
+                    f"boxblur={max(1, crown_radius)}:2"
+                    + (
+                        f",hue=s={hair_saturation}"
+                        if hair_saturation != 1.0
+                        else ""
+                    )
+                    + (
+                        f",gblur=sigma={hair_extra_sigma}"
+                        if hair_extra_sigma > 0.0
+                        else ""
+                    )
+                )
+            elif region["kind"] == "head":
+                # Round 111: ``boxblur=18:2`` was hard-coded here -- the only erase strength in the
+                # plate with no knob at all -- while the crown and the garment bands are both
+                # gradeable.  The radius is clamped to the same half-plane legality the crown uses
+                # (ffmpeg's boxblur cannot take a radius past half of the smaller chroma plane), so
+                # arming a large value on a thin window still suppresses instead of failing the graph
+                # and costing the pass its whole identity suppression.
+                head_radius = int(CHARACTER_SWAP_HEAD_BAND_PARAMETERS.get("blur_radius", 18.0))
+                head_extra_sigma = float(CHARACTER_SWAP_HEAD_BAND_PARAMETERS.get("extra_sigma", 0.0))
+                head_limit = 0
+                if plate_width > 0 and plate_height > 0:
+                    head_limit = (
+                        int(
+                            min(
+                                region_width * plate_width,
+                                region_height * plate_height / 2.0,
+                            )
+                            // 2
+                        )
+                        - 1
+                    )
+                if head_limit >= 1:
+                    head_radius = min(head_radius, head_limit)
+                roi_filter = (
+                    f"boxblur={max(1, head_radius)}:2"
+                    + (
+                        f",gblur=sigma={head_extra_sigma}"
+                        if head_extra_sigma > 0.0
+                        else ""
+                    )
+                )
+            else:
+                roi_filter = (
+                    f"boxblur={WARDROBE_BLUR_RADIUS}:3"
+                    + (
+                        f",hue=s={WARDROBE_SATURATION}"
+                        if WARDROBE_SATURATION != 1.0
+                        else ""
+                    )
+                )
+            source_pad = "0:v" if index == 0 else f"a{index}"
+            base_label = f"a{index + 1}b"
+            roi_label = f"r{index + 1}"
+            blur_label = f"b{index + 1}"
+            out_label = (
+                "out" if index == len(blur_regions) - 1 else f"a{index + 1}"
+            )
+            filter_parts.append(
+                f"[{source_pad}]split[{base_label}][{roi_label}];"
+                f"[{roi_label}]crop=iw*{region_width:.8f}:ih*{region_height:.8f}:"
+                f"iw*{region_left:.8f}:ih*{region_top:.8f},{roi_filter}[{blur_label}];"
+                f"[{base_label}][{blur_label}]overlay="
+                f"main_w*{region_left:.8f}:main_h*{region_top:.8f}[{out_label}]"
+            )
+        # Filter chains must be separated by ";" so the second region can
+        # consume the first overlay output pad; a bare join leaves trailing
+        # garbage after the last chain and ffmpeg silently fails.
+        region_graph = ";".join(filter_parts)
+        video_filter = region_graph
+        mapped_label = "out"
+        if wants_mask and mask_destination is not None:
+            # The region chain above ends at [out].  The mask stage re-labels it
+            # and composites it over the untouched sharp plate, so everything the
+            # blur did not cover keeps its own pixels: wall, furniture and depth
+            # of field stop being re-synthesised, and the suppression window has
+            # no hard border for the model to read as scene geometry.
+            video_filter = (
+                f"{region_graph};[out]format=rgba[blurred_plate];"
+                "[1:v]format=gray[plate_mask];"
+                "[blurred_plate][plate_mask]alphamerge[blurred_alpha];"
+                "[0:v]format=rgba[sharp_plate];"
+                "[sharp_plate][blurred_alpha]overlay=0:0:format=auto,"
+                "format=yuv420p[masked_plate]"
+            )
+            mapped_label = "masked_plate"
+
+        def _mouth_freeze_chains(start_label: str) -> tuple[list[str], str]:
+            """Temporal-freeze chains for every registered silent mouth band.
+
+            ``tmix`` averages the crop over ``freeze_frames`` consecutive frames,
+            which is what stops the strip from moving: a syllable-sized lip
+            movement inside a 7-frame window leaves a smear instead of a shape.
+            Gross head motion is not erased, because the band is a small window
+            inside the suppression region and the surrounding plate still moves.
+            ``setpts=PTS-STARTPTS`` re-bases the crop so ``overlay`` starts
+            painting on frame 0 rather than waiting for the window to fill.
+            """
+
+            chains: list[str] = []
+            label = start_label
+            for band_index, band in enumerate(freeze_bands):
+                base_label = f"mz{band_index}b"
+                crop_label = f"mz{band_index}c"
+                frozen_label = f"mz{band_index}f"
+                out_label = f"mz{band_index}o"
+                chains.append(
+                    f"[{label}]split[{base_label}][{crop_label}];"
+                    f"[{crop_label}]crop=iw*{band['width']:.8f}:"
+                    f"ih*{band['height']:.8f}:"
+                    f"iw*{band['left']:.8f}:ih*{band['top']:.8f},"
+                    f"tmix=frames={int(freeze_frames)},"
+                    f"setpts=PTS-STARTPTS[{frozen_label}];"
+                    f"[{base_label}][{frozen_label}]overlay="
+                    f"main_w*{band['left']:.8f}:main_h*{band['top']:.8f}"
+                    f"[{out_label}]"
+                )
+                label = out_label
+            return chains, label
+
+        if freeze_bands:
+            # The freeze always runs last: it has to see the plate the model
+            # would have seen (blur and feather already applied) and average
+            # those pixels, not the raw ones underneath.
+            freeze_chains, mapped_label = _mouth_freeze_chains(mapped_label)
+            video_filter = video_filter + ";" + ";".join(freeze_chains)
+
+        def _encode_plate_graph(
+            graph: str,
+            label: str,
+            target: Path,
+            *,
+            uses_mask: bool = False,
+        ) -> int:
+            command = [
+                str(self.runtime.ffmpeg), "-hide_banner", "-loglevel", "error",
+                "-i", str(source),
+            ]
+            if uses_mask and mask_destination is not None:
+                # The mask is a looped still image, so `-shortest` is what ends
+                # the encode with the video instead of the infinite image input.
+                command += ["-loop", "1", "-i", str(mask_destination)]
+            command += [
+                "-filter_complex", graph,
+                "-map", f"[{label}]", "-map", "0:a?", "-c:v", "libx264",
+                "-preset", "fast", "-crf", "18", "-c:a", "copy",
+            ]
+            if uses_mask:
+                command += ["-shortest"]
+            command += ["-y", str(target)]
+            done = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=180,
+            )
+            return int(getattr(done, "returncode", 1) or 0)
+
+        return_code = _encode_plate_graph(
+            video_filter,
+            mapped_label,
+            destination,
+            uses_mask=wants_mask and mask_destination is not None,
+        )
+        if (
+            return_code
+            or not destination.is_file()
+            or destination.stat().st_size <= 1024
+        ):
+            destination.unlink(missing_ok=True)
+            if not wants_mask:
+                return source.resolve(), "original"
+            # A feathered composite this ffmpeg build cannot render must not cost
+            # the pass its identity suppression at all: re-run the hard-edged
+            # graph under its own cache token so no cached plate is ever served
+            # under the wrong recipe name.
+            rect_token = hashlib.sha256(
+                (
+                    f"{base_token}|mask=rect|{plate_width}x{plate_height}"
+                    "|feather=0"
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            rect_destination = (
+                cache / f"{source.stem}_identity_suppressed_{rect_token}.mp4"
+            )
+            if (
+                rect_destination.is_file()
+                and rect_destination.stat().st_size > 1024
+            ):
+                geometry["mask_mode"] = "rect"
+                geometry["mask_feather_px"] = 0
+                return rect_destination.resolve(), strategy
+            fallback_graph, fallback_label = region_graph, "out"
+            if freeze_bands:
+                # The hard-edged arm is a different plate too, so it freezes the
+                # same registered band; a feather failure must not quietly
+                # return the model a mouth that still moves.
+                fallback_chains, fallback_label = _mouth_freeze_chains("out")
+                fallback_graph = region_graph + ";" + ";".join(fallback_chains)
+            return_code = _encode_plate_graph(
+                fallback_graph, fallback_label, rect_destination
+            )
+            if (
+                return_code
+                or not rect_destination.is_file()
+                or rect_destination.stat().st_size <= 1024
+            ):
+                rect_destination.unlink(missing_ok=True)
+                return source.resolve(), "original"
+            geometry["mask_mode"] = "rect"
+            geometry["mask_feather_px"] = 0
+            return rect_destination.resolve(), strategy
+        return destination.resolve(), strategy
+
+    def _character_swap_silent_audio_source(
+        self,
+        source: Path,
+        pass_spec: dict,
+    ) -> tuple[Path, str]:
+        """Strip the plate's original V1 voice for silent-listener Relay passes.
+
+        H3 follows audible speech in its reference audio even when the prompt
+        says the replaced performer is only listening (S2/S3 evidence: the
+        Silent Listener clauses were present and correct, yet the mouth still
+        followed the plate's own AAC track).  The exact A999 soundtrack slice
+        is restored at final assembly, so muting the plate loses nothing in
+        the master.  Non-silent passes keep their original audio untouched; a
+        pass whose plate already carries no audio stream needs no variant.
+
+        Round 49 makes the whole variant opt-in.  The manual ComfyUI graph the
+        user accepts keeps the plate's original audio - ``history_audio_mode``
+        and ``finish.audio_mode`` both stay ``source`` - and the takes still
+        close the mouth, so muting is not what produced the silent S5 the user
+        graded as correct.  Studio now matches the manual plate by default;
+        ``H3_CHARACTER_SWAP_SILENT_AUDIO_STRIP=1`` restores the policy-81
+        silent variant for the shots where the plate's voice really does leak
+        into the take.
+        """
+
+        if not CHARACTER_SWAP_SILENT_AUDIO_STRIP:
+            return source.resolve(), "original"
+        mode = str(pass_spec.get("performance_mode") or "").strip().casefold()
+        if mode not in {"silent_listener", "no_human_voice"}:
+            return source.resolve(), "original"
+        if not source.is_file():
+            return source.resolve(), "original"
+        try:
+            info = probe_media(source, self.runtime)
+            has_audio = any(
+                stream.get("codec_type") == "audio"
+                for stream in info.get("streams", [])
+                if isinstance(stream, dict)
+            )
+        except (OSError, RuntimeError, ValueError, TypeError):
+            return source.resolve(), "original"
+        if not has_audio:
+            return source.resolve(), "already_silent"
+
+        token = hashlib.sha256(
+            (
+                f"character-swap-silent-audio-v1|"
+                f"{source.resolve()}|{source.stat().st_mtime_ns}"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        cache = CACHE_ROOT / "character_swap_silent_audio"
+        cache.mkdir(parents=True, exist_ok=True)
+        destination = cache / f"{source.stem}_silent_{token}.mp4"
+
+        def valid_silent_clip(candidate: Path) -> bool:
+            """Accept only a complete silent plate that still carries video."""
+            if not candidate.is_file() or candidate.stat().st_size <= 1024:
+                return False
+            try:
+                candidate_info = probe_media(candidate, self.runtime)
+            except (OSError, RuntimeError, ValueError, TypeError):
+                return False
+            stream_types = {
+                str(stream.get("codec_type", ""))
+                for stream in candidate_info.get("streams", [])
+                if isinstance(stream, dict)
+            }
+            return "video" in stream_types and "audio" not in stream_types
+
+        if valid_silent_clip(destination):
+            return destination.resolve(), "audio_stripped"
+        # Never let two Studio instances write the same cache path.  A
+        # validated file is installed atomically, mirroring the relay source
+        # clip preparation above.
+        write_token = f"{os.getpid()}-{secrets.token_hex(4)}"
+        staging = destination.with_name(
+            f"{destination.stem}.writing-{write_token}{destination.suffix}"
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    str(self.runtime.ffmpeg), "-nostdin", "-hide_banner",
+                    "-loglevel", "error", "-y",
+                    "-i", str(source),
+                    "-an", "-c:v", "copy", "-movflags", "+faststart",
+                    str(staging),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=180,
+            )
+            if (
+                completed.returncode
+                or not staging.is_file()
+                or not valid_silent_clip(staging)
+            ):
+                detail = completed.stderr.decode("utf-8", errors="replace")[-800:]
+                staging.unlink(missing_ok=True)
+                # Non-blocking fallback: the voiced plate still renders; the
+                # recorded strategy marks the Shot for a later re-render.
+                return source.resolve(), "audio_strip_failed"
+            os.replace(staging, destination)
+        finally:
+            staging.unlink(missing_ok=True)
+        return destination.resolve(), "audio_stripped"
+
+
+    @staticmethod
+    def _identity_sheet_decision_rows(pass_spec: dict) -> dict:
+        """Return the Identity Sheet decisions a Job must carry for grading.
+
+        Only a missing decision is skipped: layout 0 is the stock layout and the
+        empty outfit view means "whole neck-down panel", so both have to reach
+        the manifest.  Zeroing out this filter is what made the 02:27 round-23
+        take unreadable after the fact.
+        """
+
+        rows: dict = {}
+        for key in IDENTITY_SHEET_DECISION_KEYS:
+            value = pass_spec.get(key)
+            if value is None:
+                continue
+            rows[key] = value
+        return rows
+
     def _compiled_character_swap_window_job(
         self,
         start: float,
@@ -32343,15 +38698,35 @@ class DirectorCutStudio(QMainWindow):
         megapixels: float,
         seed: int,
         segment_id: str,
+        output_upscale: bool = False,
     ) -> tuple[dict, list[dict], list[dict[str, str]], str, Path, MediaAsset]:
         """Compile independent unique-identity LoRA passes for one source-video Shot."""
 
-        if not CHARACTER_SWAP_WORKFLOW.is_file():
+        # Round 67: ``output_upscale`` is the Preview-only RTX Video Super
+        # Resolution request.  Preview renders at the pinned 480 prepare bucket
+        # and reads back soft, so the enhancer now runs on the *generated clip*
+        # instead of the reference.  Final Render leaves it off and keeps the
+        # pixels H3 actually produced.
+
+        # Round 69 item 2: every Segment cut out of the same source V1 must plan
+        # its Relay windows under one seed, or the second job re-enters H3 with a
+        # fresh plan and no chained history.
+        relay_seed_scope = self._character_swap_relay_seed_scope(seed)
+        # Round 112: the swap graph is chosen by the engine, so the SAM 3 edit-mask
+        # template ships on by default and ``H3_CHARACTER_SWAP_WORKFLOW_NAME=plain``
+        # puts the maskless graph back byte for byte.  The chooser falls back to the
+        # plain file when the mask template is missing, so this raise can now only
+        # fire when the installation has lost both templates.
+        swap_workflow_path = character_swap_workflow_path(PROJECT_ROOT)
+        if not swap_workflow_path.is_file():
             raise FileNotFoundError(
                 "Character Swap API workflow is missing: "
+                + str(swap_workflow_path)
+                + " (plain fallback: "
                 + str(CHARACTER_SWAP_WORKFLOW)
+                + ")"
             )
-        template = load_character_swap_workflow(CHARACTER_SWAP_WORKFLOW)
+        template = load_character_swap_workflow(swap_workflow_path)
         source_clip = self._source_remake_relay_source_clip(start, end)
         source_sync = self._source_remake_sync_audio_asset(start, end)
         if source_sync is None:
@@ -32384,6 +38759,68 @@ class DirectorCutStudio(QMainWindow):
             and illustrated_cast_count / max(1, len(loaded_cast_assets)) >= 0.6
         )
         relay_window_count = character_swap_relay_window_count(end - start)
+        # Round 52: the prompt route is decided once per Shot and stamped on
+        # every pass row, so a finished Job says out loud which prompt regime
+        # produced it.  The Design checkbox is the supported switch; the
+        # environment variable is the escape hatch back to legacy.
+        route = character_swap_route(
+            CHARACTER_SWAP_ROUTE_MANUAL if self.character_swap_manual_align else None
+        )
+        lean_audit = route != CHARACTER_SWAP_ROUTE_LEGACY
+        # Round 69 item 4: the reference framing is a property of the Shot, not of
+        # one role's box.  Deciding it here keeps every pass in the Segment on the
+        # same framing grammar.
+        shot_framing_class = self._character_swap_shot_framing_class(pass_specs)
+        # Round 114: the in-graph SAM 3 mask now takes its words and its object choice from the Shot
+        # instead of from a constant.  Measured on the godzilla Shot with free SAM-only submits
+        # (testing/_dsh_verify_13/godzilla/subject_text_probe_113e.py): conditioning the detector on
+        # ``person`` returns ONE object out of a two-figure frame, so both passes received the same
+        # mask - the left figure - and the figure that was meant to be replaced was never masked at
+        # all (frame 84: R1 covered 0.5244, R2 covered 0.0000).  The union phrase the composite
+        # already tracks with returns THREE objects on that same frame, and only ``leftmost`` /
+        # ``rightmost`` can address a chosen side (R2 + rightmost: mask on the right figure for 21 of
+        # 21 sampled frames, averaging 0.3909 of its box and bleeding only 0.0772 into R1).  So every
+        # body kind in the Shot goes into the words and the app's own role boxes pick the side this
+        # pass repaints.  H3_CHARACTER_SWAP_SAM_MASK_AUTOSELECT=off restores the single-noun,
+        # always-largest graph that rendered every take up to tonight.
+        shot_mask_nouns: list[str] = []
+        for mask_pass_spec in pass_specs:
+            mask_nouns = list(mask_pass_spec.get("nonhuman_target_nouns") or [])
+            if not mask_nouns:
+                # Round 115: the words the mask detector is conditioned on are NOT gated by
+                # H3_CHARACTER_SWAP_NONHUMAN_TARGET.  That switch decides the plate bands, the cast
+                # lock and the retry ceiling, and it sat at ``off`` for the 06:32 neca_6 take, which
+                # left ``nonhuman_target_nouns`` empty in both passes and the mask words back on
+                # ``person`` - one object out of a two-figure frame (Round 113e).  The cast captions
+                # still name what is on screen (measured on this project: P1 -> ['godzilla'],
+                # P2 -> ['gundam'] while the gate reported False).  Reading them here touches no band
+                # and no prompt; it only tells SAM 3 which body kinds to look for.
+                mask_asset = self._reference_asset(
+                    str(mask_pass_spec.get("target_media_id", "")).upper()
+                )
+                try:
+                    mask_nouns = character_swap_nonhuman_nouns(
+                        _sam31_target_recognition_text(mask_asset)
+                    )
+                except Exception:
+                    # A caption quirk must never cost a Shot its take; empty nouns are today's graph.
+                    mask_nouns = []
+                mask_pass_spec["mask_target_nouns"] = list(mask_nouns)
+            for mask_noun in mask_nouns:
+                mask_token = " ".join(str(mask_noun).strip().lower().split())
+                if mask_token and mask_token not in shot_mask_nouns:
+                    shot_mask_nouns.append(mask_token)
+        shot_role_boxes = {
+            str(box_role).strip().upper(): [float(value) for value in box_value]
+            for box_role, box_value in (
+                getattr(
+                    getattr(self, "cue", None), "source_role_bbox_overrides", None
+                ) or {}
+            ).items()
+            if isinstance(box_value, (list, tuple))
+            and len(box_value) == 4
+            and all(isinstance(value, (int, float)) for value in box_value)
+        }
         for pass_index, pass_spec in enumerate(pass_specs):
             target_reference = str(pass_spec.get("target_media_id", "")).upper()
             target_asset = self._reference_asset(target_reference)
@@ -32396,15 +38833,85 @@ class DirectorCutStudio(QMainWindow):
                     f"Character Swap requires @{target_reference}, but its Picture file is missing."
                 )
             target_is_illustrated = _looks_like_illustrated_cast(target_asset)
+            # Two different questions, deliberately two different predicates.
+            # ``target_is_illustrated`` is the medium question (is the artwork a
+            # cartoon?), which is what the live-action adaptation switch below has
+            # to keep reading from the caption so a photograph is never re-labelled
+            # by a file-format accident.  Since round 94 the close-up plate gates
+            # follow the *second* question instead: a blurred source head is a
+            # decision about what Relay's Picture 1 is, and a dead BLIP service
+            # (empty caption) must not silently un-arm it -- see
+            # ``character_swap_plate_suppression_gate``.
+            # ``target_is_design_artwork`` is the framing question (is this a
+            # generated cast reference whose whole design has to survive?), which
+            # also accepts cut-out evidence because BLIP captions routinely
+            # describe a cartoon as if it were a photograph.  Round 91: only this
+            # second question decides the Identity Sheet branch.
+            target_is_design_artwork = _character_swap_design_reference_evidence(
+                target_asset,
+                target_path,
+            )
+            pass_spec["reference_design_evidence"] = (
+                "caption"
+                if target_is_illustrated
+                else ("cutout" if target_is_design_artwork else "none")
+            )
+            # Round 105: one measurement, three consequences.  The Project's own words for
+            # this cast picture ("godzilla action figure by neca", "a gundam ...") say the
+            # replacement is not a human being, and three things in this pipeline were
+            # written for a human: the plate erases only the head, the cast lock asks the
+            # model to keep the source's "complete wardrobe, footwear and accessories", and
+            # the audit spec allows exactly one take.  All three are graded on the same run
+            # (02:08: head_layer_only on both passes, wardrobe shift -0.0376 / -0.0140
+            # against the 0.12 floor, target_likeness_score 0.019, attempts_used 1 next to
+            # ``action: retry_fresh_seed``).  The nouns travel on the pass spec so the plate
+            # builder, the prompt compiler and the retry ceiling read one fact.
+            target_recognition_text = _sam31_target_recognition_text(target_asset)
+            nonhuman_target_nouns = (
+                character_swap_nonhuman_nouns(target_recognition_text)
+                if _nonhuman_swap_target_enabled()
+                else []
+            )
+            pass_spec["nonhuman_target"] = bool(nonhuman_target_nouns)
+            pass_spec["nonhuman_target_nouns"] = list(nonhuman_target_nouns)
+            # The Media Pool picture stays the QC authority.  When an Identity
+            # Sheet replaces it as Relay's Picture 1, the sheet's white mat and
+            # panel gutters would otherwise enter the target-likeness histogram
+            # and score every good take as a mismatch.
+            raw_target_path = target_path.resolve()
+            # Garment-only QC reference, built from the Media Pool picture and
+            # never from the sheet: the sheet's grey mat would flatten straight
+            # into the wardrobe histogram.  The raw path stays the identity QC
+            # authority exactly as before; this is an extra, body-only ruler.
+            wardrobe_signature_path, wardrobe_signature_rows = (
+                self._character_swap_wardrobe_signature(raw_target_path)
+            )
             target_path, reference_framing = self._character_swap_framed_reference(
                 target_path,
                 pass_spec,
-                preserve_full_design=target_is_illustrated,
+                preserve_full_design=target_is_design_artwork,
+                source_clip=source_clip,
+                shot_framing_class=shot_framing_class,
             )
             pass_spec["reference_framing"] = reference_framing
+            # Round 69: Relay receives an opaque picture.  The Media Pool asset and
+            # the QC authority above stay exactly as they were; only the bytes that
+            # go up the wire lose their alpha, which is the one difference from the
+            # manual ComfyUI run that no prompt could compensate for.
+            target_path, alpha_flattened = self._character_swap_opaque_reference(
+                target_path
+            )
+            pass_spec["reference_alpha_flattened"] = bool(alpha_flattened)
+            for _wardrobe_key, _wardrobe_value in wardrobe_signature_rows.items():
+                pass_spec[_wardrobe_key] = _wardrobe_value
             pass_seed = derive_named_segment_seed(
                 seed,
-                f"{segment_id}:{pass_spec.get('source_role_id')}:{target_reference}",
+                (
+                    str(relay_seed_scope)
+                    if relay_seed_scope is not None
+                    else segment_id
+                )
+                + f":{pass_spec.get('source_role_id')}:{target_reference}",
             )
             live_action_adaptation = bool(
                 self.source_cast_live_action_adaptation
@@ -32413,10 +38920,91 @@ class DirectorCutStudio(QMainWindow):
                     or illustrated_cast_pool
                 )
             )
+            plate_suppression_allowed, plate_suppression_evidence = (
+                character_swap_plate_suppression_gate(
+                    target_is_illustrated,
+                    target_is_design_artwork,
+                    CHARACTER_SWAP_PLATE_SUPPRESSION,
+                )
+            )
+            pass_spec["identity_suppression_gate"] = {
+                "caption_illustrated": bool(target_is_illustrated),
+                "design_artwork_evidence": bool(target_is_design_artwork),
+                "switch_on": bool(CHARACTER_SWAP_PLATE_SUPPRESSION),
+                "allowed": bool(plate_suppression_allowed),
+                "evidence": plate_suppression_evidence,
+            }
+            relay_source_clip, source_identity_strategy = (
+                self._character_swap_identity_suppressed_source(
+                    source_clip,
+                    pass_spec,
+                    # Suppress the close-up V1 face whenever the replacement
+                    # reference is illustrated.  This helps Relay redraw the
+                    # selected identity from P without changing its medium;
+                    # live-action adaptation remains an independent opt-in.
+                    # Round 49: the suppression itself is now opt-in too.  The
+                    # manual ComfyUI graph the user grades as correct sends the
+                    # untouched V1 plate, and seed 923011008 read back from
+                    # /history confirms Studio shipped
+                    # ``..._identity_suppressed_..._silent_....mp4`` instead.
+                    # ``H3_CHARACTER_SWAP_PLATE_SUPPRESSION=1`` brings the
+                    # policy-81 close-up gates back unchanged.
+                    # Round 94: "illustrated" for this gate now means the same
+                    # caption-or-cut-out evidence round 91 gave the framing branch.
+                    # With BLIP stopped on this host the caption field is empty for
+                    # every cast picture, and the Hallway Project paid for that with
+                    # three renders in which ``PLATE_SUPPRESSION`` was on, the crown
+                    # blur and the hair-ownership sentence were ready, and the plate
+                    # still went up untouched because a caption-only predicate could
+                    # never be True.
+                    enabled=plate_suppression_allowed,
+                )
+            )
+            # Tell the prompt compiler which plate variant Relay will see so it
+            # can warn H3 not to restore a blurred source face from memory.
+            pass_spec["identity_suppression_strategy"] = source_identity_strategy
+            prompt_budget_audit: dict[str, Any] = {}
             prompt = build_character_swap_prompt(
                 pass_spec,
                 directed_scene_text=directed,
                 live_action_adaptation=live_action_adaptation,
+                prompt_audit=prompt_budget_audit,
+                route=route,
+            )
+            relay_source_clip, silent_audio_strategy = (
+                self._character_swap_silent_audio_source(
+                    relay_source_clip,
+                    pass_spec,
+                )
+            )
+            # Round 52: under both lean routes the identity QC is advisory.  It
+            # still measures every gate and the manifest still records each
+            # verdict, but a threshold can no longer spend a second or third
+            # 20-minute generation on a Segment the director grades by eye.
+            # The plate-drift gate, which is what mis-fired on the 70-minute
+            # policy-84 run, is switched off rather than relaxed.
+            lean_audit_overrides = (
+                {}
+                if not lean_audit
+                else {
+                    "advisory_only": True,
+                    "plate_audit": False,
+                    # Round 105: pinning this to 1 made the audit's own
+                    # ``action: retry_fresh_seed`` decorative -- neca_6's blocking
+                    # head-layer verdict recorded ``attempts_used: 1``, so a take the
+                    # engine itself called a failure shipped with no second attempt (the
+                    # worker's ceiling is ``max(1, min(spec, escalation))`` and its shipped
+                    # blocking lift is also 1).  A role whose Picture is not a person gets
+                    # one fresh seed: the audit already ranks attempts by resemblance to the
+                    # Picture, and the 02:08 right-hand role never resembled P1 at all
+                    # (target_likeness_score 0.019, retention_score 0.754).
+                    "maximum_attempts": (
+                        _nonhuman_swap_max_attempts()
+                        if pass_spec.get("nonhuman_target")
+                        else 1
+                    ),
+                    "strict_temporal_coverage": False,
+                }
             )
             # Different identities in the same frame must never be generated
             # serially from the preceding role's result. H3 may restore that
@@ -32424,9 +39012,35 @@ class DirectorCutStudio(QMainWindow):
             # every role from the same clean V1 plate; the worker composites
             # only each role's tracked box after all independent passes finish.
             runtime_source = False
+            # Round 112: the mask graph is a different file, so the graph that has been
+            # rendering is handed to the compiler as a *comparison* only.  The engine
+            # names any model-side difference in the manifest (base model, Turbo LoRA,
+            # swap-adapter strength, VAEs, sampler, what Picture 1 reaches the reference
+            # slot through) and rewrites nothing - the WITHMASK export is the director's
+            # own graph, and tonight's measurement of it against this one is empty.
+            model_identity_template = None
+            if swap_workflow_path.name != CHARACTER_SWAP_WORKFLOW_NAME:
+                try:
+                    model_identity_template = load_character_swap_workflow(
+                        CHARACTER_SWAP_WORKFLOW
+                    )
+                except Exception:
+                    model_identity_template = None
+            sam_mask_recipe = character_swap_sam_mask_recipe(
+                source_role_id=str(pass_spec.get("source_role_id", "")),
+                role_boxes=shot_role_boxes,
+                # Round 115: this project carries the director's boxes on one cue and nothing at all
+                # on two others (checked in director_project.h3director.json), so the hand-drawn
+                # boxes stay first choice but cannot be the only source.  The plate geometry this
+                # pass built at line 38878 always has numbers: its erase bands are this role and its
+                # protected_boxes are the other roles' rectangles.
+                geometry=pass_spec.get("identity_suppression_geometry"),
+                target_nouns=shot_mask_nouns,
+            )
+            pass_spec["sam_mask_recipe"] = dict(sam_mask_recipe)
             workflow, contract = compile_character_swap_pass(
                 template,
-                source_filename=source_clip.name,
+                source_filename=relay_source_clip.name,
                 reference_filename=target_path.name,
                 prompt=prompt,
                 seed=pass_seed,
@@ -32436,6 +39050,14 @@ class DirectorCutStudio(QMainWindow):
                     f"pass_{pass_index + 1:02d}_{pass_spec.get('source_role_id')}"
                 ),
                 runtime_source=runtime_source,
+                output_upscale=bool(output_upscale),
+                model_identity_template=model_identity_template,
+                # Round 114: the words the in-graph mask detector is conditioned on, and which of the
+                # objects it follows - both come from the Shot's own nouns and role boxes above, so a
+                # multi-role Shot no longer hands every pass the same biggest figure.
+                sam_mask_subject_text=sam_mask_recipe["subject_text"],
+                sam_mask_selection=sam_mask_recipe["selection"],
+                sam_mask_selection_index=sam_mask_recipe["index"],
             )
             reference_upload_asset = self._relay_upload_asset(
                 media_type="image",
@@ -32452,7 +39074,7 @@ class DirectorCutStudio(QMainWindow):
                     media_type="video",
                     node_id=contract["source_loader_node_id"],
                     reference_id=f"V1-{segment_id}",
-                    path=source_clip,
+                    path=relay_source_clip,
                     start=start,
                     end=end,
                 )
@@ -32561,13 +39183,131 @@ class DirectorCutStudio(QMainWindow):
                     else:
                         merged_ranges.append([range_start, range_end])
                 composite_time_ranges = merged_ranges
+            # The identity audit maps every rectangle it inspects back to the
+            # role that authored it, so the id list must survive exactly the
+            # same "is this a usable 4-tuple" filter as the rectangles.
+            # Passing the raw ``source_role_ids`` alongside a filtered rectangle
+            # list let one malformed track shift every role onto its neighbour's
+            # pixels, which turned an advisory bystander into a hard failure and
+            # hid the real one.
+            audit_role_rows = [
+                role_row
+                for role_row in (pass_spec.get("source_roles") or [])
+                if isinstance(role_row, dict)
+                and len(
+                    role_row.get("identity_audit_bbox_normalized")
+                    or role_row.get("source_bbox_normalized")
+                    or []
+                ) == 4
+            ]
+            audit_source_role_ids = [
+                str(role_row.get("source_role_id", "") or "").strip().upper()
+                for role_row in audit_role_rows
+            ]
+            audit_advisory_role_ids = [
+                role_id
+                for role_id in (
+                    pass_spec.get("qc_advisory_source_role_ids") or []
+                )
+                if role_id and role_id in audit_source_role_ids
+            ]
             pass_rows.append({
                 "pass_index": pass_index,
+                # How many passes this Shot planned.  character_swap_engine
+                # stamps it on its own rows (round 30) and uses it to decide
+                # whether the "a later character-swap pass" sentence is even
+                # true; carrying it into the Job makes the manifest
+                # self-describing, so a resumed Segment that has to re-compile
+                # the prompt cannot fall back to the two-pass default and
+                # promise a second pass that this Shot never plans (156
+                # characters of a hard 12 320-character budget).
+                "pass_total": int(pass_spec.get("pass_total", 1) or 1),
                 "source_role_id": str(pass_spec.get("source_role_id", "")),
                 "source_role_ids": list(pass_spec.get("source_role_ids") or []),
                 "target_media_id": target_reference,
+                # Round 104: the Project's own words for this Picture, so the worker can
+                # ask SAM3.1 for what is actually in the frame ("person, godzilla")
+                # instead of the word "person" for every cast reference.  It is part of
+                # the pass content on purpose: re-captioning a reference changes what the
+                # tracker hunts for, so the Segment must be re-judged, not reused.
+                "sam31_target_recognition": target_recognition_text,
+                # Round 105: what the pipeline concluded this role is, and therefore which
+                # plate / prompt / retry behaviour it used.  Recorded so a Manifest can be
+                # graded without re-running the measurement.
+                "nonhuman_target_nouns": list(nonhuman_target_nouns),
                 "live_action_adaptation": live_action_adaptation,
+                "character_swap_route": route,
                 "reference_framing": reference_framing,
+                **({
+                    # The layout, the outfit crop and both coverage numbers all
+                    # travel with the pass, so the Job and its manifest name the
+                    # sheet that was actually uploaded.  They are also part of
+                    # the content fingerprint below, which is the point: a
+                    # different layout must never be allowed to reuse a
+                    # finished Segment's take.
+                    **self._identity_sheet_decision_rows(pass_spec),
+                    # A declined sheet has to be just as provable as a built one:
+                    # the single-figure passthrough is recorded under
+                    # FULL_DESIGN_FRAMING, where these rows used to be dropped.
+                } if (
+                    reference_framing == IDENTITY_SHEET_FRAMING
+                    or pass_spec.get("identity_sheet_single_figure_passthrough")
+                ) else {}),
+                "source_identity_strategy": source_identity_strategy,
+                # The plate the model actually sees, as measured geometry (which
+                # bands were blurred and how far down the frame they reach).
+                # Relay's prompt compiler keys its plate clauses off this instead
+                # of guessing from the strategy name.
+                **({
+                    "identity_suppression_geometry": pass_spec.get(
+                        "identity_suppression_geometry"
+                    )
+                } if isinstance(
+                    pass_spec.get("identity_suppression_geometry"), dict
+                ) else {}),
+                # Prompt-length guard evidence: the compiled length, the budget
+                # it is measured against, and which tail clauses (if any) had to
+                # be sacrificed.  A Job whose prompt is still over budget after
+                # every droppable clause is gone is flagged, never silently
+                # truncated.
+                **({
+                    "prompt_budget": {
+                        key: value
+                        for key, value in (
+                            (key, prompt_budget_audit.get(key))
+                            for key in (
+                            "prompt_chars",
+                            "char_budget",
+                            "dropped_tail_clauses",
+                            "over_budget",
+                            # Round 52: the appendix is what the director is
+                            # measuring against the hand-built baseline, so the
+                            # route and the appendix length travel with the Job.
+                            "route",
+                            "author_prompt_chars",
+                            "append_chars",
+                            "append_budget",
+                            "append_over_budget",
+                            # Round 105: when the cast Picture's own words say the role is
+                            # not a person, the human cast lock is replaced by a rebuild-
+                            # the-figure sentence, and that sentence costs ~390 characters
+                            # of appendix.  Without these two rows a Manifest would show
+                            # ``append_over_budget: true`` with no way to say which clause
+                            # moved the number -- and the director grades the next 20-minute
+                            # take against exactly that line.
+                            "nonhuman_cast_lock_nouns",
+                            "nonhuman_cast_lock_chars",
+                        )
+                        )
+                        # A pass that never rewrote the cast lock reports neither row, and
+                        # a human Job's manifest stays exactly as policy 100 wrote it:
+                        # inventing the keys with ``None`` here would also move every
+                        # Segment's content fingerprint beyond the one re-validation that
+                        # the policy stamp already pays for.
+                        if value is not None
+                    }
+                } if prompt_budget_audit else {}),
+                **({"silent_audio_strategy": silent_audio_strategy} if silent_audio_strategy not in {"original", "already_silent"} else {}),
                 "speaker": bool(pass_spec.get("speaker", False)),
                 "seed": pass_seed,
                 "workflow": workflow,
@@ -32583,29 +39323,143 @@ class DirectorCutStudio(QMainWindow):
                 "runtime_source_loader_node_id": contract["source_loader_node_id"],
                 "runtime_source_loader_input": contract["source_loader_input"],
                 "relay_node_id": contract["relay_node_id"],
+                "relay_progress_mode": contract.get(
+                    "relay_progress_mode", "progress"
+                ),
                 "relay_window_count": relay_window_count,
+                # Round 51: the prepare bucket that actually went up the wire and
+                # the megapixels that chose it.  ``megapixels`` on the Job stays
+                # the director's request, so without these rows a 0.5 MP Preview
+                # that silently rendered 800x1216 is indistinguishable after the
+                # fact from one that really aged the character at 576x864 — which
+                # is the exact question the "the person became an old man" report
+                # has to be answered with.
+                "relay_prepare_resolution": contract.get(
+                    "relay_prepare_resolution", ""
+                ),
+                "requested_megapixels": contract.get("requested_megapixels"),
+                "effective_megapixels": contract.get("effective_megapixels"),
+                # Round 53: the row that says *why* the render is bigger than the
+                # number in the Preview box.  Without it, an automatic age-lock
+                # floor is indistinguishable in the Job from a knob the director
+                # forgot he set, and the cost of the fix has to be readable before
+                # the shot rather than reconstructed from a manifest afterwards.
+                "megapixel_floor": contract.get("megapixel_floor"),
+                "megapixel_floor_reason": contract.get(
+                    "megapixel_floor_reason", ""
+                ),
+                "megapixel_floor_applied": bool(
+                    contract.get("megapixel_floor_applied", False)
+                ),
+                "apparent_age_lock_in_prompt": bool(
+                    contract.get("apparent_age_lock_in_prompt", False)
+                ),
+                # Round 59: what Picture 1 actually went through on the way into
+                # the encoder.  Round 49 promised that "a silently missing upscale
+                # is visible in the manifest", but the compiler only ever put those
+                # rows in the *contract*; the pass row that Round 58 rebuilt copied
+                # the megapixel rows and left the upscale rows behind, so the newest
+                # manifests said nothing about node 9 while the older ones still did.
+                # Scale answers how many pixels appeared, quality and strength answer
+                # whether they were interpolated or invented by the NVIDIA enhancer,
+                # and that distinction is now the whole 老人化 question.
+                "reference_upscale_node_id": contract.get(
+                    "reference_upscale_node_id", ""
+                ),
+                "reference_upscale_scale": contract.get("reference_upscale_scale"),
+                "reference_upscale_scale_source": contract.get(
+                    "reference_upscale_scale_source", ""
+                ),
+                "reference_upscale_scale_override": contract.get(
+                    "reference_upscale_scale_override"
+                ),
+                "reference_upscale_quality": contract.get(
+                    "reference_upscale_quality", ""
+                ),
+                "reference_upscale_quality_source": contract.get(
+                    "reference_upscale_quality_source", ""
+                ),
+                "reference_upscale_quality_override": contract.get(
+                    "reference_upscale_quality_override"
+                ),
+                "reference_upscale_strength": contract.get(
+                    "reference_upscale_strength"
+                ),
+                "reference_upscale_strength_source": contract.get(
+                    "reference_upscale_strength_source", ""
+                ),
+                "reference_upscale_strength_override": contract.get(
+                    "reference_upscale_strength_override"
+                ),
+                "reference_image_size": contract.get("reference_image_size", ""),
+                # Round 67: the second RTX stage — the one that sharpens the
+                # generated clip rather than Picture 1.  The engine returns the
+                # full row set on every branch, so a Preview that was told to
+                # skip it still reports *why* instead of leaving the manifest
+                # mute.  These keys are stripped again before the Segment
+                # fingerprint is hashed (see below) so Final Render caches do not
+                # all go stale over a node that never appears in Final.
+                **{
+                    key: contract.get(key)
+                    for key in CHARACTER_SWAP_OUTPUT_UPSCALE_CONTRACT_KEYS
+                },
                 "identity_audit": {
                     "enabled": True,
                     "source_video_path": str(source_clip.resolve()),
-                    "source_role_ids": list(pass_spec.get("source_role_ids") or []),
+                    # Round 37k QC honesty.  ``source_video_path`` stays the raw
+                    # V1 clip, because the erasure and retention gates have to
+                    # compare the take against what V1 really looked like.  The
+                    # mouth audit needs a different reference: the plate Relay was
+                    # actually handed, whose registered mouth band this round
+                    # froze.  Without it a verdict that says "the source talks"
+                    # measures a clip the model never saw, which is exactly the
+                    # mismatch the policy-74 retries kept losing against.
+                    "plate_video_path": str(relay_source_clip.resolve()),
+                    # Round 93: the plate path alone left "was the source head
+                    # actually weakened before Relay?" as filename archaeology, and
+                    # two Hallway takes were graded on that guess.  The strategy
+                    # string names the gate that fired (``medium_silent_listener`` /
+                    # ``dominant_closeup`` / ``head_dominant_closeup``) and carries
+                    # the wardrobe and crown tags, so one manifest line now answers
+                    # whether a take was judged against a weakened V1 head or the
+                    # untouched plate -- ``"original"`` means suppression never ran.
+                    "identity_suppression_strategy": str(
+                        pass_spec.get("identity_suppression_strategy")
+                        or "original"
+                    ),
+                    # The band rectangles that actually drove the ffmpeg crop, plus
+                    # ``head_band_bottom`` / ``suppressed_frame_area`` / the crown
+                    # and halo reports.  character_swap_engine reads this same
+                    # object to choose its clauses, so the manifest now records the
+                    # geometry the prompt talked about instead of a name.
+                    "identity_suppression_geometry": dict(
+                        pass_spec.get("identity_suppression_geometry") or {}
+                    ),
+                    # Round 94: and why.  A manifest that says ``"original"`` still
+                    # left open whether the switch was off, the caption missed, or
+                    # the picture gave no cut-out evidence -- three different fixes
+                    # for one word.  These five booleans name the reason.
+                    "identity_suppression_gate": dict(
+                        pass_spec.get("identity_suppression_gate") or {}
+                    ),
+                    "source_role_ids": audit_source_role_ids,
+                    "advisory_source_role_ids": audit_advisory_role_ids,
                     "source_bboxes_normalized": [
                         list(
                             role_row.get("identity_audit_bbox_normalized")
                             or role_row.get("source_bbox_normalized")
                             or []
                         )
-                        for role_row in (pass_spec.get("source_roles") or [])
-                        if isinstance(role_row, dict)
-                        and len(
-                            role_row.get("identity_audit_bbox_normalized")
-                            or role_row.get("source_bbox_normalized")
-                            or []
-                        ) == 4
+                        for role_row in audit_role_rows
                     ],
                     "maximum_attempts": 3,
-                    "maximum_source_correlation": 0.88,
-                    "maximum_source_similarity": 0.88,
-                    "maximum_source_mae": 0.055,
+                    # Close-up retention is visible well below the old 0.88
+                    # threshold after H3 re-encoding. The S3 real-server test
+                    # kept the same face at ~0.77 similarity; catch it and let
+                    # a fresh seed/stronger LoRA attempt run.
+                    "maximum_source_correlation": 0.75,
+                    "maximum_source_similarity": 0.75,
+                    "maximum_source_mae": 0.075,
                     "minimum_erasure_correlation": 0.82,
                     "minimum_erasure_similarity": 0.82,
                     "maximum_erasure_mae": 0.12,
@@ -32617,25 +39471,75 @@ class DirectorCutStudio(QMainWindow):
                     "minimum_plate_anchor_similarity": 0.50,
                     "minimum_plate_median_similarity": 0.30,
                     "minimum_plate_median_mae": 0.12,
-                    "strict_temporal_coverage": any(
-                        marker in " ".join(
-                            str(value or "")
-                            for value in pass_spec.get("source_events") or []
-                        ).casefold()
-                        for marker in ("close-up", "close up", "tight close")
+                    # A face-filling box is exactly where early-frame V1 retention
+                    # becomes visible while the default three-point sampling misses
+                    # it; use the same verified gates as the identity suppression
+                    # blur so all three stay in step.
+                    "strict_temporal_coverage": (
+                        any(
+                            marker in " ".join(
+                                str(value or "")
+                                for value in pass_spec.get("source_events") or []
+                            ).casefold()
+                            for marker in ("close-up", "close up", "tight close")
+                        )
+                        or bool(self._pass_spec_closeup_gate_rows(pass_spec))
                     ),
                     "reference_framing": reference_framing,
                     "target_reference_path": str(target_path.resolve()),
+                    **({
+                        "target_reference_qc_path": str(raw_target_path),
+                        "identity_sheet_head_coverage": pass_spec.get(
+                            "identity_sheet_head_coverage"
+                        ),
+                    } if reference_framing == IDENTITY_SHEET_FRAMING else {}),
+                    # Whole-body replacement QC.  ``strict_temporal_coverage``
+                    # stays what it always meant (dense face sampling for
+                    # close-ups); this is the separate question the director kept
+                    # grading by eye -- the head became Picture 1 while the body
+                    # kept the source actor's cosplay.  The ruler is the wardrobe
+                    # signature above, measured on the same body rectangle the
+                    # plate blur used, so prompt, plate and QC cannot drift apart.
+                    "whole_character_audit": True,
+                    "body_bboxes_normalized": self._character_swap_body_audit_box(
+                        pass_spec, audit_role_rows
+                    ),
+                    "wardrobe_audit_mode": CHARACTER_SWAP_WARDROBE_AUDIT_MODE,
+                    "minimum_wardrobe_shift": (
+                        CHARACTER_SWAP_MINIMUM_WARDROBE_SHIFT
+                    ),
+                    **({
+                        "target_reference_wardrobe_qc_path": str(
+                            wardrobe_signature_path
+                        ),
+                    } if wardrobe_signature_path else {}),
                     "performance_mode": str(pass_spec.get("performance_mode", "")),
                     "maximum_silent_mouth_motion": 0.055,
+                    **lean_audit_overrides,
                 },
             })
+        # Round 67: the fingerprint has to answer "did the picture change?", and
+        # the Preview enhancer is a node the director can flip without touching
+        # the take Final Render will grade.  So the metadata rows that describe
+        # that node are removed from the copy being hashed: Preview still moves
+        # its own fingerprint because the compiled workflow genuinely gained a
+        # node, while every Final Segment keeps hashing byte-identical to the
+        # round before and keeps its cache.  The full rows still travel in the
+        # Job and the manifest, which is where they are read from.
+        fingerprint_passes = [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in CHARACTER_SWAP_OUTPUT_UPSCALE_CONTRACT_KEYS
+            }
+            for row in pass_rows
+        ]
         fingerprint = content_fingerprint({
             "engine": "akatz-character-swap-relay-v1",
             "render_policy_version": SMART_RENDER_POLICY_VERSION,
             "mode": self.source_remake_render_mode,
             "window": [round(start, 6), round(end, 6)],
-            "passes": pass_rows,
+            "passes": fingerprint_passes,
             "media": self._media_fingerprint_rows(fingerprint_assets),
         })
         return (
@@ -32658,14 +39562,39 @@ class DirectorCutStudio(QMainWindow):
     ) -> tuple[Path, int]:
         """Create a resumable sequential job for a work area beyond 15 seconds."""
         self._normalize_source_remake_lip_sync_routes()
+        # The Segment authoring fingerprint below hashes every Shot cue, and a
+        # cue carries the prompt-only Native-Audio prose produced by
+        # _refresh_native_audio_directions().  Prompt compilation was the first
+        # writer of that prose, so the very first Job build hashed empty strings
+        # while every later build hashed the settled text.  The manifest then
+        # stored a fingerprint that could never match its own next build, the
+        # authoring-fingerprint guard at the cache check treated each Segment as
+        # stale, and an unchanged prefix (for example the untouched first 15
+        # seconds after a Smart Cut) was re-dirtied and re-rendered.  Settle the
+        # derived prose before any hashing so building a Job is idempotent: the
+        # compiled Prompt is identical, only the hash now sees final values.
+        self._refresh_native_audio_directions()
         start, end = self.clip_start.value(), self.clip_end.value()
         planned = self._planned_render_segments()
         all_media: list[dict[str, str]] = []
         segment_rows: list[dict] = []
         workspace = self._ensure_project_workspace()
         render_root = workspace / "cache" / "generated_outputs" / request_kind / str(seed)
+        # Round 67: the preview-only RTX Video Super Resolution request.  Only
+        # Preview asks, because only Preview is read for judgement at 480 before
+        # the pixels were ever paid for; Final Render is graded on what H3
+        # produced and must not be judged through an enhancer that can invent
+        # detail.  The renderer's own ``enable_rtx_vsr`` checkbox stays the
+        # native-pipeline knob it always was, and ``H3_CHARACTER_SWAP_PREVIEW_VSR=off``
+        # turns this one off without a rebuild.
+        output_upscale_requested = request_kind == "preview"
+        relay_seed_scope = self._character_swap_relay_seed_scope(seed)
         for index, segment in enumerate(planned):
-            segment.seed = derive_named_segment_seed(seed, segment.segment_id)
+            segment.seed = (
+                int(relay_seed_scope)
+                if relay_seed_scope is not None
+                else derive_named_segment_seed(seed, segment.segment_id)
+            )
             core_start = (
                 segment.core_start_seconds
                 if segment.core_start_seconds is not None
@@ -32682,6 +39611,9 @@ class DirectorCutStudio(QMainWindow):
                 "source_remake_mode": self.source_remake_render_mode,
                 "source_cast_live_action_adaptation": bool(
                     self.source_cast_live_action_adaptation
+                ),
+                "character_swap_manual_align": bool(
+                    self.character_swap_manual_align
                 ),
                 "source_video_role_bindings": self.source_video_role_bindings,
                 "shots": [
@@ -32714,6 +39646,7 @@ class DirectorCutStudio(QMainWindow):
                     megapixels=megapixels,
                     seed=segment.seed,
                     segment_id=segment.segment_id,
+                    output_upscale=output_upscale_requested,
                 )
                 segment.fingerprint = fingerprint
                 all_media.extend(uploads)
@@ -32996,9 +39929,30 @@ class DirectorCutStudio(QMainWindow):
         approved_horizon = float(
             cached_manifest.get("target_duration_seconds", 0.0) or 0.0
         )
+        repair_scope_ids: set[str] = set()
+        if reuse_clean_segments:
+            if self.active_generation_targeted_repair_ids:
+                repair_scope_ids = set(
+                    self.active_generation_targeted_repair_ids
+                )
+            elif self.active_dirty_regeneration_ids:
+                repair_scope_ids = set(self.active_dirty_regeneration_ids)
+            elif self.render_targeted_repair_segment_ids:
+                repair_scope_ids = (
+                    set(self.render_targeted_repair_segment_ids)
+                    & set(self.render_dirty_segment_ids)
+                )
+            elif request_kind != "preview":
+                repair_scope_ids = set(self.render_dirty_segment_ids)
+            else:
+                repair_scope_ids = self._pending_dirty_segment_ids()
         for row in segment_rows:
             segment_id = str(row["segment_id"])
-            dirty = segment_id in self.render_dirty_segment_ids
+            dirty = (
+                segment_id in repair_scope_ids
+                if reuse_clean_segments
+                else segment_id in self.render_dirty_segment_ids
+            )
             current_swap_passes = [
                 value for value in (row.get("character_swap_passes") or [])
                 if isinstance(value, dict)
@@ -33012,6 +39966,32 @@ class DirectorCutStudio(QMainWindow):
                 )
             )
             cached_candidate = cached_by_id.get(segment_id) or {}
+            cached_authoring_fingerprint = str(
+                cached_candidate.get("authoring_fingerprint") or ""
+            )
+            if (
+                self._character_swap_identity_failed(cached_candidate)
+                and (not reuse_clean_segments or segment_id in repair_scope_ids)
+            ):
+                # The previous Relay Job exhausted its automatic Seed retries
+                # without replacing the selected actor.  Keep the result
+                # reviewable, but never let fingerprint_match make that failed
+                # visual identity a clean cache hit.
+                dirty = True
+                self.render_dirty_segment_ids.add(segment_id)
+                self.render_dirty_previewed_segment_ids.discard(segment_id)
+            elif (
+                cached_authoring_fingerprint
+                and cached_authoring_fingerprint
+                != str(row.get("authoring_fingerprint") or "")
+                and (not reuse_clean_segments or segment_id in repair_scope_ids)
+            ):
+                # Recover from old Projects where an Unlock Identity save was
+                # made while the Work Area was elsewhere and therefore never
+                # received a dirty Segment ID.
+                dirty = True
+                self.render_dirty_segment_ids.add(segment_id)
+                self.render_dirty_previewed_segment_ids.discard(segment_id)
             cached_composite = cached_candidate.get("character_swap_composite") or {}
             if (
                 requires_independent_role_composite
@@ -33020,6 +40000,7 @@ class DirectorCutStudio(QMainWindow):
                     "sam31_v1_plus_role_output_instance_masks_v3",
                     "sam31_v1_plus_role_output_masks_v3_fallback_delta",
                 }
+                and (not reuse_clean_segments or segment_id in repair_scope_ids)
             ):
                 # SAM3.1 role-output v2 measures every matte on its generated
                 # H3 actor, not the differently shaped source V1 performer.
@@ -33061,6 +40042,7 @@ class DirectorCutStudio(QMainWindow):
                 and reviewed_preview is not None
                 and reviewed_preview.get("authoring_fingerprint")
                 == row.get("authoring_fingerprint")
+                and not self._character_swap_identity_failed(reviewed_preview)
             )
             if lock_reviewed_repair_preview:
                 preview_path = Path(str(reviewed_preview.get("output_path", "")))
@@ -33142,7 +40124,28 @@ class DirectorCutStudio(QMainWindow):
                     row["character_swap_composite"] = deepcopy(
                         cached["character_swap_composite"]
                     )
-                if request_kind != "preview":
+                if cached.get("character_swap_identity_audits"):
+                    row["character_swap_identity_audits"] = deepcopy(
+                        cached["character_swap_identity_audits"]
+                    )
+                if cached.get("character_swap_identity_failed"):
+                    row["character_swap_identity_failed"] = True
+                if not fingerprint_match:
+                    # A deliberately reused accepted take still belongs to
+                    # the authoring state that created it.  Keeping the old
+                    # provenance prevents a later Project reopen from treating
+                    # stale pixels as a fingerprint hit for new identity data.
+                    row["fingerprint"] = cached.get("fingerprint")
+                    row["authoring_fingerprint"] = cached.get(
+                        "authoring_fingerprint"
+                    )
+                if (
+                    request_kind != "preview"
+                    and (
+                        not reuse_clean_segments
+                        or segment_id in repair_scope_ids
+                    )
+                ):
                     self.render_dirty_segment_ids.discard(segment_id)
                     self.render_dirty_previewed_segment_ids.discard(segment_id)
             elif (
@@ -33205,6 +40208,7 @@ class DirectorCutStudio(QMainWindow):
             "manifest_path": str(manifest_path),
         }
         job.update(self._immutable_final_hold_spec(start, end))
+        stamp_render_knob_provenance(job)
         job_path.parent.mkdir(parents=True, exist_ok=True)
         job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         return job_path, len(segment_rows)
@@ -33427,6 +40431,34 @@ class DirectorCutStudio(QMainWindow):
             SOURCE_REMAKE_MODE_DIRECTED_SWAP,
         }
 
+    def _character_swap_relay_seed_scope(self, master_seed: int) -> int | None:
+        """One Relay seed for every Segment cut out of the same source V1.
+
+        Round 69 item 2.  The Relay plan node drives its adaptive windows from a
+        single seed, so when an authored clip still needs more than one Studio job
+        the second job used to enter H3 with a different plan and no previous
+        window.  That is the failure the director graded as "the front half is
+        still V1, the back half is right" (the S9 take), and the accepted manual
+        run avoided it by chaining the whole clip under one seed.  Deriving the
+        seed from the source clip rather than the Segment id gives every piece of
+        one V1 the same Relay plan; ``None`` off the Relay route keeps the proven
+        per-Segment derivation untouched.
+        """
+
+        if not self._source_remake_uses_character_swap_relay():
+            return None
+        source_asset = self._reference_asset("V1")
+        if source_asset is None:
+            return None
+        identity = str(
+            source_asset.local_path or source_asset.filename or ""
+        ).strip()
+        if not identity:
+            return None
+        return derive_named_segment_seed(
+            master_seed, f"relay-source-v1:{identity}"
+        )
+
     def _source_remake_relay_source_clip(
         self,
         start: float,
@@ -33447,6 +40479,13 @@ class DirectorCutStudio(QMainWindow):
         # short and force assembly/audio to drift. The final assembler trims
         # only the harmless fractional tail.
         frame_count = max(1, math.ceil(duration * PROGRAM_MONITOR_FPS - 1e-9))
+        # The same tail-seek class that used to abort media analysis: a V1 plate
+        # from a phone or WhatsApp publishes a duration that runs past its last
+        # seekable picture, and every FFmpeg attempt below asked for the raw
+        # Timeline start, so a Shot near the end of such a plate failed twice
+        # with the same "Conversion failed!".  Clamp once, and let the audio map
+        # to the clamped position too so the Relay Shot never drifts off sync.
+        seek = clamp_seek_to_decode_span(source, float(start), runtime=self.runtime)
         cache = CACHE_ROOT / "source_remake_relay_video"
         cache.mkdir(parents=True, exist_ok=True)
         token = hashlib.sha256(
@@ -33531,7 +40570,7 @@ class DirectorCutStudio(QMainWindow):
         try:
             command = [
                 str(self.runtime.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{float(start):.6f}", "-i", str(source),
+                "-ss", f"{seek:.6f}", "-i", str(source),
             ]
             if not has_audio:
                 command.extend([
@@ -33568,20 +40607,67 @@ class DirectorCutStudio(QMainWindow):
             audio_stage = destination.with_name(
                 f"{destination.stem}.audio-{write_token}.wav"
             )
-            video_command = [
-                str(self.runtime.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{float(start):.6f}", "-i", str(source),
-                "-map", "0:v:0", "-an",
-                "-vf", "fps=24,setpts=PTS-STARTPTS", "-filter_threads", "1",
-                "-frames:v", str(frame_count), "-c:v", "libx264",
-                "-preset", "veryfast", "-crf", "18", "-threads", "1",
-                "-pix_fmt", "yuv420p", str(video_stage),
-            ]
-            video_result = run_ffmpeg(video_command, "video-only fallback")
+            def video_stage_command(
+                seek_prefix: list[str], seek_suffix: list[str]
+            ) -> list[str]:
+                return [
+                    str(self.runtime.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    *seek_prefix, "-i", str(source), *seek_suffix,
+                    "-map", "0:v:0", "-an",
+                    "-vf", "fps=24,setpts=PTS-STARTPTS", "-filter_threads", "1",
+                    "-frames:v", str(frame_count), "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "18", "-threads", "1",
+                    "-pix_fmt", "yuv420p", str(video_stage),
+                ]
+
+            # An output-side seek decodes from the beginning, so it still answers
+            # when the fast input seek lands behind the last picture of the
+            # file.  It is only reached after the normal attempt failed, and the
+            # cost is decode time, never a lost Shot.  A seek past the last
+            # picture can also exit cleanly after writing an empty container, so
+            # the stage is accepted on its measured picture length, not on its
+            # exit code alone.
+            minimum_stage_duration = max(
+                1.0 / PROGRAM_MONITOR_FPS,
+                min(duration, frame_count / PROGRAM_MONITOR_FPS) - 0.08,
+            )
+
+            def staged_video_is_usable() -> bool:
+                if not video_stage.is_file():
+                    return False
+                try:
+                    stage_duration = float(
+                        probe_media(video_stage, self.runtime).get("duration", 0.0) or 0.0
+                    )
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    # An unprobeable stage still reaches the mux and the final
+                    # validation below; only a missing file stops it here.
+                    return True
+                if stage_duration + 1e-6 >= minimum_stage_duration:
+                    return True
+                failure_details.append(
+                    "video-only fallback: FFmpeg exited without an error but the "
+                    f"stage held only {stage_duration:.3f}s of picture, short of "
+                    f"the {minimum_stage_duration:.3f}s window"
+                )
+                return False
+
+            video_result = None
+            for attempt_label, seek_prefix, seek_suffix in (
+                ("video-only fallback", ["-ss", f"{seek:.6f}"], []),
+                ("video-only fallback (output-side seek)", [], ["-ss", f"{seek:.6f}"]),
+            ):
+                video_stage.unlink(missing_ok=True)
+                video_result = run_ffmpeg(
+                    video_stage_command(seek_prefix, seek_suffix), attempt_label
+                )
+                if video_result is not None and not video_result.returncode:
+                    if staged_video_is_usable():
+                        break
             if has_audio:
                 audio_command = [
                     str(self.runtime.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                    "-ss", f"{float(start):.6f}", "-i", str(source),
+                    "-ss", f"{seek:.6f}", "-i", str(source),
                     "-map", "0:a:0", "-vn",
                     "-af", (
                         f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS,"
@@ -33676,19 +40762,11 @@ class DirectorCutStudio(QMainWindow):
             if cue.cue_type == "shot"
             and ranges_intersect(cue.start_seconds, cue.end_seconds, start, end)
         ]
-        # Relay planning isolates authored Shot boundaries. If rounding leaves
-        # more than one candidate, use the Shot owning the largest part of this
-        # window so a neighboring edit cannot leak across the cut.
-        if overlapping_shots:
-            owner = max(
-                overlapping_shots,
-                key=lambda cue: max(
-                    0.0,
-                    min(end, cue.end_seconds) - max(start, cue.start_seconds),
-                ),
-            )
-            owner_scene_indexes: list[int] = []
-            owner_scenes: list[dict] = []
+        def scenes_for_shot(cue) -> tuple[list[int], list[dict]]:
+            """Scene indexes and Scene rows that belong to one authored Shot."""
+
+            indexes: list[int] = []
+            rows: list[dict] = []
             for scene in analysis.get("scenes") or []:
                 if not isinstance(scene, dict):
                     continue
@@ -33701,21 +40779,26 @@ class DirectorCutStudio(QMainWindow):
                 if ranges_intersect(
                     scene_start,
                     scene_end,
-                    owner.start_seconds,
-                    owner.end_seconds,
+                    cue.start_seconds,
+                    cue.end_seconds,
                 ):
-                    owner_scenes.append(scene)
-                    if scene_index and scene_index not in owner_scene_indexes:
-                        owner_scene_indexes.append(scene_index)
+                    rows.append(scene)
+                    if scene_index and scene_index not in indexes:
+                        indexes.append(scene_index)
+            return indexes, rows
 
-            local_role_ids = {
-                str(role or "").strip().upper()
-                for role in (
-                    list(owner.source_role_identity_overrides)
-                    + list(owner.source_role_bbox_overrides)
-                )
-                if str(role or "").strip()
-            }
+        # Relay planning isolates authored Shot boundaries. If rounding leaves
+        # more than one candidate, use the Shot owning the largest part of this
+        # window so a neighboring edit cannot leak across the cut.
+        if overlapping_shots:
+            owner = max(
+                overlapping_shots,
+                key=lambda cue: max(
+                    0.0,
+                    min(end, cue.end_seconds) - max(start, cue.start_seconds),
+                ),
+            )
+            owner_scene_indexes, owner_scenes = scenes_for_shot(owner)
             principal_roles = analysis.setdefault("principal_roles", [])
             principal_by_id = {
                 str(row.get("role_id", "") or "").strip().upper(): row
@@ -33726,81 +40809,127 @@ class DirectorCutStudio(QMainWindow):
             # than the original Design ledger.  Overlay them onto a private
             # generation copy so Relay receives the newly selected source box
             # even when the saved global analysis still contains only the old
-            # actor list.
-            for role in sorted(local_role_ids):
-                role_row = principal_by_id.get(role)
-                if role_row is None:
-                    role_row = {
-                        "role_id": role,
-                        "visual_identity": "Shot-local detected V1 performer",
-                        "wardrobe": "",
-                        "narrative_function": "Shot-local replacement source",
-                        "scene_indexes": list(owner_scene_indexes),
-                        "appearance_evidence": [],
-                    }
-                    principal_roles.append(role_row)
-                    principal_by_id[role] = role_row
-                else:
-                    role_row["scene_indexes"] = list(dict.fromkeys([
-                        *(role_row.get("scene_indexes") or []),
-                        *owner_scene_indexes,
-                    ]))
-                for scene in owner_scenes:
-                    active_roles = [
-                        str(value or "").strip().upper()
-                        for value in scene.get("active_source_roles") or []
-                        if str(value or "").strip()
-                    ]
-                    if role not in active_roles:
-                        scene["active_source_roles"] = [*active_roles, role]
-
-            for raw_role, raw_target in owner.source_role_identity_overrides.items():
-                role = str(raw_role or "").strip().upper()
-                normalized_target = normalize_picture_reference(raw_target)
-                target_asset = (
-                    self._reference_asset(normalized_target)
-                    if normalized_target else None
-                )
-                keep_v1 = bool(
-                    str(raw_target or "").strip().upper() == KEEP_V1_TARGET
-                    or (
-                        target_asset
-                        and "[V1_SOURCE_FACE:" in str(target_asset.clip_prompt or "")
+            # actor list.  Every Shot inside this window contributes its own
+            # result scoped to its own Scenes, because Relay renders all of them.
+            def adopt_local_roles(
+                cue,
+                scene_indexes: list[int],
+                scenes: list[dict],
+            ) -> None:
+                local_role_ids = {
+                    str(role or "").strip().upper()
+                    for role in (
+                        list(cue.source_role_identity_overrides)
+                        + list(cue.source_role_bbox_overrides)
                     )
-                )
-                target = (
-                    KEEP_V1_TARGET if keep_v1 else
-                    normalized_target
-                )
-                if not role or not target:
-                    continue
-                for row in effective_bindings:
-                    if str(row.get("source_role_id", "")).strip().upper() == role:
-                        row["target_media_id"] = target
-                        row["source_thumbnail"] = keep_v1
-                # Do not require the new source role to have existed in the
-                # original global binding table.  Insert a Shot-scoped binding
-                # first so it wins setdefault() resolution for this Relay
-                # window, while neighboring Shots keep their own mappings.
-                effective_bindings.insert(0, {
-                    "source_role_id": role,
-                    "target_media_id": target,
-                    "scene_indexes": list(owner_scene_indexes),
-                    "identity_lock": "strict",
-                    "source_thumbnail": keep_v1,
-                })
+                    if str(role or "").strip()
+                }
+                for role in sorted(local_role_ids):
+                    role_row = principal_by_id.get(role)
+                    if role_row is None:
+                        role_row = {
+                            "role_id": role,
+                            "visual_identity": "Shot-local detected V1 performer",
+                            "wardrobe": "",
+                            "narrative_function": "Shot-local replacement source",
+                            "scene_indexes": list(scene_indexes),
+                            "appearance_evidence": [],
+                        }
+                        principal_roles.append(role_row)
+                        principal_by_id[role] = role_row
+                    else:
+                        role_row["scene_indexes"] = list(dict.fromkeys([
+                            *(role_row.get("scene_indexes") or []),
+                            *scene_indexes,
+                        ]))
+                    for scene in scenes:
+                        active_roles = [
+                            str(value or "").strip().upper()
+                            for value in scene.get("active_source_roles") or []
+                            if str(value or "").strip()
+                        ]
+                        if role not in active_roles:
+                            scene["active_source_roles"] = [*active_roles, role]
+
+            # A Shot-level role flag describes that Shot alone.  Rewriting every
+            # row of the global cast — the previous behaviour — let one KEEP V1
+            # choice on the longest Shot of a Segment cancel the replacement for
+            # Shots whose Scenes still map to a Picture, so the whole Segment
+            # rendered the untouched V1 plate and recorded no error anywhere.
+            # Each Shot now contributes a Scene-scoped row instead, and the
+            # owner Shot is listed first so its reading stays authoritative where
+            # two Shots of the same Segment name the same Scene.
+            shot_order = [owner] + [
+                cue for cue in overlapping_shots if cue is not owner
+            ]
+            scoped_bindings: list[dict] = []
+            for cue in shot_order:
+                if cue is owner:
+                    cue_scene_indexes, cue_scenes = owner_scene_indexes, owner_scenes
+                else:
+                    cue_scene_indexes, cue_scenes = scenes_for_shot(cue)
+                adopt_local_roles(cue, cue_scene_indexes, cue_scenes)
+                for raw_role, raw_target in cue.source_role_identity_overrides.items():
+                    role = str(raw_role or "").strip().upper()
+                    normalized_target = normalize_picture_reference(raw_target)
+                    target_asset = (
+                        self._reference_asset(normalized_target)
+                        if normalized_target else None
+                    )
+                    keep_v1 = bool(
+                        str(raw_target or "").strip().upper() == KEEP_V1_TARGET
+                        or (
+                            target_asset
+                            and "[V1_SOURCE_FACE:" in str(target_asset.clip_prompt or "")
+                        )
+                    )
+                    target = (
+                        KEEP_V1_TARGET if keep_v1 else
+                        normalized_target
+                    )
+                    if not role or not target:
+                        continue
+                    # Do not require the new source role to have existed in the
+                    # original global binding table.  A Shot-scoped row wins
+                    # inside its own Scenes while neighboring Shots keep their
+                    # own mappings; a Shot whose Scenes could not be resolved has
+                    # nothing to scope to, so its choice covers this window.
+                    scoped_bindings.append({
+                        "source_role_id": role,
+                        "target_media_id": target,
+                        "scene_indexes": list(cue_scene_indexes),
+                        "identity_lock": "strict",
+                        "source_thumbnail": keep_v1,
+                    })
+            effective_bindings[:0] = scoped_bindings
         else:
             owner = None
+            shot_order = []
+        # A Relay window renders every Shot it contains, so a role ticked for SWAP
+        # in any of those Shots is in scope and a manually drawn source box is
+        # honoured for the Shot that owns it.  The owner Shot is read first, so it
+        # stays authoritative when two Shots of one Segment disagree.
+        window_selected_roles: list[str] = []
+        window_bbox_overrides: dict[str, object] = {}
+        for cue in shot_order:
+            for raw_role in cue.source_role_swap_selection or []:
+                role = str(raw_role or "").strip().upper()
+                if role and role not in window_selected_roles:
+                    window_selected_roles.append(role)
+            for raw_role, raw_bbox in (cue.source_role_bbox_overrides or {}).items():
+                role = str(raw_role or "").strip().upper()
+                if role and role not in window_bbox_overrides:
+                    window_bbox_overrides[role] = raw_bbox
         passes = character_swap_passes_for_window(
             analysis,
             effective_bindings,
             start,
             end,
             selected_role_ids=(
-                owner.source_role_swap_selection if owner is not None else None
+                (window_selected_roles or None) if owner is not None else None
             ),
             source_bbox_overrides=(
-                owner.source_role_bbox_overrides if owner is not None else None
+                (window_bbox_overrides or None) if owner is not None else None
             ),
         )
         if owner is not None:
@@ -34140,13 +41269,15 @@ class DirectorCutStudio(QMainWindow):
         if reuse_clean_segments:
             self._start_generation(
                 "preview",
-                0.2,
+                PREVIEW_MEGAPIXELS,
                 self.preview_seed,
                 False,
                 reuse_clean_segments=True,
             )
         else:
-            self._start_generation("preview", 0.2, self.preview_seed, False)
+            self._start_generation(
+                "preview", PREVIEW_MEGAPIXELS, self.preview_seed, False
+            )
 
     def _reconcile_speech_timing_before_run(self) -> list[str]:
         """Apply speech budget and final-tail repair to the live Timeline."""
@@ -34326,21 +41457,29 @@ class DirectorCutStudio(QMainWindow):
         if repair_accept:
             # Rejecting a repair Preview means those edits need another take;
             # it does not require rerendering unrelated approved Segments.
-            self.render_dirty_previewed_segment_ids.clear()
-            self.active_dirty_regeneration_ids = set(
-                self.render_dirty_segment_ids
+            retry_ids = (
+                set(self.render_targeted_repair_segment_ids)
+                if self.render_targeted_repair_segment_ids
+                else set(self.render_dirty_segment_ids)
             )
+            self.render_dirty_previewed_segment_ids.difference_update(
+                retry_ids
+            )
+            self.active_dirty_regeneration_ids = retry_ids
             self._refresh_render_status_bar()
             self._start_generation(
                 "preview",
-                0.2,
+                PREVIEW_MEGAPIXELS,
                 self.preview_seed,
                 False,
                 reuse_clean_segments=True,
             )
         else:
             self.active_dirty_regeneration_ids.clear()
-            self._start_generation("preview", 0.2, self.preview_seed, False)
+            self.active_generation_targeted_repair_ids.clear()
+            self._start_generation(
+                "preview", PREVIEW_MEGAPIXELS, self.preview_seed, False
+            )
 
     def _has_reusable_production_segment_baseline(self) -> bool:
         """Return whether a prior accepted/final run has a durable Segment take."""
@@ -34372,7 +41511,9 @@ class DirectorCutStudio(QMainWindow):
     def accept_pre_run_preview(self) -> None:
         if not self.preview_ready or self.preview_seed is None:
             QMessageBox.information(
-                self, "Preview required", "Complete a 0.2MP / 448×448 preview first."
+                self,
+                "Preview required",
+                f"Complete a {PREVIEW_MEGAPIXELS:g}MP preview first.",
             )
             return
         if (
@@ -34424,6 +41565,26 @@ class DirectorCutStudio(QMainWindow):
     ) -> None:
         # A real ComfyUI request always leaves source-only Storyboard playback.
         self.storyboard_preview_active = False
+        if reuse_clean_segments:
+            if self.active_dirty_regeneration_ids:
+                self.active_generation_targeted_repair_ids = set(
+                    self.active_dirty_regeneration_ids
+                )
+            elif self.render_targeted_repair_segment_ids:
+                self.active_generation_targeted_repair_ids = (
+                    set(self.render_targeted_repair_segment_ids)
+                    & set(self.render_dirty_segment_ids)
+                )
+            elif request_kind != "preview":
+                self.active_generation_targeted_repair_ids = set(
+                    self.render_dirty_segment_ids
+                )
+            else:
+                self.active_generation_targeted_repair_ids = (
+                    self._pending_dirty_segment_ids()
+                )
+        else:
+            self.active_generation_targeted_repair_ids.clear()
         self._reconcile_speech_timing_before_run()
         if not self._validate_authored_text_before_run():
             return
@@ -34656,9 +41817,22 @@ class DirectorCutStudio(QMainWindow):
                         self.clip_start.value(), self.clip_end.value()
                     )
                 )
+                stamp_render_knob_provenance(job)
                 job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
-            QMessageBox.critical(self, "Queue error", str(exc))
+            tb_text = traceback.format_exc()
+            try:
+                _log_dir = Path(__file__).resolve().parent / "logs"
+                _log_dir.mkdir(exist_ok=True)
+                _tb_path = _log_dir / (
+                    f"queue_error_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+                )
+                _tb_path.write_text(tb_text, encoding="utf-8")
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self, "Queue error", f"{exc}\n\n{tb_text}"
+            )
             return
         runner = JsonLineProcess(self, "comfy-submit")
         runner.message.connect(self._generation_message)
@@ -34684,7 +41858,7 @@ class DirectorCutStudio(QMainWindow):
         self._refresh_incremental_controls()
         self.queue_button.setText("GENERATING…")
         label = {
-            "preview": "0.2MP / 448×448 preview without upscaling",
+            "preview": f"{PREVIEW_MEGAPIXELS:g}MP preview without upscaling",
             "accepted": "accepted 1.0MP render",
         }.get(request_kind, f"{megapixels:g}MP final render")
         if is_smart_render:
@@ -34781,7 +41955,14 @@ class DirectorCutStudio(QMainWindow):
                     self.render_runtime_status[segment_id] = status
                 elif status in {"reusable", "cached", "complete", "completed"}:
                     self.render_runtime_status.pop(segment_id, None)
-                    if self.submit_request_kind != "preview":
+                    if (
+                        self.submit_request_kind != "preview"
+                        and (
+                            not self.active_generation_targeted_repair_ids
+                            or segment_id
+                            in self.active_generation_targeted_repair_ids
+                        )
+                    ):
                         self.render_dirty_segment_ids.discard(segment_id)
                         self.render_dirty_previewed_segment_ids.discard(segment_id)
                 self._refresh_render_status_bar()
@@ -34797,7 +41978,14 @@ class DirectorCutStudio(QMainWindow):
                         continue
                     segment_id = str(row.get("segment_id", ""))
                     status = str(row.get("status", "")).lower()
-                    if status in {"cached", "complete", "completed", "reusable"}:
+                    if (
+                        status in {"cached", "complete", "completed", "reusable"}
+                        and (
+                            not self.active_generation_targeted_repair_ids
+                            or segment_id
+                            in self.active_generation_targeted_repair_ids
+                        )
+                    ):
                         self.render_dirty_segment_ids.discard(segment_id)
                         self.render_dirty_previewed_segment_ids.discard(segment_id)
                         self.render_runtime_status.pop(segment_id, None)
@@ -34843,6 +42031,9 @@ class DirectorCutStudio(QMainWindow):
         self.generated_player.setPosition(round(hidden_handle * 1000.0))
         self.generated_monitor_stack.setCurrentWidget(self.generated_video_widget)
         self.monitor_display_stack.setCurrentWidget(self.monitor_compare_splitter)
+        # A Shot unit is played without arming the timeline branch, so the
+        # monitor has to be told explicitly that this pane is now audible.
+        self._apply_monitor_audio_routing()
         self.generated_player.play()
         self.generation_overlay.set_message(
             f"{title}\nContinuing Smart Render…"
@@ -34912,6 +42103,9 @@ class DirectorCutStudio(QMainWindow):
             and start <= frame_tolerance
             and end >= timeline_duration - frame_tolerance
         )
+        targeted_repair_ids = set(
+            self.active_generation_targeted_repair_ids
+        )
 
         rows = [
             row
@@ -34923,6 +42117,7 @@ class DirectorCutStudio(QMainWindow):
             for row in rows
             if str(row.get("status", "")).strip().lower()
             in {"cached", "complete", "completed", "reusable"}
+            and not self._character_swap_identity_failed(row)
         ]
         successful_ids = {
             str(row.get("segment_id", "")).strip()
@@ -34935,50 +42130,114 @@ class DirectorCutStudio(QMainWindow):
             for shot_id in (row.get("shot_ids") or [])
             if str(shot_id).strip()
         }
+        failed_identity_rows = [
+            row for row in rows if self._character_swap_identity_failed(row)
+        ]
+        failed_identity_ids = {
+            str(row.get("segment_id", "")).strip()
+            for row in failed_identity_rows
+            if str(row.get("segment_id", "")).strip()
+        }
+        failed_identity_shot_ids = {
+            str(shot_id).strip()
+            for row in failed_identity_rows
+            for shot_id in (row.get("shot_ids") or [])
+            if str(shot_id).strip()
+        }
 
-        if full_timeline:
+        if targeted_repair_ids:
+            successful_ids.intersection_update(targeted_repair_ids)
+            failed_identity_ids.intersection_update(targeted_repair_ids)
+            successful_shot_ids = {
+                str(shot_id).strip()
+                for row in successful_rows
+                if str(row.get("segment_id", "")).strip()
+                in successful_ids
+                for shot_id in (row.get("shot_ids") or [])
+                if str(shot_id).strip()
+            }
+            failed_identity_shot_ids = {
+                str(shot_id).strip()
+                for row in failed_identity_rows
+                if str(row.get("segment_id", "")).strip()
+                in failed_identity_ids
+                for shot_id in (row.get("shot_ids") or [])
+                if str(shot_id).strip()
+            }
+
+        authoritative_full_timeline = bool(
+            full_timeline and not targeted_repair_ids
+        )
+        if authoritative_full_timeline:
             # This deliberately clears stale pre-Apply IDs too. They may not
             # exist in the new manifest and cannot safely be matched by ID.
             self.render_dirty_segment_ids.clear()
             self.render_dirty_previewed_segment_ids.clear()
             self.render_runtime_status.clear()
             self.render_isolated_shot_ids.clear()
+            self.render_targeted_repair_segment_ids.clear()
+            # A non-blocking identity QC failure is still not a clean take.
+            # Keep only those exact repair units dirty so the rest of a long
+            # Job can finish without permanently accepting an unchanged actor.
+            self.render_dirty_segment_ids.update(failed_identity_ids)
+            self.render_isolated_shot_ids.update(failed_identity_shot_ids)
         else:
             # Preserve dirty state outside a partial Work Area. Include the
             # live planner because short native runs may not return a manifest.
             completed_ids = set(successful_ids)
-            for segment in self._planned_render_segments():
-                unit_start = float(
-                    segment.core_start_seconds
-                    if segment.core_start_seconds is not None
-                    else segment.start_seconds
-                )
-                unit_end = float(
-                    segment.core_end_seconds
-                    if segment.core_end_seconds is not None
-                    else segment.end_seconds
-                )
-                if (
-                    unit_start >= start - frame_tolerance
-                    and unit_end <= end + frame_tolerance
-                ):
-                    completed_ids.add(segment.segment_id)
-                    successful_shot_ids.update(segment.shot_ids or [])
+            if not rows:
+                for segment in self._planned_render_segments():
+                    unit_start = float(
+                        segment.core_start_seconds
+                        if segment.core_start_seconds is not None
+                        else segment.start_seconds
+                    )
+                    unit_end = float(
+                        segment.core_end_seconds
+                        if segment.core_end_seconds is not None
+                        else segment.end_seconds
+                    )
+                    if (
+                        unit_start >= start - frame_tolerance
+                        and unit_end <= end + frame_tolerance
+                    ):
+                        completed_ids.add(segment.segment_id)
+                        successful_shot_ids.update(segment.shot_ids or [])
             self.render_dirty_segment_ids.difference_update(completed_ids)
             self.render_dirty_previewed_segment_ids.difference_update(completed_ids)
             for segment_id in completed_ids:
                 self.render_runtime_status.pop(segment_id, None)
             self.render_isolated_shot_ids.difference_update(successful_shot_ids)
+            self.render_dirty_segment_ids.update(failed_identity_ids)
+            self.render_isolated_shot_ids.update(failed_identity_shot_ids)
+
+        if targeted_repair_ids:
+            self.render_targeted_repair_segment_ids.difference_update(
+                successful_ids
+            )
+            self.render_targeted_repair_segment_ids.update(
+                failed_identity_ids
+            )
 
         self.render_dirty_previewed_segment_ids.intersection_update(
             self.render_dirty_segment_ids
         )
         self.active_dirty_regeneration_ids.clear()
+        self.active_generation_targeted_repair_ids.clear()
         self._mark_dirty()
         self._refresh_render_status_bar()
-        return full_timeline
+        return bool(authoritative_full_timeline and not failed_identity_ids)
 
     def _generation_finished(self, exit_code: int, log: str) -> None:
+        # Claim protocol safety net: whichever generation worker exited (success
+        # or crash), drop any stale studio claim so the status tray can resume
+        # its Qwen auto-load. Workers clear it themselves on a clean /free.
+        try:
+            import staged_model_driver as _h3_claim_driver
+
+            _h3_claim_driver.clear_comfy_claim()
+        except Exception:
+            pass
         self.generation_overlay.stop()
         self.queue_button.setEnabled(True)
         self.queue_button.setText("RUN+QUEUE")
@@ -35003,7 +42262,11 @@ class DirectorCutStudio(QMainWindow):
                         segment_id = str(row.get("segment_id", ""))
                         if segment_id and str(row.get("status", "")).lower() in {
                             "cached", "complete", "completed", "reusable",
-                        }:
+                        } and not self._character_swap_identity_failed(row) and (
+                            not self.active_generation_targeted_repair_ids
+                            or segment_id
+                            in self.active_generation_targeted_repair_ids
+                        ):
                             self.render_dirty_segment_ids.discard(segment_id)
                             self.render_dirty_previewed_segment_ids.discard(segment_id)
                             self.render_runtime_status.pop(segment_id, None)
@@ -35056,6 +42319,7 @@ class DirectorCutStudio(QMainWindow):
                         if isinstance(row, dict)
                         and str(row.get("status", "")).lower()
                         in {"cached", "complete", "completed", "reusable"}
+                        and not self._character_swap_identity_failed(row)
                     }
                     completed_dirty_ids.intersection_update(successful_ids)
                 self.render_dirty_previewed_segment_ids.update(
@@ -35076,6 +42340,7 @@ class DirectorCutStudio(QMainWindow):
                     if status == "running":
                         self.render_runtime_status.pop(segment_id, None)
             self.active_dirty_regeneration_ids.clear()
+            self.active_generation_targeted_repair_ids.clear()
             self._refresh_render_status_bar()
             project_copy = None
             if shown:
@@ -35115,6 +42380,12 @@ class DirectorCutStudio(QMainWindow):
                     )
             else:
                 self._restore_monitor_after_generation()
+            identity_failure_count = sum(
+                1
+                for row in (result.get("manifest") or {}).get("segments", [])
+                if isinstance(row, dict)
+                and self._character_swap_identity_failed(row)
+            )
             if kind == "preview":
                 self.preview_seed = int(seed)
                 self.preview_ready = True
@@ -35123,7 +42394,11 @@ class DirectorCutStudio(QMainWindow):
                 if result.get("smart_render"):
                     count = len((result.get("manifest") or {}).get("segments") or [])
                     self.statusBar().showMessage(
-                        f"Long 0.2MP / 448×448 preview ready · {count} segments · seed {seed}"
+                        f"Long {PREVIEW_MEGAPIXELS:g}MP preview ready · {count} segments · seed {seed}"
+                        + (
+                            f" · {identity_failure_count} identity swap(s) remain dirty"
+                            if identity_failure_count else ""
+                        )
                     )
                 else:
                     self.statusBar().showMessage(
@@ -35144,6 +42419,10 @@ class DirectorCutStudio(QMainWindow):
                         + (
                             " · clean baseline updated"
                             if committed_full_baseline else ""
+                        )
+                        + (
+                            f" · {identity_failure_count} identity swap(s) remain dirty"
+                            if identity_failure_count else ""
                         )
                     )
                 else:
@@ -35169,12 +42448,18 @@ class DirectorCutStudio(QMainWindow):
                         "their affected Segment(s)."
                         if committed_full_baseline else ""
                     )
+                    + (
+                        f"\n{identity_failure_count} Character Swap Segment(s) still retain "
+                        "the V1 actor and remain dirty for another automatic retry."
+                        if identity_failure_count else ""
+                    )
                     + (f"\nSaved project: {project_copy}" if project_copy else "")
                     + (f"\nArchive warning: {archive_warning}" if archive_warning else ""),
                 )
         else:
             self._restore_monitor_after_generation()
             self.active_dirty_regeneration_ids.clear()
+            self.active_generation_targeted_repair_ids.clear()
             for segment_id, status in list(self.render_runtime_status.items()):
                 if status == "running":
                     self.render_runtime_status[segment_id] = "failed"
@@ -35264,6 +42549,15 @@ class DirectorCutStudio(QMainWindow):
                     return False
                 if proxy_duration > source_duration + tolerance:
                     return False
+            if any(
+                stream.get("codec_type") == "audio"
+                for stream in source_info.get("streams", [])
+            ) and not any(
+                stream.get("codec_type") == "audio" for stream in proxy_streams
+            ):
+                # A proxy that lost the audio stream would play silently while
+                # still looking valid, so keep the original master in charge.
+                return False
             return True
         except (OSError, RuntimeError, ValueError, TypeError):
             return False
@@ -35282,7 +42576,7 @@ class DirectorCutStudio(QMainWindow):
         self.generated_player.setSource(QUrl.fromLocalFile(str(source)))
         self.generated_player.setPosition(self.generated_pending_position_ms)
         self.generated_monitor_stack.setCurrentWidget(self.generated_video_widget)
-        self.audio_output.setMuted(True)
+        self._apply_monitor_audio_routing()
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
         if autoplay:
             self.toggle_playback()
@@ -35330,7 +42624,7 @@ class DirectorCutStudio(QMainWindow):
         self.generated_player.setSource(QUrl.fromLocalFile(str(source)))
         self.generated_player.setPosition(self.generated_pending_position_ms)
         self.generated_monitor_stack.setCurrentWidget(self.generated_video_widget)
-        self.audio_output.setMuted(True)
+        self._apply_monitor_audio_routing()
         self.render_timeline_at(self.playhead_seconds, force_seek=True)
         self.generated_proxy_source = source.resolve()
         self.generated_proxy_target = proxy.resolve()
@@ -35485,6 +42779,7 @@ class DirectorCutStudio(QMainWindow):
         self.generated_output_label.setStyleSheet("color:#55cfdf; padding:2px 4px; font-weight:600;")
         self.export_generated_button.setEnabled(True)
         self.monitor_display_stack.setCurrentWidget(self.monitor_compare_splitter)
+        self._apply_monitor_audio_routing()
         if kind == "video":
             self._prepare_generated_monitor_video(path, autoplay=autoplay)
             if self.render_settings.dialogue_tts_engine == "h3_native":

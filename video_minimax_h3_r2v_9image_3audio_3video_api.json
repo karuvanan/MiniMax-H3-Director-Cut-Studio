@@ -3,7 +3,9 @@
     "inputs": {
       "filename_prefix": "video/MiniMax_H3",
       "format": "auto",
+      "format.codec": "auto",
       "codec": "auto",
+      "video-preview": "",
       "video": [
         "130",
         0
@@ -145,7 +147,7 @@
   },
   "127": {
     "inputs": {
-      "unet_name": "minimax_h3_ref2va_int8_convrot.safetensors",
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
@@ -166,7 +168,7 @@
   },
   "129": {
     "inputs": {
-      "noise_seed": 872356096682123
+      "noise_seed": 529028650788662
     },
     "class_type": "RandomNoise",
     "_meta": {
@@ -177,6 +179,8 @@
     "inputs": {
       "fps": 24,
       "bit_depth": 8,
+      "color_space": "sRGB",
+      "codec": "none",
       "images": [
         "147",
         0
@@ -319,12 +323,12 @@
     },
     "class_type": "MiniMaxH3ReferenceToVideo",
     "_meta": {
-      "title": "MiniMax H3 Reference to Video"
+      "title": "MiniMax H3 参考转视频"
     }
   },
   "137": {
     "inputs": {
-      "image": "h3_product_7fb7cc9d_1_c32411a1.jpg"
+      "image": "cut-1747619712-iNu5T7S.jpg"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -372,6 +376,8 @@
       "resize_type": "scale by multiplier",
       "resize_type.scale": 2,
       "quality": "ULTRA",
+      "strength": 1,
+      "image_encoding": "8-bit RGB",
       "images": [
         "122",
         0
@@ -410,34 +416,13 @@
       "strength": 1,
       "low_vram": false,
       "model": [
-        "157",
+        "643",
         0
       ]
     },
     "class_type": "MiniMaxH3TurboLoRA",
     "_meta": {
       "title": "MiniMax-H3 Turbo LoRA"
-    }
-  },
-  "151": {
-    "inputs": {
-      "enabled": true,
-      "tau": 1,
-      "min_tokens": 4096,
-      "strict": true,
-      "thresh_type": "diag",
-      "int8_qk": false,
-      "int8_pv": false,
-      "sink_conditioning": "exact_kv",
-      "dense_blocks": "",
-      "model": [
-        "632",
-        0
-      ]
-    },
-    "class_type": "MiniMaxH3MemoryEfficientSolAttentionPatch",
-    "_meta": {
-      "title": "MiniMax H3 Memory Efficient Sol Attention Patch"
     }
   },
   "152": {
@@ -489,19 +474,6 @@
     "class_type": "VRAM_Debug",
     "_meta": {
       "title": "VRAM Debug"
-    }
-  },
-  "157": {
-    "inputs": {
-      "attention": "comfy kitchen attention",
-      "model": [
-        "151",
-        0
-      ]
-    },
-    "class_type": "ModelAttentionBackend",
-    "_meta": {
-      "title": "ModelAttentionBackend"
     }
   },
   "629": {
@@ -642,6 +614,38 @@
     "class_type": "LoadImage",
     "_meta": {
       "title": "加载图像"
+    }
+  },
+  "642": {
+    "inputs": {
+      "enabled": true,
+      "tau": 1,
+      "thresh_type": "diag",
+      "exact_mode": "off",
+      "dense_steps": 0,
+      "step_off": 0,
+      "sink_tokens": 0,
+      "model": [
+        "632",
+        0
+      ]
+    },
+    "class_type": "SolAttnMiniMaxH3Patcher",
+    "_meta": {
+      "title": "Sol-Attn MiniMax H3 Patcher 🚀"
+    }
+  },
+  "643": {
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "642",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "ModelAttentionBackend"
     }
   }
 }
