@@ -1,0 +1,37 @@
+infer:
+  n_steps: 32
+  cfg: 3
+
+audio:
+  hop_size: 480
+  sample_rate: 24000
+  max_length: 36000
+  n_fft: 1920
+  num_mels: 128
+  win_size: 1920
+  fmin: 0
+  fmax: 12000
+  mel_var: 8.14
+  mel_mean: -4.92
+
+model:
+  encoder:
+    vocab_size: 3000
+    text_dim: 512
+    pitch_dim: 512
+    type_dim: 512
+    f0_bin: 361
+    f0_dim: 512
+    num_layers: 4
+
+  flow_matching:
+    mel_dim: 128
+    hidden_size: 1024
+    num_layers: 22
+    num_heads: 16
+    cfg_drop_prob: 0.2
+    use_embedding: False
+    cond_codebook_size: 512
+    cond_scale_factor: 1
+    sigma: 1e-5
+    time_scheduler: cos
