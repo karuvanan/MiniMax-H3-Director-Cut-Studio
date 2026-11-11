@@ -1,0 +1,12 @@
+# Local Subtitle Tool — Python 3.11+ recommended.
+# FFmpeg is a separate system dependency and must be available on PATH.
+
+# Local speech recognition and timestamp extraction.
+faster-whisper>=1.1.1,<2.0
+
+# LM Studio's OpenAI-compatible local API.
+openai>=1.0.0,<3.0
+
+# .docx script input and PyQt desktop interface.
+python-docx>=1.1.2,<2.0
+PyQt6>=6.7.0,<7.0
