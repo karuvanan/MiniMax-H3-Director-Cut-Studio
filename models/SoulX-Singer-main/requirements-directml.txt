@@ -1,0 +1,5 @@
+--pre
+torch==2.3.1
+torchaudio==2.3.1
+torch-directml==0.2.5.dev240914
+-r requirements.txt
